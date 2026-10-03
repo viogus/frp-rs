@@ -4253,7 +4253,7 @@ fn test_collect_config_files_admits_a_non_regular_entry_by_extension() {
     // like a file. The tree's only non-regular filter is on the `[include]`
     // `glob_in_dir` path, and it skips *directories* by the directory entry's
     // own type — `if entry.file_type()?.is_dir()`
-    // (`frp-core/src/config/file.rs:879`) — never by `is_file()`, so it admits
+    // (`frp-core/src/config/file.rs:893`) — never by `is_file()`, so it admits
     // a FIFO just as this collector does. `collect_config_files_inner` has no
     // filter at all.
     //
@@ -8015,7 +8015,7 @@ fn legacy_ini_typed_array_root_visitor_is_collected() {
 /// reserved-root bypass keys on the **port** keys and never on `type`, because
 /// keying it on `type` would collect every typed settings root and contradict
 /// `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:10182`) and the `[web_server] type`-only v1
+/// (`frp-core/src/config/tests.rs:10391`) and the `[web_server] type`-only v1
 /// boundary. This test pins the strict verdict so the delta is measured rather
 /// than silent.
 #[test]
@@ -8088,8 +8088,8 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// loader modes, `failed to parse visitor includes, err: type shouldn't be
 /// empty`; `[include]` singular gives the same with `include`. frp-rs returned
 /// rc 0 with `Proxies: 0 Visitors: 0` — `process_includes` removed the table
-/// whatever its shape (`frp-core/src/config/file.rs:154` on b4b60b91; the shape
-/// gate is now `frp-core/src/config/file.rs:298-299`) and it runs from
+/// whatever its shape (`frp-core/src/config/file.rs:158` on b4b60b91; the shape
+/// gate is now `frp-core/src/config/file.rs:312-313`) and it runs from
 /// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:1991`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
@@ -8164,12 +8164,12 @@ fn legacy_ini_includes_section_with_ports_is_a_proxy() {
 /// Go: `[includes] foo = 1` loads rc 0 in both dialects, on the client and on the
 /// server (the server legacy reader only reads `[common]`, and the client's
 /// proxy-name rule finds no `type`/port to act on). The shape gate at
-/// `frp-core/src/config/file.rs:298-299` deliberately lets the table through so the
+/// `frp-core/src/config/file.rs:312-313` deliberately lets the table through so the
 /// typeless-visitor guard (`frp-core/src/config/normalize.rs:1991`) and the
 /// collector can see it, so the loader drops whatever table is still there after
-/// normalization (`frp-core/src/config/file.rs:485`, run by the two `normalize`
-/// wrappers at `frp-core/src/config/file.rs:453` and
-/// `frp-core/src/config/file.rs:470`, `.ini` only). Without
+/// normalization (`frp-core/src/config/file.rs:499`, run by the two `normalize`
+/// wrappers at `frp-core/src/config/file.rs:467` and
+/// `frp-core/src/config/file.rs:484`, `.ini` only). Without
 /// that drop the leftover reached the v1 `includes: Vec<String>` decode and frp-rs
 /// refused a file Go loads: client rc 1 both modes, server rc 1 both modes for
 /// `[includes] foo = 1` and `[include] foo = 1` in strict mode.
@@ -8213,9 +8213,9 @@ fn legacy_ini_table_shaped_include_without_proxy_keys_is_inert() {
 /// client and the server. frp-rs carried it into the v1 `includes: Vec<String>`
 /// decode and refused a file Go loads (client and server rc 1 in both modes,
 /// `invalid type: integer \`1\`, expected a sequence`), which
-/// `drop_ini_scalar_include_keys` (`frp-core/src/config/file.rs:507`) removes. A
+/// `drop_ini_scalar_include_keys` (`frp-core/src/config/file.rs:521`) removes. A
 /// `.ini` **without** `[common]` goes down Go's v1 path too, so its type error
-/// must stay, in both modes (the other include shapes that diverge from Go are listed in the "Known bounds" comment above `go_dir` in `frp-core/src/config/file.rs:529`).
+/// must stay, in both modes (the other include shapes that diverge from Go are listed in the "Known bounds" comment above `go_dir` in `frp-core/src/config/file.rs:543`).
 #[test]
 fn legacy_ini_scalar_includes_is_inert_like_go() {
     let client_head = "[common]\nserver_addr = 127.0.0.1\nserver_port = 7000\n";
@@ -8284,9 +8284,9 @@ fn legacy_ini_scalar_includes_is_inert_like_go() {
 
 /// **v1 formats keep the table-shaped `includes` type error.** The `.ini`-only
 /// cleanup (`drop_legacy_ini_include_tables`,
-/// `frp-core/src/config/file.rs:485`) is gated on the format
+/// `frp-core/src/config/file.rs:499`) is gated on the format
 /// (`if format != ConfigFormat::Ini { return; }`,
-/// `frp-core/src/config/file.rs:487`). Without that gate a table-shaped
+/// `frp-core/src/config/file.rs:501`). Without that gate a table-shaped
 /// `includes` in TOML/YAML/JSON is dropped and frp-rs loads a file Go refuses:
 /// measured on Go v0.71.0, all three formats are rc 1 in both loader modes with
 /// `field "ClientCommonConfig.includes": cannot unmarshal object into []string`
@@ -11919,7 +11919,7 @@ fn test_server_config_defaults_pinned() {
 
 #[test]
 fn test_max_conns_per_proxy_snapshot_clamped_to_2pow20() {
-    // server.rs:195: ServerConfigSnapshot clamps max_conns_per_proxy to
+    // server.rs:233: ServerConfigSnapshot clamps max_conns_per_proxy to
     // 2^20 — a u64::MAX value would overflow the i64 normalized field
     // (u64::MAX -> -1) and truncate on 32-bit usize.
     let cfg = ServerConfig {
@@ -12452,7 +12452,7 @@ path = "/tmp/does-not-matter"
 /// used to keep the scalar and drop the section's keys, which hid a real
 /// `[includes]` section from the typeless-visitor guard and the collector, and
 /// then the `.ini`-only scalar scrub
-/// (`frp-core/src/config/file.rs:507`) deleted the scalar too. Measured on Go
+/// (`frp-core/src/config/file.rs:521`) deleted the scalar too. Measured on Go
 /// v0.71.0, the three shapes below are rc 1 in **both** loader modes with Go's
 /// own message, and the typed port-carrying one is rc 0 with one `tcp` proxy
 /// *named* `includes`.
@@ -12724,8 +12724,8 @@ fn nocommon_ini_weird_role_is_not_a_role_refusal() {
 /// ignores default-section keys, so the expansion here is a pre-existing frp-rs
 /// extension (the Go-measured shape is rc 0 with no proxies), but it must not be
 /// *silently dropped*: the `.ini`-only scalar scrub
-/// (`frp-core/src/config/file.rs:507`, `is_scalar` at
-/// `frp-core/src/config/file.rs:509`) accepts Integer/Float/Boolean/Datetime and
+/// (`frp-core/src/config/file.rs:521`, `is_scalar` at
+/// `frp-core/src/config/file.rs:523`) accepts Integer/Float/Boolean/Datetime and
 /// must keep leaving a String alone. A mutant that also accepts `String` deletes
 /// the include pattern and this file loads with zero proxies.
 #[test]
@@ -12877,7 +12877,7 @@ fn legacy_ini_common_unknown_key_residual_both_modes() {
 /// the `[common]` hoist and therefore never saw the nested key: `x12_main.ini`
 /// was rc 0 with zero proxies against Go rc 1 (the include was never read).
 /// Read it from `[common]` while the raw dialect is still visible
-/// (`frp-core/src/config/file.rs:251`).
+/// (`frp-core/src/config/file.rs:265`).
 #[test]
 fn legacy_ini_common_include_is_expanded_like_go() {
     let dir = tempfile::tempdir().unwrap();
@@ -12911,7 +12911,7 @@ fn legacy_ini_common_include_is_expanded_like_go() {
 /// `include: directory of %s not exist`). frp-rs was rc 0 because the nested
 /// include was never read; the wording of its own error is
 /// `include: directory of <dir> not exist (included by pattern <p>)`
-/// (`frp-core/src/config/file.rs:412`), but the load must fail. A mutant that
+/// (`frp-core/src/config/file.rs:426`), but the load must fail. A mutant that
 /// drops the `[common]` extraction reads zero patterns and returns `Ok`.
 ///
 /// The `missing/` spelling is the trailing-separator case: Go's `Dir` drops the
@@ -12956,7 +12956,7 @@ fn legacy_ini_common_include_missing_dir_refuses_like_go() {
 /// (`[p1] role = "visitor"`) beside the config, Go v0.71.0 is rc 1 in both
 /// loader modes (`failed to parse visitor p1, err: type shouldn't be empty`).
 /// frp-rs's [`process_includes`] uses the same single-`*`-per-component glob
-/// (`glob_in_dir`, `frp-core/src/config/file.rs:855`), so the matched file must
+/// (`glob_in_dir`, `frp-core/src/config/file.rs:869`), so the matched file must
 /// be merged and refused the same way.
 #[test]
 fn legacy_ini_common_include_glob_is_expanded_like_go() {
@@ -12985,9 +12985,9 @@ fn legacy_ini_common_include_glob_is_expanded_like_go() {
 /// Go builds the match pattern as `filepath.Join(absDir, filepath.Base(path))`
 /// and tests it with `filepath.Match` (`pkg/config/legacy/parse.go:87`), so
 /// everything after the `*` is a literal suffix that must still match. A test
-/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:904`)
+/// that only kept `name.starts_with(prefix)` (`frp-core/src/config/file.rs:918`)
 /// survived the whole suite because the extension pre-filter
-/// (`frp-core/src/config/file.rs:894-902`) already rejects the obvious cases
+/// (`frp-core/src/config/file.rs:908-916`) already rejects the obvious cases
 /// (e.g. `z*.ini` against `zebra.txt`, where the extensions differ). This pin
 /// uses `z*ini`: the star is followed by no `.`, so `Path::extension()` is
 /// `None` and the pre-filter is skipped — only the suffix test can reject
@@ -13764,7 +13764,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:389` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:223`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:12251`).
+/// `frp-core/src/config/tests.rs:12460`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -14180,7 +14180,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:12446`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:12655`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
@@ -14265,7 +14265,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// non-strict refusal is the loose-only divergence the item calls a follow-up.
 /// Recorded deliberate: making the two detectors agree would mean dropping
 /// `common` from the dotted-section roots, which the `[common.webServer.tls]`
-/// spelling pinned at `frp-core/src/config/tests.rs:7006` still needs. A mutant
+/// spelling pinned at `frp-core/src/config/tests.rs:7215` still needs. A mutant
 /// that forces `legacy_ini` false in the collector loads this file non-strict.
 #[test]
 fn dotted_common_only_section_is_legacy_for_the_collector_both_modes() {
@@ -14330,7 +14330,7 @@ fn default_section_header_is_an_ordinary_section_both_modes() {
 /// and loads zero proxies. The strict rc agrees; only the message and the
 /// non-strict verdict diverge, and matching Go's non-strict message would mean
 /// addressing the array element as `proxies[0]`, which the `.ini` reader does not
-/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12488`). Both
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12697`). Both
 /// modes pinned.
 #[test]
 fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
@@ -14366,7 +14366,7 @@ fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
 /// (`frp-core/src/config/normalize.rs:2331`) and loads `p2`, rc 0. Recorded
 /// deliberate: making a missing port fatal is a separate design question, and the
 /// sibling skip paths are pinned as intentional at
-/// `frp-core/src/config/tests.rs:10188` / `:10213`. Both modes pinned.
+/// `frp-core/src/config/tests.rs:10397` / `:10422`. Both modes pinned.
 #[test]
 fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
     let dir = tempfile::tempdir().unwrap();
@@ -14400,14 +14400,14 @@ fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
 /// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
 /// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
 /// and would contradict `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:10238`). The item calls this a design question
+/// (`frp-core/src/config/tests.rs:10447`). The item calls this a design question
 /// about whether frp-rs keeps supporting v1 settings roots in `.ini` at all, so
 /// the divergence is recorded deliberate rather than forced. The sibling
 /// typeless/port-less shape (`c2.ini`, `[p] custom_domains = ["a.com"]`) is
 /// pinned the same way both modes: Go collects `p` (rc 0), frp-rs keeps it a v1
 /// section (`unknown field "p"` strict, rc 0 non-strict), matching
 /// `typeless_ini_section_without_ports_stays_a_v1_section`
-/// (`frp-core/src/config/tests.rs:7259`).
+/// (`frp-core/src/config/tests.rs:7468`).
 #[test]
 fn legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes() {
     let dir = tempfile::tempdir().unwrap();
@@ -14580,7 +14580,7 @@ fn feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the
                 );
                 // No unhonoured-record assertion in this shape: every push into
                 // `unhonoured_server_feature_key_records()` is `#[cfg(not(feature = "…"))]`-gated
-                // (`frp-core/src/config/loader.rs:982-993`), so a build that honours this port
+                // (`frp-core/src/config/loader.rs:1020-1031`), so a build that honours this port
                 // compiles out the only push that could name `snake`; the assertion that used to
                 // sit here was structurally vacuous and could never fail, so it is replaced by
                 // this note. The feature-off half below still asserts the accepted-but-unhonoured

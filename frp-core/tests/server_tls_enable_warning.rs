@@ -26,12 +26,12 @@
 //! key wins), and a literal `tls_enable` inside `[transport.tls]` — the lift
 //! renames its five Go keys
 //! (`force`/`certFile`/`keyFile`/`trustedCaFile`/`serverName`, the match at
-//! `frp-core/src/config/normalize.rs:869-878`) and passes everything else through
+//! `frp-core/src/config/normalize.rs:918-927`) and passes everything else through
 //! unchanged, so that key is hoisted onto the
 //! same field. Either way the key was *written*. A nested
 //! `[common.transport.tls] tls_enable` counts **only when no top-level
 //! `transport` key is written**, because `[common]`'s flatten is `or_insert` on
-//! the whole value (`frp-core/src/config/normalize.rs:652-655`) — a leading
+//! the whole value (`frp-core/src/config/normalize.rs:701-704`) — a leading
 //! `[transport]` table discards `[common]`'s whole, so the key is dropped before
 //! the lift and the detector must stay silent (pinned by
 //! `common_transport_tls_needs_no_competing_top_level_transport`). An `includes`
@@ -43,13 +43,13 @@
 //! **Why a written key warns but a synthesized one does not.** The server
 //! normalizer *synthesizes* `tls_enable = true` from the legacy
 //! `[transport.tls]` section when it carries `force = true`, `certFile` or
-//! `keyFile` (`frp-core/src/config/normalize.rs:865-884`,
+//! `keyFile` (`frp-core/src/config/normalize.rs:914-933`,
 //! `table.entry("tls_enable").or_insert(…)`) — a Go-shaped input, not a user
 //! writing the frp-rs-only field. After normalization the two are
 //! indistinguishable, so `ConfigPresence::server_tls_enable_set_in` reads the
 //! **raw** value. The `[transport.tls] enable` spelling is a deliberately
 //! *unrecognized* neighbour: the *server* lift has no `"enable"` arm (only the
-//! client's does, at `frp-core/src/config/normalize.rs:1429-1437`), so it stays a
+//! client's does, at `frp-core/src/config/normalize.rs:1486-1494`), so it stays a
 //! top-level key literally named `enable` — ignored leniently, refused strictly —
 //! and never sets `tls_enable` at all. Every case is pinned below.
 //!
@@ -66,8 +66,8 @@
 //! **The two variants are covered by two different lanes, not by one run.** The
 //! `#[cfg]` split means a default-features run asserts only the `tls` text and a
 //! `--no-default-features` run only the no-TLS text: the `run:` at
-//! `.github/workflows/ci.yml:1945` (`cargo test -p frp-core`, default features)
-//! covers the `tls` variant, and the `run:` at `.github/workflows/ci.yml:1977`
+//! `.github/workflows/ci.yml:2326` (`cargo test -p frp-core`, default features)
+//! covers the `tls` variant, and the `run:` at `.github/workflows/ci.yml:2358`
 //! (`cargo test -p frp-core --no-default-features --all-targets`) covers the no-TLS
 //! one. A change to either text is therefore only seen by the
 //! lane whose feature set selects it.
@@ -430,7 +430,7 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
 // the one-line `tracing` prefix before it, and after it no byte but an optional
 // trailing newline. `contains(NEEDLE)` cannot see an appended clause (measured by
 // appending `" but honestly"` to the `tracing::warn!` at
-// `frp-core/src/config/loader.rs:932`), which is why the tail is pinned there.
+// `frp-core/src/config/loader.rs:970`), which is why the tail is pinned there.
 
 /// A written `tls_enable`, in either value, is inert — so it warns, exactly
 /// once, in both strict modes, and the loader itself stays silent.
@@ -554,7 +554,7 @@ fn synthesized_tls_enable_stays_silent() {
 /// A literal `tls_enable` written *inside* `[transport.tls]` is a third written
 /// spelling: the server lift renames its five Go keys (`force`, `certFile`,
 /// `keyFile`, `trustedCaFile`, `serverName` — the match at
-/// `frp-core/src/config/normalize.rs:869-878`) and passes every other key through
+/// `frp-core/src/config/normalize.rs:918-927`) and passes every other key through
 /// unchanged, so this one is hoisted onto the very same inert field the warning
 /// is about.
 #[test]
@@ -700,10 +700,10 @@ fn the_string_loader_stays_silent() {
 /// A nested `tls_enable` under `[common.transport.tls]` counts as written **only
 /// when no top-level `transport` key is written**, because `[common]`'s flatten
 /// is `table.entry(k).or_insert(v)` on the whole value
-/// (`frp-core/src/config/normalize.rs:652-655`): a written top-level `transport`
+/// (`frp-core/src/config/normalize.rs:701-704`): a written top-level `transport`
 /// — table or not — wins, and `[common]`'s `transport` (nested `tls` table and
 /// all) is discarded **before** the lift at
-/// `frp-core/src/config/normalize.rs:861-885` can hoist anything.
+/// `frp-core/src/config/normalize.rs:910-934` can hoist anything.
 ///
 /// This is the invariant the sibling `web_server_tls_enable_set_in` already
 /// keeps ("without this arm the detector claimed a key the loader had dropped"):

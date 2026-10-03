@@ -985,7 +985,7 @@ async fn handle_head_not_allowed() -> StatusCode {
 ///    honoured only when auth is set.
 /// 3. A *blanket* switch of `apply_admin_auth` to `route_layer` is out of scope:
 ///    the helper is shared (`frp-core/src/admin_auth.rs:36`), called from this
-///    file and from `frp-server/src/dashboard.rs:3656/3672/3696`, so it would
+///    file and from `frp-server/src/dashboard.rs:3670/3672/3696`, so it would
 ///    change the frps dashboard too. C is admin-local and leaves the helper and
 ///    the dashboard alone.
 ///
@@ -1001,7 +1001,7 @@ async fn handle_head_not_allowed() -> StatusCode {
 /// routes and 404 on the two `{name}` routes (measured 200/404/200/404); all
 /// four now answer 405, so this change also repairs them. Only the
 /// request/response *payload shape* is frp-rs-specific, as `docs/deployment.md`
-/// states. POST is unchanged: `frpc/src/main.rs:630-631` sends `POST` with a
+/// states. POST is unchanged: `frpc/src/main.rs:910-911` sends `POST` with a
 /// JSON body (`admin_post_json`), and the comment on the `/api/reload` route
 /// documents POST as a deliberate frp-rs extension.
 /// `OPTIONS /api/reload` is already 405 on both, and `POST`/`HEAD /api/stop`

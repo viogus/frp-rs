@@ -580,7 +580,7 @@ pub struct FrpsArgs {
     /// `pkg/config/flags.go:237`), so `frps verify` inherits it too. `None`
     /// means the flag was absent and the config value stands;
     /// `ServerConfig::default()` already carries Go's 60
-    /// (`frp-core/src/config/server.rs:247`), so the absent case is Go's default.
+    /// (`frp-core/src/config/server.rs:249`), so the absent case is Go's default.
     /// The value is `i64`, matching `Int64VarP` and Go's `int64` config field:
     /// Go accepts `--vhost-http-timeout -1` (its floor then applies) and refuses
     /// only what does not fit an `int64` (measured on Go v0.71.0:
@@ -751,8 +751,8 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// [`FrpsRootSlots`].
 ///
 /// **R6(a) (`TODO.md:9899`): this lane does not read the loaded config's `[log]`
-/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:500`) runs before
-/// `collect_config_files` (`frps/src/main.rs:516`), so the effective log level
+/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:524`) runs before
+/// `collect_config_files` (`frps/src/main.rs:540`), so the effective log level
 /// comes from the flags alone. Measured over a config dir whose `frps.toml`
 /// writes `[log] level = "warn"`: `frps --config-dir cfg` and
 /// `frps --config-dir cfg --log-level ""` both log at `info` (11 `INFO` records,
@@ -5919,7 +5919,7 @@ mod tests {
     /// persistent root so it is accepted on both the run and `verify` paths.
     /// This pins the parts a parse-only check would miss: the value reaches
     /// `ServerConfig` on the override lane, and an absent flag leaves Go's
-    /// default (60, `frp-core/src/config/server.rs:247`) alone.
+    /// default (60, `frp-core/src/config/server.rs:249`) alone.
     #[test]
     fn vhost_http_timeout_flag_applied_to_server_config() {
         for spelling in ["--vhost-http-timeout", "--vhost_http_timeout"] {

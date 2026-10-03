@@ -462,7 +462,7 @@ pub(super) fn process_includes(
 /// collector: Go's legacy server reader reads only `[common]` and ignores every
 /// other section, so such a table is nothing either reader turns into a setting
 /// and it must not reach `ServerConfig::includes`
-/// (`frp-core/src/config/server.rs:163`). `.ini` only; in TOML/JSON/YAML a table
+/// (`frp-core/src/config/server.rs:165`). `.ini` only; in TOML/JSON/YAML a table
 /// there is a type error in Go too.
 fn normalize_server_config_with_legacy_include_cleanup(
     value: &mut toml::Value,
@@ -851,7 +851,7 @@ pub(super) fn go_clean(path: &str) -> String {
 /// filesystem that allows such names (e.g. Linux under a non-UTF-8 locale).
 ///
 /// The `dir` guard above is unreachable in the current tree: the only caller
-/// ([`process_includes`], `file.rs:410-416`) refuses a missing or non-directory
+/// ([`process_includes`], `file.rs:424-430`) refuses a missing or non-directory
 /// `search_dir` with Go's `include: directory of … not exist` error first.
 /// Measured by deleting the guard and running `cargo test -p frp-core --lib`:
 /// the suite stays green (1071 passed), including

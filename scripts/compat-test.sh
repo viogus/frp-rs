@@ -4412,7 +4412,7 @@ run_xtcp_test() {
     should_run_test "$name" || return 0
 
     # Reap the servers the previous scenarios started, by the exact pids this
-    # run recorded (`track_pid`, `scripts/compat-test.sh:121`) — never by
+    # run recorded (`track_pid`, `scripts/compat-test.sh:153`) — never by
     # argument pattern. Two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.

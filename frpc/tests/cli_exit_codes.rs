@@ -107,7 +107,7 @@ impl Drop for TempDir {
 /// panicking, so that panic cannot orphan it. `try_wait` fails only on an OS
 /// error — an already-reaped child is not an error, std caches its status — so
 /// this is the "kill in the expect path" fix for the shape `TODO.md`'s
-/// reload-guards item lists (`frpc/tests/cli_exit_codes.rs:96`). The timeout arm
+/// reload-guards item lists (`frpc/tests/cli_exit_codes.rs:112`). The timeout arm
 /// below already kills before it panics.
 fn try_wait_or_kill(child: &mut Child, what: &str) -> Option<std::process::ExitStatus> {
     match child.try_wait() {

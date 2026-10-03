@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=7c9687924424f70828a30a32713333df6c24e67b9848cac42f6926bd3674fd35
+          guard_pin=aad684200b13e68ebfebae34df5c5bf5fa9abbaab22503a3512288a95b422870
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -433,7 +433,7 @@ jobs:
           # evidence literals while the suite stayed byte-identical. Both files are
           # pinned here.
           guard_lib=scripts/lib/compat-stray-guard.sh
-          guard_lib_pin=a335320e87c65f36aff05ec79d83bb51f996fdb1e9125c0c9daa12ad3b658189
+          guard_lib_pin=1461036f92d3f03fd0e9ef24dda271c363c4af7011da3cf7c73a8ec250bc4a28
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -1400,7 +1400,7 @@ jobs:
           fi
           echo "TODO.md citation gate fixtures ok: 60 checks hold, all 11 red-path canaries live"
       - name: A/B gate — measurable-delta classifier + verdict fixture checks
-        # TODO.md:10569 ("The A/B throughput gate fires on changes with no
+        # TODO.md:10581 ("The A/B throughput gate fires on changes with no
         # runtime code, so a red gate on `main` is not evidence of a
         # regression"). This step pins the suite that guards the delta
         # classifier and the gate arithmetic, AND the three files that suite
@@ -1454,13 +1454,13 @@ jobs:
           # run (review round 3, F3).
           unset AB_MD_CLASSIFIER AB_MD_MATRIX AB_MD_REMOTE AB_MD_SABOTAGE_CHILD
           guard_file=scripts/tests/ab-measurable-delta.sh
-          guard_pin=e5984ca968c369a126ac4c8ed53a8978aa1cfec7359291b694c1279494187e59
+          guard_pin=b0fcd4d59b1b33cb855fd1a73da718506d167c1f3d8edba9c22f0b546b0bb7c0
           guard_exact=53
           guard_floor=53
           guard_cls=scripts/ab-measurable-delta.sh
-          guard_cls_pin=02550abd49dd3d772bbe076046a710687d3cb4b72a11daaa14e55c88db0b174a
+          guard_cls_pin=dd6e97f7260de532f797a62ea0b7be8c58fd44c2b7d1c71f09db027b9887586a
           guard_matrix=scripts/ab-matrix.sh
-          guard_matrix_pin=df4199b02cc64b6d903b03c0d2bf77c6d69546e24946cf4157a4b2eef0ee4139
+          guard_matrix_pin=3c1027446ad083cd7914ff89406aad6149b14517e130dded38a725563b128b04
           guard_remote=scripts/ab-remote.sh
           guard_remote_pin=6a1ba8c695f9f984e39d28b9decea3b53271f881d25c49726fe06930d5c2559c
           # Every hashed subject must actually be verified, and it must be the
@@ -1608,6 +1608,175 @@ jobs:
           fi
           echo "A/B measurable-delta fixture checks ok: $guard_exact checks hold, all $guard_evidence_exact evidence lines live, pins verified $guard_pins_verified/$guard_pins_expected"
 
+      - name: Live path:line cites — guard + expectation-table fixture checks
+        # The TODO.md item filed at line 10540 ("A `path:line` cite in a live
+        # file is not machine-checked, so a change that inserts lines rots every
+        # cite into the file it touched"). `scripts/tests/todo-cite-guard.sh`
+        # checks only cites of TODO.md lines and `scripts/repo-health.sh` never
+        # reads the `:line` suffix, so before this step no job could see the class: one
+        # PR's insertions shifted 75 cites into its own six files, and the
+        # renumbering that followed moved the repairs themselves.
+        #
+        # Same shape as the classifier step above: the suite's bytes are pinned
+        # before it runs (`guard_pin`), the file the suite drives is pinned
+        # beside it (`guard_file`), the guard under test and its expectation
+        # table are pinned too, the suite's exact `RESULT:` total and `ok`-line
+        # count are compared, an absolute floor sits under them, and any `FAIL`
+        # line fails the step.
+        #
+        # The pins carry the same claim the classifier's `guard_lf_pin` does,
+        # twice over: `guard_subject_pin` pins `scripts/tests/pathline-cite-guard.sh`
+        # (the thing the fixture suite drives) so a guard whose scan stopped
+        # finding cites cannot keep the fixture count, and `guard_data_pin` pins
+        # `scripts/tests/pathline-cite-expectations.txt` so a regeneration —
+        # which is what `--write` does, and what laundering a rotten cite looks
+        # like — is a two-file change a reviewer sees. Every one of the four
+        # pinned files therefore reds this step when edited alone.
+        #
+        # The canary is the fixture suite's M1 witness, the falsification the
+        # item asks for: `witness M1: one-line insert reddened notes.md:1` is
+        # printed only by a run that actually mutated a synthetic tree, watched
+        # the guard name the citing file:line, and read the fingerprint reason
+        # back. Its absence means the mutation scenarios were skipped or their
+        # verdicts neutered, even if the total looks intact.
+        #
+        # The sabotage converse is the real guard run against the real tree: its
+        # `RESULT:` line must carry exactly `guard_cites` checked cites with
+        # `0 violation(s)` (a floor under `guard_cites` rejects a shrunken
+        # inventory), and a second run against an expectation table stripped to
+        # its header must *fail* — a table with no record must never read as a
+        # clean tree. Builtins only on the read-back paths, for the round-14
+        # reason the sibling steps record.
+        shell: bash
+        run: |
+          set -o pipefail
+          log=/tmp/frp-pathline-cite-fixtures.log
+          real_log=/tmp/frp-pathline-cite.log
+          sabotage_table=/tmp/frp-pathline-cite-sabotage.txt
+          status=0
+          guard_file=scripts/tests/pathline-cite-fixtures.sh
+          guard_pin=e5a08315caa259e8bcc01030a631e966dde108528eedb12e2b0a675193f968ee
+          guard_subject=scripts/tests/pathline-cite-guard.sh
+          guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
+          guard_data_file=scripts/tests/pathline-cite-expectations.txt
+          guard_data_pin=cd7a499d4d66660db4945c6fc67f2678b09a29e29138692214aa5d889aaef2b3
+          guard_exact=86
+          guard_floor=86
+          guard_canary='witness M1: one-line insert reddened notes.md:1'
+          # The measured live inventory at this head and a floor under it, the
+          # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
+          # uses: a *falling* count has to move both literals.
+          guard_cites=576
+          guard_cites_floor=576
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector; cannot verify $guard_file"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          verify_guard() {
+            local out sha
+            out=$($guard_hasher "$1" 2>/dev/null) || true
+            sha=${out%% *}
+            if [ "$sha" != "$2" ]; then
+              echo "::error::$1 is not the pinned revision (sha256 ${sha:-<none>}; expected $2)"
+              echo "::error::an edit to $1 — including one that weakens the cite guard or re-bakes its expectations — must also update $3 in the 'Live path:line cites — guard + expectation-table fixture checks' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+              return 1
+            fi
+            return 0
+          }
+          verify_guard "$guard_file" "$guard_pin" guard_pin || status=1
+          verify_guard "$guard_subject" "$guard_subject_pin" guard_subject_pin || status=1
+          verify_guard "$guard_data_file" "$guard_data_pin" guard_data_pin || status=1
+          [ "$status" = "0" ] || exit 1
+          bash "$guard_file" > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_canary_hit=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+            if [ "$guard_line" = "$guard_canary" ]; then
+              guard_canary_hit=1
+            fi
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_canary_hit" = "1" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          # The real guard against the real tree: the inventory is pinned, and
+          # the run must be clean.
+          bash "$guard_subject" > "$real_log" 2>&1 || status=1
+          guard_real=$(<"$real_log")
+          printf '%s\n' "$guard_real"
+          guard_real_result=0
+          guard_real_fail=0
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              'FAIL'*|'  FAIL'*) guard_real_fail=$((guard_real_fail + 1)) ;;
+            esac
+          done <<< "$guard_real"
+          case $guard_real in
+            *"RESULT: $guard_cites cite(s) checked, 0 violation(s)"*) guard_real_result=1 ;;
+          esac
+          [ "$guard_real_result" = "1" ] || status=1
+          [ "$guard_real_fail" = "0" ] || status=1
+          [ "$guard_cites" -ge "$guard_cites_floor" ] || status=1
+          # Sabotage converse: an expectation table with no record must never
+          # read as a clean tree (builtins only — no grep on this path).
+          : > "$sabotage_table"
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '#'*) printf '%s\n' "$guard_line" >> "$sabotage_table" ;;
+            esac
+          done < "$guard_data_file"
+          if bash "$guard_subject" "$PWD" "$sabotage_table" > /dev/null 2>&1; then
+            echo "::error::sabotage converse failed: scripts/tests/pathline-cite-guard.sh certified a tree whose expectation table carries no record"
+            status=1
+          fi
+          if [ "$guard_canary_hit" != "1" ]; then
+            echo "::error::the cite guard suite did not print its M1 witness ('$guard_canary'); its one-line-insert mutation did not run, or the guard no longer reds on a moved cite"
+          fi
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the cite guard fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the cite guard fixture did not report $guard_exact checks, the M1 witness and a clean real-tree run of $guard_cites cites (floor=$guard_floor, exact=$guard_exact, cites=$guard_cites)"
+            echo "::error::scripts/tests/pathline-cite-fixtures.sh must print $guard_exact '  ok' lines, end with 'RESULT: $guard_exact fixture check(s) hold', print 'witness M1: one-line insert reddened notes.md:1', and must not print a 'FAIL' line, while scripts/tests/pathline-cite-guard.sh prints 'RESULT: $guard_cites cite(s) checked, 0 violation(s)' on this tree; a smaller total, a missing witness, a failure line, no output at all (an \`exec\`), a regeneration that laundered a rotten cite, or a shrunken live inventory means the guard stopped biting — repair the cites by content and restore the checks rather than lowering these literals"
+            exit 1
+          fi
+          echo "cite guard fixtures ok: $guard_exact checks hold (floor $guard_floor), M1 witness present, guard/table/subject pins verified, real tree $guard_cites cites 0 violations, sabotage converse red"
   tests-unit:
     name: Tests (unit)
     runs-on: ubuntu-latest
@@ -1848,7 +2017,7 @@ jobs:
       # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
       # tests with the admin feature". The `admin` flag changes the linked
       # client: the child binds its `[webServer]` and announces it
-      # (`frp-client/src/service.rs:4414`), which is what made the pre-fix
+      # (`frp-client/src/service.rs:4445`), which is what made the pre-fix
       # assertion in `a_config_file_named_after_a_subcommand_stays_a_config_file`
       # a false positive. Re-derived on this tree with
       # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
@@ -2432,7 +2601,7 @@ jobs:
         # (`assert_eq!(stdout.trim_end(), GO_NO_PORT_MSG)`), while the
         # load-error tests check a stdout substring
         # (`stdout_of(&out).contains("unknown field \"notAKnownFrpKey\"")`, e.g.
-        # `frpc/tests/admin_cli.rs:253`; also `:285`, `:496`, `:638`) plus a
+        # `frpc/tests/admin_cli.rs:278`; also `:310`, `:521`, `:663`) plus a
         # stderr check that no `connect` was attempted. Pre-fix those fail with
         # empty stdout and stderr
         # `reload failed: connect 127.0.0.1:7400: Connection refused (os error
@@ -3027,11 +3196,11 @@ jobs:
           echo "frpc admin config-GET guard ok: $n tests listed (expected $want, floor $want_floor), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
-        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:529`)
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:544`)
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
-        # `:527` survived every lane in CI. Same three-check guard shape as its
+        # `:545` survived every lane in CI. Same three-check guard shape as its
         # siblings, with the admin build already warm from the step above.
         shell: bash
         run: |
@@ -3068,7 +3237,7 @@ jobs:
         # `a_config_file_named_after_a_subcommand_stays_a_config_file` was
         # invisible in this configuration. That hid a red: it read run mode's own
         # admin bind line (`frpc admin server starting on 127.0.0.1:<port>`,
-        # `frp-client/src/service.rs:4414`) as a dial of the config's
+        # `frp-client/src/service.rs:4445`) as a dial of the config's
         # `[webServer]` port.
         #
         # Scoped to the one target that needs the flag rather than the whole

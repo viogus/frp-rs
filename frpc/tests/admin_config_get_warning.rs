@@ -527,7 +527,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// measured before the three-way reader landed, hardcoding a reached site's
 /// answer to the no-dashboard one reds **2 of the 4** (`test result: FAILED. 2
 /// passed; 2 failed`) — the startup rows witness `:604`, the hand-edit rows
-/// witness `:771`.
+/// witness `:789`.
 fn assert_clause_is_the_dashboard_one(tag: &str, out: &str) {
     assert!(
         out.contains(DASHBOARD_CLAUSE),
@@ -718,11 +718,11 @@ fn seed_reads_the_file_non_strictly() {
 /// them all, while the shipped seed resolves both shapes here — the key sits
 /// under `[common]`, in either spelling, or in an `includes` file. Neither shape
 /// reaches a raw top-level parse: `process_includes` deep-merges the include
-/// (`frp-core/src/config/normalize.rs:600`) and the presence detector
+/// (`frp-core/src/config/normalize.rs:634`) and the presence detector
 /// (`ConfigPresence::web_server_tls_enable_set_in`) reads the value **before**
-/// `normalize` (`frp-core/src/config/normalize.rs:621`), with its own "top level
+/// `normalize` (`frp-core/src/config/normalize.rs:655`), with its own "top level
 /// first, `[common]` second" fallback per spelling
-/// (`frp-core/src/config/loader.rs:787`). The per-key section merge
+/// (`frp-core/src/config/loader.rs:825`). The per-key section merge
 /// (`merge_section_into`) runs inside `normalize`, so it is not what the flag
 /// consults — the merge has its own frp-core pin. Measured on the shipped binary
 /// before this row existed: both shapes emit **1** record at 0 GETs and still

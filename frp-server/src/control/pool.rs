@@ -269,7 +269,7 @@ pub(crate) struct NatHoleWorkConnParams<'a> {
 ///
 /// NOTE: Go frp v0.70.1 server only writes NatHoleSid on the work connection
 /// (no StartWorkConn). See /tmp/frp-source/server/proxy/xtcp.go:88-92.
-/// The Rust frpc currently expects StartWorkConn first (work_conn.rs:310),
+/// The Rust frpc currently expects StartWorkConn first (work_conn.rs:1806),
 /// so Go frps → Rust frpc XTCP is NOT compatible for the provider side.
 /// Rust frps sends both StartWorkConn (Rust frpc compat) + NatHoleSid
 /// (Go frpc compat) to support both.

@@ -362,7 +362,7 @@ async fn handle_static_file_conn(
         // — net/http writes "Www-Authenticate:", never the registry casing
         // "WWW-Authenticate:" (probe vs go1.25.12 and Go frp v0.71.0 both
         // emit Www-Authenticate). The old pin at the integration test
-        // frp-client/tests/plugin_static_file.rs:133 asserted the uncased
+        // frp-client/tests/plugin_static_file.rs:153 asserted the uncased
         // spelling and must flip with it (out of scope here — reported).
         let resp = b"HTTP/1.1 401 Unauthorized\r\n\
                        Content-Length: 13\r\n\
