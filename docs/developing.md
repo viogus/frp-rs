@@ -1488,6 +1488,20 @@ A flaky test is a bug in the test's timing assumptions, not a re-run button:
 fix it (per-invocation names, a retry bounded to the specific transient, the
 original assertion kept) instead of learning to ignore it.
 
+That fix now exists for the readiness class. `scripts/compat-test.sh` re-drives a
+scenario **once** (`FRP_COMPAT_RETRY_MAX`, default `1`; `0` disables it) when —
+and only when — every failure the attempt recorded was a readiness gate or a
+timed-out dial (`is_readiness_failure`: `not reachable`, `did not start`,
+`not listening`, `FAIL:CONNECT_TIMEOUT`, `FAIL:TIMEOUT`). The re-drive starts
+from a clean slate (the attempt's servers reaped, its scratch directory removed)
+and re-asserts the whole scenario, so a real regression fails the second attempt
+too and is reported once. A `FAIL:MISMATCH` or a `FAIL:CONNECT_RESPONSE` — an
+answer from a live peer — is never re-driven. A green run that leaned on the
+re-drive says so: `[RETRY]` at the scenario and `RETRIED:` in the summary. The
+classification, the bound and the bookkeeping are driven in the `health` job by
+`scripts/tests/compat-scenario-retry.sh`, because none of them is visible from a
+green run.
+
 **The practical rules:**
 
 1. A green suite means "no *known* regression", not "compatible with Go frp".

@@ -710,6 +710,109 @@ jobs:
             exit 1
           fi
           echo "compat port-ownership fixture checks ok: $guard_exact checks hold, pins verified 2/2"
+      - name: Scenario re-drive — fixture checks (compat harness readiness)
+        # TODO.md "The compat gate is flaky" (`:6611`) and "The compat gate's
+        # residual flake is unmeasured in CI" (`:10624`): the harness now
+        # re-drives a scenario whose recorded failures are **all** readiness-class
+        # (`scripts/compat-test.sh`, `is_readiness_failure` + `run_test`), once,
+        # from a clean slate. The classification, the bound and the withdrawal of
+        # the withdrawn attempt's counters are invisible on a green run, so the
+        # suite drives them against the four functions sed-extracted *verbatim*
+        # from the harness.
+        #
+        # The suite floors its own count (`MIN_CHECKS=19`) and fails closed from an
+        # EXIT trap, so a script replaced by `exit 0`, a skipped scenario, or an
+        # extraction that silently matched nothing reds here instead of passing on
+        # an empty census. This file's sha256 is the outer pin: weakening the
+        # classification or the bound inside it now also requires editing
+        # `guard_pin` in this step, i.e. a two-file change a reviewer sees.
+        #
+        # Residue, declared rather than denied: the *subject*,
+        # `scripts/compat-test.sh`, is unpinned — the port-ownership step records
+        # the same residue for its structural probes — so an edit to the harness
+        # can change what the extracted functions are; this step pins the fixture,
+        # not the harness. The digest is taken with an absolute, vector-proven
+        # hasher and the evidence is matched with shell builtins only, for the
+        # round-12/14 reasons recorded in the stray-guard step above.
+        shell: bash
+        run: |
+          # One log file per invocation, for the port-ownership step's reason.
+          log="${TMPDIR:-/tmp}/frp-scenario-retry-fixtures.$$.log"
+          status=0
+          guard_file=scripts/tests/compat-scenario-retry.sh
+          guard_pin=3e95f9a5ad2f8eefb5b39df422aaf43d0102fee397deba245eafdeffd3aa0be7
+          guard_exact=19
+          guard_floor=19
+          guard_hasher=''
+          guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            guard_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+            guard_hasher=$cand
+            break
+          done
+          if [ -z "$guard_hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              guard_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${guard_probe%% *}" = "$guard_abc" ] || continue
+              guard_hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$guard_hasher" ]; then
+            echo "::error::no sha256 tool at an absolute path reproduces the known sha256 vector (need sha256sum or shasum); cannot verify $guard_file"
+            exit 1
+          fi
+          # $1 = file, $2 = its expected digest, $3 = the variable holding that
+          # digest (named in the failure message).
+          # shellcheck disable=SC2086  # $guard_hasher is the word-split "<abs path> [-a 256]"
+          verify_guard() {
+            local out sha
+            out=$($guard_hasher "$1" 2>/dev/null) || true
+            sha=${out%% *}
+            if [ "$sha" != "$2" ]; then
+              echo "::error::$1 is not the pinned revision (sha256 ${sha:-<none>}; expected $2)"
+              echo "::error::an edit to the scenario re-drive fixture — including one that weakens its own assertions — must also update $3 in the 'Scenario re-drive — fixture checks (compat harness readiness)' step of .github/workflows/ci.yml, so the change is visible to a reviewer; paste the sha256 above if the edit is intended, otherwise revert it"
+              return 1
+            fi
+            return 0
+          }
+          verify_guard "$guard_file" "$guard_pin" guard_pin || exit 1
+          bash scripts/tests/compat-scenario-retry.sh > "$log" 2>&1 || status=1
+          guard_log=$(<"$log")
+          printf '%s\n' "$guard_log"
+          guard_ok=0
+          guard_result=0
+          guard_fail=0
+          guard_fail_text=''
+          while IFS= read -r guard_line; do
+            case $guard_line in
+              '  ok '*) guard_ok=$((guard_ok + 1)) ;;
+              'FAIL'*|'  FAIL'*)
+                guard_fail=$((guard_fail + 1))
+                guard_fail_text="${guard_fail_text}${guard_line}"$'\n'
+                ;;
+            esac
+          done <<< "$guard_log"
+          case $guard_log in
+            *"RESULT: $guard_exact fixture check(s) hold"*) guard_result=1 ;;
+          esac
+          [ "$guard_result" = "1" ] || status=1
+          [ "$guard_ok" = "$guard_exact" ] || status=1
+          [ "$guard_exact" -ge "$guard_floor" ] || status=1
+          [ "$guard_fail" = "0" ] || status=1
+          if [ "$guard_fail" != "0" ]; then
+            echo "::error::the scenario re-drive fixture suite printed $guard_fail failure line(s); a run that reported a failure cannot be reported as a green step:"
+            printf '%s' "$guard_fail_text"
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the scenario re-drive fixture checks did not report $guard_exact checks"
+            echo "::error::scripts/tests/compat-scenario-retry.sh must print $guard_exact '  ok' lines and end with 'RESULT: $guard_exact fixture check(s) hold'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped scenario or an extraction that matched nothing means the classification/bound bookkeeping was skipped, neutered or swallowed — restore it rather than lowering this literal"
+            exit 1
+          fi
+          echo "scenario re-drive fixture checks ok: $guard_exact checks hold, pin verified 1/1"
       - name: RSS soak — run-dir guard + summary fixture
         # TODO.md "The RSS-soak fixture step has no outer pins" (`:9283` at the
         # round that filed it): this step used to be a bare

@@ -3,6 +3,44 @@
 # frp-rs Cross-Compatibility Test Suite
 # Tests Go frp v0.71.0 <-> Rust frp-rs interoperability
 # =============================================================================
+#
+# Bounded re-drive of a timing-sensitive scenario
+# -----------------------------------------------
+# The compat gate's residual flake is a *readiness* failure: a scenario's
+# frps/frpc binds its port a little later than the gate's deadline, or a dial
+# never completes inside `send_and_expect`'s window, and the scenario reports
+# `… not reachable` / `FAIL:CONNECT_TIMEOUT` although nothing on the data plane
+# is wrong. The round-5 harness round widened every readiness gate to at least
+# `FRP_COMPAT_READY_MIN` (default 20 s) and made a red run dump the
+# `frps.log`/`frpc.log` tails under `$CI`; that absorbs a *late* listener, but
+# a *wedged* one still fails, and waiting longer cannot tell the two apart.
+#
+# So a failing attempt whose failures are **all** of that class is re-driven
+# once, from a clean slate: the attempt's servers are reaped and its scratch
+# directory is removed, so the second attempt starts the same binaries on fresh
+# ports exactly as the first did. This is the mechanism-level answer the second
+# branch of the "residual flake is unmeasured in CI" Done-when asks for —
+# re-driving the frpc start rather than waiting longer for it — and it is the
+# "bounded retry" the "compat gate is flaky" Done-when asks for. (Both items
+# live in TODO.md; they are named by title rather than by line number, because
+# the cross-file citation gate's checked-cite total is pinned and a new cite
+# would move a literal in `.github/workflows/ci.yml` that this change has no
+# business touching.)
+#
+# What is retried, and why that cannot mask a real failure:
+#   * only these failure reasons are retryable — `not reachable`,
+#     `did not start`, `not listening`, `FAIL:CONNECT_TIMEOUT`, `FAIL:TIMEOUT`.
+#     A `FAIL:MISMATCH`, a `FAIL:CONNECT_RESPONSE` or any other protocol
+#     assertion is never re-driven (`is_readiness_failure`).
+#   * the re-drive re-runs the **whole** scenario, so every assertion the first
+#     attempt made is made again. A deterministic failure (a real regression)
+#     fails the second attempt too and is reported once; only a failure that
+#     does not recur on a fresh start is absorbed.
+#   * the re-drive is bounded by `FRP_COMPAT_RETRY_MAX` (default 1; `0` disables
+#     it entirely). There is no unbounded loop.
+#   * the withdrawn attempt is printed (`[RETRY] …`) and the summary reports how
+#     many scenarios passed on a re-drive, so a green run built on retries is
+#     visible rather than silent.
 set -euo pipefail
 
 # --- Paths ---
@@ -53,6 +91,13 @@ TEST_DIR="${FRP_COMPAT_TEST_DIR:-/tmp/frp-compat-test}"
 PASS=0
 FAIL=0
 FAILURES=()
+# Bounded re-drive of a readiness-class failure (see "Bounded re-drive" at the
+# top). `RETRY_MAX` is validated right after arg parsing; `_ATTEMPT_FAILURES`
+# holds `"<name>: <reason>"` for the attempt `run_test` is currently executing,
+# and `RETRIED_PASS` counts the scenarios a re-drive turned green.
+RETRY_MAX="${FRP_COMPAT_RETRY_MAX:-1}"
+RETRIED_PASS=0
+_ATTEMPT_FAILURES=()
 VERBOSE=false
 SELECTED_TEST=""
 # Set by `should_run_test` when `--test`'s value matches a scenario. `--test`
@@ -119,6 +164,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Env: FRP_COMPAT_TEST_DIR  Scratch dir (default: /tmp/frp-compat-test)."
             echo "     Set it per run so concurrent compat runs never share a scratch dir."
+            echo "     FRP_COMPAT_RETRY_MAX  Re-drives of a readiness-class scenario"
+            echo "                          failure (default 1, 0 disables). Bounded, and"
+            echo "                          only readiness/timeout reasons are retried."
             exit 0
             ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
@@ -145,6 +193,17 @@ fi
 # Pass the resolved Go frp version/path to remote-frps.sh for VPS XTCP runs.
 export GO_FRP_VERSION
 export GO_FRP_DIR
+
+# `FRP_COMPAT_RETRY_MAX` is used in arithmetic below, and `(( ))` on a
+# non-numeric value aborts the run far from its cause; refuse the spelling up
+# front. An empty value means "use the default", which the `:-` above already
+# resolved, so it cannot reach here.
+case "$RETRY_MAX" in
+    ''|*[!0-9]*)
+        echo "ERROR: FRP_COMPAT_RETRY_MAX must be a non-negative integer, got '$RETRY_MAX'" >&2
+        exit 2
+        ;;
+esac
 
 # =============================================================================
 # Helpers
@@ -725,6 +784,10 @@ fail_test() {
     echo -e "${RED}[FAIL]${NC} $name: $reason"
     FAIL=$((FAIL + 1))
     FAILURES+=("$name: $reason")
+    # Recorded per attempt for `run_test`'s bounded re-drive: a failure whose
+    # reason is the readiness class can be re-driven, and this is the only place
+    # a scenario's failure reason is available.
+    _ATTEMPT_FAILURES+=("$name: $reason")
     if $VERBOSE || $CI; then
         echo "--- logs for $name ---"
         # CI too: the EXIT trap removes TEST_DIR, so a red run's logs never survive otherwise.
@@ -755,6 +818,19 @@ should_run_test() {
     return 1
 }
 
+# Is a scenario's failure reason the timing-sensitive class — a readiness gate
+# that never saw the listener, or a dial that never completed — rather than a
+# protocol/data assertion? Only these are re-driven. `FAIL:MISMATCH` and
+# `FAIL:CONNECT_RESPONSE` are answers from a live peer: they are never retried,
+# because a re-drive could only turn a real protocol regression into a coin
+# flip.
+is_readiness_failure() {
+    case "$1" in
+        *"not reachable"*|*"did not start"*|*"not listening"*|FAIL:CONNECT_TIMEOUT*|FAIL:TIMEOUT*) return 0 ;;
+    esac
+    return 1
+}
+
 # Wrapper that enables set -x tracing in --debug mode.
 #
 # The scenario runs in *this* shell, exactly as it does without --debug. A
@@ -767,19 +843,83 @@ should_run_test() {
 # rather than by a subshell. No scenario calls bare `exit`; the ones that used
 # to be contained by the subshell are the arg/cleanup/binary/cert checks and
 # the summary block, all of which run outside this wrapper.
+#
+# The wrapper also owns the bounded re-drive documented at the top of this file
+# ("Bounded re-drive of a timing-sensitive scenario"): an attempt whose every
+# recorded failure is readiness-class is withdrawn whole and re-run once.
 run_test() {
-    if $DEBUG; then
-        local was_trace=false rc=0
-        if [[ $- == *x* ]]; then
-            was_trace=true
+    local attempt=0
+    local fail_from pass_from failures_len
+    while :; do
+        fail_from=$FAIL
+        pass_from=$PASS
+        failures_len=${#FAILURES[@]}
+        _ATTEMPT_FAILURES=()
+
+        local rc=0
+        if $DEBUG; then
+            local was_trace=false
+            if [[ $- == *x* ]]; then
+                was_trace=true
+            fi
+            set -x
+            "$@" || rc=$?
+            $was_trace || set +x
+        else
+            "$@" || rc=$?
         fi
-        set -x
-        "$@"
-        rc=$?
-        $was_trace || set +x
-        return "$rc"
-    fi
-    "$@"
+
+        # Nothing failed in this attempt: the scenario passed (or selected
+        # itself out), so there is nothing to withdraw.
+        if (( FAIL == fail_from )); then
+            if (( attempt > 0 )); then
+                # Counted so the summary can say a green run leaned on a
+                # re-drive; a silent retry is the thing this must not become.
+                RETRIED_PASS=$(( RETRIED_PASS + 1 ))
+            fi
+            return "$rc"
+        fi
+
+        # Re-drive only when *every* failure this attempt recorded is the
+        # readiness class, and only while the bound allows it.
+        local retryable=1 rec
+        for rec in "${_ATTEMPT_FAILURES[@]}"; do
+            if ! is_readiness_failure "${rec#*: }"; then
+                retryable=0
+                break
+            fi
+        done
+        if (( retryable == 0 )) || (( attempt >= RETRY_MAX )); then
+            return "$rc"
+        fi
+
+        attempt=$(( attempt + 1 ))
+        # Withdraw the attempt whole: its failure records, and any `pass_test`
+        # it counted, belong to the attempt being thrown away.
+        FAIL=$fail_from
+        PASS=$pass_from
+        if (( failures_len == 0 )); then
+            FAILURES=()
+        else
+            FAILURES=("${FAILURES[@]:0:failures_len}")
+        fi
+        log "[RETRY] $*: attempt $attempt failed only at a readiness gate (${_ATTEMPT_FAILURES[*]}); the [FAIL] line above is withdrawn and the scenario is re-driven from a clean slate (bound FRP_COMPAT_RETRY_MAX=$RETRY_MAX)"
+        # Reap this attempt's servers before the re-drive, exactly as the
+        # phase boundaries do, so the second attempt binds fresh ports.
+        cleanup_pids
+        reap_scoped_strays
+        # A fresh scratch dir per attempt: at least one scenario appends to a
+        # config it wrote, and a re-drive must not read the failed attempt's
+        # files. The scenario dir is `$TEST_DIR/<display name>` and the display
+        # name is the part of the failure record before ": "; a name that is
+        # empty, a dot entry or contains a slash is refused rather than
+        # recursive-deleted.
+        local scn="${_ATTEMPT_FAILURES[0]%%: *}"
+        case "$scn" in
+            ""|.|..|*/*) ;;
+            *) rm -rf -- "${TEST_DIR:?}/$scn" ;;
+        esac
+    done
 }
 
 # ── Unified config writers ─────────────────────────────────
@@ -7903,6 +8043,11 @@ echo ""
 echo "============================================="
 echo -e " RESULTS: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}"
 echo "============================================="
+# A green summary that leaned on the bounded re-drive says so: the run is still
+# a pass, but a reviewer must be able to tell it from a clean one.
+if (( RETRIED_PASS > 0 )); then
+    echo -e "${YELLOW}RETRIED:${NC} $RETRIED_PASS scenario(s) passed only after a re-drive (readiness-class failure; see the [RETRY] lines above)"
+fi
 
 if [[ $FAIL -gt 0 ]]; then
     echo ""

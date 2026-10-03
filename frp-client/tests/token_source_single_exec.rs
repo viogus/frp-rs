@@ -283,12 +283,49 @@ fn expected_login_key(timestamp: i64) -> String {
     frp_core::auth::generate_token(TOKEN, timestamp)
 }
 
+/// A script name unique **per invocation**, the same shape the unit twin in
+/// `frp-core/src/auth.rs` (its `unique_token_script_path`) uses and for the same
+/// reason: a bare `token-exec.sh` is unique only while the per-test `tempdir()`
+/// is, so the property lives in a directory-creation side effect rather than in
+/// the name. An atomic sequence separates concurrent calls in this process,
+/// nanoseconds separate processes and re-runs, and the pid keeps two processes
+/// that sample the same instant apart. The `tempdir()` still owns the config,
+/// the exec log and the denied-token file.
+fn unique_token_script_path(dir: &Path) -> std::path::PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        "token-exec-{}-{}-{}.sh",
+        std::process::id(),
+        seq,
+        nanos
+    ))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_token_source_runs_once_across_logins_and_reloads() {
     common::init_tracing();
     let dir = tempfile::tempdir().expect("tempdir");
-    let script_path = dir.path().join("token-exec.sh");
+    let script_path = unique_token_script_path(dir.path());
     std::fs::write(&script_path, EXEC_SCRIPT).expect("write exec script");
+    // Robustness to a *busy* script file, asserted rather than assumed: on
+    // Linux `execve` refuses a file that another process holds open for
+    // writing (ETXTBSY, the flake this test's unit twin hit). The token source
+    // here runs `sh <script>`, so the script is only ever opened for reading
+    // and a writer elsewhere must not matter. Holding this file open for
+    // writing for the whole test is that condition made deterministic: if frpc
+    // ever execs the script itself instead of `command = "sh"`, the first
+    // resolution fails with ETXTBSY and the "exactly once" assertions below
+    // fail loudly. The handle is deliberately kept alive past the last
+    // assertion, so it covers every resolution the test drives.
+    let _busy_writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&script_path)
+        .expect("hold the token script open for writing");
     let log_path = dir.path().join("exec-count.txt");
     let denied_token_path = dir.path().join("denied-token");
     std::fs::write(&denied_token_path, "denied\n").expect("write denied-token file");
