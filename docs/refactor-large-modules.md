@@ -356,13 +356,13 @@ Block inventory, from the function's own comment landmarks:
 | ~1769–1908 | Main accept loop | **stays in `run`** |
 | ~1909–1949 | Graceful drain + OIDC stop | **stays in `run`** |
 
-**Landed from this table so far** (all eight listener rows and three of the five task rows): the WebSocket
-listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484),
-HTTP vhost listener (#485) and HTTPS vhost listener (#486) moved to `service/listeners.rs`, and the NAT-hole
-cleanup task (#487), the port-reservation pruner and the signal listener (#488) opened and extended
-`service/tasks.rs`; the rows left in `run` are the TLS certificate hot-reload task and the stale-control reaper,
-plus the two `**stays in run**` rows that stay by design. Each landed seam has an entry under "Landed so far"
-below.
+**Landed from this table so far: every row that was going to move — all eight listener rows and all five task
+rows. P1 is complete.** The WebSocket listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux
+(#483), SSH tunnel gateway (#484), HTTP vhost listener (#485) and HTTPS vhost listener (#486) moved to
+`service/listeners.rs`; the NAT-hole cleanup task (#487), the port-reservation pruner and the signal listener
+(#488), and the TLS certificate hot-reload task and stale-control reaper (#489) opened and completed
+`service/tasks.rs`. What remains in `run` is exactly the two `**stays in run**` rows (the main accept loop and the
+graceful drain + OIDC stop), which stay by design. Each landed seam has an entry under "Landed so far" below.
 
 **Landed so far** (one block per PR, pure move, per the bar below):
 
@@ -468,6 +468,23 @@ below.
   `:895-898` (the landmark + the new call; start fingerprint unchanged, only `fp_end` moved). Both reviewers
   judged that right, because the two citing sentences assert *where `run` spawns the SIGTERM task* rather than
   the task body. See the `TODO.md` progress paragraph.
+- TLS certificate hot-reload task **and** stale-control reaper → `frp-server/src/service/tasks.rs`,
+  `#[cfg(feature = "tls")] pub(super) fn spawn_tls_cert_reload_task(&self)` and
+  `pub(super) fn spawn_stale_control_reaper_task(&self)` — PR #489 at code head `6f712517` (based on
+  `8046d257`). The last two task rows, grouped for the same reason as #488. Payloads: TLS `service.rs:829-888`
+  = **60 lines / 3240 bytes** (sha256 `1212488187a7bb70…`) whose body `tasks.rs:72-131` is identical to the base
+  after the base's **uniform 4-space brace-level de-indent** (de-indented slice sha `adf2161648b32c02…`, joined
+  with a trailing newline; the two reviewers' joined-slice shas differ only in join basis), and reaper
+  `service.rs:904-1063` = **160 lines / 10273 bytes** (sha256 `1bad6d2ea5f48827…`), `cmp`-identical with **no**
+  re-indent and including all 98 of its comment lines, which are the specification. Gating: the attribute moved
+  from the braced block to **the method and its call site** (the SSH-seam convention), with the two TLS imports
+  gated in `tasks.rs` and `mod tasks;` left unconditional; the reaper is ungated. Both directions were closed by
+  mutation in review (removing A's method gate reds the no-`tls` shape; gating B's method gives `E0599` at its
+  ungated call). `frp-server/src/service.rs` 1969 → 1758, `tasks.rs` 95 → 337, and `run` now holds only the
+  accept loop and the graceful drain. Coverage: no test — both blocks' **effects** are unreachable (no lane
+  swaps a cert/key after start or waits ≥60 s; `run_id_to_ctl_tx`/`ControlTx`/`is_closed` have zero occurrences
+  in the test trees), so the gaps stay recorded. One cite **moved file** with the payload: the reaper's comment
+  references `http.rs:97-101`, now a live cite from `tasks.rs:272`. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`
