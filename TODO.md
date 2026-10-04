@@ -7466,8 +7466,8 @@ nothing about whether the described behaviour still holds.
   test, and the new `tests.rs` is classified as a whole-file test module (0 production, hence absent from the printed table; 1743 total) — which also exercises the
   earlier item that taught that tool to classify file-ified test modules. **37 live cites were re-pointed by content**
   (35 shift −6; 2 that pointed into the test module now point at `service/tests.rs`); the table was re-baked
-  (`guard_data_pin` `e76b9fb4…` → `a69297ce…` at the code seam, re-baked here to `fe867544…`; an opcode diff of the base
-  against this head is 41 removed / 41 added / 559 unchanged lines = 40 changed record lines plus the single `# pins:`
+  (`guard_data_pin` `e76b9fb4…` → `a69297ce…` at the code seam, re-baked here to `f635d02bdbfa…`; an opcode diff of the base
+  against this head is 41 removed / 41 added / 558 unchanged lines = 40 changed record lines plus the single `# pins:`
   header line, leaving 537 unchanged records — 35 target-line+raw shifts, 2 target-file moves into `service/tests.rs`,
   2 citing-line shifts and 1 fingerprint-only re-bake, of which 37 are the content re-points above) with `checked`
   still 577 and no cite added or removed, and the weak
