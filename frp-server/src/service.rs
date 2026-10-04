@@ -37,12 +37,12 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 //
 // The dashboard server block moved here the same way too; its `tracing` events
 // carry the same `frp_server::service::listeners` target.
-#[cfg(any(
-    feature = "websocket",
-    feature = "kcp",
-    feature = "quic",
-    feature = "dashboard"
-))]
+//
+// The TCPMux HTTP CONNECT listener block moved here the same way too; its
+// `tracing` events carry the same `frp_server::service::listeners` target. As
+// the first un-gated seam (`pub mod tcpmux;` is unconditional in `lib.rs`), its
+// module gate is gone: every item that can be gated carries its own `#[cfg]`;
+// the method and the three imports it needs compile in every shape, ungated.
 mod listeners;
 
 // ---------------------------------------------------------------
@@ -796,28 +796,7 @@ impl Service {
         }
 
         // Start TCPMux HTTP CONNECT listener if configured
-        if self.cfg.tcpmux_httpconnect_port > 0 {
-            let mux_bind = if self.cfg.proxy_bind_addr.is_empty() {
-                &self.cfg.bind_addr
-            } else {
-                &self.cfg.proxy_bind_addr
-            };
-            let tcpmux_addr = format_socket_addr(mux_bind, self.cfg.tcpmux_httpconnect_port);
-            let tcpmux_state = self.state.clone();
-            let tcpmux_shutdown = self.state.shutdown_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state, tcpmux_shutdown)
-                        .await
-                {
-                    error!(error = %e, "TCPMux HTTP CONNECT listener failed: {}", e);
-                }
-            });
-            info!(port = %self.cfg.tcpmux_httpconnect_port,
-                "TCPMux HTTP CONNECT listener starting on port {}",
-                self.cfg.tcpmux_httpconnect_port
-            );
-        }
+        self.start_tcpmux_listener().await;
 
         // Start SSH tunnel gateway if configured
         #[cfg(feature = "ssh")]
