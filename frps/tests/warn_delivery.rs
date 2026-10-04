@@ -911,7 +911,7 @@ fn assert_one_warning_on_stdout_with_boot(tag: &str, spawned: &Spawned, boot: us
 /// passes the caller's answer as an argument, so it never sees a real build's
 /// answer. Only an assertion on the captured stdout can, and that is what binds
 /// the two `frps/src/main.rs` emit sites (`:1078` on the `-c` path, `:625` on the
-/// `--config-dir` path) and the reload site `frp-server/src/service.rs:1405` to the
+/// `--config-dir` path) and the reload site `frp-server/src/service.rs:1390` to the
 /// build under test. The lane that runs this file **without** `--features dashboard`
 /// is what makes the no-dashboard direction observable.
 ///

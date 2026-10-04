@@ -7246,6 +7246,34 @@ nothing about whether the described behaviour still holds.
   `cli_empty_dashboard_addr_binds_loopback` is load-induced (5/5 isolated), and `cli_empty_log_file_keeps_the_files_destination`
   fails only in the `--all-features` shape (5/5 in its CI lane, red at the base too) — none reachable from a byte-identical move — and that the TLS branch is untested). Ledger unchanged at **3 open / 231 closed**.
 
+  **Progress (2026-10-04, code head `c23b5205` on `dsh/m14-ssh-gateway`, PR #484, based on `eede43dc`).** The sixth
+  P1 seam landed: `run`'s inline SSH tunnel gateway block moved byte-for-byte into
+  `frp-server/src/service/listeners.rs` as `#[cfg(feature = "ssh")] pub(super) async fn start_ssh_tunnel_gateway(&self)`
+  — payload `frp-server/src/service.rs:803-826`, **24 lines / 1157 bytes `cmp`-identical** (sha256
+  `bee86663af2ec9de1ef285dfa831488a366daf6f165fd7602f4093690287ff4f`); the landmark comment and the `#[cfg]` stay at
+  the one call site, and `frp-server/src/service.rs` goes 2054 → 2039 (`listeners.rs` 1065 → 1096). One plumbing
+  consequence was found by measurement rather than assumed: the block's `read_ok()` needs `RwLockExt`, which
+  `listeners.rs` imported only under `all(tls, any(websocket, kcp))` — false for an `ssh`-only build — so that gate
+  widened to `any(ssh, all(tls, any(websocket, kcp)))`, while `frp-server/src/service.rs`'s own copy of the import
+  had to be **retained** because its `write_ok()` is still used there (three of the four sites always compile).
+  Coverage is the KCP/QUIC/dashboard case, measured: `frp-server/tests/ssh_gateway.rs` has **17** tests, **13** of
+  which set `ssh_tunnel_gateway.bind_port` via `ssh_test_config` and reach this block through `Service::run`
+  (witness `test_ssh_gateway_startup_and_banner`), so no test was added; the **70** in-file unit tests under
+  `frp-server/src/ssh_gateway/` drive `SshListener` directly and never touch `Service::run`. **This round also
+  corrected the plan doc:** its §P8 "validation trap" claimed `scripts/compat-test.sh` "does not exercise the SSH
+  gateway at all", which the author measured false — `test_ssh_gateway_banner` (`scripts/compat-test.sh:7871`) and
+  `test_ssh_gateway_auth_rejection` (`:7933`) both start the **Rust** frps with `[ssh_tunnel_gateway] bind_port > 0`
+  and pass (the third scenario, `:8001`, uses the Go frps and is not evidence about the Rust block), while
+  `protocol-matrix.sh` genuinely has zero `ssh` references; the same paragraph's "16 e2e tests" and "79 in-file
+  unit tests" were stale and are now **17** and **70**. **16 records were re-pointed by content** with every
+  fingerprint and range end unchanged (0 re-bakes) and the pathline table re-baked (`4db8ca92…` → `a967b101…` at the seam, re-baked here to `158d4bff…`),
+  matching the step's `guard_data_pin`); the weak population by `(target, fp)` is identical (61 keys, 0 entered /
+  0 left), so the `weak_set` move to `b8f7fe77b5026b57` is pure re-keying. No `CHANGELOG.md` bullet, matching the
+  earlier seams. Reviews: verification **MERGE** (no findings) and adversarial **MERGE-with-findings**, whose only
+  change-requiring finding was the plan paragraph above (now corrected) rather than anything in the move; both
+  reviewers reproduced its three errors independently. Ledger unchanged at **3 open / 231 closed**. The remaining
+  P1 blocks are the HTTP and HTTPS vhost listeners and the five `tasks.rs` groups.
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
