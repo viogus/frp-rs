@@ -7313,7 +7313,7 @@ nothing about whether the described behaviour still holds.
   Coverage is the KCP/QUIC/dashboard case, measured: four in-process tests set `vhost_https_port > 0` through
   `Service::run` (witness `frp-server/tests/vhost_https_sni.rs:166`, plus `vhost_audit_fixes.rs:1656` which does a
   real rustls handshake) and **only** `scripts/compat-test.sh:5518` (`test_g2r_https`, Rust frps) among the compat
-  lanes reaches this block — the other three readiness assertions and both WSS scenarios run the **Go** frps and
+  lanes reaches this block — the other three readiness assertions, two of them the WSS scenarios, all run the **Go** frps and
   `write_frps_config`'s Rust branch never emits `vhost_https_port`, while `protocol-matrix.sh` never sets it
   either — so no test was added. **`scripts/compat-test.sh` ran green twice** (once by the coordinator, once by the
   verification reviewer: `86 passed, 0 failed`; the reviewer's first run flaked once in
@@ -7323,12 +7323,12 @@ nothing about whether the described behaviour still holds.
   together to 577 with the guard still exact. **15 records were re-pointed by content** — eleven single-line, plus
   three range records over two distinct ranges, plus one **target-file** change (`service.rs:785 →
   listeners.rs:1132`, the call itself) — with every fingerprint and range end unchanged (0 re-bakes) and the table
-  re-baked (`8997e3c6…` → `49052d12…`, matching the step's `guard_data_pin`); the weak population by
+  re-baked (`8997e3c6…` → `49052d12…` at the seam, re-baked here to `433b1deb…`); the weak population by
   `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to `0cbd3657dc1cd864` is pure
   re-keying. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** (no findings;
   it re-ran compat at 86/0 and confirmed the pin rise) and adversarial **MERGE** (no change-requiring finding).
   Ledger unchanged at **3 open / 231 closed**. With this seam the plan's P1 inventory has **all eight listener rows
-  landed**; only the five `tasks.rs` groups remain in `run` (the first of which creates `service/tasks.rs`).
+  landed**; the only rows left to extract are the five `tasks.rs` groups (the first of which creates `service/tasks.rs`), while the two `**stays in run**` rows remain by design.
 
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named

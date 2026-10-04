@@ -427,7 +427,7 @@ has an entry under "Landed so far" below.
   Coverage: no new test — four in-process tests set the port through `Service::run` (witness
   `frp-server/tests/vhost_https_sni.rs:166`, plus `vhost_audit_fixes.rs:1656` with a real rustls handshake)
   and `scripts/compat-test.sh:5518` (`test_g2r_https`, Rust frps) is the only compat lane that reaches it
-  (the other three readiness assertions and both WSS scenarios run the Go frps, and the matrix never sets
+  (the other three readiness assertions — two of them the WSS scenarios — run the Go frps, and the matrix never sets
   `vhost_https_port`). This seam also **adds** one live cite (the `service.rs` module comment →
   `vhost.rs:1837`), so `checked` and `guard_cites`/`guard_cites_floor` moved 576 → 577 together. See the
   `TODO.md` progress paragraph.
@@ -825,7 +825,7 @@ Remaining seams, in order:
 
 External re-export paths that must be preserved (each verified against a caller):
 `extract_sni_from_client_hello` (`tests/vhost_https_sni.rs:125`),
-`run_vhost_http_listener` / `run_vhost_https_listener` (`service.rs:660,685`),
+`run_vhost_http_listener` / `run_vhost_https_listener` (`frp-server/src/service/listeners.rs:1109,1132` — the callers moved there with the M-15/M-16 seams),
 `count_host_headers` (`tcpmux.rs:465`), `write_not_found_response`
 (`tcpmux.rs:517,714`), `clamp_vhost_timeout` (`bridge.rs:3105`), `VhostManager`
 (`state.rs:28`, `dashboard.rs`, `control/proxy.rs`, `proxy_ops/`).
