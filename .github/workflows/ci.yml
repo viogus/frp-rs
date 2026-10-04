@@ -1769,15 +1769,15 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=8997e3c6127acdc9fa3443a75ac6570f1bfe28eb5016c866beeb65e5ed2aa8bb
+          guard_data_pin=49052d1248b080074c421607bfa72fbf51940539dea6efc3f18d51e7dc6f286b
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
           # uses: a *falling* count has to move both literals.
-          guard_cites=576
-          guard_cites_floor=576
+          guard_cites=577
+          guard_cites_floor=577
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
