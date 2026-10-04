@@ -7364,6 +7364,47 @@ nothing about whether the described behaviour still holds.
   being that misdescription in the author's report, not the tree. Ledger unchanged at **3 open / 231 closed**. The
   plan's P1 inventory now records eight listener rows plus one task row landed; four `tasks.rs` groups remain.
 
+  **Progress (2026-10-04, code head `7e0e1dbc` on `dsh/m18-tasks-pruner`, PR #488, based on `4aede41b`).** The tenth
+  P1 seam landed and it is **two blocks in one PR on purpose**: the port-reservation pruner is a **3-line** call
+  chain into `proxy_ops/`, so a dedicated PR would spend a full author + two-review + records cycle on a wrapper,
+  while the signal listener is the same mechanism (a background task spawned from `run`) landing in the same module.
+  Grouping is allowed by this session's brief where it does not weaken review, so each block still carries its **own**
+  `cmp`/sha256 proof, control-flow enumeration and coverage finding — and the adversarial reviewer specifically
+  attacked the grouping, concluding nothing can hide behind the shared commit: the two payloads are independently
+  byte-identical, the `service.rs` diff is exactly two removals plus two single-line calls, and the cascade's own
+  deltas (**+7**, **+5** = +7−3+1, **−31** = +7−3+1−37+1) confirm *both* blocks landed (they account for the
+  line arithmetic; byte identity rests on the `cmp` above) — a one-block-only move would break that sum. Payloads: pruner `frp-server/src/service.rs:814-816` = **3 lines / 119 bytes `cmp`-identical**
+  (sha256 `c3b2edfdb2af7258…`) → `pub(super) fn spawn_port_reservation_pruner_task(&self)`, and signal listener
+  `:893-929` = **37 lines / 1551 bytes `cmp`-identical** (sha256 `3f678df37798fce8…`) →
+  `pub(super) fn spawn_signal_listener_task(&self)`; `frp-server/src/service.rs` 2000 → 1969, `tasks.rs` 40 → 95.
+  Both methods are **sync** (neither awaits before its spawn), both landmarks stay at their call sites (calls at
+  `:821` and `:898`), and the one import delta is `use tracing::info;` in `tasks.rs` — required, because removing it
+  fails with `cannot find macro \`info\``, and used in **both** `#[cfg]` arms so no shape leaves it unused. The
+  signal listener's `#[cfg(unix)]`/`#[cfg(not(unix))]` arms move with the block while `mod tasks;` stays
+  unconditional; the `not(unix)` arm is never compiled on macOS or on CI's Linux runners, so the adversarial round
+  **forced it by swapping the gates** and it compiles clean under `RUSTFLAGS="-D warnings"` (a cfg-swap check, not a
+  Windows toolchain build — stated as such). Coverage: the signal listener keeps a real lane
+  (`frps/tests/cli_exit_codes.rs:743` via the `:625` helper's actual `kill -TERM`), while the pruner's effect stays
+  unreachable (the inner `spawn_port_reservation_pruner` consumes the interval's immediate first tick, the expiry is
+  24 h and the XTCP tests sleep ≤300 ms), so that gap is recorded rather than papered over. Three judgement calls
+  were put to the reviewers rather than settled by the coordinator: a **range cite that straddled the seam**
+  (`service.rs:890-922` → `:895-898`, the landmark plus the new call; start fingerprint unchanged, only `fp_end`
+  moved) is **right**, because both citing sentences assert *where `run` spawns the SIGTERM task* rather than the
+  body — pointing at `tasks.rs` would make them claim the body; the `tracing` target rename for the two moved blocks
+  was re-proved live (with `RUST_LOG=frp_server::service=debug` the signal block's own record still prints); and a
+  **pre-existing mis-aimed cite** at `frps/tests/cli_exit_codes.rs:1154` — its range is the TLS accept loop while its
+  sentence is about the signal install, mis-aimed identically before and after the move, and invisible to the
+  pathline guard because that guard pins endpoints by content rather than by meaning — is **filed as its own item at
+  the end of this file** rather than fixed inside a pure-move PR. No `CHANGELOG.md` bullet, matching the earlier
+  seams. The table was re-baked (`99ba726c…` at the seam, re-baked here to `d905f480ff05…`) and the weak
+  population by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to
+  `76e593e4df44e259` is pure re-keying. Reviews: verification **MERGE** (no findings; it re-derived both payloads,
+  checked the lane, judged all three calls and re-proved the target live) and adversarial **MERGE** (no
+  change-requiring finding; it ran mutation probes for the import and forced the `not(unix)` arm). Ledger now **4 open / 231 closed / 235 headers** — the
+  fourth item is the mis-aimed-cite one filed above. The plan's P1 inventory records eight listener rows plus three
+  of the five task rows landed; the TLS certificate hot-reload task and the stale-control reaper remain in `run`
+  (with the two rows that stay there by design).
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
@@ -11223,3 +11264,20 @@ other.
   **What asserts it.** `frp-server/src/service.rs::gated_listener_port_records_follow_this_builds_readers` runs in the existing lane `.github/workflows/ci.yml:4017` (`cargo test -p frp-server --no-default-features --all-targets -j 1`), whose feature resolution *is* the hand-named shape (`cargo tree` shows frp-core's `kcp`/`quic`/`websocket` on with frp-server's listeners off); it now asserts the **shape** per port as well as the invariant (`reader == ListenerPortReader::from_features(has_listener)` and `field_present || has_listener…`), and the reviewers falsified that assertion two ways — neutering the `frp-client` dev-dep fails it with the intended message, and hard-coding a reader to `Present` fails the reader pin. The new `scripts/tests/inner-feature-port-probe.sh` builds the four hand-named shapes, the `tiny` field-absent control and the default honoured converse (six `cargo build` runs), takes each executable from cargo's `--message-format=json` artifacts with manifest/tier/inner-feature assertions and a freshness guard (`find … -newer`, so a stale or linked `target/` cannot certify the wrong shape), and checks the UDP-socket direction **both** ways — **32 checks hold**. The M-6 shape-floor step's count moved **363 → 368** (the five new frp-server lib tests legitimately run in the dashboard-only no-TLS lib shape; the step's own text forbids a floor, so this is the raise direction — it failed CI's `Tests (unit)` at 363 first).
   Reviews (PR #480): round 1 — adversarial **MERGE** (it built six shapes, confirmed the records, the socket directions and the same-gate argument), verification MERGE-with-findings with no change-requiring defect; fix confirm — verification **MERGE**, adversarial MERGE-with-findings whose one finding (three file-key socket checks in the probe queried a different port than the file named) was fixed in a probe-only commit (15 insertions / 7 deletions in three hunks) and confirmed non-vacuous by experiment.
   Scope and residues: the literal `cargo build -p frps --no-default-features --features tiny,frp-core/kcp` binary has no CI lane — the probe is the end-to-end witness and the `-p frp-server --no-default-features --all-targets` lane is the in-CI shape assertion (now explicit), and wiring the probe in would renumber the live `ci.yml:NNNN` cites and pay six feature builds per push; `frps verify` reads only the config file (Go parity), so the **flag** half is recorded on the run path while the file key is recorded on `verify` too; `--websocket-port` does not exist, so that half is file-key only; the readers are plain values, so a future caller could pass one that disagrees with its own build — every in-tree call site uses `gated_listener_port_readers()` and three `*_reader_answers_from_this_build` pins check each reader against a direct `cfg!`; and `frpc`/client-side equivalents were not touched.
+
+- [ ] **A live cite in `frps/tests/cli_exit_codes.rs` aims at the wrong range.**
+  Evidence: the doc comment at `frps/tests/cli_exit_codes.rs:1154` says "`Service::run` installs the
+  service's own `SIGTERM` handler" and points at `frp-server/src/service.rs:1148-1175`, but that
+  range is the TLS accept loop and connection-type dispatch (`ConnectionType::Tls`,
+  `handle_tls_connection`), not the signal install. The install is the landmark plus the spawn call
+  at `frp-server/src/service.rs:895-898` (the body now lives in `frp-server/src/service/tasks.rs`).
+  Found by both reviewers of PR #488 while auditing that file's cites for the
+  `tasks.rs` extraction; mis-aimed identically before and after the move, and invisible to
+  `scripts/tests/pathline-cite-guard.sh`, which pins endpoints by content rather than by meaning —
+  hence a recorded item rather than a fix smuggled into a pure-move PR. Filed at the end of this file so the
+  addition shifts no existing header; re-home it to the `P1 — documentation correctness` section at the next
+  cascade.
+  **Done-when:** the comment cites the signal-install span (or the moved body in
+  `frp-server/src/service/tasks.rs`), the pathline expectations are re-baked in the same commit, and
+  the guard still reports `101/0` and `577/0` — the latter only if the rewrite keeps a single cite, since naming
+  both the install site and the moved body would make the population 578.
