@@ -128,7 +128,7 @@ re-running the script before acting on them.
 | `frp-server/src/ssh_gateway.rs` | 4865 | 2123 | 2742 |
 | `frp-core/src/auth.rs` | 3791 | 1924 | 1867 |
 
-Note `frp-client/src/visitor.rs`: 3864 total lines with **697 lines of
+Note `frp-client/src/visitor.rs`: 2906 production lines with **959 lines of
 tests** — the largest production-to-test ratio in the repository, and it is the
 XTCP/STCP/SUDP/vnet data plane.
 
@@ -307,9 +307,9 @@ Ranked by *risk reduction per unit of disruption*, using the measurements above.
 | Priority | Target | Why | Shape |
 |---|---|---|---|
 | **P0** | **File-ify the inline test modules** in all five files below | Zero production change, same module paths, ~40–55% line reduction in the worst files; see [Step 0](#step-0--the-universal-first-move-file-ify-the-inline-tests) | one commit per file |
-| **P1** | `frp-server/src/service.rs::run` | Largest function in the repo (1291 code lines); **a linear startup sequence**, so extraction is mechanical and low-risk; `handlers/` already sets the precedent for this exact kind of split | ~10 listener blocks → named methods |
-| **P2** | `frp-client/src/service.rs` | #1 production file size (4930), #1 churn (53), #1 fix density (230), 106 cfg gates | 5 seams, ~1900 lines |
-| **P3** | `frp-client/src/visitor.rs` | #2 production size (3685) and **almost untested** (165 test lines) | 3–4 seams |
+| **P1** | `frp-server/src/service.rs::run` | Largest function in the repo at the plan's base (1291 code lines; **429** now); **a linear startup sequence**, so extraction is mechanical and low-risk; `handlers/` already sets the precedent for this exact kind of split | ~10 listener blocks → named methods |
+| **P2** | `frp-client/src/service.rs` | #1 production file size (5108), #1 churn (53), #1 fix density (230), 106 cfg gates | 5 seams, ~1900 lines |
+| **P3** | `frp-client/src/visitor.rs` | #2 production size (2906) and lightly tested (959 test lines) | 3–4 seams |
 | **P4** | `frp-server/src/control/proxy_ops/` | `handle_new_proxy` 546 code lines; 2nd-highest fix density | 2–3 seams |
 | **P5** | `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs` (`spawn_work_conn` 469, `run_udp_work_conn` 419) | Surfaced only by the measurement script; not on any file-size list | 1 seam each |
 | **P6** | `frp-server/src/control/bridge.rs` | Hot data path, highest risk per line changed. Only the UDP family and the injector adapter clearly pay | 2 seams |
@@ -425,7 +425,7 @@ KCP (largest) or WebSocket. No ordering change, no control-flow change, no error
 text change — each block already binds its own port and spawns its own task.
 
 *Risk:* **low** — no shared mutable state beyond `&self`/`AppState`, no cfg
-entanglement in this file (35 inline-test lines only), and the extraction is
+entanglement in this file (a 427-line inline `#[cfg(test)]` region now), and the extraction is
 verifiable by inspection of the diff.
 
 *Validation:* `cargo clippy -D warnings`, `cargo test --workspace --all-features`,
@@ -514,7 +514,7 @@ and `teardown_session` have load-bearing spawn/teardown order; **84
 --features tiny|micro` is mandatory per seam; and the error/`expect` text is
 contract (27 `expect` sites listed in the analysis). No `unsafe` in the file.
 
-### P3 — `frp-client/src/visitor.rs` (3864 total lines, 36 production fns, 697 test lines)
+### P3 — `frp-client/src/visitor.rs` (2906 production lines, 36 production fns, 959 test lines)
 
 Four parallel listener implementations live in one file, each with its own loop:
 
@@ -924,7 +924,7 @@ Every seam is a **pure move**. The bar:
    ~80 field-visibility widenings. So: `frp-client/src/service/` children, with
    `SessionCtx`/`Service` staying in `service.rs`. (Verified in a scratch crate —
    see P2.)
-3. **`visitor.rs` has few tests (697 test lines for 3864 total lines).** Is
+3. **`visitor.rs` has few tests (959 test lines for 2906 production lines).** Is
    adding coverage a prerequisite for splitting it, or is a pure move acceptable?
    I lean towards: pure move now, coverage as its own item.
 4. ~~Worth automating?~~ **Done** — [`scripts/large-functions.sh`](../scripts/large-functions.sh)
