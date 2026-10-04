@@ -57,6 +57,12 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // this block is un-gated (`pub mod vhost;` is unconditional in `lib.rs`), so the
 // method is ungated and no import changed: `format_socket_addr`, `error!` and
 // `info!` were already unconditional here.
+//
+// The HTTPS VHost listener block moved here the same way too; its `tracing`
+// events carry the same `frp_server::service::listeners` target. This block is
+// un-gated as well: `crate::vhost::run_vhost_https_listener` has a
+// `#[cfg(not(feature = "tls"))]` stub returning an error
+// (`frp-server/src/vhost.rs:1837`), so no gate is needed and no import changed.
 mod listeners;
 
 // ---------------------------------------------------------------
@@ -770,26 +776,7 @@ impl Service {
         // Go frp starts the HTTPS vhost listener whenever vhostHTTPSPort is
         // configured; the shared TLS acceptor auto-generates a server identity
         // when no cert/key files are set.
-        if self.cfg.vhost_https_port > 0 {
-            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
-                &self.cfg.bind_addr
-            } else {
-                &self.cfg.proxy_bind_addr
-            };
-            let https_addr = format_socket_addr(vhost_bind, self.cfg.vhost_https_port);
-            let https_addr2 = https_addr.clone();
-            let https_state = self.state.clone();
-            let https_shutdown = self.state.shutdown_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::vhost::run_vhost_https_listener(https_addr, https_state, https_shutdown)
-                        .await
-                {
-                    error!(error = %e, "HTTPS VHost listener failed: {}", e);
-                }
-            });
-            info!(addr = %https_addr2, "HTTPS VHost listener starting on {}", https_addr2);
-        }
+        self.start_https_vhost_listener().await;
 
         // Start TCPMux HTTP CONNECT listener if configured
         self.start_tcpmux_listener().await;
