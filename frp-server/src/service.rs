@@ -43,6 +43,14 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // the first un-gated seam (`pub mod tcpmux;` is unconditional in `lib.rs`), its
 // module gate is gone: every item that can be gated carries its own `#[cfg]`;
 // the method and the three imports it needs compile in every shape, ungated.
+//
+// The SSH tunnel gateway block moved here the same way too; its `tracing` events
+// carry the same `frp_server::service::listeners` target. This seam is gated
+// (`#[cfg(feature = "ssh")]`), so the method carries that gate itself and the
+// call site keeps it. The `read_ok()` the block calls needs `RwLockExt` in its
+// new module, so `listeners.rs`'s import gained the `ssh` shape (its gate was
+// `tls` + websocket/kcp only); `service.rs` keeps its own ungated import for the
+// `write_ok()` calls that stay behind.
 mod listeners;
 
 // ---------------------------------------------------------------
@@ -800,30 +808,7 @@ impl Service {
 
         // Start SSH tunnel gateway if configured
         #[cfg(feature = "ssh")]
-        if self.cfg.ssh_tunnel_gateway.bind_port > 0 {
-            let ssh_state = self.state.clone();
-            let ssh_cfg = self.cfg.clone();
-            let token = {
-                let r = self.state.reloadable.read_ok();
-                r.auth_cfg.token.clone()
-            };
-            tokio::spawn(async move {
-                match crate::ssh_gateway::SshListener::new(&ssh_cfg, ssh_state, token).await {
-                    Ok(Some(listener)) => {
-                        if let Err(e) = listener.run().await {
-                            tracing::error!(error = %e, "SSH tunnel gateway failed: {}", e);
-                        }
-                    }
-                    Ok(None) => {
-                        tracing::debug!("SSH tunnel gateway disabled (bind_port=0)");
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "SSH tunnel gateway init failed: {}", e);
-                    }
-                }
-            });
-            tracing::info!(port = %self.cfg.ssh_tunnel_gateway.bind_port, "SSH tunnel gateway starting on port {}", self.cfg.ssh_tunnel_gateway.bind_port);
-        }
+        self.start_ssh_tunnel_gateway().await;
 
         // Start KCP listener if configured
         #[cfg(feature = "kcp")]

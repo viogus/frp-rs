@@ -17,7 +17,10 @@ use frp_core::transport::IoStream;
 
 #[cfg(feature = "kcp")]
 use crate::control;
-#[cfg(all(feature = "tls", any(feature = "websocket", feature = "kcp")))]
+#[cfg(any(
+    feature = "ssh",
+    all(feature = "tls", any(feature = "websocket", feature = "kcp"))
+))]
 use crate::lock::RwLockExt;
 
 #[cfg(any(feature = "websocket", feature = "kcp", feature = "quic"))]
@@ -1060,6 +1063,34 @@ impl Service {
                 "TCPMux HTTP CONNECT listener starting on port {}",
                 self.cfg.tcpmux_httpconnect_port
             );
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    pub(super) async fn start_ssh_tunnel_gateway(&self) {
+        if self.cfg.ssh_tunnel_gateway.bind_port > 0 {
+            let ssh_state = self.state.clone();
+            let ssh_cfg = self.cfg.clone();
+            let token = {
+                let r = self.state.reloadable.read_ok();
+                r.auth_cfg.token.clone()
+            };
+            tokio::spawn(async move {
+                match crate::ssh_gateway::SshListener::new(&ssh_cfg, ssh_state, token).await {
+                    Ok(Some(listener)) => {
+                        if let Err(e) = listener.run().await {
+                            tracing::error!(error = %e, "SSH tunnel gateway failed: {}", e);
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::debug!("SSH tunnel gateway disabled (bind_port=0)");
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "SSH tunnel gateway init failed: {}", e);
+                    }
+                }
+            });
+            tracing::info!(port = %self.cfg.ssh_tunnel_gateway.bind_port, "SSH tunnel gateway starting on port {}", self.cfg.ssh_tunnel_gateway.bind_port);
         }
     }
 }
