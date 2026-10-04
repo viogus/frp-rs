@@ -361,8 +361,9 @@ rows. P1 is complete.** The WebSocket listener (#436), KCP (#450), QUIC (#481), 
 (#483), SSH tunnel gateway (#484), HTTP vhost listener (#485) and HTTPS vhost listener (#486) moved to
 `service/listeners.rs`; the NAT-hole cleanup task (#487), the port-reservation pruner and the signal listener
 (#488), and the TLS certificate hot-reload task and stale-control reaper (#489) opened and completed
-`service/tasks.rs`. What remains in `run` is exactly the two `**stays in run**` rows (the main accept loop and the
-graceful drain + OIDC stop), which stay by design. Each landed seam has an entry under "Landed so far" below.
+`service/tasks.rs`. Of the table's rows, nothing movable is left in `run`: what remains there is exactly the two
+`**stays in run**` rows (the main accept loop and the graceful drain + OIDC stop), which stay by design,
+alongside the extracted seams' call sites and the startup preamble. Each landed seam has an entry under "Landed so far" below.
 
 **Landed so far** (one block per PR, pure move, per the bar below):
 

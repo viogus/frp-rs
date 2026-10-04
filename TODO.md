@@ -7409,8 +7409,10 @@ nothing about whether the described behaviour still holds.
   eleventh P1 seam landed and **P1 is complete**: the TLS certificate hot-reload task and the stale-control reaper —
   the last two `tasks.rs` groups — moved byte-for-byte into `frp-server/src/service/tasks.rs` as
   `#[cfg(feature = "tls")] pub(super) fn spawn_tls_cert_reload_task(&self)` and
-  `pub(super) fn spawn_stale_control_reaper_task(&self)`, so `run` now holds **only** the two rows the plan said stay
-  by design (the main accept loop and the graceful drain + OIDC stop). The two blocks were grouped for the same
+  `pub(super) fn spawn_stale_control_reaper_task(&self)`, so of the rows the plan marked movable **none** is left in
+  `run`: the only rows that remain there are the two it marks `**stays in run**` (the main accept loop and the
+  graceful drain + OIDC stop), alongside the extracted seams' 13 call sites and the startup preamble (the bind, the
+  initial TLS-acceptor block and the rate-limit computation). The two blocks were grouped for the same
   reason as #488, and each kept its own proof. Payloads: TLS `frp-server/src/service.rs:829-888` = **60 lines /
   3240 bytes** (sha256 `1212488187a7bb70…`) whose body `tasks.rs:72-131` equals the base after the base's **uniform
   4-space brace-level de-indent** — every non-empty line carried ≥4 spaces, so no line was partially de-indented
@@ -7431,10 +7433,10 @@ nothing about whether the described behaviour still holds.
   `run_id_to_ctl_tx`/`ControlTx`/`is_closed` have **zero** occurrences across the test trees, with no lane killing a
   handler or calling the sweep — so no test was added, since an effect-observing lane needs an injectable clock or a
   handler-kill harness, which is behaviour work for the tasks program rather than this pure move. **14 records were
-  re-pointed by content** (every fingerprint unchanged; shifts **+9** above the removals and **−211** below,
-  consistent with 1969 → 1758), plus ten citing-line renumbers and one cite that **moved file** with the payload (the
+  re-pointed by content** (every fingerprint unchanged; shifts **+9** above the removals, **−52** for the one row between the seams
+  (= +9 + 1 − 62) and **−211** below, consistent with 1969 → 1758), plus ten citing-line renumbers and one cite that **moved file** with the payload (the
   reaper's comment references `http.rs:97-101`, now a live cite from `tasks.rs:272`); the table was re-baked
-  (`d905f480…` → `fc54f0b6…`, matching the step's `guard_data_pin`, `guard_cites` still 577) and the weak population
+  (`d905f480…` → `fc54f0b6…` at the seam, re-baked here to `791551bd…`, matching `guard_data_pin`, `guard_cites` still 577) and the weak population
   by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to `00a8aaeec9948b68` is pure
   re-keying. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE-with-findings** (its
   one finding was a figure in the *author's report* — "5 pre-spawn `let`s" where there are 4 — not in the tree) and
