@@ -94,7 +94,7 @@ impl Drop for DirRegistryEntry {
 /// Main-task ownership of `SIGTERM`/`SIGINT` for the `--config-dir` lane.
 ///
 /// The Unix `SIGTERM` handler lives inside `Service::run` — it is installed by a
-/// task `run()` spawns at its top (`frp-server/src/service.rs:895-898`, the
+/// task `run()` spawns at its top (`frp-server/src/service.rs:843-846`, the
 /// same task that also takes `ctrl_c()`) — so a `SIGTERM` that lands between the
 /// startup line and that registration takes the kernel's default disposition
 /// and kills `frps` (`rc = -15`) instead of draining. The measured window is
@@ -828,7 +828,7 @@ async fn run(mut cli: FrpsArgs) {
                             if let Err(e) = service.run().await {
                                 // `Service::run` has exactly one `Ok(())`
                                 // return — its graceful-shutdown tail
-                                // (`frp-server/src/service.rs:1281`) — so this
+                                // (`frp-server/src/service.rs:1070`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
                                 // `EXIT_RUNTIME` (`frps/src/main.rs:1194-1197`),
@@ -973,7 +973,7 @@ async fn run(mut cli: FrpsArgs) {
         // code out of construction, or `EXIT_RUNTIME` when `run()` failed — and
         // `Ok(())` only when the service ran to a graceful shutdown, the sole
         // `Ok` return in `Service::run`
-        // (`frp-server/src/service.rs:1281`). A **panicking** task reports
+        // (`frp-server/src/service.rs:1070`). A **panicking** task reports
         // `Err(JoinError)`; it is counted as an `EXIT_RUNTIME` failure rather
         // than merely logged, because `Service::run` cannot have returned
         // `Ok(())` on a panic and dropping it let a directory where every task

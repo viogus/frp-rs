@@ -582,7 +582,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 ///
 /// **Two variants, selected by the `tls` feature**, because the certificate
 /// clauses are false in a build with no TLS: `frp-server`'s whole acceptor block
-/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:737`) while this
+/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:746`) while this
 /// warning is not, and `release.yml` ships `frps-micro` / `frps-tiny` (tiny keeps
 /// `tls`; **micro does not**). Measured on a real `frps-micro`
 /// (`/tmp/tls-warn-probe/run-micro.sh`): `tls_enable = true` + only
@@ -611,8 +611,8 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 /// "tls" (command-line)` → `frp-client feature "tls"`); the same command with
 /// `-i frp-server` shows frp-server's only branch as `frps feature "micro"
 /// (command-line)`, with no `tls` feature. That binary gates the acceptor off
-/// (`frp-server/src/service.rs:737` is `#[cfg(feature = "tls")]`, with the
-/// no-acceptor branch at `:769`), so this variant's certificate clauses would
+/// (`frp-server/src/service.rs:746` is `#[cfg(feature = "tls")]`, with the
+/// no-acceptor branch at `:778`), so this variant's certificate clauses would
 /// describe a path it cannot take. Every lane builds at the
 /// workspace root with `tiny`/`micro`
 /// (`.github/workflows/release.yml:100/102/108/110/159/162/210/213` and
