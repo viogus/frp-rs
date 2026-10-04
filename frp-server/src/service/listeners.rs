@@ -5,10 +5,9 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 #[cfg(feature = "websocket")]
 use tokio::net::TcpListener;
-#[cfg(feature = "websocket")]
-use tracing::info;
 #[cfg(any(feature = "websocket", feature = "kcp", feature = "quic"))]
 use tracing::warn;
+use tracing::{error, info};
 
 use frp_core::format_socket_addr;
 #[cfg(feature = "websocket")]
@@ -1036,6 +1035,31 @@ impl Service {
                 }
             });
             tracing::info!(addr = %dash_addr2, "Dashboard web UI starting on {}", dash_addr2);
+        }
+    }
+
+    pub(super) async fn start_tcpmux_listener(&self) {
+        if self.cfg.tcpmux_httpconnect_port > 0 {
+            let mux_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let tcpmux_addr = format_socket_addr(mux_bind, self.cfg.tcpmux_httpconnect_port);
+            let tcpmux_state = self.state.clone();
+            let tcpmux_shutdown = self.state.shutdown_token.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::tcpmux::run_tcpmux_listener(tcpmux_addr, tcpmux_state, tcpmux_shutdown)
+                        .await
+                {
+                    error!(error = %e, "TCPMux HTTP CONNECT listener failed: {}", e);
+                }
+            });
+            info!(port = %self.cfg.tcpmux_httpconnect_port,
+                "TCPMux HTTP CONNECT listener starting on port {}",
+                self.cfg.tcpmux_httpconnect_port
+            );
         }
     }
 }
