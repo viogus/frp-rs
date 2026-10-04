@@ -7193,6 +7193,31 @@ nothing about whether the described behaviour still holds.
   Ledger after this round: **21 open / 192 closed** (base `470a0cde`: 20 open / 192 closed — the round
   files the item below).
 
+  **Progress (2026-10-04, code head `df0cd9a7` on `dsh/m11-quic-listener`, PR #481, based on `bf952988`).** The
+  third P1 seam landed: `run`'s inline QUIC listener block moved byte-for-byte into
+  `frp-server/src/service/listeners.rs` as `pub(super) async fn start_quic_listener(&self, rate_limiter_enabled: bool)`
+  — payload `frp-server/src/service.rs:844-1009`, **166 lines / 9503 bytes `cmp`-identical** (sha256
+  `5215d3e983cfa846227283089120738c29151ad8bdea04e4294e92549aaaf4f9`). The convention was calibrated against the
+  landed KCP seam rather than guessed: re-extracting that seam's payload reproduces the recorded 501 lines /
+  44 390 bytes / `349e49b2…`, which is what fixes the landmark comment and the `#[cfg]` at the call site rather
+  than in the moved text. `frp-server/src/service.rs` 2266 → 2104 and `listeners.rs` 823 → 995; the service.rs
+  diff is two hunks (`+3/−1` module comment/gate and `−166/+1` call site) and the listeners.rs diff three (two
+  import gates and the appended function). `mod listeners` is now gated on `any(websocket, kcp, quic)`, and the
+  `AsyncReadExt`/`RwLockExt` imports were narrowed so a `quic`-only build still compiles under `-D warnings` (CI
+  has no `frp-server` quic-only lane). The moved block is already reached end to end — six `scripts/compat-test.sh`
+  QUIC scenarios, `scripts/protocol-matrix.sh`'s `quic` row (68.65 MB/s) and
+  `frp-server/tests/transport_e2e_quic.rs`/`v2_quic_r2r.rs` — so, like the KCP seam and unlike the WebSocket one,
+  the round adds no test. The only observable difference is the moved records' `target:`
+  (`frp_server::service` → `frp_server::service::listeners`), and the adversarial reviewer confirmed in the
+  dependency source that `RUST_LOG` target matching is a `starts_with` prefix, so
+  `RUST_LOG=frp_server::service=debug` still enables them. **16 live `path:line` cites were re-pointed by content**
+  with every fingerprint and range end unchanged (0 re-bakes), and the pathline table was re-baked with
+  `guard_data_pin` `119f090e…` → `5c9d2d07…`; the weak population by `(target, fp)` is identical (61 keys, 0
+  entered / 0 left), so the `weak_set` identity move is pure re-keying. No `CHANGELOG.md` bullet, matching
+  #436/#450. Reviews: verification **MERGE** (no findings) and adversarial **MERGE** (its brace-depth count put
+  all six `return`s, three `continue`s and the `break` inside the spawned task, 10/10) — no change-requiring
+  finding in either round. Ledger unchanged at **3 open / 231 closed**.
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
