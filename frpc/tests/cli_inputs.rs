@@ -1485,7 +1485,7 @@ fn a_config_file_named_after_a_subcommand_stays_a_config_file() {
         // There is deliberately **no** "the admin port appears nowhere" check
         // next to this one. With the `admin` feature on, run mode also *binds*
         // `[webServer]` and says so (`frpc admin server starting on
-        // 127.0.0.1:<port>`, `frp-client/src/service.rs:4445`; `… listening on …`
+        // 127.0.0.1:<port>`, `frp-client/src/service.rs:4439`; `… listening on …`
         // comes from `frp-client/src/admin.rs`), so that check red on a correct
         // child — the false positive this lane was added to catch. It could not
         // fire on the failure it named either: measured, a `status` run that
