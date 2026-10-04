@@ -485,7 +485,8 @@ alongside the extracted seams' call sites and the startup preamble. Each landed 
   accept loop and the graceful drain. Coverage: no test — both blocks' **effects** are unreachable (no lane
   swaps a cert/key after start or waits ≥60 s; `run_id_to_ctl_tx`/`ControlTx`/`is_closed` have zero occurrences
   in the test trees), so the gaps stay recorded. One cite **moved file** with the payload: the reaper's comment
-  references `http.rs:97-101`, now a live cite from `tasks.rs:272`. See the `TODO.md` progress paragraph.
+  references `http.rs:97-101`, now a live cite from `tasks.rs:272` (retargeted to `http.rs:110-114` by PR #490,
+  which corrected that cite as mis-aimed). See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`

@@ -11337,5 +11337,6 @@ other.
   Guards 101/0 and 577/0, fixtures 86/0, repo-health invariants, and the author executed **all 13 `health` step
   bodies** rc 0 — its first pass red-flagged the stale pin, a positive control that the pin check is not vacuous.
   Reviews: verification **MERGE** (no findings) and adversarial **MERGE-with-findings**, whose one finding is fix
-  (2). This record supersedes the "now a live cite from `tasks.rs:272`" clause in the `:7083` M-19 paragraph, which
-  was true at `6f712517`: that cite is `http.rs:110-114` as of this PR.
+  (2). This record supersedes the same sentence in **two** dated records — the `:7083` M-19 paragraph here and the
+  plan's M-19 "Landed so far" entry (`docs/refactor-large-modules.md`, the `http.rs:97-101` clause) — both of
+  which were true at `6f712517`: that cite is `http.rs:110-114` as of this PR.
