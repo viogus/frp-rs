@@ -7274,6 +7274,30 @@ nothing about whether the described behaviour still holds.
   reviewers reproduced its three errors independently. Ledger unchanged at **3 open / 231 closed**. The remaining
   P1 blocks are the HTTP and HTTPS vhost listeners and the five `tasks.rs` groups.
 
+  **Progress (2026-10-04, code head `a9ca3bc1` on `dsh/m15-http-vhost`, PR #485, based on `2bb230ea`).** The seventh
+  P1 seam landed: `run`'s inline HTTP vhost listener block moved byte-for-byte into
+  `frp-server/src/service/listeners.rs` as `pub(super) async fn start_http_vhost_listener(&self)` — payload
+  `frp-server/src/service.rs:761-779`, **19 lines / 886 bytes `cmp`-identical** (sha256
+  `468d2d5e7b2de72c27fc5b59d8e9145fd3bed5aa4bbdbbf9e396823e1d0219c4`). The **two-line** landmark comment (the
+  Go-parity note that frp binds vhost listeners on `proxyBindAddr` when set, `pkg/server/service.go`) stays at the
+  call site, and `frp-server/src/service.rs` goes 2039 → 2027 (`listeners.rs` 1096 → 1118). This block carries no
+  `#[cfg]` and `mod listeners;` has been unconditional since the TCPMux seam, so **no gate or import change was
+  needed** — verified clean across the no-features/`tiny`/`micro` shapes under `RUSTFLAGS="-D warnings"`. Coverage
+  is the KCP/QUIC/dashboard case, measured: **54** tests across seven files reach this block in process
+  (`common::start_test_server` → `Service::run`; witness `frp-server/tests/vhost_http_timeout.rs:56`), plus nine
+  `go-to-rust-http*` compat scenarios that start the release frps with `vhost_http_port` and assert the vhost port
+  is listening, so no test was added — and the **HTTPS** vhost listener is a separate block (the next seam) and is
+  explicitly **not** claimed. The adversarial reviewer's decider proved the payload's `vhost_bind` borrow of
+  `self.cfg` is consumed by `format_socket_addr` into an owned `SocketAddr`, so NLL ends it before the spawn and no
+  reference enters the task; the payload has no `return`/`continue`/`break`/`?`. **15 records were re-pointed by
+  content** (two range rows `cmp`-identical) with every fingerprint and range end unchanged (0 re-bakes) and the
+  pathline table re-baked (`158d4bff…` → `e534245e…`, matching the step's `guard_data_pin`); the weak population by
+  `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to `e9eb54caad8666c0` is pure
+  re-keying. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** (no findings)
+  and adversarial **MERGE** (no change-requiring finding). Ledger unchanged at **3 open / 231 closed**. The plan's
+  P1 inventory now marks seven of its eight listener rows landed; the HTTPS vhost listener and the five `tasks.rs`
+  groups remain.
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
