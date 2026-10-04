@@ -7227,10 +7227,10 @@ nothing about whether the described behaviour still holds.
   `#[cfg(feature = "dashboard")]` in the same position, and `mod listeners` is now
   `any(websocket, kcp, quic, dashboard)` (rustfmt wraps the attribute). `frp-server/src/service.rs` 2104 → 2075 and
   `listeners.rs` 995 → 1041. The widened gate again stranded imports: `Duration`, `tracing::warn` and `spawn_boxed`
-  are now gated `any(websocket, kcp, quic)`, and that local sweep is the **only** guard for the dashboard-only
-  shape — CI does run a dashboard-only lane (the shape-floor step's `--no-default-features --features dashboard
-  --lib`) but does not deny warnings, so the necessity was measured by removing the gate (`error: unused import:
-  std::time::Duration`, rc 101) against the 11-shape `RUSTFLAGS="-D warnings"` sweep. Coverage is the KCP/QUIC
+  are now gated `any(websocket, kcp, quic)`. CI does lint that shape after all — the unit job's shape-floor dashboard
+  lane does not deny warnings, but the warnings job runs `RUSTFLAGS="-D warnings" cargo clippy -p frp-server
+  --no-default-features --features dashboard --all-targets` (removing the gate reds it); the local 11-shape sweep
+  covers the sibling shapes CI does not lint. Coverage is the KCP/QUIC
   case, measured: `frp-server/tests/dashboard_integration.rs` and `dashboard_v2_integration.rs` spawn the real
   `frps` binary with `[web_server] port` set and reach this block through `Service::run` (`frps/src/main.rs:1194`;
   `run_dashboard` has no other caller), 20 + 15 tests passing against the head build, so no test was added (the
@@ -7238,13 +7238,13 @@ nothing about whether the described behaviour still holds.
   check found the hazard class **absent** here: the payload has zero `return`/`continue`/`break`/`?`, every `self.`
   use is in the method body, and the single `.await` sits inside the spawned task. **16 records were re-pointed by
   content** with every fingerprint and range end unchanged (0 re-bakes) and the pathline table re-baked
-  (`9ba79402…` → `d341e58b…`, matching the step's `guard_data_pin`); the weak population by `(target, fp)` is
+  (`9ba79402…` → `d341e58b…` at the seam, re-baked here to `d5f29682…`); the weak population by `(target, fp)` is
   identical (61 keys, 0 entered / 0 left), so `weak_set`'s move to `dffa021f7cbb4551` is pure re-keying. No
   `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** (no findings) and adversarial
   **MERGE** (no change-requiring finding; its INFO notes are that the workspace suite fails three targets on this
-  host — the `127.0.0.2` alias already recorded at `TODO.md:2375` plus two load-induced `frps` completion tests
-  that pass 5/5 in isolation and in their CI lanes, one failing identically at the base, none reachable from a
-  byte-identical move — and that the TLS branch is untested). Ledger unchanged at **3 open / 231 closed**.
+  host — the `127.0.0.2` alias already recorded at `TODO.md:2375`, plus three `frps` completion cases:
+  `cli_empty_dashboard_addr_binds_loopback` is load-induced (5/5 isolated), and `cli_empty_log_file_keeps_the_files_destination`
+  fails only in the `--all-features` shape (5/5 in its CI lane, red at the base too) — none reachable from a byte-identical move — and that the TLS branch is untested). Ledger unchanged at **3 open / 231 closed**.
 
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
