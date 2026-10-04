@@ -297,7 +297,7 @@ async fn yamux_ponging_client_still_dropped_at_post_handshake_deadline() {
 /// Transport(Other("TLS connect: Connection reset by peer (os error 54)"))`
 /// from the `expect("TLS dial")` this gate guards
 /// (frp-server/tests/slowloris.rs:335 in this tree), because frp-server's `tls`
-/// feature is what builds the acceptor (frp-server/src/service.rs:712) and the
+/// feature is what builds the acceptor (frp-server/src/service.rs:718) and the
 /// `not(feature = "tls")` handler only warns `TLS connection from {} but TLS
 /// feature not enabled` and drops (frp-server/src/handlers/transport.rs:669).
 /// With `--no-default-features --features tls`, this target is 5 passed /

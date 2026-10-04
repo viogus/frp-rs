@@ -15,7 +15,7 @@
 // (frp-server/src/vhost.rs:1837) never binds and returns
 // `Err("TLS feature not enabled")`; the call site in the service is not itself
 // gated (the `crate::vhost::run_vhost_https_listener(...)` call is at
-// frp-server/src/service.rs:797). Measured with no features:
+// frp-server/src/service.rs:785). Measured with no features:
 // `connect to https vhost port: Os { code: 61, kind: ConnectionRefused,
 // message: "Connection refused" }` from the `expect("connect to https vhost
 // port")` at vhost_https_sni.rs:221 and :469 in this tree, and
