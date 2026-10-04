@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+#[cfg(any(feature = "websocket", feature = "kcp"))]
 use tokio::io::AsyncReadExt;
 #[cfg(feature = "websocket")]
 use tokio::net::TcpListener;
@@ -15,7 +16,7 @@ use frp_core::transport::IoStream;
 
 #[cfg(feature = "kcp")]
 use crate::control;
-#[cfg(feature = "tls")]
+#[cfg(all(feature = "tls", any(feature = "websocket", feature = "kcp")))]
 use crate::lock::RwLockExt;
 
 use super::{spawn_boxed, Service};
@@ -817,6 +818,177 @@ impl Service {
             match kcp_bind_rx.await {
                 Ok(_) => tracing::info!(addr = %kcp_addr, "KCP listener started on {}", kcp_addr),
                 Err(_) => tracing::error!(addr = %kcp_addr, "KCP listener failed to start"),
+            }
+        }
+    }
+
+    // `rate_limiter_enabled` is captured from `run`'s scope; passed explicitly.
+    #[cfg(feature = "quic")]
+    pub(super) async fn start_quic_listener(&self, rate_limiter_enabled: bool) {
+        if self.cfg.quic_bind_port > 0 {
+            let quic_state = self.state.clone();
+            let quic_options = self.cfg.transport.quic_options.clone().unwrap_or_default();
+            let quic_params = frp_core::quic::quic_params_from_option_values(
+                quic_options.keepalive_period,
+                quic_options.max_idle_timeout,
+                quic_options.max_incoming_streams,
+                quic_options.stream_receive_window,
+            );
+            let authenticated_stream_limit = quic_params.max_incoming_streams as usize;
+            let mut listener_quic_params = quic_params.clone();
+            listener_quic_params.max_incoming_streams = quic_params
+                .max_incoming_streams
+                .min(crate::handlers::QUIC_PREAUTH_STREAM_LIMIT as u32)
+                .max(1);
+            let quic_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.quic_bind_port);
+            let quic_addr2 = quic_addr.clone();
+            let (quic_bind_tx, quic_bind_rx) = tokio::sync::oneshot::channel::<()>();
+            let cert_path = self.cfg.tls_cert_file.clone();
+            let key_path = self.cfg.tls_key_file.clone();
+            let ca_path = if self.cfg.tls_ca_file.is_empty() {
+                None
+            } else {
+                Some(self.cfg.tls_ca_file.clone())
+            };
+            spawn_boxed(Box::pin(async move {
+                let sockaddr: std::net::SocketAddr = match quic_addr.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::error!(addr = %quic_addr, error = %e, "QUIC: invalid bind address");
+                        return;
+                    }
+                };
+
+                // Build a TLS server config that honors `trustedCaFile`
+                // (mTLS) exactly like the TCP/TLS path, then hand it to the
+                // QUIC listener. Go frp reuses NewServerTLSConfig for QUIC.
+                let tls_config = if !cert_path.is_empty() && !key_path.is_empty() {
+                    frp_core::transport::build_tls_server_config(
+                        &cert_path,
+                        &key_path,
+                        ca_path.as_deref(),
+                    )
+                } else {
+                    tracing::info!(
+                        "QUIC: no TLS cert/key configured, \
+                         auto-generating self-signed certificate"
+                    );
+                    frp_core::transport::generate_self_signed_tls_config_with_ca(ca_path.as_deref())
+                };
+                let tls_config = match tls_config {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "QUIC: failed to build TLS config"
+                        );
+                        return;
+                    }
+                };
+                let listener = match frp_core::quic::QuicListener::new_with_tls_config(
+                    sockaddr,
+                    tls_config,
+                    listener_quic_params.clone(),
+                ) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "QUIC: listen failed with built TLS config"
+                        );
+                        return;
+                    }
+                };
+                let _ = quic_bind_tx.send(());
+
+                tracing::info!(addr = %quic_addr, "QUIC listener started on {}", quic_addr);
+                'quic_accept: loop {
+                    tokio::select! {
+                            result = listener.accept() => {
+                                match result {
+                                    Ok(conn) => {
+                                        let state = quic_state.clone();
+                                        let quic_addr = conn.remote_address();
+                                        let permit = state.conn_semaphore.as_ref()
+                                            .and_then(|s| s.clone().try_acquire_owned().ok());
+                                        if permit.is_none() && state.conn_semaphore.is_some() {
+                                            warn!(addr = %quic_addr, "Max connections reached, rejecting QUIC from {}", quic_addr);
+                                            continue;
+                                        }
+                                        let rate_wait = if rate_limiter_enabled {
+                                            state.accept_rate_limiter.try_acquire().err()
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(wait) = rate_wait {
+                                            warn!(addr = %quic_addr, wait_ms = wait.as_millis(), "accept rate limit reached, delaying QUIC {}ms", wait.as_millis());
+                                            drop(permit);
+                                            tokio::time::sleep(wait).await;
+                                            continue;
+                                        }
+                                        spawn_boxed(Box::pin(async move {
+                                            let _permit = permit;
+                                            // Accept first bidirectional stream (control channel).
+                                            // This is inside the handler, not in the accept loop —
+                                            // matching Go frp's HandleQUICListener pattern where
+                                            // the accept loop never blocks on a stream.
+                                            let stream = match crate::handlers::await_quic_preauth(
+                                                conn.accept_bi(),
+                                                tokio::time::Instant::now()
+                                                    + crate::handlers::QUIC_FIRST_FRAME_TIMEOUT,
+                                                &state.shutdown_token,
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(stream)) => stream,
+                                                Ok(Err(e)) => {
+                                                    tracing::warn!(error = %e, "QUIC: failed to accept first stream: {e}");
+                                                    return;
+                                                }
+                                                Err(crate::handlers::QuicPreauthError::TimedOut) => {
+                                                    tracing::warn!(addr = %quic_addr, "QUIC connection timed out before opening control stream");
+                                                    conn.close(b"control stream timeout");
+                                                    return;
+                                                }
+                                                Err(crate::handlers::QuicPreauthError::Cancelled) => {
+                                                    conn.close(b"server shutdown");
+                                                    return;
+                                                }
+                                            };
+                                            // The first-frame budget starts after the stream is
+                                            // accepted, not while we are waiting for the peer to
+                                            // open it (Go frp applies the read deadline post-accept).
+                                            let deadline = tokio::time::Instant::now()
+                                                + crate::handlers::QUIC_FIRST_FRAME_TIMEOUT;
+                                            crate::handlers::handle_quic_stream(
+                                                stream,
+                                                conn,
+                                                state,
+                                                deadline,
+                                                authenticated_stream_limit,
+                                            ).await;
+                                        }));
+                                    }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "QUIC accept error, retrying...");
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                                continue;
+                            }
+                        }
+                        }
+                        _ = quic_state.shutdown_token.cancelled() => {
+                            tracing::debug!("QUIC accept loop: shutdown requested");
+                            break 'quic_accept;
+                        }
+                    }
+                }
+                tracing::info!("QUIC accept loop shut down gracefully");
+            }));
+            match quic_bind_rx.await {
+                Ok(_) => {
+                    tracing::info!(addr = %quic_addr2, "QUIC listener started on {}", quic_addr2)
+                }
+                Err(_) => tracing::error!(addr = %quic_addr2, "QUIC listener failed to start"),
             }
         }
     }
