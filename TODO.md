@@ -7330,6 +7330,40 @@ nothing about whether the described behaviour still holds.
   Ledger unchanged at **3 open / 231 closed**. With this seam the plan's P1 inventory has **all eight listener rows
   landed**; the only rows left to extract are the five `tasks.rs` groups (the first of which creates `service/tasks.rs`), while the two `**stays in run**` rows remain by design.
 
+  **Progress (2026-10-04, code head `a687feed` on `dsh/m17-tasks-nathole`, PR #487, based on `e8d63b7c`).** The ninth
+  P1 seam — the **first of the five `tasks.rs` groups**, and the first that creates a module rather than appending
+  to `listeners.rs` — landed: `run`'s inline NAT-hole session cleanup task moved byte-for-byte into the **new**
+  `frp-server/src/service/tasks.rs` as `pub(super) fn spawn_nat_hole_cleanup_task(&self)` — payload
+  `frp-server/src/service.rs:804-824`, **21 lines / 1070 bytes `cmp`-identical with no re-indent at all** (sha256
+  `60e05ed0b27aca58125c80ed7e05c013b9dc65b744de47fb80ae7f6681f1da34`). The four-line landmark comment stays at the
+  call site (now `:806-809`, one call at `:810`), and `frp-server/src/service.rs` goes 2014 → 2000. The method is
+  deliberately **sync** rather than `async fn`: the block awaited nothing before its `tokio::spawn`, so an `async`
+  signature would introduce an await point the original never had. `mod tasks;` is unconditional beside
+  `mod listeners;` (both `self.state.xtcp` and `crate::nathole` exist in every shape), and the module header
+  records that any later feature-gated task carries its own `#[cfg]` on its item. **One operator-visible delta,
+  recorded not pinned** (same class as the `proxy_ops` file-ification round): the moved `tracing` events now carry
+  target `frp_server::service::tasks` instead of `frp_server::service`. The reviewers verified this is safe against
+  the repo's *actual* subscriber rather than from documentation — `frp-core/src/logging.rs::filter_from_env` builds a
+  `tracing_subscriber::filter::Targets` (prefix matching), not an `EnvFilter`, and a live head-built frps with
+  `RUST_LOG=frp_server::service=debug` plus SIGINT still printed the moved record — and no test or lane asserts on
+  the target string. Coverage is a **recorded gap**: every `Service::run` lane reaches the spawn (the first tick
+  fires immediately) but **no** lane observes an expiry — the 60 s cadence and 120 s expiry are hard-coded while the
+  XTCP tests sleep ≤300 ms, and the effect is covered only by direct `expire_sessions`/`clean` unit calls — so no
+  test was added; an expiry-observing lane needs an injectable clock, which is a behaviour change belonging to the
+  tasks program rather than to this pure move. **14 records were re-pointed by content** (eleven single-line plus
+  three range records over two distinct ranges), every fingerprint unchanged (0 re-bakes), with the shift **+6** for
+  the four `:724` cites and the `:756` shorthand (they sit below the new `mod` note) and **−14** for the rest; the
+  table was re-baked (`433b1deb…` → `339f1128…`, matching the step's `guard_data_pin`, `guard_cites` still 577) and
+  the weak population by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to
+  `4c2baea88ee0a27c` is pure re-keying. One row (`frps/tests/server_protocol.rs:679`) is an **ordinary content
+  shift**, not a repair: the author report described `:1217 → :1203` as fixing a pre-existing off-by-one, and both
+  reviewers falsified that by measuring the base — `:1217` *is* the `#[cfg(not(feature = "websocket"))]` attribute
+  carrying exactly the stored fingerprint `53c310b95373c046`, and the base's own guard run was 577/0 — so nothing was
+  smuggled and the pure-move property holds. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews:
+  verification **MERGE-with-findings** and adversarial **MERGE-with-findings**, the only change-requiring finding
+  being that misdescription in the author's report, not the tree. Ledger unchanged at **3 open / 231 closed**. The
+  plan's P1 inventory now records eight listener rows plus one task row landed; four `tasks.rs` groups remain.
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
