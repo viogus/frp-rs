@@ -392,6 +392,16 @@ Block inventory, from the function's own comment landmarks:
   The block is reached end to end — `frp-server/tests/dashboard_integration.rs` and `dashboard_v2_integration.rs`
   spawn the real `frps` binary with `[web_server] port` set through `Service::run` — so, like KCP and QUIC, no
   new test; the payload's non-empty-cert TLS branch stays unexercised. See the `TODO.md` progress paragraph.
+- SSH tunnel gateway → `frp-server/src/service/listeners.rs`,
+  `#[cfg(feature = "ssh")] pub(super) async fn start_ssh_tunnel_gateway(&self)` — PR #484 at code head
+  `c23b5205` (based on `eede43dc`): payload `service.rs:803-826` is **24 lines / 1157 bytes
+  `cmp`-identical** (sha256 `bee86663af2ec9de1ef285dfa831488a366daf6f165fd7602f4093690287ff4f`), and
+  `frp-server/src/service.rs` 2054 → 2039. The block's `read_ok()` needed `RwLockExt`, which `listeners.rs`
+  imported only under `all(tls, any(websocket, kcp))` — false for an `ssh`-only build — so that gate widened to
+  `any(ssh, all(tls, any(websocket, kcp)))`, and `service.rs`'s own copy of the import had to be **retained**
+  (`write_ok()` is still used there). Coverage: no new test — `frp-server/tests/ssh_gateway.rs` has 17 tests,
+  14 of which set the gateway port through `Service::run`; the 70 in-file unit tests drive `SshListener`
+  directly. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`
@@ -835,9 +845,18 @@ lifecycle (handshake timeout → auth wait → permit release → control-exit/i
 select → cleanup) where the teardown ordering is the point.
 
 **The validation trap, and it matters more than the seams:** `scripts/compat-test.sh`
-**does not exercise the SSH gateway at all** — its only "ssh" references are XTCP
-VPS remote-key plumbing. A green compat run proves nothing here. The real nets are
-`frp-server/tests/ssh_gateway.rs` (16 e2e tests) and the 79 in-file unit tests, so
+**covers only the SSH gateway's banner and auth-rejection surface, not the gateway itself.**
+An earlier revision of this section said compat "does not exercise the SSH gateway at all";
+that was measured false in the M-14 round — `test_ssh_gateway_banner`
+(`scripts/compat-test.sh:7871`) and `test_ssh_gateway_auth_rejection` (`:7933`) both write a
+**Rust** frps config, append `[ssh_tunnel_gateway] bind_port = <port>` and launch `$RUST_FRPS`,
+so they do reach the gateway through `Service::run` (both registered at `:8140-8141` and both
+passing). The third scenario, `test_ssh_gateway_go_frps_compat` (`:8001`), launches the **Go**
+frps and proves nothing about this side. `scripts/protocol-matrix.sh` has zero `ssh`
+references. The real nets are `frp-server/tests/ssh_gateway.rs` (**17** e2e tests, **14** of
+which set `ssh_tunnel_gateway.bind_port` via `ssh_test_config`) and the **70** in-file unit
+tests under `frp-server/src/ssh_gateway/` (`tests.rs` 62 + `key_tests.rs` 3 + `preauth_tests.rs`
+2 + `virtual_ctrl_tests.rs` 3 — note they drive `SshListener` directly, not `Service::run`), so
 those must be run *before and after* each step, not just a compile check.
 
 *Risk:* low for steps 0–5, medium for 6–7. `run`'s body is the only place where

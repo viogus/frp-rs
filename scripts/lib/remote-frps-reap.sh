@@ -9,7 +9,7 @@
 #
 # Why this file exists as a unit: the remote helper used to manage the
 # comparison server with `pkill -f 'frps -c frps.toml'` / `pgrep -f` over ssh
-# (`TODO.md:10123`). Name plus argument selects *any* process on the VPS whose
+# (`TODO.md:10151`). Name plus argument selects *any* process on the VPS whose
 # command line carries that text — the same hazard the local compat sweep
 # already lost (PR #430) — and the local fix cannot be copied: over an ssh hop
 # there is no `$TEST_DIR/` ownership prefix and no baseline census to subtract
