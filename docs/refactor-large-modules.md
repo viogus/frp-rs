@@ -356,11 +356,11 @@ Block inventory, from the function's own comment landmarks:
 | ~1769–1908 | Main accept loop | **stays in `run`** |
 | ~1909–1949 | Graceful drain + OIDC stop | **stays in `run`** |
 
-**Landed from this table so far** (seven of the eight listener rows; none of the task rows): the WebSocket
-listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484) and
-HTTP vhost listener (#485) have moved to `service/listeners.rs`; the rows still in `run` are the HTTPS vhost
-listener, the five `tasks.rs` groups and the two `**stays in run**` rows that stay by design. Each landed seam has an
-entry under "Landed so far" below.
+**Landed from this table so far** (all eight listener rows; none of the task rows): the WebSocket listener
+(#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484), HTTP vhost
+listener (#485) and HTTPS vhost listener (#486) have moved to `service/listeners.rs`; the only rows left in
+`run` are the five `tasks.rs` groups, plus the two `**stays in run**` rows that stay by design. Each landed seam
+has an entry under "Landed so far" below.
 
 **Landed so far** (one block per PR, pure move, per the bar below):
 
@@ -418,6 +418,19 @@ entry under "Landed so far" below.
   scenarios that start the release frps with `vhost_http_port` and assert the port is listening, so no new
   test; the HTTPS vhost listener is a separate block and is **not** claimed. See the `TODO.md` progress
   paragraph.
+- HTTPS vhost listener → `frp-server/src/service/listeners.rs`,
+  `pub(super) async fn start_https_vhost_listener(&self)` — PR #486 at code head `a6382daf` (based on
+  `d3b0f418`): payload `service.rs:773-792` is **20 lines / 916 bytes `cmp`-identical** (sha256
+  `89000dc0d04b1d512b0698e0bb49ce8c74f0630681bfcb68bab5f6d0274c01ec`), and `frp-server/src/service.rs`
+  2027 → 2014. No `#[cfg]` and no gate/import change: the ungated call site is legal in every shape because
+  `run_vhost_https_listener` has a same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1837`.
+  Coverage: no new test — four in-process tests set the port through `Service::run` (witness
+  `frp-server/tests/vhost_https_sni.rs:166`, plus `vhost_audit_fixes.rs:1656` with a real rustls handshake)
+  and `scripts/compat-test.sh:5518` (`test_g2r_https`, Rust frps) is the only compat lane that reaches it
+  (the other three readiness assertions and both WSS scenarios run the Go frps, and the matrix never sets
+  `vhost_https_port`). This seam also **adds** one live cite (the `service.rs` module comment →
+  `vhost.rs:1837`), so `checked` and `guard_cites`/`guard_cites_floor` moved 576 → 577 together. See the
+  `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`

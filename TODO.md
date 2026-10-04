@@ -7298,6 +7298,38 @@ nothing about whether the described behaviour still holds.
   P1 inventory now marks seven of its eight listener rows landed; the HTTPS vhost listener, the five `tasks.rs`
   groups and the two rows that stay in `run` by design remain.
 
+  **Progress (2026-10-04, code head `a6382daf` on `dsh/m16-https-vhost`, PR #486, based on `d3b0f418`).** The eighth
+  P1 seam — **the last listener block** — landed: `run`'s inline HTTPS vhost listener moved byte-for-byte into
+  `frp-server/src/service/listeners.rs` as `pub(super) async fn start_https_vhost_listener(&self)` — payload
+  `frp-server/src/service.rs:773-792`, **20 lines / 916 bytes `cmp`-identical** (sha256
+  `89000dc0d04b1d512b0698e0bb49ce8c74f0630681bfcb68bab5f6d0274c01ec`). The **four-line** landmark comment (the
+  Go-parity note about `vhostHTTPSPort` and the shared TLS acceptor) stays at the call site, and
+  `frp-server/src/service.rs` goes 2027 → 2014 (`listeners.rs` 1118 → 1141). No `#[cfg]` and no gate or import
+  change was needed: the ungated call site is legal in **every** shape because `run_vhost_https_listener` has a
+  same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1837`. The adversarial reviewer proved by
+  mutation that the payload's `https_addr2` clone is **required** (substituting the moved `https_addr` for the
+  post-spawn `info!` fails with `error[E0382]: borrow of moved value`, restored byte-for-byte), and that the
+  `vhost_bind` borrow of `self.cfg` is consumed by `format_socket_addr` into an owned `String` before the spawn.
+  Coverage is the KCP/QUIC/dashboard case, measured: four in-process tests set `vhost_https_port > 0` through
+  `Service::run` (witness `frp-server/tests/vhost_https_sni.rs:166`, plus `vhost_audit_fixes.rs:1656` which does a
+  real rustls handshake) and **only** `scripts/compat-test.sh:5518` (`test_g2r_https`, Rust frps) among the compat
+  lanes reaches this block — the other three readiness assertions and both WSS scenarios run the **Go** frps and
+  `write_frps_config`'s Rust branch never emits `vhost_https_port`, while `protocol-matrix.sh` never sets it
+  either — so no test was added. **`scripts/compat-test.sh` ran green twice** (once by the coordinator, once by the
+  verification reviewer: `86 passed, 0 failed`; the reviewer's first run flaked once in
+  `go-to-rust-route-by-http-user`, the **HTTP**-vhost scenario this diff cannot reach, and passed 3/3 isolated on
+  re-run — the readiness class, not this seam). This seam also **adds** one live cite (the `service.rs` module
+  comment → `vhost.rs:1837`), so the pathline table grew 576 → **577** and `guard_cites`/`guard_cites_floor` rose
+  together to 577 with the guard still exact. **15 records were re-pointed by content** — eleven single-line, plus
+  three range records over two distinct ranges, plus one **target-file** change (`service.rs:785 →
+  listeners.rs:1132`, the call itself) — with every fingerprint and range end unchanged (0 re-bakes) and the table
+  re-baked (`8997e3c6…` → `49052d12…`, matching the step's `guard_data_pin`); the weak population by
+  `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to `0cbd3657dc1cd864` is pure
+  re-keying. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** (no findings;
+  it re-ran compat at 86/0 and confirmed the pin rise) and adversarial **MERGE** (no change-requiring finding).
+  Ledger unchanged at **3 open / 231 closed**. With this seam the plan's P1 inventory has **all eight listener rows
+  landed**; only the five `tasks.rs` groups remain in `run` (the first of which creates `service/tasks.rs`).
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
