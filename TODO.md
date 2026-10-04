@@ -11305,7 +11305,7 @@ other.
   Reviews (PR #480): round 1 — adversarial **MERGE** (it built six shapes, confirmed the records, the socket directions and the same-gate argument), verification MERGE-with-findings with no change-requiring defect; fix confirm — verification **MERGE**, adversarial MERGE-with-findings whose one finding (three file-key socket checks in the probe queried a different port than the file named) was fixed in a probe-only commit (15 insertions / 7 deletions in three hunks) and confirmed non-vacuous by experiment.
   Scope and residues: the literal `cargo build -p frps --no-default-features --features tiny,frp-core/kcp` binary has no CI lane — the probe is the end-to-end witness and the `-p frp-server --no-default-features --all-targets` lane is the in-CI shape assertion (now explicit), and wiring the probe in would renumber the live `ci.yml:NNNN` cites and pay six feature builds per push; `frps verify` reads only the config file (Go parity), so the **flag** half is recorded on the run path while the file key is recorded on `verify` too; `--websocket-port` does not exist, so that half is file-key only; the readers are plain values, so a future caller could pass one that disagrees with its own build — every in-tree call site uses `gated_listener_port_readers()` and three `*_reader_answers_from_this_build` pins check each reader against a direct `cfg!`; and `frpc`/client-side equivalents were not touched.
 
-- [ ] **A live cite in `frps/tests/cli_exit_codes.rs` aims at the wrong range.**
+- [x] **A live cite in `frps/tests/cli_exit_codes.rs` aims at the wrong range.**
   Evidence: the doc comment at `frps/tests/cli_exit_codes.rs:1154` says "`Service::run` installs the
   service's own `SIGTERM` handler" and points at `frp-server/src/service.rs:1148-1175`, but that
   range is the TLS accept loop and connection-type dispatch (`ConnectionType::Tls`,
@@ -11321,3 +11321,22 @@ other.
   `frp-server/src/service/tasks.rs`), the pathline expectations are re-baked in the same commit, and
   the guard still reports `101/0` and `577/0` — the latter only if the rewrite keeps a single cite, since naming
   both the install site and the moved body would make the population 578.
+
+  **Done (2026-10-04, PR #490 at code heads `08fe9856` + `1efa33a2`, based on `78ea7ae4`).** Both mis-aims are
+  fixed. (1) `frps/tests/cli_exit_codes.rs:1154` now cites `frp-server/src/service.rs:843-846` — the three-line
+  landmark plus `self.spawn_signal_listener_task();` — the span the **same file at `:565`**, `frps/src/main.rs:97`
+  and `docs/developing.md:2265` already used, instead of the TLS accept / connection-type dispatch region
+  `937-964`. (2) The adversarial round's sibling hunt then found the **same class** one file over: the reaper
+  comment (moved verbatim in M-19) cited `http.rs:97-101` for the plugin `users` map's "bounded by live controls",
+  but that span is `join_plugin_base`'s URL formatting — the quoted phrase is in the `users` field's doc comment, so
+  it now cites `http.rs:110-114` (`:114` is the phrase line; `remove_user` is at `:222`). Each fix re-baked its
+  expectations row and `ci.yml`'s `guard_data_pin` in the same commit: `checked` stays **577** with no cite added or
+  removed, and the pinned weak count fell **109 → 107** across the two rows for the honest, deterministic reason —
+  each retargeted row's old start endpoint was a repeated line (`.await;` ×5 and `} else {` ×5) while both new
+  endpoints occur once each, so the rows left the weak set rather than being retired (`checked` is the only floor).
+  Guards 101/0 and 577/0, fixtures 86/0, repo-health invariants, and the author executed **all 13 `health` step
+  bodies** rc 0 — its first pass red-flagged the stale pin, a positive control that the pin check is not vacuous.
+  Reviews: verification **MERGE** (no findings) and adversarial **MERGE-with-findings**, whose one finding is fix
+  (2). This record supersedes the same sentence in **two** dated records — the `:7083` M-19 paragraph here and the
+  plan's M-19 "Landed so far" entry (`docs/refactor-large-modules.md`, the `http.rs:97-101` clause) — both of
+  which were true at `6f712517`: that cite is `http.rs:110-114` as of this PR.

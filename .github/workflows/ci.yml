@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=5414be9e42c252733e7769f6a021de3327f3d45a9fcf9e34aa466f7bd48432a2
+          guard_data_pin=e76b9fb496be112a488ec49f73c55802bd2403d812948d4efda88385d7532872
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
