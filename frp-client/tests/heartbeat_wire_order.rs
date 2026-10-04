@@ -710,7 +710,7 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 /// teardown instead of a skip drops the session and the mock's reads fail.
 ///
 /// The one remaining limit, filed as its own item below the closed
-/// `TODO.md:9434`: the windows admit ANY call-site literal in their
+/// `TODO.md:9438`: the windows admit ANY call-site literal in their
 /// `[1s, 3s]` / `[3s, 5s]` class — the review measured 1 s, 2.5 s and 2.9 s
 /// all passing for the first — so a wrong literal inside a class is not
 /// distinguishable end-to-end, and only the constant-vs-literal pin in the

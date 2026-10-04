@@ -7463,15 +7463,19 @@ nothing about whether the described behaviour still holds.
   wrong as written. The move remains right and in scope (a test-only gate does not belong in production), and the
   author flagged the judgement call rather than silently following the brief. `scripts/large-functions.sh` reports the
   plan's `5108 / 6856` figures **exactly** at base; after the move `service.rs` is 5106 production / 5108 total / 2
-  test, and the new `tests.rs` is classified as a whole-file test module (0 / 1743 / 1743) — which also exercises the
+  test, and the new `tests.rs` is classified as a whole-file test module (0 production, hence absent from the printed table; 1743 total) — which also exercises the
   earlier item that taught that tool to classify file-ified test modules. **37 live cites were re-pointed by content**
   (35 shift −6; 2 that pointed into the test module now point at `service/tests.rs`); the table was re-baked
-  (`guard_data_pin` `e76b9fb4…` → `a69297ce…`; the whole-table diff against base is this move's 39 removed / 39 added
-  / 538 unchanged rows plus one pins-header line) with `checked` still 577 and no cite added or removed, and the weak
+  (`guard_data_pin` `e76b9fb4…` → `a69297ce…` at the code seam, re-baked here to `fe867544…`; an opcode diff of the base
+  against this head is 41 removed / 41 added / 559 unchanged lines = 40 changed record lines plus the single `# pins:`
+  header line, leaving 537 unchanged records — 35 target-line+raw shifts, 2 target-file moves into `service/tests.rs`,
+  2 citing-line shifts and 1 fingerprint-only re-bake, of which 37 are the content re-points above) with `checked`
+  still 577 and no cite added or removed, and the weak
   population is **107 → 107** (`weak_set` `67578c6b…` → `f9c334c1…`): by `(target, fp)` one key left and one entered
-  (the same fingerprint moving file), and keyed by (citing file, line, target) three left and three entered. No
+  (the same fingerprint moving file), keyed by (citing file, line, target) three left and three entered, and on the
+  guard's own key (`target:line-end`, the one `weak_set` hashes) four left and four entered. No
   `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** at the tip; adversarial
-  **DO-NOT-MERGE → MERGE**. Ledger unchanged at **4 open / 231 closed / 235 headers**.
+  **DO-NOT-MERGE → MERGE**. Ledger unchanged at **3 open / 232 closed / 235 headers** (the P2 item stays open).
 
   *Process note, recorded deliberately.* The first review dispatch named `a55adb82`, an in-flight pre-rebase commit
   that was briefly the pushed head; at it the adversarial found the pathline guard **red** (the table had been
