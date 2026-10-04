@@ -269,7 +269,7 @@ impl Service {
                         // entry (removed_control_id), but this sweep's
                         // remove_if deleted that entry first, so the
                         // generation guard fails there and remove_user is
-                        // skipped — the plugin `users` map (http.rs:97-101,
+                        // skipped — the plugin `users` map (http.rs:110-114,
                         // "bounded by live controls") would otherwise grow by
                         // one entry per control that exited without a clean
                         // unregister: exactly the path this reaper exists

@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=577 weak=108 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=4a7dc67818de44eb ambiguous_set=3343d4d37da5672a excluded_set=196581ae767a847a
+#   pins: checked=577 weak=107 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=67578c6b995cb9ce ambiguous_set=3343d4d37da5672a excluded_set=196581ae767a847a
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -431,7 +431,7 @@ frp-server/src/handlers/transport.rs	1670	-	c6a8bd377e839231	-	absolute	frp-serv
 frp-server/src/handlers/transport.rs	227	-	21a5b9cde656d99c	-	absolute	frp-server/src/handlers/transport.rs	transport.rs:227	18
 frp-server/src/handlers/transport.rs	669	-	a5e8fea2069641bb	-	absolute	frp-server/tests/server_protocol.rs	frp-server/src/handlers/transport.rs:669	753
 frp-server/src/handlers/transport.rs	669	-	a5e8fea2069641bb	-	absolute	frp-server/tests/slowloris.rs	frp-server/src/handlers/transport.rs:669	302
-frp-server/src/plugin/http.rs	97	101	985045f1c0578a8d	cae662172fd450bb	absolute	frp-server/src/service/tasks.rs	http.rs:97-101	272
+frp-server/src/plugin/http.rs	110	114	83ec21160630267f	06d167faa256f147	absolute	frp-server/src/service/tasks.rs	http.rs:110-114	272
 frp-server/src/plugin/mod.rs	202	-	d10b36aa74a59bcf	-	shorthand	frp-server/src/control/proxy_ops/unregister_generation_tests.rs	:202	175
 frp-server/src/plugin/mod.rs	29	-	2ecee109b8f3197a	-	shorthand	frp-server/src/control/proxy_ops/unregister_generation_tests.rs	:29	174
 frp-server/src/plugin/mod.rs	30	32	cbadcd0a5ae438e5	d10b36aa74a59bcf	shorthand	frp-server/src/control/proxy_ops/unregister_generation_tests.rs	:30-32	175
