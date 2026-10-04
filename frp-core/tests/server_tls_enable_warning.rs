@@ -430,7 +430,7 @@ fn the_message_names_the_inertness_the_real_switch_and_the_certificate() {
 // the one-line `tracing` prefix before it, and after it no byte but an optional
 // trailing newline. `contains(NEEDLE)` cannot see an appended clause (measured by
 // appending `" but honestly"` to the `tracing::warn!` at
-// `frp-core/src/config/loader.rs:970`), which is why the tail is pinned there.
+// `frp-core/src/config/loader.rs:1103`), which is why the tail is pinned there.
 
 /// A written `tls_enable`, in either value, is inert — so it warns, exactly
 /// once, in both strict modes, and the loader itself stays silent.

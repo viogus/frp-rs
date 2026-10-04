@@ -911,7 +911,7 @@ fn assert_one_warning_on_stdout_with_boot(tag: &str, spawned: &Spawned, boot: us
 /// passes the caller's answer as an argument, so it never sees a real build's
 /// answer. Only an assertion on the captured stdout can, and that is what binds
 /// the two `frps/src/main.rs` emit sites (`:1078` on the `-c` path, `:625` on the
-/// `--config-dir` path) and the reload site `frp-server/src/service.rs:1568` to the
+/// `--config-dir` path) and the reload site `frp-server/src/service.rs:1617` to the
 /// build under test. The lane that runs this file **without** `--features dashboard`
 /// is what makes the no-dashboard direction observable.
 ///
@@ -1706,7 +1706,7 @@ fn a_config_dir_sigusr1_reloads_every_service() {
 /// (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`).
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:812)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:820)"
 )]
 #[cfg(unix)]
 #[test]
@@ -1773,7 +1773,7 @@ fn a_config_dir_sigusr1_does_not_count_a_panicking_service() {
 /// name (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`).
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:691)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:699)"
 )]
 #[cfg(unix)]
 #[test]
