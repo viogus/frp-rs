@@ -323,7 +323,7 @@ Ranked by *risk reduction per unit of disruption*, using the measurements above.
 
 ## Per-file analysis
 
-### P1 — `frp-server/src/service.rs::run` (1291 code lines) — do this first
+### P1 — `frp-server/src/service.rs::run` (1291 code lines at the plan's base; **429** now) — do this first
 
 `run` is not a tangled algorithm. It is a **linear startup sequence**: ~10
 independent "if this port is configured, start that listener" blocks, three
@@ -331,7 +331,7 @@ one-shot background tasks, the main accept loop, and a graceful-drain tail. That
 makes it the safest large-scale extraction available anywhere in this codebase —
 far safer than `run_message_loop`, where `select!` fairness is load-bearing.
 
-`service.rs` has only **10 production functions**; `run` is 1291 of its 2074
+`service.rs` has only **10 production functions**; `run` is 1291 of its 2074 at the plan's base (**429** now)
 production lines. The connection-*handling* half of this file was already split
 into `frp-server/src/handlers/` (`dispatch.rs` 1568, `transport.rs` 2043); the
 listener-*startup* half never was. This finishes that job.
@@ -433,7 +433,7 @@ verifiable by inspection of the diff.
 `scripts/protocol-matrix.sh` (this is exactly the 11-row transport matrix — the WS
 and KCP rows would catch a listener that stops starting), and the `health` CI job.
 
-### P2 — `frp-client/src/service.rs` (4930 production lines, 34 production fns)
+### P2 — `frp-client/src/service.rs` (5108 production lines, 34 production fns)
 
 **The layout question is settled, and empirically.** A scratch crate was used to
 verify the module rules rather than assume them:
@@ -460,7 +460,7 @@ which inflated several entries): `run_message_loop` 1109, `register_proxies` 594
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
-| **S0** | `service/tests.rs` | the inline test module (4930–6381, 1452 LOC) + the two test-only imports that become dead in the parent (`tokio::sync::watch`, `crate::vnet::{register_vnet_tun, vnet_tun_cidr}`) | **very low** — no production line changes, but the imports must move or clippy's `unused_imports` fires |
+| **S0** | `service/tests.rs` | the inline test module (5112–6855, 1744 LOC) + the two test-only imports that become dead in the parent (`tokio::sync::watch`, `crate::vnet::{register_vnet_tun, vnet_tun_cidr}`) | **very low** — no production line changes, but the imports must move or clippy's `unused_imports` fires |
 | S1 | `service/reload_apply.rs` | `request_reload`, `close_wire_name_for_reload`, `try_reload`, `reload_from_sources` (4321–4823), `filter_active_proxies`, `filter_active_visitors` (~570 LOC) | low — **zero `tokio::spawn`, no `select!`** in range; only a phase-A/commit ordering to preserve. Needs `pub(crate) use reload_apply::{filter_active_proxies, ...}` — mandatory, `store.rs:592` spells the path |
 | S2 | `service/registration.rs` | the registration frame plumbing (511–693) + `register_proxies` (1798–2391, ~590 LOC) | low–medium — the response loop is a cancellation-sensitive state machine and the `Arc<Mutex<IoStream>>` → `Arc::try_unwrap` handoff is subtle, but a verbatim move changes neither |
 | S3 | `service/message_loop.rs` | `run_message_loop` (2752–3860) + `SessionChannels`, `LoopExit`, `StunResult`, the retry statics (~1180 LOC) | medium — pure relocation; 4 vnet gates, 3 spawns and 5 `expect` sites must land unchanged |
