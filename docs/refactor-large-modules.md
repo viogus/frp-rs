@@ -128,7 +128,7 @@ re-running the script before acting on them.
 | `frp-server/src/ssh_gateway.rs` | 4865 | 2123 | 2742 |
 | `frp-core/src/auth.rs` | 3791 | 1924 | 1867 |
 
-Note `frp-client/src/visitor.rs`: 3685 production lines with only **165 lines of
+Note `frp-client/src/visitor.rs`: 3864 total lines with **697 lines of
 tests** — the largest production-to-test ratio in the repository, and it is the
 XTCP/STCP/SUDP/vnet data plane.
 
@@ -308,7 +308,7 @@ Ranked by *risk reduction per unit of disruption*, using the measurements above.
 |---|---|---|---|
 | **P0** | **File-ify the inline test modules** in all five files below | Zero production change, same module paths, ~40–55% line reduction in the worst files; see [Step 0](#step-0--the-universal-first-move-file-ify-the-inline-tests) | one commit per file |
 | **P1** | `frp-server/src/service.rs::run` | Largest function in the repo (1291 code lines); **a linear startup sequence**, so extraction is mechanical and low-risk; `handlers/` already sets the precedent for this exact kind of split | ~10 listener blocks → named methods |
-| **P2** | `frp-client/src/service.rs` | #1 production file size (4930), #1 churn (53), #1 fix density (230), 84 cfg gates | 5 seams, ~1900 lines |
+| **P2** | `frp-client/src/service.rs` | #1 production file size (4930), #1 churn (53), #1 fix density (230), 106 cfg gates | 5 seams, ~1900 lines |
 | **P3** | `frp-client/src/visitor.rs` | #2 production size (3685) and **almost untested** (165 test lines) | 3–4 seams |
 | **P4** | `frp-server/src/control/proxy_ops/` | `handle_new_proxy` 546 code lines; 2nd-highest fix density | 2–3 seams |
 | **P5** | `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs` (`spawn_work_conn` 469, `run_udp_work_conn` 419) | Surfaced only by the measurement script; not on any file-size list | 1 seam each |
@@ -400,7 +400,7 @@ Block inventory, from the function's own comment landmarks:
   imported only under `all(tls, any(websocket, kcp))` — false for an `ssh`-only build — so that gate widened to
   `any(ssh, all(tls, any(websocket, kcp)))`, and `service.rs`'s own copy of the import had to be **retained**
   (`write_ok()` is still used there). Coverage: no new test — `frp-server/tests/ssh_gateway.rs` has 17 tests,
-  14 of which set the gateway port through `Service::run`; the 70 in-file unit tests drive `SshListener`
+  13 of which set the gateway port through `Service::run`; the 70 in-file unit tests drive `SshListener`
   directly. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
@@ -514,7 +514,7 @@ and `teardown_session` have load-bearing spawn/teardown order; **84
 --features tiny|micro` is mandatory per seam; and the error/`expect` text is
 contract (27 `expect` sites listed in the analysis). No `unsafe` in the file.
 
-### P3 — `frp-client/src/visitor.rs` (3685 production lines, 36 production fns, 165 test lines)
+### P3 — `frp-client/src/visitor.rs` (3864 total lines, 36 production fns, 697 test lines)
 
 Four parallel listener implementations live in one file, each with its own loop:
 
@@ -822,7 +822,7 @@ Unlike the others, this file's size is **not** a structure problem: 56 productio
 functions spread over ~10 independent concerns, and the largest is `run` at **310
 code lines**. So it was going to be listed as "leave alone", and that is *half*
 right — but [Step 0](#step-0--the-universal-first-move-file-ify-the-inline-tests)
-applies here too (2129 test lines, 44% of the file), and there is one genuinely
+applied here too — PR #451 moved the inline tests out, and the stand-alone test target is now 1257 lines — and there is one genuinely
 clean seam.
 
 | Order | New module | Moves | Notes |
@@ -845,7 +845,7 @@ lifecycle (handshake timeout → auth wait → permit release → control-exit/i
 select → cleanup) where the teardown ordering is the point.
 
 **The validation trap, and it matters more than the seams:** `scripts/compat-test.sh`
-**covers only the SSH gateway's banner and auth-rejection surface, not the gateway itself.**
+**covers only the SSH gateway's banner and auth-rejection surface, not the gateway's full behaviour.**
 An earlier revision of this section said compat "does not exercise the SSH gateway at all";
 that was measured false in the M-14 round — `test_ssh_gateway_banner`
 (`scripts/compat-test.sh:7871`) and `test_ssh_gateway_auth_rejection` (`:7933`) both write a
@@ -853,7 +853,7 @@ that was measured false in the M-14 round — `test_ssh_gateway_banner`
 so they do reach the gateway through `Service::run` (both registered at `:8140-8141` and both
 passing). The third scenario, `test_ssh_gateway_go_frps_compat` (`:8001`), launches the **Go**
 frps and proves nothing about this side. `scripts/protocol-matrix.sh` has zero `ssh`
-references. The real nets are `frp-server/tests/ssh_gateway.rs` (**17** e2e tests, **14** of
+references. The real nets are `frp-server/tests/ssh_gateway.rs` (**17** e2e tests, **13** of
 which set `ssh_tunnel_gateway.bind_port` via `ssh_test_config`) and the **70** in-file unit
 tests under `frp-server/src/ssh_gateway/` (`tests.rs` 62 + `key_tests.rs` 3 + `preauth_tests.rs`
 2 + `virtual_ctrl_tests.rs` 3 — note they drive `SshListener` directly, not `Service::run`), so
@@ -880,14 +880,15 @@ Every seam is a **pure move**. The bar:
    `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 3. `cargo test --workspace --all-features` **and** `cargo check
    --no-default-features --features tiny|micro` (mandatory for `service.rs`, with
-   its 84 cfg gates).
+   its 35 `#[cfg]` attributes now).
 4. `bash scripts/compat-test.sh` — the only hard compatibility evidence.
 5. `bash scripts/protocol-matrix.sh` — catches data-plane breakage that compiles
    and connects fine.
    **But check what a gate actually covers before trusting it:** `compat-test.sh`
-   does *not* exercise the SSH gateway (its only "ssh" hits are XTCP VPS remote-key
-   plumbing), so for `ssh_gateway.rs` the relevant gates are
-   `frp-server/tests/ssh_gateway.rs` and the in-file unit tests. Likewise
+   covers only the SSH gateway's banner and auth-rejection surface
+   (`scripts/compat-test.sh:7871` and `:7933`, both Rust-frps; the `:8001` scenario is
+   Go-frps), so the decisive gates are `frp-server/tests/ssh_gateway.rs` (17 tests, 13
+   through `Service::run`) and the 70 in-file unit tests under `frp-server/src/ssh_gateway/`. Likewise
    `run_sudp_message_bridge` has no compat coverage for the mixed-codec path.
 6. For `bridge.rs` seams: `scripts/ab-matrix.sh` if the move touches anything on
    the pump path. A pure file move should not, but verify rather than assume.
@@ -923,7 +924,7 @@ Every seam is a **pure move**. The bar:
    ~80 field-visibility widenings. So: `frp-client/src/service/` children, with
    `SessionCtx`/`Service` staying in `service.rs`. (Verified in a scratch crate —
    see P2.)
-3. **`visitor.rs` has almost no tests (165 lines for 3685 production lines).** Is
+3. **`visitor.rs` has few tests (697 test lines for 3864 total lines).** Is
    adding coverage a prerequisite for splitting it, or is a pure move acceptable?
    I lean towards: pure move now, coverage as its own item.
 4. ~~Worth automating?~~ **Done** — [`scripts/large-functions.sh`](../scripts/large-functions.sh)

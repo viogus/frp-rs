@@ -7256,7 +7256,7 @@ nothing about whether the described behaviour still holds.
   `listeners.rs` imported only under `all(tls, any(websocket, kcp))` — false for an `ssh`-only build — so that gate
   widened to `any(ssh, all(tls, any(websocket, kcp)))`, while `frp-server/src/service.rs`'s own copy of the import
   had to be **retained** because its `write_ok()` is still used there (three of the four sites always compile).
-  Coverage is the KCP/QUIC/dashboard case, measured: `frp-server/tests/ssh_gateway.rs` has **17** tests, **14** of
+  Coverage is the KCP/QUIC/dashboard case, measured: `frp-server/tests/ssh_gateway.rs` has **17** tests, **13** of
   which set `ssh_tunnel_gateway.bind_port` via `ssh_test_config` and reach this block through `Service::run`
   (witness `test_ssh_gateway_startup_and_banner`), so no test was added; the **70** in-file unit tests under
   `frp-server/src/ssh_gateway/` drive `SshListener` directly and never touch `Service::run`. **This round also
@@ -7266,7 +7266,7 @@ nothing about whether the described behaviour still holds.
   and pass (the third scenario, `:8001`, uses the Go frps and is not evidence about the Rust block), while
   `protocol-matrix.sh` genuinely has zero `ssh` references; the same paragraph's "16 e2e tests" and "79 in-file
   unit tests" were stale and are now **17** and **70**. **16 records were re-pointed by content** with every
-  fingerprint and range end unchanged (0 re-bakes) and the pathline table re-baked (`4db8ca92…` → `a967b101…`,
+  fingerprint and range end unchanged (0 re-bakes) and the pathline table re-baked (`4db8ca92…` → `a967b101…` at the seam, re-baked here to `158d4bff…`),
   matching the step's `guard_data_pin`); the weak population by `(target, fp)` is identical (61 keys, 0 entered /
   0 left), so the `weak_set` move to `b8f7fe77b5026b57` is pure re-keying. No `CHANGELOG.md` bullet, matching the
   earlier seams. Reviews: verification **MERGE** (no findings) and adversarial **MERGE-with-findings**, whose only
