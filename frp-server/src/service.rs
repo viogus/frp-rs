@@ -68,6 +68,13 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // Like the TCPMux/vhost seams this block is un-gated (`self.state.xtcp` and
 // `crate::nathole` exist in every shape), so `mod tasks;` is un-gated too and
 // no import changed here.
+// The port-reservation pruner and the signal listener moved to
+// `service/tasks.rs` the same way; their `tracing` events carry the same
+// `frp_server::service::tasks` target. Neither block awaits before its
+// `tokio::spawn`, so both methods are sync. Both are un-gated
+// (`self.state.shutdown_token` exists in every shape), so the signal block's
+// own `#[cfg(unix)]`/`#[cfg(not(unix))]` arms move with it and `mod tasks;`
+// stays un-gated; `tasks.rs` gained the `info!` import its two records need.
 mod listeners;
 mod tasks;
 
@@ -811,9 +818,7 @@ impl Service {
 
         // Periodic port-reservation pruner: sweep 24h-expired entries so stale
         // reservations don't block port reuse. Same 60s cadence as NAT cleanup.
-        self.state
-            .clone()
-            .spawn_port_reservation_pruner(self.state.shutdown_token.clone());
+        self.spawn_port_reservation_pruner_task();
 
         // Periodic TLS certificate hot-reload: stat cert/key files every 60 seconds.
         // When mtimes change (e.g., certbot/cert-manager renews in-place), rebuild
@@ -890,43 +895,7 @@ impl Service {
         // Spawn signal listener for graceful shutdown.
         // ctrl_c() only catches SIGINT; SIGTERM needs an explicit unix signal
         // handler (docker stop / systemctl stop send SIGTERM).
-        let shutdown_token = self.state.shutdown_token.clone();
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                // SIGTERM → graceful shutdown (docker stop / systemctl stop
-                // send SIGTERM; ctrl_c() alone only catches SIGINT).
-                let mut term_sig =
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    {
-                        Ok(s) => Some(s),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "SIGTERM handler unavailable: {}", e);
-                            None
-                        }
-                    };
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received SIGINT, initiating graceful shutdown...");
-                    }
-                    _ = async {
-                        if let Some(sig) = term_sig.as_mut() {
-                            sig.recv().await;
-                        } else {
-                            std::future::pending::<()>().await;
-                        }
-                    } => {
-                        info!("Received SIGTERM, initiating graceful shutdown...");
-                    }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c().await.ok();
-                info!("Received SIGINT, initiating graceful shutdown...");
-            }
-            shutdown_token.cancel();
-        });
+        self.spawn_signal_listener_task();
 
         // Stale-control reaper: run_id_to_ctl_tx entries whose receiver has
         // been dropped (control handler panicked / exited without running

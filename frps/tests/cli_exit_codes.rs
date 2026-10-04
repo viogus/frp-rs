@@ -562,7 +562,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// 1. *The install race.* `Service::run` spawns the SIGTERM task from the same
 ///    async fn that later runs the accept loop
-///    (`frp-server/src/service.rs:890-922`), so the listener can be accepting
+///    (`frp-server/src/service.rs:895-898`), so the listener can be accepting
 ///    before that task has been polled even once — and then SIGTERM takes the
 ///    default disposition.
 /// 2. *The foreign-listener false witness.* `ephemeral_port()` binds a port and
@@ -1151,7 +1151,7 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 /// The interval where that matters is narrow. From the moment
 /// `early_shutdown.watch(...)` puts a service into the fan-out list until
 /// `Service::run` installs the service's own `SIGTERM` handler
-/// (`frp-server/src/service.rs:1179-1206`), only the recorder can cancel that
+/// (`frp-server/src/service.rs:1148-1175`), only the recorder can cancel that
 /// token. The debug-only post-registration hold
 /// (`FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS=30_000` with
 /// `..._DELAY_FILES=a.toml`) parks `a.toml`'s task inside exactly that interval
