@@ -7405,6 +7405,46 @@ nothing about whether the described behaviour still holds.
   of the five task rows landed; the TLS certificate hot-reload task and the stale-control reaper remain in `run`
   (with the two rows that stay there by design).
 
+  **Progress (2026-10-04, code head `6f712517` on `dsh/m19-tasks-tls-reaper`, PR #489, based on `8046d257`).** The
+  eleventh P1 seam landed and **P1 is complete**: the TLS certificate hot-reload task and the stale-control reaper —
+  the last two `tasks.rs` groups — moved byte-for-byte into `frp-server/src/service/tasks.rs` as
+  `#[cfg(feature = "tls")] pub(super) fn spawn_tls_cert_reload_task(&self)` and
+  `pub(super) fn spawn_stale_control_reaper_task(&self)`, so of the rows the plan marked movable **none** is left in
+  `run`: the only rows that remain there are the two it marks `**stays in run**` (the main accept loop and the
+  graceful drain + OIDC stop), alongside the extracted seams' 13 call sites and the startup preamble (the bind, the
+  initial TLS-acceptor block and the rate-limit computation). The two blocks were grouped for the same
+  reason as #488, and each kept its own proof. Payloads: TLS `frp-server/src/service.rs:829-888` = **60 lines /
+  3240 bytes** (sha256 `1212488187a7bb70…`) whose body `tasks.rs:72-131` equals the base after the base's **uniform
+  4-space brace-level de-indent** — every non-empty line carried ≥4 spaces, so no line was partially de-indented
+  (the de-indented slice hashes to `adf2161648b32c02…` when joined with a trailing newline; the reviewers' joined
+  shas differ only in join basis, so the sha is only meaningful with that basis stated); and reaper `:904-1063` =
+  **160 lines / 10273 bytes** (sha256 `1bad6d2ea5f48827…`), `cmp`-identical with **no** re-indent and carrying all
+  **98** of its comment lines, which are the specification (double-call safety, generation guards, the same-`run_id`
+  reconnect race). `frp-server/src/service.rs` 1969 → 1758, `tasks.rs` 95 → 337. **Gating** is the subtlety this
+  block carried: the base's `#[cfg(feature = "tls")]` sat on a braced block, and it now sits on **both the method and
+  its call site** (the SSH-seam convention) with the two TLS imports gated in `tasks.rs` while `mod tasks;` stays
+  unconditional; the reaper is ungated. Because the two blocks have **different** gates, the adversarial round
+  attacked the grouping from both directions by mutation — removing A's method gate reds the no-`tls` shape, and
+  gating B's method produces `E0599` at its ungated call site — and seven shapes (including `--features tls` as the
+  reverse and `tls,http-proxy,tcp-mux` as a partial set) are clean under `RUSTFLAGS="-D warnings"`. Both methods are
+  sync by measurement, not style. **Coverage is a recorded gap for both**: every `Service::run` lane reaches each
+  spawn and its shutdown arm, but no lane observes either effect — nothing swaps a cert/key after start or waits
+  ≥60 s on that path (the tested swap is the SIGUSR1 acceptor mechanism), and
+  `run_id_to_ctl_tx`/`ControlTx`/`is_closed` have **zero** occurrences across the test trees, with no lane killing a
+  handler or calling the sweep — so no test was added, since an effect-observing lane needs an injectable clock or a
+  handler-kill harness, which is behaviour work for the tasks program rather than this pure move. **14 records were
+  re-pointed by content** (every fingerprint unchanged; shifts **+9** above the removals, **−52** for the one row between the seams
+  (= +9 + 1 − 62) and **−211** below, consistent with 1969 → 1758), plus ten citing-line renumbers and one cite that **moved file** with the payload (the
+  reaper's comment references `http.rs:97-101`, now a live cite from `tasks.rs:272`); the table was re-baked
+  (`d905f480…` → `fc54f0b6…` at the seam, re-baked here to `791551bd…`, matching `guard_data_pin`, `guard_cites` still 577) and the weak population
+  by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to `00a8aaeec9948b68` is pure
+  re-keying. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE-with-findings** (its
+  one finding was a figure in the *author's report* — "5 pre-spawn `let`s" where there are 4 — not in the tree) and
+  adversarial **MERGE** (no change-requiring finding; two mutations, seven shapes, and the cascade arithmetic
+  +9 / −52 = +9+1−62 / −211 = +9+1−62+1−160, which only adds up if both blocks left `run`). Ledger unchanged at
+  **4 open / 231 closed / 235 headers**. **The item stays open**: P1 is done, but the same item's scope continues into
+  P2 (`frp-client/src/service.rs`), which the plan splits into S0–S5.
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
