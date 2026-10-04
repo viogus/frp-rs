@@ -356,11 +356,12 @@ Block inventory, from the function's own comment landmarks:
 | ~1769–1908 | Main accept loop | **stays in `run`** |
 | ~1909–1949 | Graceful drain + OIDC stop | **stays in `run`** |
 
-**Landed from this table so far** (all eight listener rows; none of the task rows): the WebSocket listener
-(#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484), HTTP vhost
-listener (#485) and HTTPS vhost listener (#486) have moved to `service/listeners.rs`; the only rows left in
-`run` are the five `tasks.rs` groups, plus the two `**stays in run**` rows that stay by design. Each landed seam
-has an entry under "Landed so far" below.
+**Landed from this table so far** (all eight listener rows and one of the five task rows): the WebSocket
+listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484),
+HTTP vhost listener (#485) and HTTPS vhost listener (#486) moved to `service/listeners.rs`, and the NAT-hole
+cleanup task (#487) opened `service/tasks.rs`; the rows left in `run` are the remaining four `tasks.rs` groups,
+plus the two `**stays in run**` rows that stay by design. Each landed seam has an entry under "Landed so far"
+below.
 
 **Landed so far** (one block per PR, pure move, per the bar below):
 
@@ -431,6 +432,21 @@ has an entry under "Landed so far" below.
   `vhost_https_port`). This seam also **adds** one live cite (the `service.rs` module comment →
   `vhost.rs:1837`), so `checked` and `guard_cites`/`guard_cites_floor` moved 576 → 577 together. See the
   `TODO.md` progress paragraph.
+- NAT-hole session cleanup task → **new module** `frp-server/src/service/tasks.rs`,
+  `pub(super) fn spawn_nat_hole_cleanup_task(&self)` — PR #487 at code head `a687feed` (based on `e8d63b7c`):
+  payload `service.rs:804-824` is **21 lines / 1070 bytes `cmp`-identical with no re-indent** (sha256
+  `60e05ed0b27aca58125c80ed7e05c013b9dc65b744de47fb80ae7f6681f1da34`), and `frp-server/src/service.rs`
+  2014 → 2000. The method is deliberately **sync**, not `async fn`: the block awaited nothing before its
+  `tokio::spawn`, so an `async fn` would add an await point that never existed. `mod tasks;` is unconditional
+  beside `mod listeners;` (both `self.state.xtcp` and `crate::nathole` exist in every shape); later gated tasks
+  carry their own `#[cfg]`. One disclosed consequence: the moved block's `tracing` target becomes
+  `frp_server::service::tasks` — verified safe empirically, because `frp-core/src/logging.rs::filter_from_env`
+  builds a `tracing_subscriber::filter::Targets` (prefix matching) rather than an `EnvFilter`, and a live run
+  with `RUST_LOG=frp_server::service=debug` still prints the moved record. Coverage: no test — every
+  `Service::run` lane reaches the spawn but none observes an expiry (60 s cadence / 120 s expiry are
+  hard-coded while the XTCP tests sleep ≤300 ms), and the effect is covered only by direct
+  `expire_sessions`/`clean` unit calls; an expiry-observing lane needs an injectable clock, which is a
+  behaviour change for the tasks program rather than this seam. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`

@@ -63,7 +63,13 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // un-gated as well: `crate::vhost::run_vhost_https_listener` has a
 // `#[cfg(not(feature = "tls"))]` stub returning an error
 // (`frp-server/src/vhost.rs:1837`), so no gate is needed and no import changed.
+// The NAT-hole session cleanup task moved to `service/tasks.rs` the same way;
+// its two `tracing` events carry the same `frp_server::service::tasks` target.
+// Like the TCPMux/vhost seams this block is un-gated (`self.state.xtcp` and
+// `crate::nathole` exist in every shape), so `mod tasks;` is un-gated too and
+// no import changed here.
 mod listeners;
+mod tasks;
 
 // ---------------------------------------------------------------
 // Helpers
@@ -801,27 +807,7 @@ impl Service {
         // Sessions should normally be completed by the provider's NatHoleReport,
         // but if the provider crashes or the network drops, this ensures sessions
         // older than 2 minutes don't leak memory.
-        let nat_hole = self.state.xtcp.nat_hole.clone();
-        let nat_shutdown_token = self.state.shutdown_token.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        nat_hole.expire_sessions(Duration::from_secs(120)).await;
-                        // Clean expired analyzer entries to prevent unbounded memory growth.
-                        let (removed, total) = nat_hole.analyzer.clean();
-                        if removed > 0 {
-                            tracing::debug!(removed = %removed, total = %total, "Analyzer cleanup: removed {}/{} expired entries", removed, total);
-                        }
-                    }
-                    _ = nat_shutdown_token.cancelled() => {
-                        tracing::debug!("NAT cleanup task: shutdown requested, stopping");
-                        break;
-                    }
-                }
-            }
-        });
+        self.spawn_nat_hole_cleanup_task();
 
         // Periodic port-reservation pruner: sweep 24h-expired entries so stale
         // reservations don't block port reuse. Same 60s cadence as NAT cleanup.

@@ -94,7 +94,7 @@ impl Drop for DirRegistryEntry {
 /// Main-task ownership of `SIGTERM`/`SIGINT` for the `--config-dir` lane.
 ///
 /// The Unix `SIGTERM` handler lives inside `Service::run` — it is installed by a
-/// task `run()` spawns at its top (`frp-server/src/service.rs:904-936`, the
+/// task `run()` spawns at its top (`frp-server/src/service.rs:890-922`, the
 /// same task that also takes `ctrl_c()`) — so a `SIGTERM` that lands between the
 /// startup line and that registration takes the kernel's default disposition
 /// and kills `frps` (`rc = -15`) instead of draining. The measured window is
@@ -419,7 +419,7 @@ fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[String]) {
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
 fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
-    // Go frp parity (TODO.md:9950): with an explicit `-c` the config file is
+    // Go frp parity (TODO.md:9984): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
     // (`frps/src/main.rs:1068-1070`), so consulting the CLI log flags here would
@@ -468,7 +468,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // `log.InitLogger` the *file's* `Log.DisablePrintColor`
     // (`cmd/frps/root.go:112`), so `frps -c frps.toml --disable-log-color=true`
     // is ignored by Go while frp-rs still honours it. Unlike the four log flags
-    // masked above, this one is not named by R1 (TODO.md:9950) and
+    // masked above, this one is not named by R1 (TODO.md:9984) and
     // `frps/tests/cli_exit_codes.rs:1945` (`disable_log_color_value_spelling_is_applied`)
     // pins the current behaviour, so changing it is a separate item.
     let ansi = logging::resolve_ansi(
@@ -828,7 +828,7 @@ async fn run(mut cli: FrpsArgs) {
                             if let Err(e) = service.run().await {
                                 // `Service::run` has exactly one `Ok(())`
                                 // return — its graceful-shutdown tail
-                                // (`frp-server/src/service.rs:1326`) — so this
+                                // (`frp-server/src/service.rs:1312`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
                                 // `EXIT_RUNTIME` (`frps/src/main.rs:1194-1197`),
@@ -973,7 +973,7 @@ async fn run(mut cli: FrpsArgs) {
         // code out of construction, or `EXIT_RUNTIME` when `run()` failed — and
         // `Ok(())` only when the service ran to a graceful shutdown, the sole
         // `Ok` return in `Service::run`
-        // (`frp-server/src/service.rs:1326`). A **panicking** task reports
+        // (`frp-server/src/service.rs:1312`). A **panicking** task reports
         // `Err(JoinError)`; it is counted as an `EXIT_RUNTIME` failure rather
         // than merely logged, because `Service::run` cannot have returned
         // `Ok(())` on a panic and dropping it let a directory where every task
