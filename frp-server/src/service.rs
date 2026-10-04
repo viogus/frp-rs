@@ -39,10 +39,10 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // carry the same `frp_server::service::listeners` target.
 //
 // The TCPMux HTTP CONNECT listener block moved here the same way too; its
-// `tracing` events carry the same `frp_server::service::listeners` target. It is
-// the first seam whose block carries no `#[cfg]` (`pub mod tcpmux;` is
-// unconditional in `lib.rs`), so the module gate is gone — every item in
-// `listeners.rs` carries its own `#[cfg]` instead.
+// `tracing` events carry the same `frp_server::service::listeners` target. As
+// the first un-gated seam (`pub mod tcpmux;` is unconditional in `lib.rs`), its
+// module gate is gone: every item that can be gated carries its own `#[cfg]`;
+// the method and the three imports it needs compile in every shape, ungated.
 mod listeners;
 
 // ---------------------------------------------------------------
