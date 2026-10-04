@@ -356,10 +356,11 @@ Block inventory, from the function's own comment landmarks:
 | ~1769–1908 | Main accept loop | **stays in `run`** |
 | ~1909–1949 | Graceful drain + OIDC stop | **stays in `run`** |
 
-**Landed from this table so far** (all eight listener rows and one of the five task rows): the WebSocket
+**Landed from this table so far** (all eight listener rows and three of the five task rows): the WebSocket
 listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484),
 HTTP vhost listener (#485) and HTTPS vhost listener (#486) moved to `service/listeners.rs`, and the NAT-hole
-cleanup task (#487) opened `service/tasks.rs`; the rows left in `run` are the remaining four `tasks.rs` groups,
+cleanup task (#487), the port-reservation pruner and the signal listener (#488) opened and extended
+`service/tasks.rs`; the rows left in `run` are the TLS certificate hot-reload task and the stale-control reaper,
 plus the two `**stays in run**` rows that stay by design. Each landed seam has an entry under "Landed so far"
 below.
 
@@ -447,6 +448,26 @@ below.
   hard-coded while the XTCP tests sleep ≤300 ms), and the effect is covered only by direct
   `expire_sessions`/`clean` unit calls; an expiry-observing lane needs an injectable clock, which is a
   behaviour change for the tasks program rather than this seam. See the `TODO.md` progress paragraph.
+- Port-reservation pruner **and** signal listener → `frp-server/src/service/tasks.rs`,
+  `pub(super) fn spawn_port_reservation_pruner_task(&self)` and
+  `pub(super) fn spawn_signal_listener_task(&self)` — PR #488 at code head `7e0e1dbc` (based on `4aede41b`).
+  Two blocks in one PR on purpose: the pruner is a 3-line call chain into `proxy_ops/`, so a dedicated PR would
+  spend a full review cycle on a wrapper, and the signal listener is the same mechanism in the same module;
+  each still carries its own `cmp`/sha256 proof, control-flow enumeration and coverage finding. Payloads:
+  pruner `service.rs:814-816` = **3 lines / 119 bytes `cmp`-identical** (sha256
+  `c3b2edfdb2af7258…`) and signal listener `service.rs:893-929` = **37 lines / 1551 bytes `cmp`-identical**
+  (sha256 `3f678df37798fce8…`); `frp-server/src/service.rs` 2000 → 1969, `tasks.rs` 40 → 95. Both methods are
+  **sync** (neither awaits before its spawn); both landmarks stay at their call sites; the one import delta is
+  `use tracing::info;` in `tasks.rs` (the moved `info!` records need it in both cfg arms). The signal
+  listener's `#[cfg(unix)]`/`#[cfg(not(unix))]` arms move with the block and `mod tasks;` stays unconditional;
+  the never-compiled `not(unix)` arm was checked by swapping the gates (compiles clean under
+  `RUSTFLAGS="-D warnings"`). Coverage: the signal listener keeps its existing lane
+  (`frps/tests/cli_exit_codes.rs:743` via the `:625` helper's real `kill -TERM`), and the pruner's effect
+  remains unreachable (the inner fn consumes the interval's first tick; 24 h expiry), so that gap stays
+  recorded. One range cite that straddled the seam was re-anchored by content — `service.rs:890-922` →
+  `:895-898` (the landmark + the new call; start fingerprint unchanged, only `fp_end` moved). Both reviewers
+  judged that right, because the two citing sentences assert *where `run` spawns the SIGTERM task* rather than
+  the task body. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`

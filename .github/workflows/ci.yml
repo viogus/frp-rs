@@ -115,7 +115,7 @@ jobs:
         # `exec true` planted after the trap never runs it and exits 0 with no
         # output at all. So the total is pinned *outside*: this step requires the
         # suite's summary line verbatim, and 32 is what the scenarios in
-        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:9533` round
+        # scripts/tests/repo-health-fixtures.sh print (the `TODO.md:9572` round
         # added the in-file floor; a scenario added or removed there moves this
         # literal — restore the checks rather than lowering it). In-file,
         # `enforce_substance` also checksums the scenario-6 metric check and the
@@ -164,7 +164,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=203e8d916c7bba27b77443fea3c7b209da4eba3303bb7c94a3ccd03d1e487f84
+          guard_pin=8cd483d82b17ac64a427047db22ae62f7e597d32371f0eb40253477db8c51699
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -333,7 +333,7 @@ jobs:
         # *outside*, the way the `log_completion` step below pins its own 6: this
         # step requires the suite's summary line verbatim, and 40 is what the
         # scenarios in scripts/tests/compat-stray-guard.sh print (21 before the
-        # `TODO.md:9565` round added the ordered `SHAPE` anchors, the symlink
+        # `TODO.md:9604` round added the ordered `SHAPE` anchors, the symlink
         # `wait_exec` probe, the empty-`ps` branch and the failed-probe
         # kill-then-continue case; 31 after the round-2 pins exercised the loop's
         # empty-`cmd` guard, the exit-0-empty reap arm, and the second half of the
@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=2f91a828f1bb6af5839af2f63513056526c235a17d2972d0ddae5b5d9346e8a5
+          guard_pin=0083d4555470b704a8e10d7b7514c4add8e777ccd5d6f7b18ded922338f9f4a6
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -1197,7 +1197,7 @@ jobs:
           log=/tmp/frp-remote-frps-reap.log
           status=0
           guard_file=scripts/tests/remote-frps-reap.sh
-          guard_pin=e112d5baec5c00c9a8dfdf2bab4d2295061b27bc08df7f9d522dac456a77335c
+          guard_pin=0da6bf1c21db7a32597a39b2bf1f89ba08f6ff0fb41e5d9c1ebef930639d6dee
           guard_exact=37
           guard_floor=37
           guard_canary='reap: the decoy whose command line carries frps -c frps.toml survived'
@@ -1510,7 +1510,7 @@ jobs:
           fi
           echo "TODO.md citation gate fixtures ok: 60 checks hold, all 11 red-path canaries live"
       - name: A/B gate — measurable-delta classifier + verdict fixture checks
-        # TODO.md:10755 ("The A/B throughput gate fires on changes with no
+        # TODO.md:10794 ("The A/B throughput gate fires on changes with no
         # runtime code, so a red gate on `main` is not evidence of a
         # regression"). This step pins the suite that guards the delta
         # classifier and the gate arithmetic, AND the three files that suite
@@ -1564,13 +1564,13 @@ jobs:
           # run (review round 3, F3).
           unset AB_MD_CLASSIFIER AB_MD_MATRIX AB_MD_REMOTE AB_MD_SABOTAGE_CHILD
           guard_file=scripts/tests/ab-measurable-delta.sh
-          guard_pin=56e12fae81ece79710425a63a66e075286e19c36c1cd7f95b9e9e214d88887a9
+          guard_pin=016d6333f3d1c0ddcfe730a17071239f73957e3b46bef71c73cda07523fd9654
           guard_exact=53
           guard_floor=53
           guard_cls=scripts/ab-measurable-delta.sh
-          guard_cls_pin=12ae54e167646e1e4b1965a135b8b329d79c1c44a661a2c6b07f27c71558d9fb
+          guard_cls_pin=c28f2046553ee148abf069eba34ca9d629b0dc288a84c6a4bb79b8c0f335889c
           guard_matrix=scripts/ab-matrix.sh
-          guard_matrix_pin=6530f4d357741b8b023a54edb82dc2bc2cf445b9d6fe9647131005d72c9f8a94
+          guard_matrix_pin=c79884f53c58fdc3c6dae981d93ecdf49e064aff097e4ec96dfa998e767bcacf
           guard_remote=scripts/ab-remote.sh
           guard_remote_pin=6a1ba8c695f9f984e39d28b9decea3b53271f881d25c49726fe06930d5c2559c
           # Every hashed subject must actually be verified, and it must be the
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=5299503bb9c40207ce123402c680f9ea97c9d8cbff613c59b57686e9d47c8721
+          guard_data_pin=99ba726cf7e6bb0e01721e24a0fc1a179e3d592a78f7b5f317d6da1ee60a2e07
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2030,7 +2030,7 @@ jobs:
       # `cargo test -p frps --test cli_exit_codes -- --list`.
       # 44 → 45 with the `-l`-shorthand refusal pin
       # `short_l_is_not_a_frps_shorthand_and_the_refusal_is_pinned`
-      # (`TODO.md:10062`): +1. Re-derived with the same `--list` command.
+      # (`TODO.md:10101`): +1. Re-derived with the same `--list` command.
       FRPS_CLI_TESTS: "45"
       # The absolute floor under the declared count above. `FRPS_CLI_TESTS` is a
       # *declared* literal, and the step's equality check ("the file lists what
@@ -3054,7 +3054,7 @@ jobs:
         # `--log-max-days 0`, both arbited by Go's `-c` lane — see the file's own
         # section comments), and 9 → 10 with the `-c`-lane non-empty-flag pin
         # `cli_nonempty_log_level_flag_does_not_override_the_config_file`
-        # (`TODO.md:9984`). It is the count of `#[test]`s in that one file, and
+        # (`TODO.md:10023`). It is the count of `#[test]`s in that one file, and
         # it lives in exactly one place in this step — the `expected=` line — so
         # a new pin means editing one number, not hunting a duplicated one.
         #
@@ -3598,7 +3598,7 @@ jobs:
     env:
       FRPS_RELEASE_CLI_TESTS: "45"
       # The absolute floor under the listed count: the same exact+floor pair
-      # every other count guard in this file carries (item `TODO.md:9193`), so a
+      # every other count guard in this file carries (item `TODO.md:9232`), so a
       # delete-plus-lower edit has to move both literals and the diagnostic
       # below names which one fell. The debug lane pins the identical 45 as
       # `env.FRPS_CLI_TESTS` on the tests-unit job.
