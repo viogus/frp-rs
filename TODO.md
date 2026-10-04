@@ -7242,7 +7242,7 @@ nothing about whether the described behaviour still holds.
   identical (61 keys, 0 entered / 0 left), so `weak_set`'s move to `dffa021f7cbb4551` is pure re-keying. No
   `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** (no findings) and adversarial
   **MERGE** (no change-requiring finding; its INFO notes are that the workspace suite fails three targets on this
-  host — the `127.0.0.2` alias already recorded at `TODO.md:2375`, plus three `frps` completion cases:
+  host — the `127.0.0.2` alias already recorded at `TODO.md:2375`, plus two `frps` completion cases:
   `cli_empty_dashboard_addr_binds_loopback` is load-induced (5/5 isolated), and `cli_empty_log_file_keeps_the_files_destination`
   fails only in the `--all-features` shape (5/5 in its CI lane, red at the base too) — none reachable from a byte-identical move — and that the TLS branch is untested). Ledger unchanged at **3 open / 231 closed**.
 
