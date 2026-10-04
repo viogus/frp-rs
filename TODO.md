@@ -7396,7 +7396,7 @@ nothing about whether the described behaviour still holds.
   sentence is about the signal install, mis-aimed identically before and after the move, and invisible to the
   pathline guard because that guard pins endpoints by content rather than by meaning — is **filed as its own item at
   the end of this file** rather than fixed inside a pure-move PR. No `CHANGELOG.md` bullet, matching the earlier
-  seams. The table was re-baked to `99ba726c…` (equal to the step's `guard_data_pin`, `guard_cites` still 577) and the weak
+  seams. The table was re-baked (`99ba726c…` at the seam, re-baked here to `d905f480ff05…`) and the weak
   population by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to
   `76e593e4df44e259` is pure re-keying. Reviews: verification **MERGE** (no findings; it re-derived both payloads,
   checked the lane, judged all three calls and re-proved the target live) and adversarial **MERGE** (no
