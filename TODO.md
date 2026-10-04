@@ -7372,8 +7372,8 @@ nothing about whether the described behaviour still holds.
   `cmp`/sha256 proof, control-flow enumeration and coverage finding — and the adversarial reviewer specifically
   attacked the grouping, concluding nothing can hide behind the shared commit: the two payloads are independently
   byte-identical, the `service.rs` diff is exactly two removals plus two single-line calls, and the cascade's own
-  deltas (**+7**, **+5** = +7−3+1, **−31** = +7−3+1−37+1) prove *both* blocks landed — a one-block-only move would
-  break that sum. Payloads: pruner `frp-server/src/service.rs:814-816` = **3 lines / 119 bytes `cmp`-identical**
+  deltas (**+7**, **+5** = +7−3+1, **−31** = +7−3+1−37+1) confirm *both* blocks landed (they account for the
+  line arithmetic; byte identity rests on the `cmp` above) — a one-block-only move would break that sum. Payloads: pruner `frp-server/src/service.rs:814-816` = **3 lines / 119 bytes `cmp`-identical**
   (sha256 `c3b2edfdb2af7258…`) → `pub(super) fn spawn_port_reservation_pruner_task(&self)`, and signal listener
   `:893-929` = **37 lines / 1551 bytes `cmp`-identical** (sha256 `3f678df37798fce8…`) →
   `pub(super) fn spawn_signal_listener_task(&self)`; `frp-server/src/service.rs` 2000 → 1969, `tasks.rs` 40 → 95.
@@ -7396,9 +7396,11 @@ nothing about whether the described behaviour still holds.
   sentence is about the signal install, mis-aimed identically before and after the move, and invisible to the
   pathline guard because that guard pins endpoints by content rather than by meaning — is **filed as its own item at
   the end of this file** rather than fixed inside a pure-move PR. No `CHANGELOG.md` bullet, matching the earlier
-  seams. Reviews: verification **MERGE** (no findings; it re-derived both payloads, checked the lane, judged all
-  three calls and re-proved the target live) and adversarial **MERGE** (no change-requiring finding; it ran mutation
-  probes for the import and forced the `not(unix)` arm). Ledger now **4 open / 231 closed / 235 headers** — the
+  seams. The table was re-baked to `99ba726c…` (equal to the step's `guard_data_pin`, `guard_cites` still 577) and the weak
+  population by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to
+  `76e593e4df44e259` is pure re-keying. Reviews: verification **MERGE** (no findings; it re-derived both payloads,
+  checked the lane, judged all three calls and re-proved the target live) and adversarial **MERGE** (no
+  change-requiring finding; it ran mutation probes for the import and forced the `not(unix)` arm). Ledger now **4 open / 231 closed / 235 headers** — the
   fourth item is the mis-aimed-cite one filed above. The plan's P1 inventory records eight listener rows plus three
   of the five task rows landed; the TLS certificate hot-reload task and the stale-control reaper remain in `run`
   (with the two rows that stay there by design).
@@ -11272,7 +11274,10 @@ other.
   Found by both reviewers of PR #488 while auditing that file's cites for the
   `tasks.rs` extraction; mis-aimed identically before and after the move, and invisible to
   `scripts/tests/pathline-cite-guard.sh`, which pins endpoints by content rather than by meaning —
-  hence a recorded item rather than a fix smuggled into a pure-move PR.
+  hence a recorded item rather than a fix smuggled into a pure-move PR. Filed at the end of this file so the
+  addition shifts no existing header; re-home it to the `P1 — documentation correctness` section at the next
+  cascade.
   **Done-when:** the comment cites the signal-install span (or the moved body in
   `frp-server/src/service/tasks.rs`), the pathline expectations are re-baked in the same commit, and
-  the guard still reports `101/0` and `577/0`.
+  the guard still reports `101/0` and `577/0` — the latter only if the rewrite keeps a single cite, since naming
+  both the install site and the moved body would make the population 578.
