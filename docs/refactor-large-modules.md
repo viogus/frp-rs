@@ -824,7 +824,7 @@ Remaining seams, in order:
 | 5 | `src/vhost/https.rs` | HTTPS/SNI listener + not-TLS stub (**must move as a pair**), `read_client_hello_prefix`, `extract_sni_from_client_hello` | medium |
 
 External re-export paths that must be preserved (each verified against a caller):
-`extract_sni_from_client_hello` (`tests/vhost_https_sni.rs:125`),
+`extract_sni_from_client_hello` (`tests/vhost_https_sni.rs:160` — the only call; the old cite's line is now a config field),
 `run_vhost_http_listener` / `run_vhost_https_listener` (`frp-server/src/service/listeners.rs:1109,1132` — the callers moved there with the M-15/M-16 seams),
 `count_host_headers` (`tcpmux.rs:465`), `write_not_found_response`
 (`tcpmux.rs:517,714`), `clamp_vhost_timeout` (`bridge.rs:3105`), `VhostManager`
