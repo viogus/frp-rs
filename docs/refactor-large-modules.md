@@ -359,7 +359,7 @@ Block inventory, from the function's own comment landmarks:
 **Landed from this table so far** (seven of the eight listener rows; none of the task rows): the WebSocket
 listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484) and
 HTTP vhost listener (#485) have moved to `service/listeners.rs`; the rows still in `run` are the HTTPS vhost
-listener and the five `tasks.rs` groups, plus the two rows above that stay by design. Each landed seam has an
+listener, the five `tasks.rs` groups and the two `**stays in run**` rows that stay by design. Each landed seam has an
 entry under "Landed so far" below.
 
 **Landed so far** (one block per PR, pure move, per the bar below):

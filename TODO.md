@@ -7288,15 +7288,15 @@ nothing about whether the described behaviour still holds.
   `go-to-rust-http*` compat scenarios that start the release frps with `vhost_http_port` and assert the vhost port
   is listening, so no test was added — and the **HTTPS** vhost listener is a separate block (the next seam) and is
   explicitly **not** claimed. The adversarial reviewer's decider proved the payload's `vhost_bind` borrow of
-  `self.cfg` is consumed by `format_socket_addr` into an owned `SocketAddr`, so NLL ends it before the spawn and no
+  `self.cfg` is consumed by `format_socket_addr` into an owned `String`, so NLL ends it before the spawn and no
   reference enters the task; the payload has no `return`/`continue`/`break`/`?`. **15 records were re-pointed by
-  content** (two range rows `cmp`-identical) with every fingerprint and range end unchanged (0 re-bakes) and the
-  pathline table re-baked (`158d4bff…` → `e534245e…`, matching the step's `guard_data_pin`); the weak population by
+  content** (three range records over two distinct ranges, all `cmp`-identical) with every fingerprint and range end unchanged (0 re-bakes) and the
+  pathline table re-baked (`158d4bff…` → `e534245e…` at the seam, re-baked here to `8997e3c6…`); the weak population by
   `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to `e9eb54caad8666c0` is pure
   re-keying. No `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** (no findings)
   and adversarial **MERGE** (no change-requiring finding). Ledger unchanged at **3 open / 231 closed**. The plan's
-  P1 inventory now marks seven of its eight listener rows landed; the HTTPS vhost listener and the five `tasks.rs`
-  groups remain.
+  P1 inventory now marks seven of its eight listener rows landed; the HTTPS vhost listener, the five `tasks.rs`
+  groups and the two rows that stay in `run` by design remain.
 
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
