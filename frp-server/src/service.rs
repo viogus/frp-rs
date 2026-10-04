@@ -34,7 +34,15 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 //
 // The QUIC listener block moved here the same way too; its `tracing` events
 // carry the same `frp_server::service::listeners` target.
-#[cfg(any(feature = "websocket", feature = "kcp", feature = "quic"))]
+//
+// The dashboard server block moved here the same way too; its `tracing` events
+// carry the same `frp_server::service::listeners` target.
+#[cfg(any(
+    feature = "websocket",
+    feature = "kcp",
+    feature = "quic",
+    feature = "dashboard"
+))]
 mod listeners;
 
 // ---------------------------------------------------------------
@@ -848,44 +856,7 @@ impl Service {
 
         // Start dashboard server if configured
         #[cfg(feature = "dashboard")]
-        if self.cfg.web_server.port > 0 {
-            let dash_addr = format_socket_addr(&self.cfg.web_server.addr, self.cfg.web_server.port);
-            let dash_addr2 = dash_addr.clone();
-            let dash_state = self.state.clone();
-            let dash_user = self.cfg.web_server.user.clone();
-            let dash_pwd = self.cfg.web_server.password.clone();
-            let dash_tls_cert = if self.cfg.web_server.tls_cert().is_empty() {
-                None
-            } else {
-                Some(self.cfg.web_server.tls_cert().to_string())
-            };
-            let dash_tls_key = if self.cfg.web_server.tls_key().is_empty() {
-                None
-            } else {
-                Some(self.cfg.web_server.tls_key().to_string())
-            };
-            let enable_prom = self.cfg.web_server.enable_prometheus;
-            let dash_assets = self.cfg.web_server.assets_dir.clone();
-            let dash_shutdown = self.state.shutdown_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) = crate::dashboard::run_dashboard(
-                    dash_addr,
-                    dash_state,
-                    dash_user,
-                    dash_pwd,
-                    enable_prom,
-                    dash_tls_cert,
-                    dash_tls_key,
-                    dash_assets,
-                    dash_shutdown,
-                )
-                .await
-                {
-                    tracing::error!(error = %e, "Dashboard server failed: {}", e);
-                }
-            });
-            tracing::info!(addr = %dash_addr2, "Dashboard web UI starting on {}", dash_addr2);
-        }
+        self.start_dashboard_listener().await;
 
         // Background cleanup for stale NAT hole punch sessions.
         // Sessions should normally be completed by the provider's NatHoleReport,

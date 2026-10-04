@@ -382,6 +382,16 @@ Block inventory, from the function's own comment landmarks:
   `scripts/protocol-matrix.sh`'s `quic` row, `frp-server/tests/transport_e2e_quic.rs`), so no new test; `mod
   listeners` is now gated on `any(websocket, kcp, quic)` and the `AsyncReadExt`/`RwLockExt` imports were
   narrowed so a `quic`-only build still compiles clean. See the `TODO.md` progress paragraph.
+- Dashboard server → `frp-server/src/service/listeners.rs`,
+  `pub(super) async fn start_dashboard_listener(&self)` — PR #482 at code head `284b7431` (based on `48e547a9`):
+  payload `service.rs:851-888` is **38 lines / 1650 bytes `cmp`-identical** (sha256
+  `dc70b3124bfa4b4d28f2d6e8a01499a9e3028d1d9b38d991fb2172cabaae5f45`), and `frp-server/src/service.rs`
+  2104 → 2075. The block never used `rate_limiter_enabled`, so the method takes `&self` alone; `mod listeners`
+  is now gated on `any(websocket, kcp, quic, dashboard)` and the `Duration`/`tracing::warn`/`spawn_boxed`
+  imports were narrowed to `any(websocket, kcp, quic)` (a `dashboard`-only build is the shape that proves it).
+  The block is reached end to end — `frp-server/tests/dashboard_integration.rs` and `dashboard_v2_integration.rs`
+  spawn the real `frps` binary with `[web_server] port` set through `Service::run` — so, like KCP and QUIC, no
+  new test; the payload's non-empty-cert TLS branch stays unexercised. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`
