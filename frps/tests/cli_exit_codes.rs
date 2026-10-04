@@ -1151,7 +1151,7 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
 /// The interval where that matters is narrow. From the moment
 /// `early_shutdown.watch(...)` puts a service into the fan-out list until
 /// `Service::run` installs the service's own `SIGTERM` handler
-/// (`frp-server/src/service.rs:937-964`), only the recorder can cancel that
+/// (`frp-server/src/service.rs:843-846`), only the recorder can cancel that
 /// token. The debug-only post-registration hold
 /// (`FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS=30_000` with
 /// `..._DELAY_FILES=a.toml`) parks `a.toml`'s task inside exactly that interval

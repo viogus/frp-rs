@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=577 weak=109 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=00a8aaeec9948b68 ambiguous_set=3343d4d37da5672a excluded_set=196581ae767a847a
+#   pins: checked=577 weak=108 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=4a7dc67818de44eb ambiguous_set=3343d4d37da5672a excluded_set=196581ae767a847a
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -454,8 +454,8 @@ frp-server/src/service.rs	746	-	11314c6e379da4e8	-	absolute	frp-server/tests/slo
 frp-server/src/service.rs	778	-	115dba24105ef893	-	shorthand	frp-core/src/config/loader.rs	:778	615
 frp-server/src/service.rs	843	-	cd03225fbab2a8ca	-	absolute	docs/developing.md	frp-server/src/service.rs:843	2265
 frp-server/src/service.rs	843	846	cd03225fbab2a8ca	dfa18710942470ca	absolute	frps/src/main.rs	frp-server/src/service.rs:843-846	97
+frp-server/src/service.rs	843	846	cd03225fbab2a8ca	dfa18710942470ca	absolute	frps/tests/cli_exit_codes.rs	frp-server/src/service.rs:843-846	1154
 frp-server/src/service.rs	843	846	cd03225fbab2a8ca	dfa18710942470ca	absolute	frps/tests/cli_exit_codes.rs	frp-server/src/service.rs:843-846	565
-frp-server/src/service.rs	937	964	4233903d37e49b67	427dd2e1bde945cf	absolute	frps/tests/cli_exit_codes.rs	frp-server/src/service.rs:937-964	1154
 frp-server/src/service.rs	961	-	53c310b95373c046	-	shorthand	frp-server/tests/server_protocol.rs	:961	679
 frp-server/src/service.rs	994	-	cb97f3bf1f5c9b33	-	absolute	frp-server/tests/server_protocol.rs	frp-server/src/service.rs:994	678
 frp-server/src/service/listeners.rs	1132	-	7bcb2bb332bc5f74	-	absolute	frp-server/tests/vhost_https_sni.rs	frp-server/src/service/listeners.rs:1132	18
