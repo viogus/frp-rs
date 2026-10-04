@@ -7201,18 +7201,18 @@ nothing about whether the described behaviour still holds.
   landed KCP seam rather than guessed: re-extracting that seam's payload reproduces the recorded 501 lines /
   44 390 bytes / `349e49b2…`, which is what fixes the landmark comment and the `#[cfg]` at the call site rather
   than in the moved text. `frp-server/src/service.rs` 2266 → 2104 and `listeners.rs` 823 → 995; the service.rs
-  diff is two hunks (`+3/−1` module comment/gate and `−166/+1` call site) and the listeners.rs diff three (two
+  diff is two hunks (`+4/−1` module comment/gate — a net +3 — and `+1/−166` call site) and the listeners.rs diff three (two
   import gates and the appended function). `mod listeners` is now gated on `any(websocket, kcp, quic)`, and the
   `AsyncReadExt`/`RwLockExt` imports were narrowed so a `quic`-only build still compiles under `-D warnings` (CI
   has no `frp-server` quic-only lane). The moved block is already reached end to end — six `scripts/compat-test.sh`
-  QUIC scenarios, `scripts/protocol-matrix.sh`'s `quic` row (68.65 MB/s) and
+  QUIC scenarios, `scripts/protocol-matrix.sh`'s `quic` row and
   `frp-server/tests/transport_e2e_quic.rs`/`v2_quic_r2r.rs` — so, like the KCP seam and unlike the WebSocket one,
   the round adds no test. The only observable difference is the moved records' `target:`
   (`frp_server::service` → `frp_server::service::listeners`), and the adversarial reviewer confirmed in the
   dependency source that `RUST_LOG` target matching is a `starts_with` prefix, so
   `RUST_LOG=frp_server::service=debug` still enables them. **16 live `path:line` cites were re-pointed by content**
   with every fingerprint and range end unchanged (0 re-bakes), and the pathline table was re-baked with
-  `guard_data_pin` `119f090e…` → `5c9d2d07…`; the weak population by `(target, fp)` is identical (61 keys, 0
+  `guard_data_pin` `119f090e…` → `5c9d2d07…` (the records commit re-bakes it once more to `9ba79402…`); the weak population by `(target, fp)` is identical (61 keys, 0
   entered / 0 left), so the `weak_set` identity move is pure re-keying. No `CHANGELOG.md` bullet, matching
   #436/#450. Reviews: verification **MERGE** (no findings) and adversarial **MERGE** (its brace-depth count put
   all six `return`s, three `continue`s and the `break` inside the spawned task, 10/10) — no change-requiring
