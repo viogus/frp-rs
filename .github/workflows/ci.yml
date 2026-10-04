@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=8acd4e102f6ed824d78dcdf22a663d1dbf796ad6bdf59ccb7907a0edbfe93a0e
+          guard_pin=bdbde2fa775fe224557e91bbc4f86dc0b735014b04562917e3ff531ae40c12db
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
