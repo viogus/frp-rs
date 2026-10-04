@@ -433,7 +433,7 @@ below.
   `vhost.rs:1837`), so `checked` and `guard_cites`/`guard_cites_floor` moved 576 → 577 together. See the
   `TODO.md` progress paragraph.
 - NAT-hole session cleanup task → **new module** `frp-server/src/service/tasks.rs`,
-  `pub(super) fn spawn_nat_hole_cleanup_task(&self)` — PR #487 at code head `a687feed` (based on `d3b0f418`):
+  `pub(super) fn spawn_nat_hole_cleanup_task(&self)` — PR #487 at code head `a687feed` (based on `e8d63b7c`):
   payload `service.rs:804-824` is **21 lines / 1070 bytes `cmp`-identical with no re-indent** (sha256
   `60e05ed0b27aca58125c80ed7e05c013b9dc65b744de47fb80ae7f6681f1da34`), and `frp-server/src/service.rs`
   2014 → 2000. The method is deliberately **sync**, not `async fn`: the block awaited nothing before its

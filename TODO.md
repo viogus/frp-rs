@@ -7344,8 +7344,8 @@ nothing about whether the described behaviour still holds.
   recorded not pinned** (same class as the `proxy_ops` file-ification round): the moved `tracing` events now carry
   target `frp_server::service::tasks` instead of `frp_server::service`. The reviewers verified this is safe against
   the repo's *actual* subscriber rather than from documentation — `frp-core/src/logging.rs::filter_from_env` builds a
-  `tracing_subscriber::filter::Targets` (prefix matching), not an `EnvFilter`, and a live head-built frps with
-  `RUST_LOG=frp_server::service=debug` plus SIGINT still printed the moved record — and no test or lane asserts on
+  `tracing_subscriber::filter::Targets` (prefix matching), not an `EnvFilter`, and a live head-built frps run by the
+  verification reviewer with `RUST_LOG=frp_server::service=debug` plus SIGINT still printed the moved record — and no test or lane asserts on
   the target string. Coverage is a **recorded gap**: every `Service::run` lane reaches the spawn (the first tick
   fires immediately) but **no** lane observes an expiry — the 60 s cadence and 120 s expiry are hard-coded while the
   XTCP tests sleep ≤300 ms, and the effect is covered only by direct `expire_sessions`/`clean` unit calls — so no
@@ -7353,7 +7353,7 @@ nothing about whether the described behaviour still holds.
   tasks program rather than to this pure move. **14 records were re-pointed by content** (eleven single-line plus
   three range records over two distinct ranges), every fingerprint unchanged (0 re-bakes), with the shift **+6** for
   the four `:724` cites and the `:756` shorthand (they sit below the new `mod` note) and **−14** for the rest; the
-  table was re-baked (`433b1deb…` → `339f1128…`, matching the step's `guard_data_pin`, `guard_cites` still 577) and
+  table was re-baked (`433b1deb…` → `339f1128…` at the seam, re-baked here to `5eb3fcad…`, matching the step's `guard_data_pin`, `guard_cites` still 577) and
   the weak population by `(target, fp)` is identical (61 keys, 0 entered / 0 left), so the `weak_set` move to
   `4c2baea88ee0a27c` is pure re-keying. One row (`frps/tests/server_protocol.rs:679`) is an **ordinary content
   shift**, not a repair: the author report described `:1217 → :1203` as fixing a pre-existing off-by-one, and both
