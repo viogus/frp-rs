@@ -371,6 +371,17 @@ Block inventory, from the function's own comment landmarks:
   already covered end to end (`scripts/protocol-matrix.sh`'s KCP rows and
   `scripts/compat-test.sh`'s KCP+TLS / KCP+tcpMux scenarios), so the move ships without a new test;
   `mod listeners` is now gated on `any(websocket, kcp)`. See the `TODO.md` progress paragraph.
+- QUIC listener → `frp-server/src/service/listeners.rs`,
+  `pub(super) async fn start_quic_listener(&self, rate_limiter_enabled: bool)` — PR #481 at code head
+  `df0cd9a7` (based on `bf952988`): payload `service.rs:844-1009` is **166 lines / 9503 bytes
+  `cmp`-identical** (sha256 `5215d3e983cfa846227283089120738c29151ad8bdea04e4294e92549aaaf4f9`), and
+  `frp-server/src/service.rs` 2266 → 2104. The convention was calibrated against the KCP entry above by
+  re-extracting its payload (which reproduces the recorded 501 lines / 44 390 bytes / `349e49b2…`), so the
+  landmark comment and the `#[cfg]` stay at the call site. Like KCP and unlike WebSocket the dedicated
+  `quic_bind_port` path is already reached (six `scripts/compat-test.sh` QUIC scenarios,
+  `scripts/protocol-matrix.sh`'s `quic` row, `frp-server/tests/transport_e2e_quic.rs`), so no new test; `mod
+  listeners` is now gated on `any(websocket, kcp, quic)` and the `AsyncReadExt`/`RwLockExt` imports were
+  narrowed so a `quic`-only build still compiles clean. See the `TODO.md` progress paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`
