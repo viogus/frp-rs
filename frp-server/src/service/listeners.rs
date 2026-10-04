@@ -1093,4 +1093,26 @@ impl Service {
             tracing::info!(port = %self.cfg.ssh_tunnel_gateway.bind_port, "SSH tunnel gateway starting on port {}", self.cfg.ssh_tunnel_gateway.bind_port);
         }
     }
+
+    pub(super) async fn start_http_vhost_listener(&self) {
+        if self.cfg.vhost_http_port > 0 {
+            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
+                &self.cfg.bind_addr
+            } else {
+                &self.cfg.proxy_bind_addr
+            };
+            let http_addr = format_socket_addr(vhost_bind, self.cfg.vhost_http_port);
+            let http_state = self.state.clone();
+            let http_shutdown = self.state.shutdown_token.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::vhost::run_vhost_http_listener(http_addr, http_state, http_shutdown)
+                        .await
+                {
+                    error!(error = %e, "HTTP VHost listener failed: {}", e);
+                }
+            });
+            info!(port = %self.cfg.vhost_http_port, "HTTP VHost listener starting on port {}", self.cfg.vhost_http_port);
+        }
+    }
 }

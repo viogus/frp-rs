@@ -51,6 +51,12 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // new module, so `listeners.rs`'s import gained the `ssh` shape (its gate was
 // `tls` + websocket/kcp only); `service.rs` keeps its own ungated import for the
 // `write_ok()` calls that stay behind.
+//
+// The HTTP VHost listener block moved here the same way too; its `tracing` events
+// carry the same `frp_server::service::listeners` target. Like the TCPMux seam,
+// this block is un-gated (`pub mod vhost;` is unconditional in `lib.rs`), so the
+// method is ungated and no import changed: `format_socket_addr`, `error!` and
+// `info!` were already unconditional here.
 mod listeners;
 
 // ---------------------------------------------------------------
@@ -758,25 +764,7 @@ impl Service {
 
         // Start HTTP VHost listener if configured. Go frp binds vhost
         // listeners on proxyBindAddr when set (pkg/server/service.go).
-        if self.cfg.vhost_http_port > 0 {
-            let vhost_bind = if self.cfg.proxy_bind_addr.is_empty() {
-                &self.cfg.bind_addr
-            } else {
-                &self.cfg.proxy_bind_addr
-            };
-            let http_addr = format_socket_addr(vhost_bind, self.cfg.vhost_http_port);
-            let http_state = self.state.clone();
-            let http_shutdown = self.state.shutdown_token.clone();
-            tokio::spawn(async move {
-                if let Err(e) =
-                    crate::vhost::run_vhost_http_listener(http_addr, http_state, http_shutdown)
-                        .await
-                {
-                    error!(error = %e, "HTTP VHost listener failed: {}", e);
-                }
-            });
-            info!(port = %self.cfg.vhost_http_port, "HTTP VHost listener starting on port {}", self.cfg.vhost_http_port);
-        }
+        self.start_http_vhost_listener().await;
 
         // Start HTTPS VHost listener if configured
         // Go frp starts the HTTPS vhost listener whenever vhostHTTPSPort is

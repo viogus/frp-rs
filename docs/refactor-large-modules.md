@@ -356,6 +356,12 @@ Block inventory, from the function's own comment landmarks:
 | ~1769–1908 | Main accept loop | **stays in `run`** |
 | ~1909–1949 | Graceful drain + OIDC stop | **stays in `run`** |
 
+**Landed from this table so far** (seven of the eight listener rows; none of the task rows): the WebSocket
+listener (#436), KCP (#450), QUIC (#481), dashboard server (#482), TCPMux (#483), SSH tunnel gateway (#484) and
+HTTP vhost listener (#485) have moved to `service/listeners.rs`; the rows still in `run` are the HTTPS vhost
+listener, the five `tasks.rs` groups and the two `**stays in run**` rows that stay by design. Each landed seam has an
+entry under "Landed so far" below.
+
 **Landed so far** (one block per PR, pure move, per the bar below):
 
 - WebSocket listener → `frp-server/src/service/listeners.rs`,
@@ -402,6 +408,16 @@ Block inventory, from the function's own comment landmarks:
   (`write_ok()` is still used there). Coverage: no new test — `frp-server/tests/ssh_gateway.rs` has 17 tests,
   13 of which set the gateway port through `Service::run`; the 70 in-file unit tests drive `SshListener`
   directly. See the `TODO.md` progress paragraph.
+- HTTP vhost listener → `frp-server/src/service/listeners.rs`,
+  `pub(super) async fn start_http_vhost_listener(&self)` — PR #485 at code head `a9ca3bc1` (based on
+  `2bb230ea`): payload `service.rs:761-779` is **19 lines / 886 bytes `cmp`-identical** (sha256
+  `468d2d5e7b2de72c27fc5b59d8e9145fd3bed5aa4bbdbbf9e396823e1d0219c4`), and `frp-server/src/service.rs`
+  2039 → 2027. No `#[cfg]` on the block and no gate or import change was needed (`mod listeners;` is already
+  unconditional). The block is reached in process by 54 tests across seven files (`common::start_test_server`
+  → `Service::run`; witness `frp-server/tests/vhost_http_timeout.rs:56`) and by nine `go-to-rust-http*` compat
+  scenarios that start the release frps with `vhost_http_port` and assert the port is listening, so no new
+  test; the HTTPS vhost listener is a separate block and is **not** claimed. See the `TODO.md` progress
+  paragraph.
 
 - Inline tests of `frp-server/src/control/bridge.rs` → `frp-server/src/control/bridge/tests.rs`
   (parent file kept, sibling module dir, as in the entry above) — PR #451 at code head `9f064385`

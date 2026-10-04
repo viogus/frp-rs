@@ -562,7 +562,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 ///
 /// 1. *The install race.* `Service::run` spawns the SIGTERM task from the same
 ///    async fn that later runs the accept loop
-///    (`frp-server/src/service.rs:929-961`), so the listener can be accepting
+///    (`frp-server/src/service.rs:917-949`), so the listener can be accepting
 ///    before that task has been polled even once — and then SIGTERM takes the
 ///    default disposition.
 /// 2. *The foreign-listener false witness.* `ephemeral_port()` binds a port and
@@ -604,7 +604,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 /// window before anything else.
 ///
 /// **That window is now closed for `--config-dir` — and only there**
-/// (`TODO.md:9559`). main installs its own `SIGTERM`/`SIGINT` recorder
+/// (`TODO.md:9583`). main installs its own `SIGTERM`/`SIGINT` recorder
 /// (`EarlyShutdown` in `frps/src/main.rs`) *before* the startup line, and each
 /// per-file task hands its `AppState` to that recorder when it registers, so a
 /// `SIGTERM` that lands in this window is recorded and the service's shutdown
@@ -1072,7 +1072,7 @@ fn sigterm_inside_the_registration_window(
     }
 }
 
-/// `TODO.md:9559`, the window driven **deterministically** instead of raced: the
+/// `TODO.md:9583`, the window driven **deterministically** instead of raced: the
 /// debug-only `FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS` parks the per-file task
 /// *before* it registers — therefore before `Service::run` installs its own
 /// `SIGTERM` handler — and the hold is far longer than this pin's timeout, so
@@ -1144,14 +1144,14 @@ fn config_dir_sigterm_inside_the_registration_window_exits_0_through_the_recorde
     );
 }
 
-/// `TODO.md:9559`, the **fan-out** half of the recorder (review round 2, F7):
+/// `TODO.md:9583`, the **fan-out** half of the recorder (review round 2, F7):
 /// `record()` must cancel the tokens of services that registered *before* the
 /// signal, not only let a later one observe it through the `watch()` handoff.
 ///
 /// The interval where that matters is narrow. From the moment
 /// `early_shutdown.watch(...)` puts a service into the fan-out list until
 /// `Service::run` installs the service's own `SIGTERM` handler
-/// (`frp-server/src/service.rs:1218-1245`), only the recorder can cancel that
+/// (`frp-server/src/service.rs:1206-1233`), only the recorder can cancel that
 /// token. The debug-only post-registration hold
 /// (`FRPS_CFGDIR_TEST_POST_REGISTRATION_DELAY_MS=30_000` with
 /// `..._DELAY_FILES=a.toml`) parks `a.toml`'s task inside exactly that interval
@@ -1297,7 +1297,7 @@ fn config_dir_recorded_signal_fans_out_to_an_already_registered_service() {
     );
 }
 
-/// `TODO.md:9559`, **recorded** rather than fixed: the collector admits a
+/// `TODO.md:9583`, **recorded** rather than fixed: the collector admits a
 /// directory entry by lowercased extension with no regular-file check
 /// (`frp-core/src/config/file.rs:958`/`:976`; the `directory` guards live only in
 /// the include-path `glob_in_dir` at `:873`/`:893`), and the loader then does a
@@ -2363,7 +2363,7 @@ fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
 /// `strconv.ParseInt: … value out of range` on stderr naming the flag in its
 /// hyphen form and 0 bytes on stdout.
 ///
-/// **Which parts of the refusal are contractual (R4, `TODO.md:9962`).** The
+/// **Which parts of the refusal are contractual (R4, `TODO.md:9986`).** The
 /// sentence is not: frp-rs prints 84 B
 /// ``Error: couldn't parse `9999999999999999999`: number too large to fit in
 /// target type`` — bpaf's wording — where Go prints 2214 B (`strconv.ParseInt`'s
@@ -2451,7 +2451,7 @@ fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
     }
 }
 
-/// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:9972`). Go registers
+/// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:9996`). Go registers
 /// `log_level` with an empty shorthand (`pkg/config/flags.go:244`,
 /// `cmd.PersistentFlags().StringVarP(&c.Log.Level, "log_level", "", …)`), so
 /// `frps -c cfg -l ""` is rc **1** there too — but pflag's wording is
