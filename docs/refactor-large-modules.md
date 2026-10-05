@@ -549,7 +549,8 @@ which inflated several entries): `run_message_loop` 1109, `register_proxies` 594
 | S1 | `service/reload_apply.rs` | `request_reload`, `close_wire_name_for_reload`, `try_reload`, `reload_from_sources`, `filter_active_proxies`, `filter_active_visitors` — **measured at the pre-S1 base: 645 lines (six spans, each including its doc comment), 31 533 bytes**; the earlier `(4321–4823)` / `(~570 LOC)` figures came from an older revision's line numbering (`reload_from_sources` sits at 4471 pre-S0 and 4465/4466 after it — never 4321) and from the classifier's doc-comment-excluding body count (the span's width, 503, *is* that body count) | low — **verified**: zero `tokio::spawn`, no `select!`, no `unsafe` in range; the phase-A/commit ordering in `reload_from_sources` (send the Close/New batch before resolving wire keys and committing plugin/health state, Step 7 last) is the thing to preserve. The `pub(crate) use reload_apply::{filter_active_proxies, filter_active_visitors}` is **mandatory and exactly sufficient**: those two free fns are the only items reached by an external *path* (`store.rs:592`) plus the parent's call sites; the other four are inherent `impl Service` methods, whose visibility is per-`fn`, so their method callers (`frpc/src/main.rs:702`, the reload tests) stay reachable without a re-export |
 | S2 | `service/registration.rs` | the registration frame plumbing + `register_proxies` — **measured at the pre-S2 base: the coherent plumbing block is `:505-688` (184 lines / 8531 bytes, `006b1698…`; the earlier `511–693` span was one line short of `reg_frame_payload_read`'s closing brace) and `register_proxies` is `:1874-2480` = 607 lines / 35 848 bytes including its 13-line doc comment (594 / 34 943 without it, which is why the old `~590 LOC` was close) | low–medium — the response loop is a cancellation-sensitive state machine and the `Arc<Mutex<IoStream>>` → `Arc::try_unwrap` handoff is subtle, but a verbatim move changes neither |
 | S3 | `service/message_loop.rs` | `run_message_loop` + `SessionChannels`, `LoopExit`, `StunResult`, `PROXY_RETRY_INTERVAL`, `WAIT_START_RETRY_TIMEOUT` and the `const PROXY_RETRY_GRACE` — **measured at the pre-S3 base: `run_message_loop` is `:2055-3163` (1109 lines / 68 389 bytes, `17ab1908…`; the row's `2752–3860` had the same 1109-line width but an older revision's numbering — the loop starts at 2890 pre-S0, 2847 after S1 and 2055 after S2, so 2752 matches none of them) and the moved plumbing block is `:172-234`, so the moved span is 1181 lines, of which 1175 are byte-identical carry-over and 11 are retokenised visibility lines — the row's `~1180 LOC` corroborated**. **Two corrections from the landed seam:** `REGISTRATION_RESPONSE_TIMEOUT` does **not** move (zero references inside the moved span; all five production references are in `registration.rs`, the phase it bounds), and **`PING_FIRST_BACKOFF` stays** because it is `pub const` API — `frp-client/tests/heartbeat_wire_order.rs` imports `frp_client::service::PING_FIRST_BACKOFF`, so moving it would break a published path | medium — pure relocation; 4 vnet gates ✓, 3 spawns ✓ and **7** `expect` sites (the row said 5; measured on seven distinct lines) must land unchanged |
-| **S3b** | *(same file)* | **the arm bodies** of `run_message_loop`, one per PR — see below | medium each |
+| **S3b** | *(same file)* | **the arm bodies** of `run_message_loop`, in **five grouped PRs** (A–D2 below) — the earlier
+"one per PR" was a pre-arm-1 risk guess; see the regrouping note | medium per group |
 | S4 | `service/session.rs` | `run`, `connect_and_login`, `spawn_session_tasks`, `teardown_session`, `request_stop`, `shutdown_visitor_tasks`, `cancel_detached_tasks`, `spawn_admin_server` — **measured at the pre-S4 base: 1313 lines / 66 103 bytes (66 029 characters) with doc comments and attributes, or 1264 lines fn-only, so the row's `~1500 LOC` was overstated by 12–16%; **the spans are an older revision's numbering** — measured, `run` starts at 1298 pre-S0, 1255 at the S1 head and 1007 at the pre-S4 base, so the row's `(1166–1538)` matches none of them**. `spawn_admin_server`'s coherent span **includes** the `#[cfg(feature = "admin")]` attribute directly above it (a gate-less slice compiles the axum admin server into every build) | medium — **both risk claims verified by measurement, not repeated**: the teardown really is 5 steps (five `// Step N:` comments, ascending, no gaps) and the spawn order is load-bearing (writer task, then the vnet controllers whose route adverts ride the writer channel, then previous-session visitor shutdown, then the vnet visitor listener, then the STCP/XTCP listener) |
 | S5 | `service/health.rs` | `health_check_monitored`, `spawn_health_checks`, `healthy_resets_error_count` — **measured: 136 lines / 6380 bytes (6368 characters) with doc comments, or 107 lines fn-only, so `~100 LOC` was close** | low — **not skipped: done in S4's PR** (#495), because folding it in cost one cycle instead of an author + two reviews + records cycle of its own; each module still carried its own per-item proofs and reference audit |
 
@@ -565,7 +566,7 @@ the de-indented original apart from a whitespace-only `matches!` reflow, `contin
 follows the `select!` inside the loop) and one dropped `&` at the `remove_vnet_tun` writer argument
 (type-exact, since the parameter is already `&Arc<…>`; the `needless_borrow` explanation did not reproduce — see below). Skeleton invariants unchanged (4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, no
 `biased;` in code), and twelve `heartbeat_wire_order.rs` cites were re-pointed with every header pin identical.
-**12 arms remain**, in the order the table gives.
+**13 arms remain across 11 rows**, in five groups and in the order the table gives.
 
 **S3** (PR #494) — `service/message_loop.rs` (1219 lines) holds `run_message_loop` plus its three companion types and three retry items; across 1181 moved lines the **only** delta is **eleven `pub(super)` tokens** (the method; the three types; and `SessionChannels`' seven fields, which the parent's field-named literal requires — found by compilation, `E0451`). A plain `use message_loop::{…}` suffices; no re-export was needed. The loop skeleton is byte-identical (persisted partial-frame read, one persistent heartbeat `Sleep` re-armed at the loop top, no `biased;` — the third is why `frp-client/tests/partial_frame_survives_competing_ping_tick.rs`, unchanged by this seam, still witnesses the invariants from the child module), and **S3b did not happen** (the new file declares exactly one `fn`). `service.rs` 3681 → 2512.
 
@@ -596,6 +597,44 @@ terminal, so its `continue` becomes a plain `return`.
 | vnet trio 3184–3324 | 141 | `cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`; 3 gates |
 | `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
 
+**Regrouping (decided after arm 1 landed, 2026-10-04).** The row's original "one per PR" predates the first arm, when
+the recipe, the signature constraint and the coverage gap were all unknown. Arm 1 (`CloseProxy`, PR #498) established
+them, so the remaining work is grouped **by code adjacency where the arms are contiguous and by mechanism otherwise**
+(which is why D2's two non-contiguous arms still belong together) into five PRs — which is what the project's
+own instruction asks for ("group related items that share a mechanism into one PR where that does not weaken review").
+Grouping reduces ceremony, **not evidence**: every arm in a group still carries its own per-arm proof (base span/bytes/
+sha256 → extracted span/bytes/sha256, the deltas enumerated — whitespace reflow, `continue;` → `return;`, any forced
+type-exactness change — its own terminality argument, and the skeleton-invariants check), and each PR still gets two
+reviews, at least one adversarial, and **each grouped PR's description carries a per-arm checklist** — one row per arm
+with its span/bytes/sha, terminality argument and delta list — so a single review pass cannot silently skip an arm.
+
+| group | arms | measured spans at `main` = `9f75d9e0` | LOC |
+|---|---|---|---:|
+| **A** | `NatHoleClient` + `NatHoleResp` + `NewProxyResp` | `:326-347` + `:348-386` + `:387-428` | 103 |
+| **B** | vnet trio (`VnetRouteAdvertise`/`VnetPacket`/`VnetRouteRemove`) | `:430-499` + `:501-535` + `:537-569` | 138 measured, vs the table's 141 — the row counts the three blank separator lines between the trio's arms, which the per-arm spans do not |
+| **C** | ping tick + proxy retry tick | `:580-665` + `:667-796` | 216 |
+| **D1** | XTCP notify → STUN + STUN result + `xtcp_cleanup` (share `pending_xtcp`/`xtcp_sockets`) | `:876-978` + `:982-1012` + `:1020-1032` | 147 |
+| **D2** | health event + visitor request | `:798-858` + `:1037-1071` | 96 — **mechanism, not adjacency**: both are event→side-effect handlers on the control connection (proxy health transitions; visitor requests) that no other group covers, which is why they pair despite straddling D1 |
+
+Every measured LOC above matches the row's own figure for that arm (e.g. ping 86, retry 130, STUN result 31,
+`xtcp_cleanup` 13), so the table's **sizes** were right all along — only its **line numbers** were pre-S3 and stale.
+**C stays its own group on purpose, but not for the reason first written here.** Measured across the eleven arms,
+the eleven arms take **only short-lived, single-lock critical sections** (measured: 27 lock/write/read uses, including
+six `self.proxy_info_map.write().await` — one of them at `:784`, inside C's retry arm — plus `route_table.write().await`
+and `vnet_peer_routes.lock()`), so lock *volume* does not distinguish the groups; what does is that the **ordering**
+hazard lives in the functions these arms call (`try_reload`, the `:758-762` note). What actually distinguishes C is that it is the only group carrying a
+**documented ordering invariant**: the lock-order note at `:758-762` plus the retry arm's own "both locks' writers
+run only in this message-loop task" obligation. **D1 owns the largest hidden surface** — the only three `tokio::spawn`s
+among the eleven, plus three shared NAT-hole maps (`pending_xtcp`, `xtcp_sockets`, `visitor_pending`), so its review
+must apply the same "handler called inline, never spawned" check that C's does. Two further measured facts the groups
+share: all thirteen arms contain **zero** `LoopExit::` (the loop's six exits live outside them, so no arm's early exit
+can move another's preconditions), and the `continue;` → `return;` transformation **recurs in three of the eleven** —
+`NatHoleClient` `:337`, `NatHoleResp` `:373` (inside the nested `match` at `:368`) and ping tick `:650` — so **group A
+carries two of them**, and A's and C's delta lists must include the line. None of the three sits inside an inner loop
+(each start→`continue` span has no `for`/`while`/`loop`), so the landed arm's terminality proof generalises verbatim.
+A group's arms also share mutable state (A: `p2p_bridge_tokens`; `NatHoleResp` and all three D1 arms share the NAT-hole
+maps), so every per-arm proof must carry its own borrow/signature delta — the coupling column already anticipates it.
+
 **Correction to every row above, from the first landed arm (PR #498).** The coupling column says `&SessionCtx` for
 several arms; a handler **cannot** take a shared `&SessionCtx`. `SessionCtx` owns
 `reader: Option<BoxedReadHalf>` where `BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>`, so
@@ -614,8 +653,9 @@ inputs) on the wire to a client `Service`. The landed extraction makes such a te
 method, `E0624`) or an inline `#[cfg(test)] mod` in `message_loop.rs`; the first arm deliberately did not add one,
 and it should be added with a later arm rather than left as a note.
 
-Order: `CloseProxy` → retry → ping → STUN spawn → health → `NewProxyResp` →
-`NatHoleResp` → visitor → STUN result → `NatHoleClient` → vnet trio. Leave the
+Order: `CloseProxy` (landed) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`) → **B** (vnet trio) → **C**
+(ping, retry) → **D1** (XTCP/STUN/cleanup) → **D2** (health/visitor); within a group, the arms may go in either
+order as long as each keeps its own proof. Leave the
 3–11-line arms inline. **Handlers must be `.await`ed inline, never spawned** — the
 retry arm's own comment records that "both locks' writers run only in this
 message-loop task", which holds only while that is true.
