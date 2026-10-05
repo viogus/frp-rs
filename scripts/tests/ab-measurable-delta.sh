@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Fixture checks for the A/B throughput gate's delta classifier and verdict
-# (TODO.md:10983).
+# (TODO.md:10988).
 #
 # Two artefacts are under test, both driven for real — no copies of their logic
 # live here:
