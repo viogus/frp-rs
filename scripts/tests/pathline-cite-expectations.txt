@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=579 weak=105 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=926d76a78607a76d ambiguous_set=3343d4d37da5672a excluded_set=5e330a4eac751977
+#   pins: checked=579 weak=104 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=dbbea8513634ee3b ambiguous_set=3343d4d37da5672a excluded_set=5e330a4eac751977
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -61,7 +61,7 @@ frp-client/src/admin.rs	1149	-	11314c6e379da4e8	-	absolute	docs/config.md	frp-cl
 frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	absolute	docs/config.md	frp-client/src/admin.rs:1164	192
 frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	absolute	docs/config.md	frp-client/src/admin.rs:1164	192
 frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	shorthand	.github/workflows/ci.yml	:1164	4065
-frp-client/src/admin.rs	2044	-	119fe0b5b92fc3f6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:2044	53
+frp-client/src/admin.rs	2045	-	ebfe8e660b31114e	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:2045	53
 frp-client/src/admin.rs	391	-	a891a6a9bba37da4	-	absolute	docs/developing.md	frp-client/src/admin.rs:391	237
 frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	525
 frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	535

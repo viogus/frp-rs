@@ -11559,7 +11559,7 @@ other.
   re-aimed here. Reviews: adversarial **MERGE-with-findings** and verification **MERGE**, the latter checking all
   four Done-when clauses and recommending closure — done here.
 
-- [ ] **A second live cite in `frpc/tests/admin_config_get_warning.rs` is content-stable but semantically weak.**
+- [x] **A second live cite in `frpc/tests/admin_config_get_warning.rs` is content-stable but semantically weak.**
   Evidence: `:53` cites `frp-client/src/admin.rs:2044`, which is the opening `assert_eq!(` — text repeated **17×**
   in that file, which is why the row sits in the guard's weak set. Unlike the item above, the sentence it backs is
 *not* a call-site claim ("this target stays green while the in-process one reds on the `None` case"), so
@@ -11570,3 +11570,25 @@ other.
   `None` case the prose discusses), the expectations are re-baked in the same commit, and any `weak`/`weak_set`
   change is explained there. Both reviewers of PR #496 independently recommended filing it rather than folding it
   in, because the guard pins content rather than meaning and nothing else will catch it.
+  **Done (PR #497, code head `67236adc`, based on `79ee0d22`).** `:53` now cites `frp-client/src/admin.rs:2045` —
+  `seed_web_server_tls_enable_seen(None),`, unique in the file and in the tracked tree — instead of the opening
+  `assert_eq!(` at `:2044`, which repeats **17×** under the guard's normalization (16× byte-exact, the difference
+  being one line that varies only in internal spacing). The prose's meaning survives: `:2044-2047` *is* the `None`
+  assertion and `:2048-2052` the missing-path one, so the `.unwrap_or(ABSENT)` mutant reds at the `None` case
+  first. A **range** would not have helped — the guard derives weakness from the cited **start** line alone
+  (`weak = bool(start) and occurrences(target, start) > 1`, `pathline-cite-guard.sh:449`) — so a re-aim to a unique
+  start was the only route. The expectations were re-baked in the same commit: exactly one row changed
+  (`119fe0b5…` → `ebfe8e66…`, same citing line), `checked` stayed 579, and `weak` fell 105 → 104 with the departing
+  key named and nothing entering the set. Reviews: adversarial **MERGE-with-findings** and verification **MERGE**,
+  the latter checking all three Done-when clauses and recommending closure — done here, keeping this item's
+  "hardening, not a defect" framing.
+  *Two corrections that review produced, recorded because the counts were mine:* this item's closing claim was too
+  broad — it is true by **citing-file** scope (this was the only weak row citing this test file, now 0 of 104) but
+  the **target-file** scope had **three** weak rows at the base (`:2044` plus the `admin.rs:1149` pair) and **two**
+  at this head, so "the only remaining weak note naming this file" was one too high if read as a target-file
+  count. And on the surviving pair, **both reviewers independently concluded no item is warranted**: `:1149` is the
+  `#[cfg(feature = "tls")]` directly above `match (tls_cert_file, tls_key_file)` and `:1164` its `not(tls)` discard
+  arm, and both citing sentences (`ci.yml`, `docs/config.md`) are semantically exact — the rows are weak only
+  because that attribute repeats 7×, i.e. **weak in the good direction** where re-anchoring would change what the
+  sentences point at. That is the useful boundary for this class: a weak row is a defect when it witnesses a line
+  that does not carry the claim, and merely noisy when it witnesses the right line whose text happens to repeat.
