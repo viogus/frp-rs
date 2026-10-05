@@ -599,12 +599,14 @@ terminal, so its `continue` becomes a plain `return`.
 
 **Regrouping (decided after arm 1 landed, 2026-10-04).** The row's original "one per PR" predates the first arm, when
 the recipe, the signature constraint and the coverage gap were all unknown. Arm 1 (`CloseProxy`, PR #498) established
-them, so the remaining work is grouped **by code adjacency and mechanism** into five PRs — which is what the project's
+them, so the remaining work is grouped **by code adjacency where the arms are contiguous and by mechanism otherwise**
+(which is why D2's two non-contiguous arms still belong together) into five PRs — which is what the project's
 own instruction asks for ("group related items that share a mechanism into one PR where that does not weaken review").
 Grouping reduces ceremony, **not evidence**: every arm in a group still carries its own per-arm proof (base span/bytes/
 sha256 → extracted span/bytes/sha256, the deltas enumerated — whitespace reflow, `continue;` → `return;`, any forced
 type-exactness change — its own terminality argument, and the skeleton-invariants check), and each PR still gets two
-reviews, at least one adversarial.
+reviews, at least one adversarial, and **each grouped PR's description carries a per-arm checklist** — one row per arm
+with its span/bytes/sha, terminality argument and delta list — so a single review pass cannot silently skip an arm.
 
 | group | arms | measured spans at `main` = `9f75d9e0` | LOC |
 |---|---|---|---:|
@@ -616,9 +618,20 @@ reviews, at least one adversarial.
 
 Every measured LOC above matches the row's own figure for that arm (e.g. ping 86, retry 130, STUN result 31,
 `xtcp_cleanup` 13), so the table's **sizes** were right all along — only its **line numbers** were pre-S3 and stale.
-**C stays its own group on purpose**: those two arms carry the load-bearing lock/writer comments (the retry arm's own
-note that both locks' writers run only in this message-loop task), so it is the group most likely to fail review, and a
-clean revert of a 216-line block is worth more than the ceremony saved by merging it into a neighbour.
+**C stays its own group on purpose, but not for the reason first written here.** Measured across the eleven arms,
+**no remaining arm takes an async write or a lock at all** — the landed `CloseProxy` arm was the only lock-heavy one —
+and C's two arms take only *read* guards. What actually distinguishes C is that it is the only group carrying a
+**documented ordering invariant**: the lock-order note at `:758-762` plus the retry arm's own "both locks' writers
+run only in this message-loop task" obligation. **D1 owns the largest hidden surface** — the only three `tokio::spawn`s
+among the eleven, plus three shared NAT-hole maps (`pending_xtcp`, `xtcp_sockets`, `visitor_pending`), so its review
+must apply the same "handler called inline, never spawned" check that C's does. Two further measured facts the groups
+share: all thirteen arms contain **zero** `LoopExit::` (the loop's six exits live outside them, so no arm's early exit
+can move another's preconditions), and the `continue;` → `return;` transformation **recurs in three of the eleven** —
+`NatHoleClient` `:337`, `NatHoleResp` `:373` (inside the nested `match` at `:368`) and ping tick `:650` — so **group A
+carries two of them**, and A's and C's delta lists must include the line. None of the three sits inside an inner loop
+(each start→`continue` span has no `for`/`while`/`loop`), so the landed arm's terminality proof generalises verbatim.
+A group's arms also share mutable state (A: `p2p_bridge_tokens`; `NatHoleResp` and all three D1 arms share the NAT-hole
+maps), so every per-arm proof must carry its own borrow/signature delta — the coupling column already anticipates it.
 
 **Correction to every row above, from the first landed arm (PR #498).** The coupling column says `&SessionCtx` for
 several arms; a handler **cannot** take a shared `&SessionCtx`. `SessionCtx` owns
