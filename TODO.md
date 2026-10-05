@@ -7685,7 +7685,10 @@ nothing about whether the described behaviour still holds.
   **MERGE-with-findings** (its one change-requiring finding was in the author's *report* — it said the handler could
   be unit-tested "from `service/tests.rs`", which is impossible while the method is private; that is why the sentence
   above names `pub(super)` or an inline test) and verification **MERGE**. Ledger unchanged at **3 open / 234 closed /
-  237 headers**; **12 of the plan's 13 S3b arms remain**, which is why this item stays open.
+  237 headers**; **11 of the plan's 12 S3b rows remain**, now grouped into five PRs (the plan's S3b row records the regrouping and
+the measured spans), which is why this item stays open. *(This sentence previously said "12 of the plan's 13";
+both numbers were wrong — the table has twelve data rows, its thirteenth `|` line being the header, and one row
+(the `vnet trio`) covers three arms, which is the likely origin of the miscount.)*
 
 
 
