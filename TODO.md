@@ -7623,7 +7623,7 @@ nothing about whether the described behaviour still holds.
   tokens plus one rustfmt signature reflow** (adding `pub(super) ` pushed `shutdown_visitor_tasks`' signature past 100
   columns); all eleven base spans verify per item, six of them byte-identical. This seam needed a **new tool rather
   than a re-export**: two of the moved items are *free functions* with **unqualified** callers in `service.rs`,
-  `registration.rs`, `reload_apply.rs` and the test module, so the parent gained a **private**
+  `session.rs`, `registration.rs`, `reload_apply.rs` and the test module, so the parent gained a **private**
   `use health::{health_check_monitored, healthy_resets_error_count};` — a private `use` reaches `service` and its
   descendants, which is exactly those functions' original reach (verified by probe: deleting it fails with four
   `E0425`s), and a tree-wide search finds **zero** `frp_client::service::<name>` references, so no public path wanted
