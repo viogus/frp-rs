@@ -589,15 +589,11 @@ terminal, so its `continue` becomes a plain `return`.
 | ping tick 3335–3420 | 86 | `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, writer |
 | XTCP notify → STUN 3631–3733 | 103 | `xtcp_sockets`, `stun_result_tx`, `nat_hole_stun_server`; spawns |
 | health event 3553–3613 | 61 | `p2p_bridge_tokens`, `proxy_info_map`, `health_proxy_configs`, `v2`, `cfg_user`, writer |
-| `NewProxyResp` 3142–3183 | 42 | `proxy_info_map` + `&mut last_start_err` |
-| ~~`NatHoleResp`~~ **landed** (PR #501) | 39 | base `:348-386` / 2625 B / `1fdfffd5…` → `handle_nat_hole_resp_arm`; coupling: `&mut SessionCtx`
-(`&mut pending_xtcp`, `&mut visitor_pending`, `&xtcp_sockets`, `session_alive`) and `writer`; **`p2p_bridge_tokens` is reached
-via `&self`, not passed** (the row listed it as a parameter, which is what sent this group's brief wrong) |
+| ~~`NewProxyResp`~~ **landed** (PR #501) | 42 | base `:387-428` / 2881 B / `41fc390d…` → `handle_new_proxy_resp_arm`; coupling: `&mut last_start_err` only — **no `ctx` at all**; `proxy_info_map` reached via `&self`; and it gains the **first direct test** of these arms (the inline `mod tests`) |
+| ~~`NatHoleResp`~~ **landed** (PR #501) | 39 | base `:348-386` / 2625 B / `1fdfffd5…` → `handle_nat_hole_resp_arm`; coupling: `&mut SessionCtx` (`&mut pending_xtcp`, `&mut visitor_pending`, `&xtcp_sockets`, `session_alive`) and `writer`; **`p2p_bridge_tokens` is reached via `&self`, not passed** (the row listed it as a parameter, which is what sent this group's brief wrong) |
 | visitor request 3792–3826 | 35 | `&mut visitor_pending`, `xtcp_cleanup_tx`, `v2`, writer; spawns |
 | STUN result 3737–3767 | 31 | `&mut pending_xtcp`, `xtcp_sockets`, `stun_result_rx`, writer; spawns |
-| ~~`NatHoleClient`~~ **landed** (PR #501) | 22 | base `:326-347` / 1498 B / `f4ff263c…` → `handle_nat_hole_client_arm`; coupling: `&mut SessionCtx`,
-`writer`, `punch_proxy_still_live`, `session_alive`; **`p2p_bridge_tokens` via `&self`** (split `self` / `.p2p_bridge_tokens` /
-`.lock()` across lines at `:1197-1199`, which is why a joined-literal grep misses it) |
+| ~~`NatHoleClient`~~ **landed** (PR #501) | 22 | base `:326-347` / 1498 B / `f4ff263c…` → `handle_nat_hole_client_arm`; coupling: `&mut SessionCtx`, `writer`, `punch_proxy_still_live`, `session_alive`; **`p2p_bridge_tokens` via `&self`** (split `self` / `.p2p_bridge_tokens` / `.lock()` across lines at `:1197-1199`, which is why a joined-literal grep misses it) |
 | vnet trio 3184–3324 | 141 | `cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`; 3 gates |
 | `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
 
@@ -609,6 +605,9 @@ suppresses a genuine future warning rather than documenting a constraint, and it
 touched. Group A is also the precedent for the checklist: each arm's row carries its own `continue` census, its own
 `LoopExit::` count and its own stripped inner-loop scan, with only the loop-level "nothing follows the `select!`" fact
 shared — which is what makes a grouped PR reviewable arm by arm.
+This correction is not cosmetic for group **D1**: its `xtcp_cleanup` and STUN rows have the same shape as the two NatHole
+rows (they list state that is in fact reached through `&self`), so without it D1's brief would have sent its author hunting
+parameters that must not exist.
 
 **Regrouping (decided after arm 1 landed, 2026-10-04).** The row's original "one per PR" predates the first arm, when
 the recipe, the signature constraint and the coverage gap were all unknown. Arm 1 (`CloseProxy`, PR #498) established
