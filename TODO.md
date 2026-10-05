@@ -7704,8 +7704,11 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   rc 101 with `clippy::needless_borrow`) — which is the rule this program adopted after being burned twice by un-rerun
   attributions. `NewProxyResp` turned out to need **no `SessionCtx` at all** (it reads only `self.proxy_info_map` and the
   loop-local `last_start_err`, whose `&mut` is threaded in), so it is the first of these arms to get a **direct test**: a
-  new inline `#[cfg(test)] mod tests` driving the handler over five cases with a real `Service` (both independent review
-  rounds confirmed an inverted phase or `is_empty` condition would change three of its assertions). The two NatHole
+  new inline `#[cfg(test)] mod tests` driving the handler with **four calls covering five behaviours** over a real
+  `Service` (error→`StartErr`+anchor, unknown proxy untouched, `WaitStart`→`Running`, `StartErr`→`Running`, `Running`
+  untouched); the adversarial round's mutation check found that inverting the phase or `is_empty` condition changes three
+  of its assertions, while the verification round verified the test's content, its call/behaviour counts and that it
+  passes — the two claims are attributed accordingly rather than merged. The two NatHole
   handlers still have **no direct lane** (they need a full `SessionCtx` + `ControlWriter`) and that gap is stated rather
   than papered over, with the fix named for a later group. The plan's own coupling rows for these two arms were
   **directionally wrong** — they listed `p2p_bridge_tokens` as a parameter, but `ctx.p2p_bridge_tokens` is used zero

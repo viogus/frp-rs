@@ -666,7 +666,8 @@ inputs) on the wire to a client `Service`. The landed extraction makes such a te
 method, `E0624`) or an inline `#[cfg(test)] mod` in `message_loop.rs`; the first arm deliberately did not add one,
 and it should be added with a later arm rather than left as a note. **Group A did add one** (PR #501): `NewProxyResp`
 needs no `SessionCtx`, so `handle_new_proxy_resp_arm` is driven directly by a new inline `#[cfg(test)] mod tests`
-(five cases over a real `Service`; an inverted phase or `is_empty` condition changes three of its assertions); the two
+(four calls covering five behaviours over a real `Service`; the adversarial round's mutation check found an inverted
+phase or `is_empty` condition changes three of its assertions); the two
 NatHole handlers still have no lane, for exactly the `SessionCtx` + `ControlWriter` reason above. One distinction worth
 keeping straight: group A's two `&writer` → `writer` drops **are** clippy-forced (re-adding the `&` gives rc 101 with
 three `needless_borrow` errors), whereas the landed `CloseProxy` arm's was lint-clean type-exactness — so a dropped `&`
