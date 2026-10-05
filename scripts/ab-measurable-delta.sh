@@ -12,7 +12,7 @@
 #   2  usage error, or a revision that cannot be resolved to a commit → the
 #      caller must NOT treat this as a skip. Fail closed towards measuring.
 #
-# The whole point (TODO.md:11079): a red gate on `main` is not evidence of a
+# The whole point (TODO.md:11114): a red gate on `main` is not evidence of a
 # regression when the delta re-measured the same binaries. Run 36996762744
 # measured a docs-comment-only delta at +58.8% (`plain`) and -15.6%
 # (`encrypt_compress`) in the same run, and the retired PR mode measured

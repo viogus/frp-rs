@@ -660,11 +660,17 @@ is a type-level requirement rather than a stylistic one — the landed handler o
 seam also showed that a handler's `writer` parameter needs
 `#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` (rc 101 without it in the non-`vnet` `-D warnings`
 shape), and that the landed arm's coupling list in the table above needs regenerating (it uses no `plugin_handles` and no
-	`self.cfg`). It also showed that **none of these arms has a direct test lane**: no test puts a `CloseProxy` (or most other arm
+	`self.cfg`). It also showed that **none of these arms had a direct test lane when the first arm landed**: no test puts a `CloseProxy` (or most other arm
 inputs) on the wire to a client `Service`. The landed extraction makes such a test cheap, but it needs either
 `pub(super)` on the handler (the same minimal widening S2 and S4 needed — a sibling test module cannot see a private
 method, `E0624`) or an inline `#[cfg(test)] mod` in `message_loop.rs`; the first arm deliberately did not add one,
-and it should be added with a later arm rather than left as a note.
+and it should be added with a later arm rather than left as a note. **Group A did add one** (PR #501): `NewProxyResp`
+needs no `SessionCtx`, so `handle_new_proxy_resp_arm` is driven directly by a new inline `#[cfg(test)] mod tests`
+(five cases over a real `Service`; an inverted phase or `is_empty` condition changes three of its assertions); the two
+NatHole handlers still have no lane, for exactly the `SessionCtx` + `ControlWriter` reason above. One distinction worth
+keeping straight: group A's two `&writer` → `writer` drops **are** clippy-forced (re-adding the `&` gives rc 101 with
+three `needless_borrow` errors), whereas the landed `CloseProxy` arm's was lint-clean type-exactness — so a dropped `&`
+in this file is justified by measurement each time, never by the precedent.
 
 Order: `CloseProxy` (landed) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`) → **B** (vnet trio) → **C**
 (ping, retry) → **D1** (XTCP/STUN/cleanup) → **D2** (health/visitor); within a group, the arms may go in either
