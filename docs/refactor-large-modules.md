@@ -594,12 +594,15 @@ terminal, so its `continue` becomes a plain `return`.
 | visitor request 3792–3826 | 35 | `&mut visitor_pending`, `xtcp_cleanup_tx`, `v2`, writer; spawns |
 | STUN result 3737–3767 | 31 | `&mut pending_xtcp`, `xtcp_sockets`, `stun_result_rx`, writer; spawns |
 | ~~`NatHoleClient`~~ **landed** (PR #501) | 22 | base `:326-347` / 1498 B / `f4ff263c…` → `handle_nat_hole_client_arm`; coupling: `&mut SessionCtx`, `writer`, `punch_proxy_still_live`, `session_alive`; **`p2p_bridge_tokens` via `&self`** (split `self` / `.p2p_bridge_tokens` / `.lock()` across lines at `:1197-1199`, which is why a joined-literal grep misses it) |
-| vnet trio 3184–3324 | 141 | `cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`; 3 gates |
+| ~~vnet trio~~ **landed** (PR #502) | 138 measured (70+35+33; the row's 141 counts the three separator lines between the arms) | base `:336-405` / `:407-441` / `:443-475` → `handle_vnet_route_advertise_arm` / `handle_vnet_packet_arm` / `handle_vnet_route_remove_arm`; each arm keeps its call-site `#[cfg(feature = "vnet")]` **and** the handler gains one; coupling `&self` only (`cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`) |
 | `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
 
-**`writer`-parameter rule, from group A (PR #501).** A handler needs
-`#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` **only when its `writer` is used solely inside
-`#[cfg(feature = "vnet")]` code**. Measured both ways: removing the attribute from the landed `handle_close_proxy` gives
+**`writer`-parameter rule, from groups A and B (PRs #501, #502).** A handler needs
+`#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` **only when its only use of `writer` sits behind a
+vnet gate** — and a handler that takes **no `writer` at all never needs it**: group B's three vnet arms are
+receive-only (0 `writer` in code; the four textual hits are doc prose), so they carry no attribute, and a
+*counterfactual* `writer` parameter on one of them is unused even with `vnet` on, i.e. the precondition cannot obtain.
+Settle each case by a removal probe; the two group-A handlers happen to carry a non-load-bearing attribute. Measured both ways: removing the attribute from the landed `handle_close_proxy` gives
 rc 101 (`unused variable: writer`), while removing it from the two group-A handlers gives rc 0 — so on those two it
 suppresses a genuine future warning rather than documenting a constraint, and it should be dropped when they are next
 touched. Group A is also the precedent for the checklist: each arm's row carries its own `continue` census, its own
@@ -671,6 +674,14 @@ NatHole handlers still have no lane, for exactly the `SessionCtx` + `ControlWrit
 keeping straight: group A's two `&writer` → `writer` drops **are** clippy-forced (re-adding the `&` gives rc 101 with
 three `needless_borrow` errors), whereas the landed `CloseProxy` arm's was lint-clean type-exactness — so a dropped `&`
 in this file is justified by measurement each time, never by the precedent.
+
+**cfg-gate placement, from group B (PR #502).** A vnet arm's `#[cfg(feature = "vnet")]` must sit on **both** the call
+site and the extracted handler, and the pair is load-bearing **only in the non-`vnet` shape**: measured with
+`--no-default-features --features tls,tcp-mux`, removing **one** handler gate gives rc 101 with 6 errors
+(`E0425`×3 + `E0609`×3) and **one** call-site gate 2 (`E0599`×2), while removing **all three** handler gates gives 15
+(7 `E0425` + 8 `E0609`) and all three call-site gates 6 — the counts are scope-dependent, so state which. With `vnet`
+**on**, removing either is **rc 0**: both gates are inert there. That is also why a gate census must be reported per
+shape rather than as one number.
 
 Order: `CloseProxy` (landed, PR #498) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`; **landed, PR #501**) →
 **B** (vnet trio — the next group) → **C**
