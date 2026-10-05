@@ -281,9 +281,9 @@ impl Service {
                     // Detach the completed future before handling the
                     // message: the select has dropped the branch future,
                     // and the loop-top `if pending_read.is_none()` above
-                    // recreates a fresh one for the next frame. A
-                    // `continue` inside the message match below therefore
-                    // also restarts the read at the next frame boundary.
+                    // recreates a fresh one for the next frame. Every
+                    // non-terminal path in the match below falls off this arm
+                    // body, which restarts the read at the next boundary.
                     pending_read = None;
                     match msg {
                         Ok(FrpMessage::ReqWorkConn(_)) => {
@@ -2181,16 +2181,6 @@ mod tests {
              must not"
         );
 
-        eprintln!(
-            "PROBE2 phase_p2={:?} last_start_err_keys={:?}",
-            service
-                .proxy_info_map
-                .read()
-                .await
-                .get("user.p2")
-                .map(|i| i.phase.clone()),
-            last_start_err.keys().collect::<Vec<_>>()
-        );
         {
             let map = service.proxy_info_map.read().await;
             assert_eq!(
