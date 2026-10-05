@@ -7613,6 +7613,39 @@ nothing about whether the described behaviour still holds.
   closed / 236 headers**. *On the reviewers' report-missing finding:* both rounds reported the author's report absent;
   it exists at the coordinator path (`.worktrees/report-m24.md`, 25 778 bytes) — the checks appear to have looked
   relative to their own detached worktrees, so that finding is refuted rather than recorded as a gap.
+  **Progress (2026-10-04, code head `495e76c9` on `dsh/m25-p2-s4s5-session`, PR #495, based on `dc3cc81d`).** The
+  fifth and final **P2** seam (S4+S5, grouped) landed: the session path and the health path moved into the new child
+  modules `frp-client/src/service/session.rs` (**1363 lines**, eight items — `run`, `connect_and_login`,
+  `spawn_session_tasks`, `teardown_session`, `request_stop`, `shutdown_visitor_tasks`, `cancel_detached_tasks`,
+  `spawn_admin_server`) and `frp-client/src/service/health.rs` (**166 lines**, three items —
+  `health_check_monitored`, `spawn_health_checks`, `healthy_resets_error_count`), taking
+  `frp-client/src/service.rs` from 2512 to **1072**. Across **1449 moved lines the entire delta is five `pub(super)`
+  tokens plus one rustfmt signature reflow** (adding `pub(super) ` pushed `shutdown_visitor_tasks`' signature past 100
+  columns); all eleven base spans verify per item, six of them byte-identical. This seam needed a **new tool rather
+  than a re-export**: two of the moved items are *free functions* with **unqualified** callers in `service.rs`,
+  `registration.rs`, `reload_apply.rs` and the test module, so the parent gained a **private**
+  `use health::{health_check_monitored, healthy_resets_error_count};` — a private `use` reaches `service` and its
+  descendants, which is exactly those functions' original reach (verified by probe: deleting it fails with four
+  `E0425`s), and a tree-wide search finds **zero** `frp_client::service::<name>` references, so no public path wanted
+  them. **The seam's most valuable catch was in this batch's own brief:** my `spawn_admin_server` span excluded the
+  `#[cfg(feature = "admin")]` attribute sitting directly above the function, and moving that gate-less slice would
+  have compiled the axum admin server into every build; the corrected coherent span carries the gate, and both
+  reviewers audited the attribute block above all eleven items to show it was the only instance of its class. Two plan
+  claims were **verified by measurement rather than repeated**: the teardown really is 5 steps (five `// Step N:`
+  comments, ascending, no gaps) and the spawn order really is load-bearing (writer task → the vnet controllers whose
+  route advertisements ride the writer channel → previous-session visitor shutdown → the vnet visitor listener → the
+  STCP/XTCP listener). **18 expectation rows changed** (16 content re-points + 2 re-keys) with `checked`/`weak`
+  unchanged at 579/107; the table was re-baked, `SCEN10_REGION_SHA` was a **third consecutive verified no-op**, and
+  exactly one pin was refreshed (`guard_data_pin` → `d6c4847a…`), the audit reporting 20/0. No `CHANGELOG.md` bullet,
+  matching the earlier seams. Reviews: verification **MERGE-with-findings** and adversarial **MERGE-with-findings**,
+  both with the tree clean; the one tree finding was the two new module comments calling a *private* `use` a
+  "re-export" — which contradicts this seam's whole point — and it was folded in an additive comment-only commit
+  (five lines changed in place, zero non-comment lines, no cascade). Both review rounds independently answered the
+  completeness question the same way: **with S3b excepted, nothing from the plan's P2 table remains unmoved**, and
+  S5 was done rather than skipped. That leaves **S3b** — the arm bodies of `run_message_loop`, which the plan itself
+  scopes as "one per PR" — as the only remaining P2 row, which is why this item stays open. Ledger unchanged at
+  **4 open / 232 closed / 236 headers**.
+
 
   **Progress (2026-10-01, code head `a618f281` on `refactor/fileify-proxy-ops`, PR #453).** P4
   (`frp-server/src/control/proxy_ops`) landed Step 0 plus seams 1–2 as three pure-move commits:
