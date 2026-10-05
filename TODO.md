@@ -7512,7 +7512,9 @@ nothing about whether the described behaviour still holds.
   checked count rose **577 → 579** — a genuine *extend*, verified by finding both new rows (the new module comment's
   `store.rs:592` cite and a test comment's extended path) and confirming nothing was dropped; the weak population
   stayed **107** with `weak_set` re-keyed `f9c334c1…` → `d32d0bec…`, the table re-baked (`03766d54…` at the code
-  seam, re-baked here to `4bf2c176a651…`) and `guard_cites`/`guard_cites_floor` raised with it to 579. No `CHANGELOG.md` bullet, matching the
+  seam; it is re-baked again by this very paragraph, so **this record deliberately states no literal for it** — the
+  authoritative value is the step's own `guard_data_pin`, which is the check) and `guard_cites`/`guard_cites_floor`
+  raised with it to 579. No `CHANGELOG.md` bullet, matching the
   earlier seams. Reviews: verification **MERGE-with-findings** and adversarial **MERGE-with-findings**, every finding
   being a figure in the *author's report* (the move arithmetic, the payload join basis, a stale-cite count) rather
   than anything in the tree. Ledger unchanged at **3 open / 232 closed / 235 headers**.

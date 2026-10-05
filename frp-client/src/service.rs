@@ -701,7 +701,7 @@ fn reg_frame_payload_read(
 /// `frp-client/tests/heartbeat_wire_order.rs` derives its tolerance from it, so
 /// a wrong-but-in-range backoff hard-coded at the `interval.reset_after(delay)`
 /// call site (5s satisfied the old `[1.0s, 6.0s]` window) now reds the e2e test
-/// (TODO.md:9473). A duplicated literal in either place is what this constant
+/// (TODO.md:9475). A duplicated literal in either place is what this constant
 /// exists to prevent.
 pub const PING_FIRST_BACKOFF: Duration = Duration::from_secs(2);
 
