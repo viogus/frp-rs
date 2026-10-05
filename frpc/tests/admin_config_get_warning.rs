@@ -526,9 +526,10 @@ fn rival_bind_fails(port: u16) -> bool {
 /// assertion. Every test in this file reaches it through [`assert_records`];
 /// measured before the three-way reader landed, hardcoding a reached site's
 /// answer to the no-dashboard one reds **2 of the 4** (`test result: FAILED. 2
-/// passed; 2 failed`) — the startup rows witness `frp-client/src/service.rs:598`,
-/// the hand-edit rows witness `frp-client/src/service.rs:783`. These two live on
-/// in `service.rs`; only the reload site moved to `service/reload_apply.rs:98`.
+/// passed; 2 failed`) — the startup rows witness
+/// `frp-client/src/service/registration.rs:115`, the hand-edit rows witness
+/// `frp-client/src/service.rs:599`; the reload site is
+/// `service/reload_apply.rs:98`.
 fn assert_clause_is_the_dashboard_one(tag: &str, out: &str) {
     assert!(
         out.contains(DASHBOARD_CLAUSE),

@@ -916,7 +916,7 @@ The surface is much smaller than a proxy type's, and unlike a proxy type it has
   `local_addr`, the task's `JoinHandle`, and a shutdown sender. Existing plugins
   in `frp-client/src/plugin/` are the templates; pick the closest one
   (`socks5.rs` for a protocol speaker, `static_file.rs` for a trivial one).
-- `frp-client/src/service.rs:1052` starts plugins for `p.plugin`. `virtual_net`
+- `frp-client/src/service.rs:868` starts plugins for `p.plugin`. `virtual_net`
   is special-cased there because its work connections go to the shared vnet
   controller in `frp-client/src/work_conn.rs`.
 - Server-side plugins are a **different** surface: `frp-server/src/plugin/mod.rs`

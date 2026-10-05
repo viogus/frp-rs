@@ -7518,6 +7518,41 @@ nothing about whether the described behaviour still holds.
   earlier seams. Reviews: verification **MERGE-with-findings** and adversarial **MERGE-with-findings**, every finding
   being a figure in the *author's report* (the move arithmetic, the payload join basis, a stale-cite count) rather
   than anything in the tree. Ledger unchanged at **3 open / 232 closed / 235 headers**.
+
+  **Progress (2026-10-04, code head `f25e4b10` on `dsh/m23-p2-s2-registration`, PR #493, based on `707b826a`).** The
+  third **P2** seam (S2) landed: the registration path moved byte-for-byte into the new child module
+  `frp-client/src/service/registration.rs` (815 lines) — the frame-plumbing block (base `service.rs:505-688` = **184
+  lines / 8531 bytes, `cmp`-identical**) with `RegFrameHdr`, the three `RegReadStage`/`RegStageDone`/`RegTimerKind`
+  enums and the two `reg_frame_*` readers, plus `register_proxies` (base `:1874-2480` = 607 lines / 35 848 bytes
+  including its 13-line doc comment). `frp-client/src/service.rs` 4467 → **3681**. **Exactly one line is not
+  mechanical**: `async fn register_proxies` became `pub(super) async fn register_proxies`, because its only callers
+  are the parent (`service.rs:1300`) and the sibling `service::tests` (`tests.rs:930`) — a private item is `E0624`
+  from both, so `pub(super)` is the minimal grant (probe-confirmed; `pub(crate)`/`pub` would widen and moving a call
+  would change more). **No re-export was needed** this time — all seven moved names are referenced only inside the
+  moved text — which both reviewers established **by search**, the same way S1's mandatory `store.rs:592` re-export
+  was established. The moved `select!` block (the F10 response loop, now `registration.rs:488`) is unchanged by
+  construction: zero `tokio::spawn`, zero `unsafe`, exactly one `select!`, with 5 `break`s and 5 `continue`s all
+  inside it. (An `.await` count is recorded as **19 lines / 20 occurrences** — the two review rounds counted those
+  two ways because `registration.rs:418` carries two awaits on one line, and both are right under their own scope.) Two measured corrections to this seam's brief: its part-1 span `505-687` stopped one line
+  before `reg_frame_payload_read`'s closing brace (the coherent block is `505-688`), and its `register_proxies` count
+  excluded the doc comment (`1887-2480`/594 reproduces exactly *for that scope*) — both conventions are now stated in
+  the plan. **29 expectation rows were re-pointed by content** over nine files, each confirmed against the *old*
+  fingerprint, with one cite changing file (`admin_config_get_warning.rs` → `service/registration.rs:115`); `checked`
+  and `weak` are unchanged at **579 / 107** (two of the re-points sit on repeated-text lines and were already weak,
+  which is why the weak count does not move). The table was re-baked with `guard_data_pin`; in the **code** commit `SCEN10_REGION_SHA` was a verified **no-op**
+  (that commit changed no `.sh` file and no cite inside the region), while the records commits that followed did
+  re-bake it because their cite re-points included lines inside the region — so **this record deliberately states no
+  region literal either**, for the same reason it states none for the table: the authoritative values are the file's
+  own constant and `ci.yml`'s `guard_pin`, which the step checks. The pin audit reports 20/0 either way. No `CHANGELOG.md`
+  bullet, matching the earlier seams. Reviews: verification **MERGE-with-findings** (one NIT) and adversarial
+  **MERGE-with-findings**, both finding the tree clean. Ledger now **4 open / 232 closed / 236 headers** — the fourth
+  is the mis-aim filed at the end of this file, on both reviewers' recommendation.
+  *On the mis-aim this seam disclosed rather than fixed:* the `admin_config_get_warning.rs` comment's two rows witness
+  incidental lines (`registration.rs:115` is `.map_err(|e| {`; `service.rs:599` is `)`, a line whose text occurs
+  16×), and the provenance reaches back before S0 (the same text sat at `service.rs:604` at `9346923c^`). The seam
+  re-pointed it by content and deleted one now-false clause, touching no code; both reviewers judged that the right
+  scope for a pure-move PR and asked for the item above, which is filed with the correct targets the comment itself
+  already names (`frpc/src/main.rs:621`, `frp-client/src/admin.rs:771`).
   *On the stale locators this seam leaves in this file:* `TODO.md` is a point-in-time record, and the pathline guard
   classifies its source-path locators as point-in-time (`excluded` — counted and reported, never enforced), so its
   `frp-client/src/service.rs:NNNN` locators are **frozen as history** rather than cascaded —
@@ -11421,3 +11456,20 @@ other.
   (2). This record supersedes the same sentence in **two** dated records — the `:7083` M-19 paragraph here and the
   plan's M-19 "Landed so far" entry (`docs/refactor-large-modules.md`, the `http.rs:97-101` clause) — both of
   which were true at `6f712517`: that cite is `http.rs:110-114` as of this PR.
+
+- [ ] **A live cite in `frpc/tests/admin_config_get_warning.rs` aims at incidental lines.**
+  Evidence: the comment's two rows witness lines that do not carry what the prose claims — after the P2 S2 move it
+  cites `frp-client/src/service/registration.rs:115` (which is `.map_err(|e| {`) and `frp-client/src/service.rs:599`
+  (a line whose text is just `)`, occurring **16×** in that file). The same comment already names better targets
+  (`frp-client/src/admin.rs:771`, unique) and the OIDC-gate statement near `frpc/src/main.rs:621` (itself a `}` line
+  repeated 120×, so not a good target as-is), so the fix is to make the rows witness the claimed lines or
+  to name the witness lines in the prose. Provenance: at `9346923c^` the identical `.map_err(|e| {` sat at
+  `service.rs:604`, so this has been mis-aimed since before the S0 seam; the S2 seam re-pointed it **by content only**
+  (the fingerprint is stable, so `scripts/tests/pathline-cite-guard.sh` cannot see the mis-aim) and deleted one
+  now-false clause, and **both reviewers of PR #493 independently recommended filing it rather than fixing it inside a
+  pure-move PR** — the same disposition the M-18/M-20 mis-aim got before it was closed by PR #490.
+  **Done-when:** each row witnesses a line that carries the claim the comment makes (or the prose names the lines the
+  rows actually witness), the pathline expectations are re-baked in the same commit, and the guard still reports
+  `101/0` and its current `checked` count, with any `weak`/`weak_set` change explained in the same commit — a
+  semantic re-aim to a unique witness will legitimately *shrink* the weak set, since these rows are weak precisely
+  because their targets are repeated-text lines.
