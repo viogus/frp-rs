@@ -566,7 +566,7 @@ the de-indented original apart from a whitespace-only `matches!` reflow, `contin
 follows the `select!` inside the loop) and one dropped `&` at the `remove_vnet_tun` writer argument
 (type-exact, since the parameter is already `&Arc<…>`; the `needless_borrow` explanation did not reproduce — see below). Skeleton invariants unchanged (4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, no
 `biased;` in code), and twelve `heartbeat_wire_order.rs` cites were re-pointed with every header pin identical.
-**12 arms remain**, in the order the table gives.
+**13 arms remain across 11 rows**, in five groups and in the order the table gives.
 
 **S3** (PR #494) — `service/message_loop.rs` (1219 lines) holds `run_message_loop` plus its three companion types and three retry items; across 1181 moved lines the **only** delta is **eleven `pub(super)` tokens** (the method; the three types; and `SessionChannels`' seven fields, which the parent's field-named literal requires — found by compilation, `E0451`). A plain `use message_loop::{…}` suffices; no re-export was needed. The loop skeleton is byte-identical (persisted partial-frame read, one persistent heartbeat `Sleep` re-armed at the loop top, no `biased;` — the third is why `frp-client/tests/partial_frame_survives_competing_ping_tick.rs`, unchanged by this seam, still witnesses the invariants from the child module), and **S3b did not happen** (the new file declares exactly one `fn`). `service.rs` 3681 → 2512.
 
@@ -611,16 +611,18 @@ with its span/bytes/sha, terminality argument and delta list — so a single rev
 | group | arms | measured spans at `main` = `9f75d9e0` | LOC |
 |---|---|---|---:|
 | **A** | `NatHoleClient` + `NatHoleResp` + `NewProxyResp` | `:326-347` + `:348-386` + `:387-428` | 103 |
-| **B** | vnet trio (`VnetRouteAdvertise`/`VnetPacket`/`VnetRouteRemove`) | `:430-499` + `:501-535` + `:537-569` | 138 |
+| **B** | vnet trio (`VnetRouteAdvertise`/`VnetPacket`/`VnetRouteRemove`) | `:430-499` + `:501-535` + `:537-569` | 138 measured, vs the table's 141 — the row counts the three blank separator lines between the trio's arms, which the per-arm spans do not |
 | **C** | ping tick + proxy retry tick | `:580-665` + `:667-796` | 216 |
 | **D1** | XTCP notify → STUN + STUN result + `xtcp_cleanup` (share `pending_xtcp`/`xtcp_sockets`) | `:876-978` + `:982-1012` + `:1020-1032` | 147 |
-| **D2** | health event + visitor request | `:798-858` + `:1037-1071` | 96 |
+| **D2** | health event + visitor request | `:798-858` + `:1037-1071` | 96 — **mechanism, not adjacency**: both are event→side-effect handlers on the control connection (proxy health transitions; visitor requests) that no other group covers, which is why they pair despite straddling D1 |
 
 Every measured LOC above matches the row's own figure for that arm (e.g. ping 86, retry 130, STUN result 31,
 `xtcp_cleanup` 13), so the table's **sizes** were right all along — only its **line numbers** were pre-S3 and stale.
 **C stays its own group on purpose, but not for the reason first written here.** Measured across the eleven arms,
-**no remaining arm takes an async write or a lock at all** — the landed `CloseProxy` arm was the only lock-heavy one —
-and C's two arms take only *read* guards. What actually distinguishes C is that it is the only group carrying a
+the eleven arms take **only short-lived, single-lock critical sections** (measured: 27 lock/write/read uses, including
+six `self.proxy_info_map.write().await` — one of them at `:784`, inside C's retry arm — plus `route_table.write().await`
+and `vnet_peer_routes.lock()`), so lock *volume* does not distinguish the groups; what does is that the **ordering**
+hazard lives in the functions these arms call (`try_reload`, the `:758-762` note). What actually distinguishes C is that it is the only group carrying a
 **documented ordering invariant**: the lock-order note at `:758-762` plus the retry arm's own "both locks' writers
 run only in this message-loop task" obligation. **D1 owns the largest hidden surface** — the only three `tokio::spawn`s
 among the eleven, plus three shared NAT-hole maps (`pending_xtcp`, `xtcp_sockets`, `visitor_pending`), so its review
