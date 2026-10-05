@@ -324,107 +324,13 @@ impl Service {
                             warn!(error = %err.error, "Server error: {}", err.error);
                         }
                         Ok(FrpMessage::NatHoleClient(nhc)) => {
-                            // F2 cancel-before-reinsert guard: a reload removal
-                            // or health Close at an earlier iteration cancelled
-                            // this proxy's P2P token; a NatHoleClient the server
-                            // already queued must not re-arm a fresh uncancelled
-                            // token here (the punch/bridge would then run until
-                            // the peer closes). Bail before the insert — the same
-                            // guard therefore covers the spawn in
-                            // handle_nat_hole_client (no token, no punch).
-                            if !self.punch_proxy_still_live(&nhc.proxy_name).await {
-                                debug!(proxy_name = %nhc.proxy_name, "Ignoring NatHoleClient for dead proxy '{}'", nhc.proxy_name);
-                                continue;
-                            }
-                            let proxy_token = self
-                                .p2p_bridge_tokens
-                                .lock()
-                                .await
-                                .entry(nhc.proxy_name.clone())
-                                .or_insert_with(CancellationToken::new)
-                                .clone();
-                            self.handle_nat_hole_client(*nhc, &writer, ctx.v2, ctx.session_alive.clone(), proxy_token).await;
+                            self.handle_nat_hole_client_arm(nhc, ctx, &writer).await;
                         }
                         Ok(FrpMessage::NatHoleResp(resp)) => {
-                            // Lazily resolve the provider's cancel token from the
-                            // sid → proxy_name map. A visitor-routed resp (or an
-                            // unknown sid) has no pending provider proxy; the
-                            // fresh inert token it gets is never inserted into
-                            // the map and simply stays uncancelled.
-                            let sid = resp.sid.clone().unwrap_or_default();
-                            let proxy_name = if sid.is_empty() {
-                                None
-                            } else {
-                                ctx.pending_xtcp.get(&sid).cloned()
-                            };
-                            // F2 cancel-before-reinsert guard, same race as the
-                            // NatHoleClient arm: a reload removal or health Close
-                            // cancelled this proxy's P2P token at an earlier
-                            // iteration; a NatHoleResp the server already queued
-                            // must not re-arm a fresh uncancelled token. Reclaim
-                            // the sid's socket + pending_xtcp entries so the
-                            // bailed resp cannot leak the STUN UDP socket.
-                            let proxy_token = match proxy_name {
-                                Some(name) if !name.is_empty() => {
-                                    if !self.punch_proxy_still_live(&name).await {
-                                        debug!(proxy_name = %name, "Ignoring NatHoleResp for dead proxy '{}'", name);
-                                        ctx.pending_xtcp.remove(&sid);
-                                        ctx.xtcp_sockets.lock().await.remove(&sid);
-                                        continue;
-                                    }
-                                    self
-                                        .p2p_bridge_tokens
-                                        .lock()
-                                        .await
-                                        .entry(name)
-                                        .or_insert_with(CancellationToken::new)
-                                        .clone()
-                                }
-                                _ => CancellationToken::new(),
-                            };
-                            self.handle_nat_hole_resp(*resp, &mut ctx.pending_xtcp, &mut ctx.visitor_pending, &ctx.xtcp_sockets, &writer, ctx.session_alive.clone(), proxy_token).await;
+                            self.handle_nat_hole_resp_arm(resp, ctx, &writer).await;
                         }
                         Ok(FrpMessage::NewProxyResp(resp)) => {
-                            if let Some(err) = resp.error.as_ref().filter(|e| !e.is_empty()) {
-                                warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
-                                // Update phase if proxy was being retried (WaitStart -> StartErr).
-                                let mut map = self.proxy_info_map.write().await;
-                                if let Some(info) = map.get_mut(&resp.proxy_name) {
-                                    if info.phase == ProxyPhase::WaitStart {
-                                        info.err = err.clone();
-                                        info.phase = ProxyPhase::StartErr(err.clone());
-                                        // Anchor the StartErr retry on the error
-                                        // time (Go frp: lastStartErr.Add(
-                                        // startErrTimeout)) so the next tick
-                                        // does not immediately re-send.
-                                        last_start_err.insert(
-                                            resp.proxy_name.clone(),
-                                            Instant::now(),
-                                        );
-                                    }
-                                }
-                            } else {
-                                // Successful registration from retry path.
-                                // Accept it from WaitStart (normal) or
-                                // StartErr (a healthy response that just
-                                // missed the 30s retry deadline must not
-                                // be thrown away — Go frp keeps
-                                // re-registering until the response
-                                // lands).
-                                let mut map = self.proxy_info_map.write().await;
-                                if let Some(info) = map.get_mut(&resp.proxy_name) {
-                                    if info.phase == ProxyPhase::WaitStart
-                                        || matches!(info.phase, ProxyPhase::StartErr(_))
-                                    {
-                                        if let Some(ref remote) = resp.remote_addr {
-                                            info.remote_addr.clone_from(remote);
-                                        }
-                                        info.err.clear();
-                                        info.phase = ProxyPhase::Running;
-                                        info!(proxy_name = %resp.proxy_name, "Proxy '{}' re-registered", resp.proxy_name);
-                                    }
-                                }
-                            }
+                            self.handle_new_proxy_resp_arm(resp, &mut last_start_err).await;
                         }
                         #[cfg(feature = "vnet")]
                         Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
@@ -1248,5 +1154,323 @@ impl Service {
         // just deleted — punch_proxy_still_live must reject
         // it (matches the health-Close CheckFailed marking
         // in HealthEvent).
+    }
+
+    /// Handle a server-sent `NatHoleClient` (XTCP provider side): drop the
+    /// frame if the proxy's P2P bridge token was already cancelled (a reload
+    /// removal or a health Close), otherwise arm the token and delegate the
+    /// punch to `Self::handle_nat_hole_client`.
+    ///
+    /// Extracted from the `run_message_loop` `NatHoleClient` arm by the P2 S3b
+    /// seam (group A). The arm was terminal — nothing follows the `select!`
+    /// inside the loop, so its `continue` resumed at the loop top, which is
+    /// exactly where falling off this body lands — and that `continue` is the
+    /// `return` here. It bound to the message loop, not to an inner one: the
+    /// arm contains no `for`/`while`/`loop` (the only textual match is the
+    /// English word "for" inside a log string). Called inline from the loop,
+    /// never spawned: the retry arm's lock-order note ("both locks' writers
+    /// run only in this message-loop task") holds only while that stays true.
+    async fn handle_nat_hole_client_arm(
+        &self,
+        nhc: Box<msg::NatHoleClient>,
+        // `&mut`, not `&`: `SessionCtx` holds the boxed reader half, so it is
+        // `Send` but NOT `Sync` — a shared `&SessionCtx` held across this fn's
+        // awaits makes `run_message_loop`'s future non-`Send`, which the
+        // spawned `client_service.run()` call sites require. The body only
+        // reads `ctx.v2` and `ctx.session_alive`, so the exclusive borrow is a
+        // type-level requirement, not a mutation.
+        ctx: &mut SessionCtx,
+        #[cfg_attr(not(feature = "vnet"), allow(unused_variables))] writer: &Arc<ControlWriter>,
+    ) {
+        // F2 cancel-before-reinsert guard: a reload removal
+        // or health Close at an earlier iteration cancelled
+        // this proxy's P2P token; a NatHoleClient the server
+        // already queued must not re-arm a fresh uncancelled
+        // token here (the punch/bridge would then run until
+        // the peer closes). Bail before the insert — the same
+        // guard therefore covers the spawn in
+        // handle_nat_hole_client (no token, no punch).
+        if !self.punch_proxy_still_live(&nhc.proxy_name).await {
+            debug!(proxy_name = %nhc.proxy_name, "Ignoring NatHoleClient for dead proxy '{}'", nhc.proxy_name);
+            return;
+        }
+        let proxy_token = self
+            .p2p_bridge_tokens
+            .lock()
+            .await
+            .entry(nhc.proxy_name.clone())
+            .or_insert_with(CancellationToken::new)
+            .clone();
+        self.handle_nat_hole_client(*nhc, writer, ctx.v2, ctx.session_alive.clone(), proxy_token)
+            .await;
+    }
+
+    /// Handle a server-sent `NatHoleResp`: resolve the sid's provider proxy,
+    /// refuse one whose P2P bridge token was already cancelled (reclaiming its
+    /// sid's socket and `pending_xtcp` slot), otherwise arm the token and
+    /// delegate to `Self::handle_nat_hole_resp`.
+    ///
+    /// Extracted from the `run_message_loop` `NatHoleResp` arm by the P2 S3b
+    /// seam (group A). The arm was terminal — nothing follows the `select!`
+    /// inside the loop, so its `continue` resumed at the loop top, which is
+    /// exactly where falling off this body lands — and that `continue` is the
+    /// `return` here. It sat inside the `match proxy_name` (a match, not a
+    /// loop) and bound to the message loop; the arm contains no
+    /// `for`/`while`/`loop` (the only textual match is the English word "for"
+    /// inside a log string). Called inline from the loop, never spawned, for
+    /// the reason the previous handler records.
+    async fn handle_nat_hole_resp_arm(
+        &self,
+        resp: Box<msg::NatHoleResp>,
+        // `&mut` for the same type-level reason as `handle_nat_hole_client_arm`;
+        // this body additionally takes disjoint `&mut`/`&` borrows of three of
+        // `ctx`'s own fields in the delegate call.
+        ctx: &mut SessionCtx,
+        #[cfg_attr(not(feature = "vnet"), allow(unused_variables))] writer: &Arc<ControlWriter>,
+    ) {
+        // Lazily resolve the provider's cancel token from the
+        // sid → proxy_name map. A visitor-routed resp (or an
+        // unknown sid) has no pending provider proxy; the
+        // fresh inert token it gets is never inserted into
+        // the map and simply stays uncancelled.
+        let sid = resp.sid.clone().unwrap_or_default();
+        let proxy_name = if sid.is_empty() {
+            None
+        } else {
+            ctx.pending_xtcp.get(&sid).cloned()
+        };
+        // F2 cancel-before-reinsert guard, same race as the
+        // NatHoleClient arm: a reload removal or health Close
+        // cancelled this proxy's P2P token at an earlier
+        // iteration; a NatHoleResp the server already queued
+        // must not re-arm a fresh uncancelled token. Reclaim
+        // the sid's socket + pending_xtcp entries so the
+        // bailed resp cannot leak the STUN UDP socket.
+        let proxy_token = match proxy_name {
+            Some(name) if !name.is_empty() => {
+                if !self.punch_proxy_still_live(&name).await {
+                    debug!(proxy_name = %name, "Ignoring NatHoleResp for dead proxy '{}'", name);
+                    ctx.pending_xtcp.remove(&sid);
+                    ctx.xtcp_sockets.lock().await.remove(&sid);
+                    return;
+                }
+                self.p2p_bridge_tokens
+                    .lock()
+                    .await
+                    .entry(name)
+                    .or_insert_with(CancellationToken::new)
+                    .clone()
+            }
+            _ => CancellationToken::new(),
+        };
+        self.handle_nat_hole_resp(
+            *resp,
+            &mut ctx.pending_xtcp,
+            &mut ctx.visitor_pending,
+            &ctx.xtcp_sockets,
+            writer,
+            ctx.session_alive.clone(),
+            proxy_token,
+        )
+        .await;
+    }
+
+    /// Apply one server `NewProxyResp` to `proxy_info_map`: a non-empty error
+    /// moves a `WaitStart` proxy to `StartErr` and anchors its retry clock in
+    /// `last_start_err`; success accepts `WaitStart` or `StartErr` as
+    /// `Running`.
+    ///
+    /// Extracted from the `run_message_loop` `NewProxyResp` arm by the P2 S3b
+    /// seam (group A). The arm is terminal and carries no `continue`, so its
+    /// body is the de-indented original apart from rustfmt reflow. It takes no
+    /// ctx at all: the arm reads only `self.proxy_info_map` and the loop-local
+    /// `last_start_err` (never a `SessionCtx` field). Directly exercised by
+    /// this module's `#[cfg(test)] mod tests`.
+    async fn handle_new_proxy_resp_arm(
+        &self,
+        resp: msg::NewProxyResp,
+        last_start_err: &mut HashMap<String, Instant>,
+    ) {
+        if let Some(err) = resp.error.as_ref().filter(|e| !e.is_empty()) {
+            warn!(proxy_name = %resp.proxy_name, error = %err, "Proxy '{}' registration error: {}", resp.proxy_name, err);
+            // Update phase if proxy was being retried (WaitStart -> StartErr).
+            let mut map = self.proxy_info_map.write().await;
+            if let Some(info) = map.get_mut(&resp.proxy_name) {
+                if info.phase == ProxyPhase::WaitStart {
+                    info.err = err.clone();
+                    info.phase = ProxyPhase::StartErr(err.clone());
+                    // Anchor the StartErr retry on the error
+                    // time (Go frp: lastStartErr.Add(
+                    // startErrTimeout)) so the next tick
+                    // does not immediately re-send.
+                    last_start_err.insert(resp.proxy_name.clone(), Instant::now());
+                }
+            }
+        } else {
+            // Successful registration from retry path.
+            // Accept it from WaitStart (normal) or
+            // StartErr (a healthy response that just
+            // missed the 30s retry deadline must not
+            // be thrown away — Go frp keeps
+            // re-registering until the response
+            // lands).
+            let mut map = self.proxy_info_map.write().await;
+            if let Some(info) = map.get_mut(&resp.proxy_name) {
+                if info.phase == ProxyPhase::WaitStart
+                    || matches!(info.phase, ProxyPhase::StartErr(_))
+                {
+                    if let Some(ref remote) = resp.remote_addr {
+                        info.remote_addr.clone_from(remote);
+                    }
+                    info.err.clear();
+                    info.phase = ProxyPhase::Running;
+                    info!(proxy_name = %resp.proxy_name, "Proxy '{}' re-registered", resp.proxy_name);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proxy_info(phase: ProxyPhase) -> ProxyRuntimeInfo {
+        ProxyRuntimeInfo {
+            local_addr: "127.0.0.1:8080".to_string(),
+            proxy_type: "tcp".to_string(),
+            use_encryption: false,
+            use_compression: false,
+            sk: String::new(),
+            bandwidth_limit: 0,
+            bandwidth_limit_mode: String::new(),
+            bandwidth_limiter: None,
+            proxy_protocol_version: String::new(),
+            plugin: String::new(),
+            remote_addr: String::new(),
+            err: String::new(),
+            config_snapshot: String::new(),
+            phase,
+        }
+    }
+
+    async fn test_service() -> Service {
+        let cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed")
+    }
+
+    /// The extracted `NewProxyResp` arm, driven directly. That arm has no
+    /// wire-level lane (no test puts a `NewProxyResp` on the wire to a client
+    /// `Service`), so this is the direct test for the phase and
+    /// `last_start_err` transitions it owns: an error moves
+    /// `WaitStart` -> `StartErr`, records the message and anchors the retry
+    /// clock; success accepts `WaitStart` and `StartErr` as `Running`
+    /// (clearing the error and copying `remote_addr`); a `Running` proxy and
+    /// an unknown proxy are left untouched by both branches.
+    #[tokio::test]
+    async fn new_proxy_resp_arm_moves_phase_and_anchors_retry() {
+        let service = test_service().await;
+        {
+            let mut map = service.proxy_info_map.write().await;
+            map.insert("user.p1".to_string(), proxy_info(ProxyPhase::WaitStart));
+            map.insert("user.p2".to_string(), proxy_info(ProxyPhase::WaitStart));
+            map.insert("user.p3".to_string(), proxy_info(ProxyPhase::Running));
+        }
+        let mut last_start_err: HashMap<String, Instant> = HashMap::new();
+
+        // Non-empty error on a WaitStart proxy -> StartErr + retry anchor.
+        service
+            .handle_new_proxy_resp_arm(
+                msg::NewProxyResp {
+                    proxy_name: "user.p1".to_string(),
+                    remote_addr: None,
+                    error: Some("port already used".to_string()),
+                },
+                &mut last_start_err,
+            )
+            .await;
+        // Unknown proxy: neither branch may panic or anchor a clock.
+        service
+            .handle_new_proxy_resp_arm(
+                msg::NewProxyResp {
+                    proxy_name: "user.unknown".to_string(),
+                    remote_addr: None,
+                    error: Some("boom".to_string()),
+                },
+                &mut last_start_err,
+            )
+            .await;
+
+        {
+            let map = service.proxy_info_map.read().await;
+            let p1 = map.get("user.p1").expect("p1 present");
+            match &p1.phase {
+                ProxyPhase::StartErr(e) => assert_eq!(e, "port already used"),
+                other => panic!("expected StartErr, got {}", other.as_str()),
+            }
+            assert_eq!(p1.err, "port already used");
+            let p3 = map.get("user.p3").expect("p3 present");
+            assert_eq!(
+                p3.phase.as_str(),
+                "running",
+                "the error branch must not touch a Running proxy"
+            );
+        }
+        assert!(
+            last_start_err.contains_key("user.p1"),
+            "the StartErr retry clock must be anchored on the error"
+        );
+        assert!(
+            !last_start_err.contains_key("user.unknown"),
+            "an unknown proxy must not anchor a retry clock"
+        );
+
+        // Success from WaitStart -> Running.
+        service
+            .handle_new_proxy_resp_arm(
+                msg::NewProxyResp {
+                    proxy_name: "user.p2".to_string(),
+                    remote_addr: Some("1.2.3.4:7001".to_string()),
+                    error: None,
+                },
+                &mut last_start_err,
+            )
+            .await;
+        // Empty (not absent) error is success, and StartErr may still recover.
+        service
+            .handle_new_proxy_resp_arm(
+                msg::NewProxyResp {
+                    proxy_name: "user.p1".to_string(),
+                    remote_addr: Some("1.2.3.4:7002".to_string()),
+                    error: Some(String::new()),
+                },
+                &mut last_start_err,
+            )
+            .await;
+
+        {
+            let map = service.proxy_info_map.read().await;
+            let p2 = map.get("user.p2").expect("p2 present");
+            assert_eq!(p2.phase.as_str(), "running");
+            assert_eq!(p2.remote_addr, "1.2.3.4:7001");
+            assert!(p2.err.is_empty());
+            let p1 = map.get("user.p1").expect("p1 present");
+            assert_eq!(p1.phase.as_str(), "running");
+            assert_eq!(p1.remote_addr, "1.2.3.4:7002");
+            assert!(p1.err.is_empty());
+            let p3 = map.get("user.p3").expect("p3 present");
+            assert_eq!(p3.phase.as_str(), "running");
+            assert!(
+                p3.remote_addr.is_empty(),
+                "the success branch must not touch a Running proxy"
+            );
+        }
     }
 }

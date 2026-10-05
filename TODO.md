@@ -7690,6 +7690,44 @@ the measured spans), which is why this item stays open. *(This sentence previous
 both numbers were wrong — the table has twelve data rows (its block is fourteen `|`
 lines: header, separator, then the twelve rows), and one row (the `vnet trio`) covers three arms, so the table
 names fourteen arms in twelve rows; that extra count is the likely origin of the miscount.)*
+  **Progress (2026-10-04, code head `8be584f6` on `dsh/m31-s3b-group-a`, PR #501, based on `3ea66f81`).** The first
+  **grouped** S3b PR landed: group **A** (the three NAT-hole / proxy-response arms — `NatHoleClient` base `:326-347`,
+  `NatHoleResp` `:348-386`, `NewProxyResp` `:387-428`; 22 + 39 + 42 lines) became three `.await`ed calls plus the private
+  handlers `handle_nat_hole_client_arm` / `handle_nat_hole_resp_arm` / `handle_new_proxy_resp_arm`, taking
+  `message_loop.rs` 1252 → **1476**. **This group carried two of the program's three remaining `continue;` → `return;`
+  transformations** (old `:337`, and `:373` inside the nested `match proxy_name`), each proved separately — nothing
+  follows the `select!` inside the loop, neither `continue` sits in an inner loop, and no arm contains a `LoopExit::` —
+  so the file's `continue;` count fell **3 → 1** (the last is ping tick `:650`, group C). Per arm the deltas are
+  enumerated: `NatHoleClient` 3 (`continue`→`return`, `&writer`→`writer`, one reflow; token streams equal, 714 == 714),
+  `NatHoleResp` 4 (same two plus two reflows and one join), `NewProxyResp` 1 (reflow only — no `continue`, no `writer`).
+  **Both `&writer` → `writer` drops were justified by re-running the lint**, not by citing it (re-adding the `&` gives
+  rc 101 with `clippy::needless_borrow`) — which is the rule this program adopted after being burned twice by un-rerun
+  attributions. `NewProxyResp` turned out to need **no `SessionCtx` at all** (it reads only `self.proxy_info_map` and the
+  loop-local `last_start_err`, whose `&mut` is threaded in), so it is the first of these arms to get a **direct test**: a
+  new inline `#[cfg(test)] mod tests` driving the handler with **four calls covering five behaviours** over a real
+  `Service` (error→`StartErr`+anchor, unknown proxy untouched, `WaitStart`→`Running`, `StartErr`→`Running`, `Running`
+  untouched); the adversarial round's mutation check found that inverting the phase or `is_empty` condition changes three
+  of its assertions, while the verification round verified the test's content, its call/behaviour counts and that it
+  passes — the two claims are attributed accordingly rather than merged. The two NatHole
+  handlers still have **no direct lane** (they need a full `SessionCtx` + `ControlWriter`) and that gap is stated rather
+  than papered over, with the fix named for a later group. The plan's own coupling rows for these two arms were
+  **directionally wrong** — they listed `p2p_bridge_tokens` as a parameter, but `ctx.p2p_bridge_tokens` is used zero
+  times and both handlers reach it through `&self` — and are corrected in the same records round, because D1's rows have
+  the same shape and would have sent a reviewer hunting a parameter that must not exist. The `writer`-parameter rule is
+  now stated too: `cfg_attr(not(feature = "vnet"), allow(unused_variables))` is needed only when a handler's `writer` is
+  used *solely* inside vnet-gated code (removing it from these two gives rc 0; removing it from the landed
+  `handle_close_proxy` gives rc 101). Cascade: 12 cites re-pointed in `heartbeat_wire_order.rs`, table re-baked
+  12/12/567 with `checked`/`weak` unchanged at 579/104, `SCEN10_REGION_SHA` a verified **no-op**, pins 20/20. Gates:
+  fmt and both clippy shapes rc 0; workspace tests **2690 passed / 2 failed**, both the known host failures and both
+  re-triaged (the `127.0.0.2` bind reproduced with a base-built binary; the all-features `log_completion` case shown not
+  to link `frp-client`, with a byte-identical `frps` artifact either way); **13/13 health step bodies rc 0 before the
+  commit and again on the committed head**; compat **86/0**; protocol-matrix **11/0**. Reviews: adversarial
+  **MERGE-with-findings** — it judged the **per-arm checklist "the strongest artefact this program has produced"**, 9/9
+  rows independently re-derived, with only the loop-level "nothing follows the `select!`" fact shared — and verification
+  **MERGE**, which re-derived the same 9 rows and confirmed that the checklist meets the condition the regrouping was
+  made conditional on: *a single review pass cannot skip an arm*. Ledger unchanged at **3 open / 234 closed /
+  237 headers**; the plan now records **10 arms across 8 rows** remaining (groups B, C, D1, D2).
+
 
 
 

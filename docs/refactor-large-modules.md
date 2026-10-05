@@ -589,13 +589,25 @@ terminal, so its `continue` becomes a plain `return`.
 | ping tick 3335–3420 | 86 | `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, writer |
 | XTCP notify → STUN 3631–3733 | 103 | `xtcp_sockets`, `stun_result_tx`, `nat_hole_stun_server`; spawns |
 | health event 3553–3613 | 61 | `p2p_bridge_tokens`, `proxy_info_map`, `health_proxy_configs`, `v2`, `cfg_user`, writer |
-| `NewProxyResp` 3142–3183 | 42 | `proxy_info_map` + `&mut last_start_err` |
-| `NatHoleResp` 3103–3141 | 39 | `&mut pending_xtcp`, `xtcp_sockets`, `&mut visitor_pending`, `p2p_bridge_tokens`, writer |
+| ~~`NewProxyResp`~~ **landed** (PR #501) | 42 | base `:387-428` / 2881 B / `41fc390d…` → `handle_new_proxy_resp_arm`; coupling: `&mut last_start_err` only — **no `ctx` at all**; `proxy_info_map` reached via `&self`; and it gains the **first direct test** of these arms (the inline `mod tests`) |
+| ~~`NatHoleResp`~~ **landed** (PR #501) | 39 | base `:348-386` / 2625 B / `1fdfffd5…` → `handle_nat_hole_resp_arm`; coupling: `&mut SessionCtx` (`&mut pending_xtcp`, `&mut visitor_pending`, `&xtcp_sockets`, `session_alive`) and `writer`; **`p2p_bridge_tokens` is reached via `&self`, not passed** (the row listed it as a parameter, which is what sent this group's brief wrong) |
 | visitor request 3792–3826 | 35 | `&mut visitor_pending`, `xtcp_cleanup_tx`, `v2`, writer; spawns |
 | STUN result 3737–3767 | 31 | `&mut pending_xtcp`, `xtcp_sockets`, `stun_result_rx`, writer; spawns |
-| `NatHoleClient` 3081–3102 | 22 | `punch_proxy_still_live`, `p2p_bridge_tokens`, `session_alive`, writer |
+| ~~`NatHoleClient`~~ **landed** (PR #501) | 22 | base `:326-347` / 1498 B / `f4ff263c…` → `handle_nat_hole_client_arm`; coupling: `&mut SessionCtx`, `writer`, `punch_proxy_still_live`, `session_alive`; **`p2p_bridge_tokens` via `&self`** (split `self` / `.p2p_bridge_tokens` / `.lock()` across lines at `:1197-1199`, which is why a joined-literal grep misses it) |
 | vnet trio 3184–3324 | 141 | `cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`; 3 gates |
 | `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
+
+**`writer`-parameter rule, from group A (PR #501).** A handler needs
+`#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` **only when its `writer` is used solely inside
+`#[cfg(feature = "vnet")]` code**. Measured both ways: removing the attribute from the landed `handle_close_proxy` gives
+rc 101 (`unused variable: writer`), while removing it from the two group-A handlers gives rc 0 — so on those two it
+suppresses a genuine future warning rather than documenting a constraint, and it should be dropped when they are next
+touched. Group A is also the precedent for the checklist: each arm's row carries its own `continue` census, its own
+`LoopExit::` count and its own stripped inner-loop scan, with only the loop-level "nothing follows the `select!`" fact
+shared — which is what makes a grouped PR reviewable arm by arm.
+This correction is not cosmetic for group **D1**: its `xtcp_cleanup` and STUN rows have the same shape as the two NatHole
+rows (they list state that is in fact reached through `&self`), so without it D1's brief would have sent its author hunting
+parameters that must not exist.
 
 **Regrouping (decided after arm 1 landed, 2026-10-04).** The row's original "one per PR" predates the first arm, when
 the recipe, the signature constraint and the coverage gap were all unknown. Arm 1 (`CloseProxy`, PR #498) established
@@ -647,13 +659,21 @@ is a type-level requirement rather than a stylistic one — the landed handler o
 seam also showed that a handler's `writer` parameter needs
 `#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` (rc 101 without it in the non-`vnet` `-D warnings`
 shape), and that the landed arm's coupling list in the table above needs regenerating (it uses no `plugin_handles` and no
-	`self.cfg`). It also showed that **none of these arms has a direct test lane**: no test puts a `CloseProxy` (or most other arm
+	`self.cfg`). It also showed that **none of these arms had a direct test lane when the first arm landed**: no test puts a `CloseProxy` (or most other arm
 inputs) on the wire to a client `Service`. The landed extraction makes such a test cheap, but it needs either
 `pub(super)` on the handler (the same minimal widening S2 and S4 needed — a sibling test module cannot see a private
 method, `E0624`) or an inline `#[cfg(test)] mod` in `message_loop.rs`; the first arm deliberately did not add one,
-and it should be added with a later arm rather than left as a note.
+and it should be added with a later arm rather than left as a note. **Group A did add one** (PR #501): `NewProxyResp`
+needs no `SessionCtx`, so `handle_new_proxy_resp_arm` is driven directly by a new inline `#[cfg(test)] mod tests`
+(four calls covering five behaviours over a real `Service`; the adversarial round's mutation check found an inverted
+phase or `is_empty` condition changes three of its assertions); the two
+NatHole handlers still have no lane, for exactly the `SessionCtx` + `ControlWriter` reason above. One distinction worth
+keeping straight: group A's two `&writer` → `writer` drops **are** clippy-forced (re-adding the `&` gives rc 101 with
+three `needless_borrow` errors), whereas the landed `CloseProxy` arm's was lint-clean type-exactness — so a dropped `&`
+in this file is justified by measurement each time, never by the precedent.
 
-Order: `CloseProxy` (landed) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`) → **B** (vnet trio) → **C**
+Order: `CloseProxy` (landed, PR #498) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`; **landed, PR #501**) →
+**B** (vnet trio — the next group) → **C**
 (ping, retry) → **D1** (XTCP/STUN/cleanup) → **D2** (health/visitor); within a group, the arms may go in either
 order as long as each keeps its own proof. Leave the
 3–11-line arms inline. **Handlers must be `.await`ed inline, never spawned** — the
