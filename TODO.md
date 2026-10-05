@@ -7493,8 +7493,8 @@ nothing about whether the described behaviour still holds.
   **P2** seam (S1) landed: `frp-client/src/service/reload_apply.rs` (674 lines, declared `mod reload_apply;`) now holds
   six items moved byte-for-byte out of `service.rs` — `request_reload`, `close_wire_name_for_reload`, `try_reload`,
   `reload_from_sources` (540 of the 645 moved lines), `filter_active_proxies` and `filter_active_visitors`;
-  `frp-client/src/service.rs` 5107 → **4467**. The measured payload is **645 lines / 31 533 bytes** — larger than this
-  seam's brief said (620) because **the brief's per-item counts excluded each item's doc comment**, and the brief's
+  `frp-client/src/service.rs` 5107 → **4467**. The measured payload is **645 lines / 31 533 bytes** (each span joined with a trailing newline; line-joined they
+  total 31 527) — larger than this seam's brief said (620) because **the brief's per-item counts excluded each item's doc comment**, and the brief's
   sha256 prefixes used a different join convention; the author re-derived every figure from the base revision instead
   of trusting the brief, and the reviewers confirmed all six blocks are line-for-line identical base↔head **including
   their doc comments** (only the new `//!` module header is new). The move arithmetic, corrected in review: **five
@@ -7511,16 +7511,18 @@ nothing about whether the described behaviour still holds.
   plugin/health state, Step 7 last). **36 expectation rows were re-pointed by content** across 11 citing files, and the
   checked count rose **577 → 579** — a genuine *extend*, verified by finding both new rows (the new module comment's
   `store.rs:592` cite and a test comment's extended path) and confirming nothing was dropped; the weak population
-  stayed **107** with `weak_set` re-keyed `f9c334c1…` → `d32d0bec…`, the table re-baked to `03766d54…` (= the step's
-  `guard_data_pin`) and `guard_cites`/`guard_cites_floor` raised with it to 579. No `CHANGELOG.md` bullet, matching the
+  stayed **107** with `weak_set` re-keyed `f9c334c1…` → `d32d0bec…`, the table re-baked (`03766d54…` at the code
+  seam, re-baked here to `4bf2c176a651…`) and `guard_cites`/`guard_cites_floor` raised with it to 579. No `CHANGELOG.md` bullet, matching the
   earlier seams. Reviews: verification **MERGE-with-findings** and adversarial **MERGE-with-findings**, every finding
   being a figure in the *author's report* (the move arithmetic, the payload join basis, a stale-cite count) rather
   than anything in the tree. Ledger unchanged at **3 open / 232 closed / 235 headers**.
-  *On the ~38 stale locators this seam leaves in this file:* `TODO.md` is a point-in-time record and no guard scans it
-  as a citing file, so its `frp-client/src/service.rs:NNNN` locators are **frozen as history** rather than cascaded —
-  the reviewers agreed that is the right call, and the counts they measured differ slightly (25 distinct lines; 37
-  occurrences in one round, 38 in the other, the difference being whether one line already stale before S1 is
-  counted). Only locators inside *open* items' Done-when clauses would need re-pointing, and no open item has one.
+  *On the stale locators this seam leaves in this file:* `TODO.md` is a point-in-time record, and the pathline guard
+  classifies its source-path locators as point-in-time (`excluded` — counted and reported, never enforced), so its
+  `frp-client/src/service.rs:NNNN` locators are **frozen as history** rather than cascaded —
+  the reviewers agreed that is the right call. Measured with the full pattern
+  (`frp-client/src/service\.rs:[0-9]+(-[0-9]+)?`) the count is **38 locators (32 single-line + 6 line-ranges) across
+  26 distinct tokens**, at both heads; an earlier round's 25/37 came from a single-line-only pattern that dropped the
+  ranges. Only locators inside *open* items' Done-when clauses would need re-pointing, and no open item has one.
 
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
