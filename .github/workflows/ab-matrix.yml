@@ -2,7 +2,7 @@ name: A/B Matrix (throughput gate)
 
 # Detects throughput regressions against a dedicated VPS (exclusive CPU).
 #
-# THE GATE IS INFORMATIONAL (TODO.md:10950). A >GATE_PCT delta prints the table
+# THE GATE IS INFORMATIONAL (TODO.md:10952). A >GATE_PCT delta prints the table
 # and a ::warning:: and the job stays GREEN; set AB_GATE_ENFORCE=1 (the
 # `enforce` dispatch input) to restore the hard failure. The decision rests on
 # these numbers, and the script header repeats them:

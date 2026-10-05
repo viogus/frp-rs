@@ -7531,17 +7531,19 @@ nothing about whether the described behaviour still holds.
   would change more). **No re-export was needed** this time — all seven moved names are referenced only inside the
   moved text — which both reviewers established **by search**, the same way S1's mandatory `store.rs:592` re-export
   was established. The moved `select!` block (the F10 response loop, now `registration.rs:488`) is unchanged by
-  construction: zero `tokio::spawn`, zero `unsafe`, exactly one `select!`, with 20 `.await`s, 5 `break`s and 5
-  `continue`s all inside it. Two measured corrections to this seam's brief: its part-1 span `505-687` stopped one line
+  construction: zero `tokio::spawn`, zero `unsafe`, exactly one `select!`, with 5 `break`s and 5 `continue`s all
+  inside it. (An `.await` count was also recorded here and then withdrawn: the two review rounds counted 19 and 20 for
+  the moved text with different scopes, and a figure two careful checkers cannot reconcile is not worth asserting.) Two measured corrections to this seam's brief: its part-1 span `505-687` stopped one line
   before `reg_frame_payload_read`'s closing brace (the coherent block is `505-688`), and its `register_proxies` count
   excluded the doc comment (`1887-2480`/594 reproduces exactly *for that scope*) — both conventions are now stated in
   the plan. **29 expectation rows were re-pointed by content** over nine files, each confirmed against the *old*
   fingerprint, with one cite changing file (`admin_config_get_warning.rs` → `service/registration.rs:115`); `checked`
   and `weak` are unchanged at **579 / 107** (two of the re-points sit on repeated-text lines and were already weak,
   which is why the weak count does not move). The table was re-baked with `guard_data_pin`; in the **code** commit `SCEN10_REGION_SHA` was a verified **no-op**
-  (that commit changed no `.sh` file and no cite inside the region), whereas **this records commit did re-bake it**
-  (`a4077909…` → `6bedda20953f154…`) because the cascade re-pointed cites inside the region; the pin audit reports
-  20/0 either way. No `CHANGELOG.md`
+  (that commit changed no `.sh` file and no cite inside the region), while the records commits that followed did
+  re-bake it because their cite re-points included lines inside the region — so **this record deliberately states no
+  region literal either**, for the same reason it states none for the table: the authoritative values are the file's
+  own constant and `ci.yml`'s `guard_pin`, which the step checks. The pin audit reports 20/0 either way. No `CHANGELOG.md`
   bullet, matching the earlier seams. Reviews: verification **MERGE-with-findings** (one NIT) and adversarial
   **MERGE-with-findings**, both finding the tree clean. Ledger now **4 open / 232 closed / 236 headers** — the fourth
   is the mis-aim filed at the end of this file, on both reviewers' recommendation.
