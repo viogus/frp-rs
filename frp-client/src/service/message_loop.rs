@@ -1964,7 +1964,9 @@ mod tests {
         ctx.client_scopes = vec!["HeartBeats".to_string()];
         let period = Duration::from_millis(10);
         ctx.ping_interval = Some(tokio::time::interval(period));
-        ctx.ping_retry_backoff = None;
+        // `ping_retry_backoff` is already `None` from `test_session_ctx()`, so
+        // the skip path below (which asserts it becomes `Some`) starts from a
+        // clean streak without re-assigning the handler's own line.
 
         service.handle_ping_tick_arm(&mut ctx, &writer).await;
 
