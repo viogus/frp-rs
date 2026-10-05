@@ -562,8 +562,8 @@ which inflated several entries): `run_message_loop` 1109, `register_proxies` 594
 **S3b, first arm** (PR #498, `CloseProxy`) — the arm body (base `:314-429` = 116 lines / 7032 bytes,
 `1e869a6d…`) became one `.await`ed call to a private `handle_close_proxy`; the extracted body is identical to
 the de-indented original apart from a whitespace-only `matches!` reflow, `continue;` → `return;` (sound: nothing
-follows the `select!` inside the loop) and one dropped `&` that `clippy::needless_borrow` rejects (`&&Arc`
-auto-deref, same reference). Skeleton invariants unchanged (4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, no
+follows the `select!` inside the loop) and one dropped `&` at the `remove_vnet_tun` writer argument
+(type-exact, since the parameter is already `&Arc<…>`; the `needless_borrow` explanation did not reproduce — see below). Skeleton invariants unchanged (4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, no
 `biased;` in code), and twelve `heartbeat_wire_order.rs` cites were re-pointed with every header pin identical.
 **12 arms remain**, in the order the table gives.
 
@@ -601,12 +601,14 @@ several arms; a handler **cannot** take a shared `&SessionCtx`. `SessionCtx` own
 `reader: Option<BoxedReadHalf>` where `BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>`, so
 `SessionCtx: Send + !Sync` ⇒ `&SessionCtx: !Send`; holding that shared reference across a handler's `await`s makes
 `run_message_loop`'s future non-`Send` and breaks `tokio::spawn(client_service.run())` at its test call sites
-(`E0277`, reproduced by two independent rounds: `Sync` not implemented → `Box<dyn …>` → `Option<Box<…>>` →
+(the reproducible failure is `E0308` "types differ in mutability" at the call site; one round additionally reported
+	the chain `Sync` not implemented → `Box<dyn …>` → `Option<Box<…>>` →
 `SessionCtx` → `&SessionCtx`). **Every handler here takes `&mut SessionCtx`** (or a disjoint field borrow), which
 is a type-level requirement rather than a stylistic one — the landed handler only *reads* `cfg_user`/`v2`. The same
 seam also showed that a handler's `writer` parameter needs
 `#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` (rc 101 without it in the non-`vnet` `-D warnings`
-shape), and that **none of these arms has a direct test lane**: no test puts a `CloseProxy` (or most other arm
+shape), and that the landed arm's coupling list in the table above needs regenerating (it uses no `plugin_handles` and no
+	`self.cfg`). It also showed that **none of these arms has a direct test lane**: no test puts a `CloseProxy` (or most other arm
 inputs) on the wire to a client `Service`. The landed extraction makes such a test cheap, but it needs either
 `pub(super)` on the handler (the same minimal widening S2 and S4 needed — a sibling test module cannot see a private
 method, `E0624`) or an inline `#[cfg(test)] mod` in `message_loop.rs`; the first arm deliberately did not add one,

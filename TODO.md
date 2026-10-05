@@ -7653,16 +7653,23 @@ nothing about whether the described behaviour still holds.
   program's first non-pure-move change**, so the evidence bar changed with it: the extracted body is identical to the
   de-indented original apart from a whitespace-only `matches!` reflow, `continue;` → `return;` (proved sound: nothing
   follows the `select!` inside the loop, so the old `continue` and the handler's fall-through land in the same place)
-  and one dropped `&` that `clippy::needless_borrow` rejects under `-D warnings` — an `&&Arc` auto-deref passing the
-  same reference. The skeleton invariants are untouched (**4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, and no
+  and one dropped `&` at the `remove_vnet_tun` writer argument (the parameter is already `&Arc<ControlWriter>`, so
+  passing `writer` directly is type-exact — the author and one reviewer attributed the drop to
+  `clippy::needless_borrow`, and the other re-added `&writer` and got a clean `-D warnings` build, so it is recorded
+  as type-exactness rather than a lint forcing it). The skeleton invariants are untouched (**4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, and no
   `biased;` in code** — the three textual hits are prose), the handler is `.await`ed inline and never spawned, and
   `partial_frame_survives_competing_ping_tick.rs` still passes. **Two findings from this arm change the remaining
   twelve's briefs.** (1) **The plan's coupling column is wrong for every arm**: a handler cannot take `&SessionCtx` at
   all — `SessionCtx` owns `reader: Option<BoxedReadHalf>` (`Box<dyn AsyncRead + Unpin + Send>`), so it is
   `Send + !Sync` and a shared borrow held across the handler's awaits makes `run_message_loop`'s future non-`Send`,
-  breaking the `tokio::spawn(client_service.run())` test call sites; `E0277` was reproduced independently by both
-  review rounds, and the correct signature is **`&mut SessionCtx`** — a type-level requirement, not a style choice
-  (the landed handler only reads). The row also omitted `self.cfg`, and a handler's `writer` parameter needs
+  breaking the `tokio::spawn(client_service.run())` test call sites. The reproducible failure is **`E0308`** ("types
+  differ in mutability") at the new call site and at the pre-existing `handle_req_work_conn`; one round also reported
+  the `!Sync`/`Send` chain as `E0277` and the other could not reproduce that error code, so the Send obligation is
+  recorded as the *reason* rather than as a reproduced error. Either way the correct signature is **`&mut SessionCtx`**
+  — a type-level requirement, not a style choice (the landed handler only reads). The row's coupling list also needs regenerating from the landed handler — measured, it uses `proxy_info_map`,
+  `p2p_bridge_tokens`, the seven `vnet_*` fields, `channels` and `writer`, and **not** `plugin_handles` or `self.cfg`
+  (the first report claimed the row omitted `self.cfg`; the verifying round measured that this arm does not use it). A
+  handler's `writer` parameter needs
   `#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` (rc 101 without it in the non-vnet `-D warnings`
   shape). (2) **None of these arms has a direct test lane** — no test puts a `CloseProxy` on the wire to a client
   `Service` (the only producer is the server's dashboard delete path), so the arm is covered only indirectly; the
