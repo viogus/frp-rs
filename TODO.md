@@ -7821,7 +7821,8 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   that need no peer. **My own two claims about this group were falsified by measurement and are corrected rather than
   defended:** (1) the M-31 note said D1's rows "have the same shape" as the NatHole rows, i.e. that they list state
   reached through `&self` — measured, all three base spans and all three handlers contain **zero `self.` uses** (`ctx.`
-  1/4/2), so D1's state arrives through the single `&mut SessionCtx`; the rows' real defects are that they present
+  1/4/2 occurrences, 4/4/2 distinct fields — both bases named, since they differ), so D1's state arrives through the single
+  `&mut SessionCtx`; the rows' real defects are that they present
   `ctx` fields as parameters and that the STUN row omits the loop-local `xtcp_cleanup_tx` and `ctx.v2` (both fixed in
   the table). The adversarial round that first reported the `&self` shape — correctly, for group A's NatHole arms —
   **retracted its transfer to D1 in the same round**. (2) My brief attributed the file's four `tokio::spawn` grep hits

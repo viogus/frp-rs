@@ -611,9 +611,10 @@ shared — which is what makes a grouped PR reviewable arm by arm.
 **This correction does *not* generalise to every later group, and the earlier claim that it did was wrong.** An M-31 draft
 said it was "not cosmetic for group **D1**" because those rows "have the same shape" (state reached through `&self`).
 Measured when D1 actually landed (PR #504): all three of its base spans and all three handlers contain **zero** `self.`
-uses (`ctx.` 1/4/2), so D1's state does arrive through the single `&mut SessionCtx`. Its rows' real defects are narrower —
+uses -- while `ctx.` counts **1/4/2 occurrences, or 4/4/2 distinct fields** (the two bases differ, so both are named) --
+so D1's state does arrive through the single `&mut SessionCtx`. Its rows' real defects are narrower —
 they present `ctx` fields as if they were separate parameters, and the STUN row omits the **loop-local** `xtcp_cleanup_tx`
-and `ctx.v2`. Both the adversarial round that first reported the `&self` shape (about group A's NatHole arms, where
+(which that handler's signature carries as `xtcp_cleanup_tx: &mpsc::Sender<String>`) and `ctx.v2`. Both the adversarial round that first reported the `&self` shape (about group A's NatHole arms, where
 `self.p2p_bridge_tokens` really is used) and this record now say so: the clause was dropped rather than defended, because
 a mechanism measured in one group is not evidence about another.
 
