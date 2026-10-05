@@ -40,7 +40,7 @@
 #   9  a `ps` that fails in the exit trap does not turn a live synthetic of ours
 #      into a stranger: an unidentifiable pid we started is still killed.
 #   10 `scripts/compat-test.sh` carries no pattern kill and its XTCP pre-test
-#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:9562).
+#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:9594).
 #   11 that sweep, driven against three real synthetic servers: the
 #      in-`$TEST_DIR` leak started after the baseline is reaped, while the
 #      baseline server and the same-named out-of-tree peer are left alone. This
@@ -339,7 +339,7 @@ enforce_shape() {
 #                Without it, replacing that body with a forged `rc=1`/`out`
 #                behind the identical labels left the suite green (SG-M1,
 #                measured by the adversarial reviewer).
-#   scenario-10  TODO.md:9562's fix: the input derivation (`compat_src=`, the
+#   scenario-10  TODO.md:9594's fix: the input derivation (`compat_src=`, the
 #                comment strip) *and* both assertion blocks. Pinning only the
 #                two verdict blocks left the line that produces the text they
 #                read unpinned, so a forged input — a literal string containing
@@ -369,7 +369,7 @@ enforce_shape() {
 # name, deleting a marker or reassigning `self` all red instead of silently
 # shrinking the guarded set.
 SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
-SCEN10_REGION_SHA='a4077909b26ceb8a837b94eab2916a5fc7c6b298741985f0506d5321bf8fed4b'
+SCEN10_REGION_SHA='6bedda20953f154c4ad4c1a037d50730f5165470986da6200fabdeb0d3d099b5'
 SCEN12_REGION_SHA='6742cb4ea68f2ecb9baa13910fd0ba250507e44368935085711b4cd68d8fa159'
 SCEN13_REGION_SHA='071ade36c23aa45df0908f633a3e2f9686574fd672c9d83796526bdf0db24a67'
 PINNED_REGIONS='scenario-2 scenario-10 scenario-12 scenario-13'
@@ -1381,7 +1381,7 @@ else
   kill -9 "$victim9b" 2>/dev/null || true
 fi
 
-# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:9562) ------
+# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:9594) ------
 # `run_xtcp_test` used two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls,
 # which select any process on the host whose command line carries that pattern —
 # a developer's unrelated run, or a sibling worktree's compat run. The
@@ -1411,9 +1411,9 @@ else
   bad "compat-test.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
 fi
 xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
-# TODO.md:9562 replaced *two* pattern kills with a pid-exact pair, so the
+# TODO.md:9594 replaced *two* pattern kills with a pid-exact pair, so the
 # scenario has to see both halves inside `run_xtcp_test`: the tracked-pid reaper
-# (`cleanup_pids`, TODO.md:9562's first replacement) and the guard's baseline-aware
+# (`cleanup_pids`, TODO.md:9594's first replacement) and the guard's baseline-aware
 # census sweep (`reap_scoped_strays`). Pinning only the latter let a mutant that
 # deleted the `cleanup_pids` call stay green (measured, reviewer 1).
 xtcp_calls=$(printf '%s\n' "$xtcp_body" | grep -cE '^[[:space:]]*cleanup_pids([[:space:]]|$)' || true)
@@ -1422,7 +1422,7 @@ case "$xtcp_body" in *'reap_scoped_strays'*) xtcp_sweep=true ;; esac
 if $xtcp_sweep && [ "$xtcp_calls" -ge 1 ]; then
   ok 'compat-test.sh: run_xtcp_test sweeps with cleanup_pids and reap_scoped_strays'
 else
-  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:9562 needs both, one per pkill -f it replaced"
+  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:9594 needs both, one per pkill -f it replaced"
 fi
 # --- end substance pin: scenario-10 ---
 
