@@ -2363,7 +2363,7 @@ fn verify_accepts_vhost_http_timeout_both_spellings_and_prints_go_line() {
 /// `strconv.ParseInt: … value out of range` on stderr naming the flag in its
 /// hyphen form and 0 bytes on stdout.
 ///
-/// **Which parts of the refusal are contractual (R4, `TODO.md:10537`).** The
+/// **Which parts of the refusal are contractual (R4, `TODO.md:10589`).** The
 /// sentence is not: frp-rs prints 84 B
 /// ``Error: couldn't parse `9999999999999999999`: number too large to fit in
 /// target type`` — bpaf's wording — where Go prints 2214 B (`strconv.ParseInt`'s
@@ -2451,7 +2451,7 @@ fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
     }
 }
 
-/// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:10514`). Go registers
+/// `-l` is **not** a shorthand on `frps` (R5, `TODO.md:10566`). Go registers
 /// `log_level` with an empty shorthand (`pkg/config/flags.go:244`,
 /// `cmd.PersistentFlags().StringVarP(&c.Log.Level, "log_level", "", …)`), so
 /// `frps -c cfg -l ""` is rc **1** there too — but pflag's wording is

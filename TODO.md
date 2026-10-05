@@ -7847,6 +7847,58 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   the M-33 records commit's message:* it said `TODO.md` went 11731 → 11766; the tree reads **11770** at that head (the
   plan's 1145 was right). Ledger unchanged at **3 open / 234 closed / 237 headers**; the plan records **2 arms across 2
   rows** remaining — group D2, the last.
+  **Progress (2026-10-05, code head `698ce44b` on `dsh/m35-s3b-group-d2`, PR #505, based on `fac8511b`) — S3b is
+  complete.** The fifth and **last** grouped PR landed: group **D2**, the health-event arm (base `:375-435`, 61L /
+  4154 B / `708b6b21…`) and the visitor-request arm (`:484-518`, 35L / 2285 B / `af0bd955…`), became
+  `handle_health_event_arm` (`:1506-1575`) and `handle_visitor_request_arm` (`:1620-1660`), taking `message_loop.rs`
+  2551 → **2917**. It is the only group justified by **mechanism rather than adjacency** (the two arms are
+  non-contiguous, D1's cluster between them, and both are event → side-effect handlers on the control connection that no
+  other group covers). Deltas: health **2 rustfmt reflows only** (tokens 633 = 633) and visitor **0 deltas** — the
+  program's **second zero-delta arm** — with **0 statements added, removed or reordered and 0 `&` drops**; both handler
+  bodies were re-measured token-by-token and are identical to their base bodies apart from the arm's own closing brace.
+  **With this PR every S3b row is landed: all 12 data rows / 14 arms** (`CloseProxy` #498, A #501, B #502, C #503, D1
+  #504, D2 #505), and that was verified **three times independently of the plan's table** — by the author's census, by the
+  adversarial round walking the 12 rows against the merged tree, and by the verifying round counting the merged `select!`
+  directly: it holds exactly **14 handler calls** (`handle_close_proxy` plus thirteen `*_arm`), i.e. exactly the 14 arms — which matters here because the table is exactly what
+  this program has learned not to trust. What remains inline in `run_message_loop` is what the plan excludes: the six
+  small `match msg` arms, `reload`, `stop`, the watchdog, `writer.wait_failed`, the read arm's plumbing and the two
+  timer futures whose bodies are now handler calls. **Two things about this seam are worth more than the extraction.**
+  (1) **The health arm carries a real ordering obligation**, and it was checked rather than assumed: it takes
+  `self.p2p_bridge_tokens.lock()` **then** writes `self.proxy_info_map`, the **inverse** of `handle_close_proxy`'s order,
+  which that handler's own comment already names as "the lock order used by HealthEvent" (preserved at `:600-603`);
+  it therefore stays inline and is never spawned, while the visitor arm legitimately spawns exactly one off-loop cleanup.
+  (2) **The M-31 coupling correction is a per-row fact, not a general one — and both of my generalisations of it were
+  wrong.** I first said D1's rows "have the same shape" as the NatHole rows (state via `&self`); D1 measured zero `self.`
+  uses, so I rewrote the plan to say the correction "does not generalise". This group falsified *that* too: D2 landed
+  **one row of each shape in a single PR** — the health row uses `self.` (5 uses / 3 fields) exactly as group A's
+  NatHole rows do, while the visitor row is `ctx.`-only (`self.` = 0) exactly as D1's three are. The plan now says
+  **derive each row's mechanism from the arm, never from another group**, and each row was additionally corrected (the
+  health row presented `ctx` fields as parameters; the visitor row omitted the loop-owned `xtcp_cleanup_tx`, which its
+  handler's signature carries as `&mpsc::Sender<String>`). A third correction of mine belongs here: my brief told the
+  author that the health arm is what group C's reworded comment describes — it is not; that comment is in the **read
+  arm** (`:285-286`). The `writer` rule was settled per handler in the no-vnet shape (both handlers use it
+  unconditionally, so neither carries the attribute: removal gives rc 101 `unused variable: writer`), and the `cfg`
+  census is recorded **with its counting rule** (production region **11 real attributes** = 7 `vnet` + 1
+  `any(target_os)` + 3 `cfg_attr`, raw `#[cfg` lines 16) — the fifth case in this program where two careful measurers
+  reported different, all-correct numbers for the same thing, and the plan now requires the rule to be named. Coverage:
+  the gap is closed for both arms with two **mutation-witnessed** tests (dropping the token cancel reds the health test;
+  inlining the visitor spawn reds the other), and the round also established that `health_plugin_registration.rs` is
+  **not** coverage — it emits no `HealthEvent` — so the new test is those branches' only witness. The weak-cite header is
+  byte-identical (`checked=579 weak=104 weak_set=dbbea851…`), so no repeat of group C's test-induced regression. Cascade:
+  12 cites re-pointed by fingerprint, table re-baked 12/12/567, region a verified **no-op**, pins 20/20, **13/13 health
+  step bodies rc 0 on the frozen tree before the commit and again on the head** (the sweep is one `set -e` script whose
+  last step is the commit, so a failing sweep aborts it — the gate my own earlier error had skipped). Gates: workspace
+  **2700 passed / 2 failed** (both known host failures re-triaged; no `AddrInUse`/`ConnectionRefused`), compat **86/0**,
+  protocol-matrix **11/0**, fmt/clippy/both feature shapes rc 0. Reviews: adversarial **MERGE-with-findings** and
+  verification **MERGE**. *Errata carried into this message:* the health step I reported as "step 9" was the 0-indexed
+  extracted-body file, i.e. 1-indexed step 10 (`TODO.md cross-file citation gate`), and the `ctx.` usage I recorded as
+  "1/4/2" is the joined-literal count — the same arms measure 7/6/2 counting split `ctx`/`.field` forms and 4/4/2 as
+  distinct fields, so all three bases are named here rather than one. *Harness observation, for a decision rather than a
+  claim:* three different fixture suites in the `health` job have now flaked exactly once each across the last four
+  rounds (M-29 step 9, M-33 step 6, M-35 step 11 "canaries seen: 8/11"), each passing on isolated re-runs and on the
+  next full sweep. Ledger unchanged at **3 open / 234 closed / 237 headers**; the plan's S3b section now states that all
+  12 rows are landed and that `run_message_loop` is a dispatch skeleton rather than a large function.
+
 
 
 
