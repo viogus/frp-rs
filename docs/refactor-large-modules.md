@@ -559,6 +559,14 @@ which inflated several entries): `run_message_loop` 1109, `register_proxies` 594
 
 **S4+S5** (PR #495, grouped) — `service/session.rs` (1363 lines) and `service/health.rs` (166 lines) hold the session and health paths; across 1449 moved lines the **entire** delta is **five `pub(super)` tokens plus one rustfmt signature reflow** (adding `pub(super) ` pushed `shutdown_visitor_tasks`' signature past 100 columns). This is the seam that needed a *new* tool rather than a re-export: `health_check_monitored` and `healthy_resets_error_count` are free functions with **unqualified** callers in `service.rs`, `session.rs`, `registration.rs`, `reload_apply.rs` and the test module, so the parent gained a **private** `use health::{…};` — a private `use` is visible to `service` and its descendants, i.e. exactly the original reach (probe-confirmed: deleting it fails with four `E0425`s), and nothing outside `service` names any of the eleven items. `service.rs` 2512 → **1072**. **With S3b excepted this closes the plan's P2 table**; the 1072 remaining lines are the deliberately-retained glue (`SessionCtx`, `Service` and their `impl`s, plus helpers).
 
+**S3b, first arm** (PR #498, `CloseProxy`) — the arm body (base `:314-429` = 116 lines / 7032 bytes,
+`1e869a6d…`) became one `.await`ed call to a private `handle_close_proxy`; the extracted body is identical to
+the de-indented original apart from a whitespace-only `matches!` reflow, `continue;` → `return;` (sound: nothing
+follows the `select!` inside the loop) and one dropped `&` that `clippy::needless_borrow` rejects (`&&Arc`
+auto-deref, same reference). Skeleton invariants unchanged (4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, no
+`biased;` in code), and twelve `heartbeat_wire_order.rs` cites were re-pointed with every header pin identical.
+**12 arms remain**, in the order the table gives.
+
 **S3** (PR #494) — `service/message_loop.rs` (1219 lines) holds `run_message_loop` plus its three companion types and three retry items; across 1181 moved lines the **only** delta is **eleven `pub(super)` tokens** (the method; the three types; and `SessionChannels`' seven fields, which the parent's field-named literal requires — found by compilation, `E0451`). A plain `use message_loop::{…}` suffices; no re-export was needed. The loop skeleton is byte-identical (persisted partial-frame read, one persistent heartbeat `Sleep` re-armed at the loop top, no `biased;` — the third is why `frp-client/tests/partial_frame_survives_competing_ping_tick.rs`, unchanged by this seam, still witnesses the invariants from the child module), and **S3b did not happen** (the new file declares exactly one `fn`). `service.rs` 3681 → 2512.
 
 **S2** (PR #493) — `service/registration.rs` (815 lines) holds the registration frame plumbing (base `service.rs:505-688`, byte-identical) and `register_proxies` (base `:1874-2480`), the latter identical **except one visibility token**: `pub(super)` was required because its only callers are the parent (`service.rs:1300`) and the sibling `service/tests.rs:930`, and a private item is `E0624` from both (probe-confirmed). **No re-export was needed** — unlike S1, all seven moved names are referenced only inside the moved text (verified by full-tree search in both review rounds). `service.rs` 4467 → 3681. The stray-guard region was a verified **no-op** in the code commit (no `.sh` file changed and no cite inside it moved) — the first such cascade since the region mechanism was understood — while the records commit that followed did re-bake it, because its cite re-points included lines inside the region.
@@ -575,7 +583,7 @@ terminal, so its `continue` becomes a plain `return`.
 
 | Arm (lines) | LOC | Coupling to pass |
 |---|---:|---|
-| `CloseProxy` 2956–3071 | 116 | `&SessionCtx`, `proxy_info_map`, `health_cancels`, `p2p_bridge_tokens`, vnet fields, `plugin_handles`, writer |
+| ~~`CloseProxy`~~ **landed** (PR #498) | 116 | **`&mut SessionCtx` — not `&SessionCtx`** (see the correction below), `proxy_info_map`, `health_cancels`, `p2p_bridge_tokens`, the seven vnet fields, `plugin_handles`, writer, **plus `self.cfg`** (which this row omitted; read once in the vnet teardown) |
 | proxy retry tick 3422–3551 | 130 | `&mut SessionCtx` (`waitstart_seen`), `&mut last_start_err`, `proxies`, `cfg`, `proxy_info_map`, writer |
 | ping tick 3335–3420 | 86 | `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, writer |
 | XTCP notify → STUN 3631–3733 | 103 | `xtcp_sockets`, `stun_result_tx`, `nat_hole_stun_server`; spawns |
@@ -587,6 +595,22 @@ terminal, so its `continue` becomes a plain `return`.
 | `NatHoleClient` 3081–3102 | 22 | `punch_proxy_still_live`, `p2p_bridge_tokens`, `session_alive`, writer |
 | vnet trio 3184–3324 | 141 | `cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`; 3 gates |
 | `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
+
+**Correction to every row above, from the first landed arm (PR #498).** The coupling column says `&SessionCtx` for
+several arms; a handler **cannot** take a shared `&SessionCtx`. `SessionCtx` owns
+`reader: Option<BoxedReadHalf>` where `BoxedReadHalf = Box<dyn AsyncRead + Unpin + Send>`, so
+`SessionCtx: Send + !Sync` ⇒ `&SessionCtx: !Send`; holding that shared reference across a handler's `await`s makes
+`run_message_loop`'s future non-`Send` and breaks `tokio::spawn(client_service.run())` at its test call sites
+(`E0277`, reproduced by two independent rounds: `Sync` not implemented → `Box<dyn …>` → `Option<Box<…>>` →
+`SessionCtx` → `&SessionCtx`). **Every handler here takes `&mut SessionCtx`** (or a disjoint field borrow), which
+is a type-level requirement rather than a stylistic one — the landed handler only *reads* `cfg_user`/`v2`. The same
+seam also showed that a handler's `writer` parameter needs
+`#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` (rc 101 without it in the non-`vnet` `-D warnings`
+shape), and that **none of these arms has a direct test lane**: no test puts a `CloseProxy` (or most other arm
+inputs) on the wire to a client `Service`. The landed extraction makes such a test cheap, but it needs either
+`pub(super)` on the handler (the same minimal widening S2 and S4 needed — a sibling test module cannot see a private
+method, `E0624`) or an inline `#[cfg(test)] mod` in `message_loop.rs`; the first arm deliberately did not add one,
+and it should be added with a later arm rather than left as a note.
 
 Order: `CloseProxy` → retry → ping → STUN spawn → health → `NewProxyResp` →
 `NatHoleResp` → visitor → STUN result → `NatHoleClient` → vnet trio. Leave the

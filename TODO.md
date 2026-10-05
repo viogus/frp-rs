@@ -7645,6 +7645,41 @@ nothing about whether the described behaviour still holds.
   S5 was done rather than skipped. That leaves **S3b** — the arm bodies of `run_message_loop`, which the plan itself
   scopes as "one per PR" — as the only remaining P2 row, which is why this item stays open. Ledger unchanged at
   **4 open / 232 closed / 236 headers**.
+  **Progress (2026-10-04, code head `93292af3` on `dsh/m28-s3b-closeproxy-arm`, PR #498, based on `d00b2a6f`).** The
+  **first arm of S3b** landed — the plan's own follow-on row, "the arm bodies of `run_message_loop`, one per PR", so
+  this is the first PR of a 13-arm program rather than another module seam. The `CloseProxy` arm (base
+  `service/message_loop.rs:314-429` = **116 lines / 7032 bytes / `1e869a6d…`**) is now a single `.await`ed call at
+  `:314` plus a private `impl Service` method `handle_close_proxy`; `message_loop.rs` 1219 → 1253. **This is the
+  program's first non-pure-move change**, so the evidence bar changed with it: the extracted body is identical to the
+  de-indented original apart from a whitespace-only `matches!` reflow, `continue;` → `return;` (proved sound: nothing
+  follows the `select!` inside the loop, so the old `continue` and the handler's fall-through land in the same place)
+  and one dropped `&` that `clippy::needless_borrow` rejects under `-D warnings` — an `&&Arc` auto-deref passing the
+  same reference. The skeleton invariants are untouched (**4 vnet gates, 3 `tokio::spawn`, 7 `.expect(`, and no
+  `biased;` in code** — the three textual hits are prose), the handler is `.await`ed inline and never spawned, and
+  `partial_frame_survives_competing_ping_tick.rs` still passes. **Two findings from this arm change the remaining
+  twelve's briefs.** (1) **The plan's coupling column is wrong for every arm**: a handler cannot take `&SessionCtx` at
+  all — `SessionCtx` owns `reader: Option<BoxedReadHalf>` (`Box<dyn AsyncRead + Unpin + Send>`), so it is
+  `Send + !Sync` and a shared borrow held across the handler's awaits makes `run_message_loop`'s future non-`Send`,
+  breaking the `tokio::spawn(client_service.run())` test call sites; `E0277` was reproduced independently by both
+  review rounds, and the correct signature is **`&mut SessionCtx`** — a type-level requirement, not a style choice
+  (the landed handler only reads). The row also omitted `self.cfg`, and a handler's `writer` parameter needs
+  `#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` (rc 101 without it in the non-vnet `-D warnings`
+  shape). (2) **None of these arms has a direct test lane** — no test puts a `CloseProxy` on the wire to a client
+  `Service` (the only producer is the server's dashboard delete path), so the arm is covered only indirectly; the
+  extraction makes a direct test cheap, but it needs either `pub(super)` on the handler (a sibling test module cannot
+  see a private method — `E0624`, the same minimal widening S2 and S4 needed) or an inline `#[cfg(test)] mod` in
+  `message_loop.rs`. The first arm deliberately did not add one, and the record says it should arrive with a later
+  arm rather than stay a note. Cascade: 12 cites re-pointed in `heartbeat_wire_order.rs` (fingerprint-preserving, and
+  the table's `pins:` header came out **byte-identical** because none of them is weak), `checked`/`weak` unchanged at
+  579/104, `SCEN10_REGION_SHA` a verified no-op, exactly one pin refreshed (`guard_data_pin` → `01d1ea97…`), audit
+  20/20. Gates: fmt/clippy/default/non-vnet `-D warnings` rc 0; workspace tests 2689 passed with only the two known
+  host failures, both re-triaged against binaries built from the base; **13/13 health step bodies rc 0 twice** (before
+  the commit and on the committed head); compat **86/0**; protocol-matrix **11/0**. Reviews: adversarial
+  **MERGE-with-findings** (its one change-requiring finding was in the author's *report* — it said the handler could
+  be unit-tested "from `service/tests.rs`", which is impossible while the method is private; that is why the sentence
+  above names `pub(super)` or an inline test) and verification **MERGE**. Ledger unchanged at **3 open / 234 closed /
+  237 headers**; **12 of the plan's 13 S3b arms remain**, which is why this item stays open.
+
 
 
   **Progress (2026-10-01, code head `a618f281` on `refactor/fileify-proxy-ops`, PR #453).** P4
