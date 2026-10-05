@@ -312,120 +312,7 @@ impl Service {
                             }
                         }
                         Ok(FrpMessage::CloseProxy(cp)) => {
-                            info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
-                            // Registration race: a server CloseProxy for an
-                            // OLD registration can land while a same-name
-                            // reload re-registration (phase New/WaitStart) is
-                            // in flight. Marking it Closed would kill the NEW
-                            // proxy — Closed is excluded from the retry loop
-                            // and the health-monitor kill below is not re-armed
-                            // — so skip the teardown when a registration is
-                            // pending; the authoritative phase comes from its
-                            // NewProxyResp. (Go deletes the entry by name —
-                            // same-keyed semantics — so this is client-side
-                            // robustness beyond parity.)
-                            let kill = {
-                                let mut map = self.proxy_info_map.write().await;
-                                match map.get_mut(&cp.proxy_name) {
-                                    Some(info)
-                                        if matches!(
-                                            info.phase,
-                                            ProxyPhase::New | ProxyPhase::WaitStart
-                                        ) =>
-                                    {
-                                        false
-                                    }
-                                    Some(info) => {
-                                        info.phase = ProxyPhase::Closed;
-                                        true
-                                    }
-                                    None => true, // absent: still reap stale handles
-                                }
-                            };
-                            if !kill {
-                                continue;
-                            }
-                            // Cancel health check task and remove map entry.
-                            let mut cancels = channels.health_cancels.lock().await;
-                            if let Some(cancel) = cancels.get(&cp.proxy_name) {
-                                cancel.store(true, Ordering::Relaxed);
-                            }
-                            cancels.remove(&cp.proxy_name);
-                            // Cancel any XTCP P2P bridge tasks for this proxy
-                            // and drop the token (a re-registered proxy gets a
-                            // fresh token via lazy get_or_insert_with).
-                            let mut tokens = self.p2p_bridge_tokens.lock().await;
-                            if let Some(token) = tokens.remove(&cp.proxy_name) {
-                                token.cancel();
-                            }
-                            // Mirror the reload-removal path (try_reload
-                            // commit phase): drop the local plugin listener
-                            // handle — PluginHandle::Drop fires the shutdown
-                            // oneshot, so the plugin task exits and its bind
-                            // port is released — and tear down the vnet TUN
-                            // controller. Without this, a server-initiated
-                            // CloseProxy (dashboard delete) leaves the plugin
-                            // listener and TUN running even though the proxy
-                            // is gone (finding 2).
-                            //
-                            // plugin_handles and the vnet maps are keyed by
-                            // the BARE proxy name (start_plugin /
-                            // register_vnet_tun), while the wire CloseProxy
-                            // name carries the {user.} prefix — strip it.
-                            let bare_name = if ctx.cfg_user.is_empty() {
-                                cp.proxy_name.clone()
-                            } else {
-                                let prefix = format!("{}.", ctx.cfg_user);
-                                cp.proxy_name
-                                    .strip_prefix(&prefix)
-                                    .unwrap_or(&cp.proxy_name)
-                                    .to_string()
-                            };
-                            // Teardown order mirrors try_reload: vnet TUN
-                            // removal first, then the plugin handle drop.
-                            #[cfg(feature = "vnet")]
-                            {
-                                let vnet = self
-                                    .cfg
-                                    .read()
-                                    .await
-                                    .proxies
-                                    .iter()
-                                    .find(|p| p.name == bare_name)
-                                    .map(|p| p.virtual_net.clone())
-                                    .unwrap_or_default();
-                                remove_vnet_tun(
-                                    &self.vnet_tuns,
-                                    &self.vnet_tun_tx,
-                                    &self.vnet_tun_cancels,
-                                    &self.vnet_tun_names,
-                                    &self.vnet_tun_subnets,
-                                    &self.vnet_controller.route_table(),
-                                    &self.vnet_peer_routes,
-                                    &writer,
-                                    ctx.v2,
-                                    &bare_name,
-                                    &vnet,
-                                )
-                                .await;
-                            }
-                            {
-                                let mut handles = self
-                                    .plugin_handles
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner());
-                                if handles.remove(&bare_name).is_some() {
-                                    debug!(proxy_name = %bare_name, "CloseProxy: dropped plugin handle for '{}'", bare_name);
-                                }
-                            }
-                            // The Closed phase (set above, outside the lock
-                            // order used by HealthEvent): the server's nathole
-                            // session outlives the close (NAT_HOLE_TIMEOUT =
-                            // 10s), so a late NatHoleClient/NatHoleResp would
-                            // otherwise punch/bridge for a proxy the server
-                            // just deleted — punch_proxy_still_live must reject
-                            // it (matches the health-Close CheckFailed marking
-                            // in HealthEvent).
+                            self.handle_close_proxy(cp, ctx, &writer, channels).await;
                         }
                         Ok(FrpMessage::CloseProxyResp(cpr)) => {
                             info!(proxy_name = %cpr.proxy_name, "Server confirmed proxy close: {}", cpr.proxy_name);
@@ -1215,5 +1102,151 @@ impl Service {
                 }
             }
         }
+    }
+
+    /// Handle a server-initiated `CloseProxy` for one proxy: mark it
+    /// `Closed` (unless a same-name registration is in flight), stop its
+    /// health monitor and its XTCP P2P bridge token, and release its local
+    /// resources — the plugin listener handle and the vnet TUN controller —
+    /// mirroring the reload-removal commit phase. A proxy in `New`/
+    /// `WaitStart` is skipped: the `CloseProxy` belongs to an OLD registration
+    /// whose authoritative phase arrives with its own `NewProxyResp`.
+    ///
+    /// Extracted from the `run_message_loop` `CloseProxy` arm by the P2 S3b
+    /// seam. The arm was terminal — nothing follows the `select!` inside the
+    /// loop, so its `continue` resumed at the loop top, which is exactly where
+    /// falling off the branch body lands — and that `continue` is the `return`
+    /// here. Every other statement, its order and all five `.await`s are
+    /// unchanged; the one further delta is the vnet teardown's writer argument
+    /// (`writer`, not the original `&writer`: this parameter is already a
+    /// `&Arc<ControlWriter>`, so the re-borrow is a clippy `needless_borrow` —
+    /// the same reference reaches `remove_vnet_tun`). Called inline from the
+    /// loop, never spawned: the retry arm's lock-order note ("both locks'
+    /// writers run only in this message-loop task") holds only while that stays
+    /// true.
+    async fn handle_close_proxy(
+        &self,
+        cp: msg::CloseProxy,
+        // `&mut`, not `&`: `SessionCtx` holds the boxed reader half, so it is
+        // `Send` but NOT `Sync` — a shared `&SessionCtx` held across this fn's
+        // awaits makes `run_message_loop`'s future non-`Send`, which the
+        // spawned `client_service.run()` call sites in the client integration
+        // tests require. The body only reads `ctx.cfg_user` and `ctx.v2`, so
+        // the exclusive borrow is a type-level requirement, not a mutation.
+        ctx: &mut SessionCtx,
+        // Read only by the vnet teardown below (same reason
+        // `spawn_session_tasks` allows its `proxies` binding unused).
+        #[cfg_attr(not(feature = "vnet"), allow(unused_variables))] writer: &Arc<ControlWriter>,
+        channels: &SessionChannels<'_>,
+    ) {
+        info!(proxy_name = %cp.proxy_name, "Server closed proxy: {}", cp.proxy_name);
+        // Registration race: a server CloseProxy for an
+        // OLD registration can land while a same-name
+        // reload re-registration (phase New/WaitStart) is
+        // in flight. Marking it Closed would kill the NEW
+        // proxy — Closed is excluded from the retry loop
+        // and the health-monitor kill below is not re-armed
+        // — so skip the teardown when a registration is
+        // pending; the authoritative phase comes from its
+        // NewProxyResp. (Go deletes the entry by name —
+        // same-keyed semantics — so this is client-side
+        // robustness beyond parity.)
+        let kill = {
+            let mut map = self.proxy_info_map.write().await;
+            match map.get_mut(&cp.proxy_name) {
+                Some(info) if matches!(info.phase, ProxyPhase::New | ProxyPhase::WaitStart) => {
+                    false
+                }
+                Some(info) => {
+                    info.phase = ProxyPhase::Closed;
+                    true
+                }
+                None => true, // absent: still reap stale handles
+            }
+        };
+        if !kill {
+            return;
+        }
+        // Cancel health check task and remove map entry.
+        let mut cancels = channels.health_cancels.lock().await;
+        if let Some(cancel) = cancels.get(&cp.proxy_name) {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        cancels.remove(&cp.proxy_name);
+        // Cancel any XTCP P2P bridge tasks for this proxy
+        // and drop the token (a re-registered proxy gets a
+        // fresh token via lazy get_or_insert_with).
+        let mut tokens = self.p2p_bridge_tokens.lock().await;
+        if let Some(token) = tokens.remove(&cp.proxy_name) {
+            token.cancel();
+        }
+        // Mirror the reload-removal path (try_reload
+        // commit phase): drop the local plugin listener
+        // handle — PluginHandle::Drop fires the shutdown
+        // oneshot, so the plugin task exits and its bind
+        // port is released — and tear down the vnet TUN
+        // controller. Without this, a server-initiated
+        // CloseProxy (dashboard delete) leaves the plugin
+        // listener and TUN running even though the proxy
+        // is gone (finding 2).
+        //
+        // plugin_handles and the vnet maps are keyed by
+        // the BARE proxy name (start_plugin /
+        // register_vnet_tun), while the wire CloseProxy
+        // name carries the {user.} prefix — strip it.
+        let bare_name = if ctx.cfg_user.is_empty() {
+            cp.proxy_name.clone()
+        } else {
+            let prefix = format!("{}.", ctx.cfg_user);
+            cp.proxy_name
+                .strip_prefix(&prefix)
+                .unwrap_or(&cp.proxy_name)
+                .to_string()
+        };
+        // Teardown order mirrors try_reload: vnet TUN
+        // removal first, then the plugin handle drop.
+        #[cfg(feature = "vnet")]
+        {
+            let vnet = self
+                .cfg
+                .read()
+                .await
+                .proxies
+                .iter()
+                .find(|p| p.name == bare_name)
+                .map(|p| p.virtual_net.clone())
+                .unwrap_or_default();
+            remove_vnet_tun(
+                &self.vnet_tuns,
+                &self.vnet_tun_tx,
+                &self.vnet_tun_cancels,
+                &self.vnet_tun_names,
+                &self.vnet_tun_subnets,
+                &self.vnet_controller.route_table(),
+                &self.vnet_peer_routes,
+                writer,
+                ctx.v2,
+                &bare_name,
+                &vnet,
+            )
+            .await;
+        }
+        {
+            let mut handles = self
+                .plugin_handles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if handles.remove(&bare_name).is_some() {
+                debug!(proxy_name = %bare_name, "CloseProxy: dropped plugin handle for '{}'", bare_name);
+            }
+        }
+        // The Closed phase (set above, outside the lock
+        // order used by HealthEvent): the server's nathole
+        // session outlives the close (NAT_HOLE_TIMEOUT =
+        // 10s), so a late NatHoleClient/NatHoleResp would
+        // otherwise punch/bridge for a proxy the server
+        // just deleted — punch_proxy_still_live must reject
+        // it (matches the health-Close CheckFailed marking
+        // in HealthEvent).
     }
 }
