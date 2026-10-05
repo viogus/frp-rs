@@ -1064,9 +1064,9 @@ mod session;
 // calls `health_check_monitored`, `registration.rs`/`reload_apply.rs` call it
 // through their existing `use super::*;`, `reload_apply.rs` calls
 // `spawn_health_checks` by method-call syntax, and `tests.rs` calls
-// `healthy_resets_error_count`. The two free functions are re-exported with a
-// private `use` because the sibling modules and `tests.rs` still spell them
-// unqualified; a private `use` in this module is visible to `service` and its
-// descendants, which is exactly their original reach.
+// `healthy_resets_error_count`. The parent imports the two free functions
+// with a private `use` because the sibling modules and `tests.rs` still spell
+// them unqualified; a private `use` in this module is visible to `service` and
+// its descendants, which is exactly their original reach.
 mod health;
 use health::{health_check_monitored, healthy_resets_error_count};

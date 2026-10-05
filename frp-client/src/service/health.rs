@@ -13,7 +13,7 @@
 //! `frp-client/src/service/registration.rs` and
 //! `frp-client/src/service/reload_apply.rs`; `healthy_resets_error_count` is
 //! called from `run()` and from `frp-client/src/service/tests.rs`. All three
-//! therefore need `pub(super)`, and the parent re-exports the two free
+//! therefore need `pub(super)`, and the parent imports the two free
 //! functions with a private `use`, which preserves exactly the reach they had
 //! as private items of `service` (unqualified spellings in the sibling and
 //! test modules keep resolving through their existing `use super::*;`). This
