@@ -1129,7 +1129,7 @@ VirtualNet = true
 
 #[test]
 fn test_vhost_http_timeout_is_go_signed_int64() {
-    // `TODO.md:9038`. Go's `VhostHTTPTimeout` field is `int64`
+    // `TODO.md:9071`. Go's `VhostHTTPTimeout` field is `int64`
     // (`pkg/config/v1/server.go`) and the flag is `Int64VarP`
     // (`pkg/config/flags.go:237`), so the file lane accepts a negative value and
     // refuses only what does not fit an `int64`. Measured on Go v0.71.0
@@ -12525,7 +12525,7 @@ fn test_ini_yes_no_bool_inference() {
 /// The field *set* is the daemon's, but the *condition* is not: this gate
 /// refuses either spelling on `verify` regardless of `auth_method`, while the
 /// daemon gates `auth.tokenSource` unconditionally and `auth.oidc_token_source`
-/// only under `auth_method == AuthMethod::Oidc` (`frp-client/src/service.rs:750-753`)
+/// only under `auth_method == AuthMethod::Oidc` (`frp-client/src/service.rs:661-664`)
 /// — measured, `frpc -c` on the `method = "token"` OIDC config above starts and
 /// logs its connection attempts where Go's `frpc -c` exits 1 on the gate line.
 /// The third loop arm pins the fail-closed condition.
