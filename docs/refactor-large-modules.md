@@ -672,7 +672,8 @@ keeping straight: group A's two `&writer` → `writer` drops **are** clippy-forc
 three `needless_borrow` errors), whereas the landed `CloseProxy` arm's was lint-clean type-exactness — so a dropped `&`
 in this file is justified by measurement each time, never by the precedent.
 
-Order: `CloseProxy` (landed) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`) → **B** (vnet trio) → **C**
+Order: `CloseProxy` (landed, PR #498) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`; **landed, PR #501**) →
+**B** (vnet trio — the next group) → **C**
 (ping, retry) → **D1** (XTCP/STUN/cleanup) → **D2** (health/visitor); within a group, the arms may go in either
 order as long as each keeps its own proof. Leave the
 3–11-line arms inline. **Handlers must be `.await`ed inline, never spawned** — the
