@@ -1769,15 +1769,15 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=f635d02bdbfaa6a3633969933addc0d2ca7496984675467f929d136a1d794ab0
+          guard_data_pin=03766d54d02b8b760011cb2cf36d99975fc416ac320eff006388f044164ba81c
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
           # uses: a *falling* count has to move both literals.
-          guard_cites=577
-          guard_cites_floor=577
+          guard_cites=579
+          guard_cites_floor=579
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -2127,7 +2127,7 @@ jobs:
       # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
       # tests with the admin feature". The `admin` flag changes the linked
       # client: the child binds its `[webServer]` and announces it
-      # (`frp-client/src/service.rs:4439`), which is what made the pre-fix
+      # (`frp-client/src/service.rs:4402`), which is what made the pre-fix
       # assertion in `a_config_file_named_after_a_subcommand_stays_a_config_file`
       # a false positive. Re-derived on this tree with
       # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
@@ -3347,7 +3347,7 @@ jobs:
         # `a_config_file_named_after_a_subcommand_stays_a_config_file` was
         # invisible in this configuration. That hid a red: it read run mode's own
         # admin bind line (`frpc admin server starting on 127.0.0.1:<port>`,
-        # `frp-client/src/service.rs:4439`) as a dial of the config's
+        # `frp-client/src/service.rs:4402`) as a dial of the config's
         # `[webServer]` port.
         #
         # Scoped to the one target that needs the flag rather than the whole

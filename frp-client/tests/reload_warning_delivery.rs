@@ -97,7 +97,7 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 
 /// The clause the reloaded record must carry — decided by **this crate's**
 /// build, not by a literal argument. `Service::reload_from_sources`
-/// (`frp-client/src/service.rs:4483`) passes
+/// (`frp-client/src/service/reload_apply.rs:98`) passes
 /// `frp_client::web_server_tls_enable_reader()`, which answers from this crate's
 /// own `admin` and `tls` features; a site that hardcodes any of the three
 /// answers still compiles and still emits one `KEY` record, so only a
