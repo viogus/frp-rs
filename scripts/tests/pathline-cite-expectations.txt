@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=579 weak=107 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=f3bebca82b98dc14 ambiguous_set=3343d4d37da5672a excluded_set=5e330a4eac751977
+#   pins: checked=579 weak=105 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=926d76a78607a76d ambiguous_set=3343d4d37da5672a excluded_set=5e330a4eac751977
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -63,7 +63,8 @@ frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	absolute	docs/config.md	frp-cl
 frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	shorthand	.github/workflows/ci.yml	:1164	4065
 frp-client/src/admin.rs	2044	-	119fe0b5b92fc3f6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:2044	53
 frp-client/src/admin.rs	391	-	a891a6a9bba37da4	-	absolute	docs/developing.md	frp-client/src/admin.rs:391	237
-frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	521
+frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	525
+frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	535
 frp-client/src/control.rs	309	311	3662ccabe5670d2a	3662ccabe5670d2a	absolute	frp-client/tests/end_to_end.rs	frp-client/src/control.rs:309-311	119
 frp-client/src/control.rs	350	-	e7ce24a27d5fc382	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/control.rs:350	171
 frp-client/src/control.rs	389	395	8943aadc26663e90	deae1565210c2676	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-client/src/control.rs:389-395	60
@@ -95,18 +96,16 @@ frp-client/src/service/message_loop.rs	777	-	0b863e73f6466a07	-	absolute	frp-cli
 frp-client/src/service/message_loop.rs	777	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:777	880
 frp-client/src/service/message_loop.rs	777	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:777	896
 frp-client/src/service/message_loop.rs	777	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:777	911
-frp-client/src/service/registration.rs	115	-	1ccc87e2fce9a944	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/service/registration.rs:115	530
 frp-client/src/service/reload_apply.rs	120	123	05b30098a28e064a	abfa59370983ca52	absolute	frp-client/tests/token_source_single_exec.rs	frp-client/src/service/reload_apply.rs:120-123	42
 frp-client/src/service/reload_apply.rs	29	32	bbbe79a003995e74	e52a1813c4604951	absolute	frp-client/tests/reload_malformed_config.rs	reload_apply.rs:29-32	13
 frp-client/src/service/reload_apply.rs	619	-	f2b7922dacaf8895	-	absolute	docs/developing.md	frp-client/src/service/reload_apply.rs:619	487
 frp-client/src/service/reload_apply.rs	96	97	c8048d4676282e14	e44c5a040931a2d2	absolute	frp-client/tests/reload_malformed_config.rs	frp-client/src/service/reload_apply.rs:96-97	4
 frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frp-client/tests/reload_warning_delivery.rs	frp-client/src/service/reload_apply.rs:98	100
-frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/service/reload_apply.rs:98	523
-frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	service/reload_apply.rs:98	532
+frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/service/reload_apply.rs:98	527
+frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	service/reload_apply.rs:98	536
 frp-client/src/service/session.rs	1357	-	c3a2715e37dc9808	-	absolute	.github/workflows/ci.yml	frp-client/src/service/session.rs:1357	2130
 frp-client/src/service/session.rs	1357	-	c3a2715e37dc9808	-	absolute	.github/workflows/ci.yml	frp-client/src/service/session.rs:1357	3350
 frp-client/src/service/session.rs	1357	-	c3a2715e37dc9808	-	absolute	frpc/tests/cli_inputs.rs	frp-client/src/service/session.rs:1357	1488
-frp-client/src/service/session.rs	55	-	ba5ec51d07a4ac0e	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/service/session.rs:55	531
 frp-client/src/service/session.rs	624	-	66f781d6e9a09354	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/service/session.rs:624	22
 frp-client/src/service/session.rs	631	-	f9a81bb417ba3b30	-	absolute	frp-client/tests/heartbeat_wire_order.rs	session.rs:631	747
 frp-client/src/service/session.rs	631	-	f9a81bb417ba3b30	-	absolute	frp-client/tests/req_work_conn_token_source.rs	session.rs:631	152
@@ -232,7 +231,7 @@ frp-core/src/config/loader.rs	176	-	846cae52a7734d3d	-	absolute	docs/developing.
 frp-core/src/config/loader.rs	186	-	3f577e11e77d75cb	-	absolute	docs/deployment.md	frp-core/src/config/loader.rs:186	828
 frp-core/src/config/loader.rs	186	-	3f577e11e77d75cb	-	absolute	docs/developing.md	frp-core/src/config/loader.rs:186	788
 frp-core/src/config/loader.rs	524	541	37985c74289b1d4c	648bffd597b50d2b	absolute	frps/tests/log_completion.rs	frp-core/src/config/loader.rs:524-541	518
-frp-core/src/config/loader.rs	958	-	161afdc304b9b409	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/loader.rs:958	727
+frp-core/src/config/loader.rs	958	-	161afdc304b9b409	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/loader.rs:958	731
 frp-core/src/config/normalize.rs	1172	-	d110735fd184a92b	-	absolute	docs/developing.md	frp-core/src/config/normalize.rs:1172	787
 frp-core/src/config/normalize.rs	1183	-	eb19bc2efe5c6559	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1183	14452
 frp-core/src/config/normalize.rs	1183	1184	eb19bc2efe5c6559	31ce65a1fdcc0748	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1183-1184	12729
@@ -275,8 +274,8 @@ frp-core/src/config/normalize.rs	633	-	84c2ca147bfd2023	-	absolute	frp-core/src/
 frp-core/src/config/normalize.rs	633	-	84c2ca147bfd2023	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:633	13493
 frp-core/src/config/normalize.rs	633	-	84c2ca147bfd2023	-	absolute	frpc/tests/legacy_ini_fixture.rs	frp-core/src/config/normalize.rs:633	91
 frp-core/src/config/normalize.rs	634	-	f373f20129c9aabc	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:634	8283
-frp-core/src/config/normalize.rs	634	-	f373f20129c9aabc	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/normalize.rs:634	723
-frp-core/src/config/normalize.rs	655	-	ac81a286abed88d1	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/normalize.rs:655	725
+frp-core/src/config/normalize.rs	634	-	f373f20129c9aabc	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/normalize.rs:634	727
+frp-core/src/config/normalize.rs	655	-	ac81a286abed88d1	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/normalize.rs:655	729
 frp-core/src/config/normalize.rs	664	-	c68ba03b3fb91dda	-	shorthand	docs/deployment.md	:664	827
 frp-core/src/config/normalize.rs	701	704	4e387d630865aa5f	aa698d57ead7284d	absolute	frp-core/src/config/loader.rs	frp-core/src/config/normalize.rs:701-704	1007
 frp-core/src/config/normalize.rs	701	704	4e387d630865aa5f	aa698d57ead7284d	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/normalize.rs:701-704	34
@@ -508,8 +507,9 @@ frpc/src/main.rs	367	371	f0733919e8b6ec90	9d8b2b5670d18da8	absolute	frpc/tests/l
 frpc/src/main.rs	544	-	cdb87d227d5ee3a7	-	absolute	.github/workflows/ci.yml	frpc/src/main.rs:544	3309
 frpc/src/main.rs	545	-	88dbee046eea5a5e	-	absolute	frpc/tests/warn_delivery.rs	frpc/src/main.rs:545	551
 frpc/src/main.rs	545	-	88dbee046eea5a5e	-	shorthand	.github/workflows/ci.yml	:545	3313
-frpc/src/main.rs	621	-	d10b36aa74a59bcf	-	absolute	frpc/tests/admin_config_get_warning.rs	frpc/src/main.rs:621	520
 frpc/src/main.rs	649	-	6e03400b768229bb	-	absolute	frpc/tests/log_completion.rs	frpc/src/main.rs:649	24
+frpc/src/main.rs	649	662	6e03400b768229bb	4d69b75b23031b35	absolute	frpc/tests/admin_config_get_warning.rs	frpc/src/main.rs:649-662	521
+frpc/src/main.rs	649	662	6e03400b768229bb	4d69b75b23031b35	absolute	frpc/tests/admin_config_get_warning.rs	frpc/src/main.rs:649-662	534
 frpc/src/main.rs	662	-	4d69b75b23031b35	-	shorthand	frpc/tests/warn_delivery.rs	:662	551
 frpc/src/main.rs	847	-	4d69b75b23031b35	-	absolute	frpc/tests/warn_delivery.rs	frpc/src/main.rs:847	742
 frpc/src/main.rs	847	-	4d69b75b23031b35	-	shorthand	frpc/tests/warn_delivery.rs	:847	552
