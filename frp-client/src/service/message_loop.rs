@@ -334,144 +334,15 @@ impl Service {
                         }
                         #[cfg(feature = "vnet")]
                         Ok(FrpMessage::VnetRouteAdvertise(adv)) => {
-                            // Isolation: only accept routes for virtual nets
-                            // this client participates in. Advertisements for
-                            // other vnets are ignored (design spec: different
-                            // virtual nets have isolated routing tables).
-                            let vnet = adv.virtual_net.clone().unwrap_or_default();
-                            if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
-                                debug!(
-                                    vnet,
-                                    proxy_name = %adv.proxy_name,
-                                    "ignoring vnet route advertisement for unknown virtual net"
-                                );
-                            } else {
-                                info!(vnet, subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
-                                // Update the shared route table (TX direction lookup).
-                                {
-                                    let route_table = self.vnet_controller.route_table();
-                                    let mut routes = route_table.write().await;
-                                    if let Err(e) =
-                                        routes.insert(&vnet, &adv.proxy_name, &adv.subnet)
-                                    {
-                                        warn!(%e, "failed to add vnet route");
-                                    }
-                                }
-                                // Inject OS route so the kernel sends matching packets
-                                // through the TUN device instead of the default gateway.
-                                // vnet_tun_names is keyed by *local* proxy name, while
-                                // adv.proxy_name is the *remote* peer's name — so match
-                                // by virtual_net (the route's isolation domain, already
-                                // validated above) instead of by name. The local vnet
-                                // proxy owning that virtual net is the one whose TUN must
-                                // carry this route; with no local TUN for the net (e.g.
-                                // this client is only a visitor) there is nothing to
-                                // inject, which is correct — the old code grabbed an
-                                // arbitrary TUN and silently misrouted.
-                                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                                {
-                                    let local_tun_proxy: Option<String> = {
-                                        let cfg = self.cfg.read().await;
-                                        cfg.proxies
-                                            .iter()
-                                            .find(|p| {
-                                                p.proxy_type == "vnet" && p.virtual_net == vnet
-                                            })
-                                            .map(|p| p.name.clone())
-                                    };
-                                    let names = self.vnet_tun_names.lock().await;
-                                    if let Some(tun_name) =
-                                        local_tun_proxy.as_deref().and_then(|n| names.get(n))
-                                    {
-                                        add_os_route(&adv.subnet, tun_name);
-                                        self.vnet_peer_routes.lock().await.insert(
-                                            adv.proxy_name.clone(),
-                                            (
-                                                adv.subnet.clone(),
-                                                tun_name.clone(),
-                                                vnet.clone(),
-                                            ),
-                                        );
-                                    } else {
-                                        debug!(
-                                            vnet,
-                                            proxy_name = %adv.proxy_name,
-                                            "vnet route advertise: no local TUN for virtual net '{}' — skipping OS route",
-                                            vnet
-                                        );
-                                    }
-                                }
-                            }
+                            self.handle_vnet_route_advertise_arm(adv).await;
                         }
                         #[cfg(feature = "vnet")]
                         Ok(FrpMessage::VnetPacket(vpkt)) => {
-                            match frp_core::base64::decode(&vpkt.data) {
-                                Ok(packet) => {
-                                    // Virtual_net visitors first: deliver into
-                                    // the visitor's STCP/XTCP tunnel. TUN-backed
-                                    // vnet proxies fall back to their TUN channel
-                                    // only when no visitor consumed the packet
-                                    // (Err returns the packet untouched).
-                                    match self
-                                        .vnet_controller
-                                        .deliver_visitor_packet(&vpkt.proxy_name, packet)
-                                    {
-                                        Ok(()) => {}
-                                        Err(packet) => {
-                                            let txs = self
-                                                .vnet_tun_tx
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner());
-                                            if let Some(tx) = txs.get(&vpkt.proxy_name) {
-                                                // Single destination: the Vec
-                                                // moves into the Arc (no copy).
-                                                if tx.try_send(Arc::from(packet)).is_err() {
-                                                    warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
-                                                }
-                                            } else {
-                                                debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(%e, "VnetPacket base64 decode error");
-                                }
-                            }
+                            self.handle_vnet_packet_arm(vpkt).await;
                         }
                         #[cfg(feature = "vnet")]
                         Ok(FrpMessage::VnetRouteRemove(adv)) => {
-                            // Isolation: mirror the advertise handler — only
-                            // accept removals for virtual nets this client
-                            // participates in. Removals for other vnets are
-                            // ignored (defensive symmetry; in practice there
-                            // is no matching route to clean up anyway).
-                            let vnet = adv.virtual_net.clone().unwrap_or_default();
-                            if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
-                                debug!(
-                                    vnet,
-                                    proxy_name = %adv.proxy_name,
-                                    "ignoring vnet route removal for unknown virtual net"
-                                );
-                            } else {
-                                info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
-                                if let Some((subnet, tun_name, _)) = self
-                                    .vnet_peer_routes
-                                    .lock()
-                                    .await
-                                    .remove(&adv.proxy_name)
-                                {
-                                    remove_os_route(&subnet, &tun_name);
-                                }
-                                self.vnet_controller
-                                    .route_table()
-                                    .write()
-                                    .await
-                                    .remove(&vnet, &adv.proxy_name);
-                                self.vnet_controller
-                                    .unregister_visitor_route(&adv.proxy_name)
-                                    .await;
-                            }
+                            self.handle_vnet_route_remove_arm(adv).await;
                         }
                         Ok(_) => {
                             // Other messages are ignored
@@ -1329,6 +1200,183 @@ impl Service {
             }
         }
     }
+
+    /// Handle a server-sent `VnetRouteAdvertise`: accept it only for a virtual
+    /// net this client participates in, insert the route into the shared route
+    /// table (TX lookup), and inject the matching OS route through the local
+    /// TUN device that owns that net.
+    ///
+    /// Extracted from the `run_message_loop` `VnetRouteAdvertise` arm by the
+    /// P2 S3b seam (group B). The arm was terminal — nothing follows the
+    /// `select!` inside the loop, so falling off this body lands at the loop
+    /// top exactly where falling off the arm did — and it carried no
+    /// `continue` and no inner loop, so there is no control-flow delta. It
+    /// carries **two** gates, both preserved: the `vnet` feature gate on this
+    /// fn and on the call site (the body reads vnet-only `Service` fields and
+    /// the vnet-feature-gated `vnet` module's helpers, so the arm cannot
+    /// compile without the feature), and the original `linux`/`macos`
+    /// `target_os` gate on the OS-route block inside the body. It takes no
+    /// `SessionCtx` and no writer: the arm body reads only `&self`. Called
+    /// inline from the loop, never spawned —
+    /// the retry arm's lock-order note ("both locks' writers run only in this
+    /// message-loop task") holds only while that stays true.
+    #[cfg(feature = "vnet")]
+    async fn handle_vnet_route_advertise_arm(&self, adv: msg::VnetRouteAdvertise) {
+        // Isolation: only accept routes for virtual nets
+        // this client participates in. Advertisements for
+        // other vnets are ignored (design spec: different
+        // virtual nets have isolated routing tables).
+        let vnet = adv.virtual_net.clone().unwrap_or_default();
+        if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
+            debug!(
+                vnet,
+                proxy_name = %adv.proxy_name,
+                "ignoring vnet route advertisement for unknown virtual net"
+            );
+        } else {
+            info!(vnet, subnet = %adv.subnet, proxy_name = %adv.proxy_name, "peer vnet route advertisement received");
+            // Update the shared route table (TX direction lookup).
+            {
+                let route_table = self.vnet_controller.route_table();
+                let mut routes = route_table.write().await;
+                if let Err(e) = routes.insert(&vnet, &adv.proxy_name, &adv.subnet) {
+                    warn!(%e, "failed to add vnet route");
+                }
+            }
+            // Inject OS route so the kernel sends matching packets
+            // through the TUN device instead of the default gateway.
+            // vnet_tun_names is keyed by *local* proxy name, while
+            // adv.proxy_name is the *remote* peer's name — so match
+            // by virtual_net (the route's isolation domain, already
+            // validated above) instead of by name. The local vnet
+            // proxy owning that virtual net is the one whose TUN must
+            // carry this route; with no local TUN for the net (e.g.
+            // this client is only a visitor) there is nothing to
+            // inject, which is correct — the old code grabbed an
+            // arbitrary TUN and silently misrouted.
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                let local_tun_proxy: Option<String> = {
+                    let cfg = self.cfg.read().await;
+                    cfg.proxies
+                        .iter()
+                        .find(|p| p.proxy_type == "vnet" && p.virtual_net == vnet)
+                        .map(|p| p.name.clone())
+                };
+                let names = self.vnet_tun_names.lock().await;
+                if let Some(tun_name) = local_tun_proxy.as_deref().and_then(|n| names.get(n)) {
+                    add_os_route(&adv.subnet, tun_name);
+                    self.vnet_peer_routes.lock().await.insert(
+                        adv.proxy_name.clone(),
+                        (adv.subnet.clone(), tun_name.clone(), vnet.clone()),
+                    );
+                } else {
+                    debug!(
+                        vnet,
+                        proxy_name = %adv.proxy_name,
+                        "vnet route advertise: no local TUN for virtual net '{}' — skipping OS route",
+                        vnet
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle a server-sent `VnetPacket`: base64-decode the payload and hand
+    /// it to the virtual-net visitor tunnel first; if no visitor consumes it,
+    /// forward it to the TUN channel registered for that proxy.
+    ///
+    /// Extracted from the `run_message_loop` `VnetPacket` arm by the P2 S3b
+    /// seam (group B). The arm was terminal — nothing follows the `select!`
+    /// inside the loop, so falling off this body lands at the loop top exactly
+    /// where falling off the arm did — and it carried no `continue` and no
+    /// inner loop (the nested `match`es are not loops), so there is no
+    /// control-flow delta. It carries **one** gate, preserved: the `vnet`
+    /// feature gate on this fn and on the call site (the body reaches the
+    /// vnet-only `Service` fields). It takes no `SessionCtx` and no writer:
+    /// the arm body reads only `&self`. Called inline from the loop,
+    /// never spawned — the retry arm's lock-order note ("both locks' writers
+    /// run only in this message-loop task") holds only while that stays true.
+    #[cfg(feature = "vnet")]
+    async fn handle_vnet_packet_arm(&self, vpkt: msg::VnetPacket) {
+        match frp_core::base64::decode(&vpkt.data) {
+            Ok(packet) => {
+                // Virtual_net visitors first: deliver into
+                // the visitor's STCP/XTCP tunnel. TUN-backed
+                // vnet proxies fall back to their TUN channel
+                // only when no visitor consumed the packet
+                // (Err returns the packet untouched).
+                match self
+                    .vnet_controller
+                    .deliver_visitor_packet(&vpkt.proxy_name, packet)
+                {
+                    Ok(()) => {}
+                    Err(packet) => {
+                        let txs = self.vnet_tun_tx.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(tx) = txs.get(&vpkt.proxy_name) {
+                            // Single destination: the Vec
+                            // moves into the Arc (no copy).
+                            if tx.try_send(Arc::from(packet)).is_err() {
+                                warn!(proxy_name = %vpkt.proxy_name, "vnet TUN channel closed");
+                            }
+                        } else {
+                            debug!(proxy_name = %vpkt.proxy_name, "vnet packet dropped: no visitor or TUN target");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(%e, "VnetPacket base64 decode error");
+            }
+        }
+    }
+
+    /// Handle a server-sent `VnetRouteRemove`: accept it only for a virtual net
+    /// this client participates in, then drop the peer's OS route, route-table
+    /// entry and visitor route.
+    ///
+    /// Extracted from the `run_message_loop` `VnetRouteRemove` arm by the P2
+    /// S3b seam (group B). The arm was terminal — nothing follows the `select!`
+    /// inside the loop, so falling off this body lands at the loop top exactly
+    /// where falling off the arm did — and it carried no `continue` and no
+    /// inner loop, so there is no control-flow delta. It carries **one** gate,
+    /// preserved: the `vnet` feature gate on this fn and on the call site (the
+    /// body reads vnet-only `Service` fields and the vnet module's helper). It
+    /// takes no `SessionCtx` and no writer: the arm body reads only `&self`.
+    /// Called inline from the loop, never spawned — the retry arm's lock-order
+    /// note ("both locks' writers run only in this message-loop task") holds
+    /// only while that stays true.
+    #[cfg(feature = "vnet")]
+    async fn handle_vnet_route_remove_arm(&self, adv: msg::VnetRouteRemove) {
+        // Isolation: mirror the advertise handler — only
+        // accept removals for virtual nets this client
+        // participates in. Removals for other vnets are
+        // ignored (defensive symmetry; in practice there
+        // is no matching route to clean up anyway).
+        let vnet = adv.virtual_net.clone().unwrap_or_default();
+        if !local_vnet_set(&*self.cfg.read().await).contains(&vnet) {
+            debug!(
+                vnet,
+                proxy_name = %adv.proxy_name,
+                "ignoring vnet route removal for unknown virtual net"
+            );
+        } else {
+            info!(vnet, proxy_name = %adv.proxy_name, "peer vnet route removed");
+            if let Some((subnet, tun_name, _)) =
+                self.vnet_peer_routes.lock().await.remove(&adv.proxy_name)
+            {
+                remove_os_route(&subnet, &tun_name);
+            }
+            self.vnet_controller
+                .route_table()
+                .write()
+                .await
+                .remove(&vnet, &adv.proxy_name);
+            self.vnet_controller
+                .unregister_visitor_route(&adv.proxy_name)
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1472,5 +1520,239 @@ mod tests {
                 "the success branch must not touch a Running proxy"
             );
         }
+    }
+
+    /// A `Service` whose config participates in the `corp-net` virtual net: one
+    /// `virtual_net` proxy with a TUN address. That is the precondition
+    /// `local_vnet_set` applies before a vnet route frame is accepted, so it is
+    /// what the three vnet handlers below need to reach their accept branch.
+    #[cfg(feature = "vnet")]
+    async fn vnet_service() -> Service {
+        let mut cfg = ClientConfig {
+            server_addr: "127.0.0.1".to_string(),
+            server_port: 7000,
+            token: "test-token".to_string(),
+            ..Default::default()
+        };
+        cfg.virtual_net.address = "10.0.0.1".to_string();
+        cfg.proxies.push(frp_core::config::ProxyConfig {
+            name: "vnet-a".to_string(),
+            proxy_type: "vnet".to_string(),
+            vnet_ip: "10.0.0.2".to_string(),
+            vnet_netmask: "255.255.255.0".to_string(),
+            virtual_net: "corp-net".to_string(),
+            // `ProxyConfig`'s derived `Default` gives `enabled: false` (the
+            // serde default is `true`, so only a hand-built config sees this),
+            // and `with_unsafe_features` retains only enabled entries — without
+            // this the vnet proxy is dropped and `local_vnet_set` is empty.
+            enabled: true,
+            ..Default::default()
+        });
+        Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+            .await
+            .expect("service init must succeed")
+    }
+
+    /// The extracted `VnetPacket` arm, driven directly. No lane puts a
+    /// `VnetPacket` on the wire to a client `Service` (the `vnet` feature is in
+    /// no default build, and a server forwards one only to a peer that shares
+    /// the virtual net), so this is the direct test for the arm's three
+    /// behaviours: a decoded payload reaches the TUN channel registered for the
+    /// proxy, an undecodable payload is dropped, and a packet for a proxy with
+    /// neither a visitor nor a TUN channel is dropped.
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_packet_arm_delivers_to_tun_channel_and_drops_bad_input() {
+        let service = vnet_service().await;
+        let packet = vec![0x45u8, 0x00, 0x00, 0x14, 0xde, 0xad];
+        let (tx, mut rx) = mpsc::channel::<Arc<[u8]>>(4);
+        service
+            .vnet_tun_tx
+            .lock()
+            .unwrap()
+            .insert("vnet-a".to_string(), tx);
+
+        service
+            .handle_vnet_packet_arm(msg::VnetPacket {
+                proxy_name: "vnet-a".to_string(),
+                data: frp_core::base64::encode(&packet),
+            })
+            .await;
+        let delivered = rx
+            .try_recv()
+            .expect("a decoded packet must reach the proxy's TUN channel");
+        assert_eq!(&*delivered, &packet[..]);
+
+        // Undecodable payload: warn, no delivery.
+        service
+            .handle_vnet_packet_arm(msg::VnetPacket {
+                proxy_name: "vnet-a".to_string(),
+                data: "!!!!".to_string(),
+            })
+            .await;
+        assert!(rx.try_recv().is_err(), "a decode error must not deliver");
+
+        // Neither a visitor route nor a TUN channel for the name: dropped.
+        service
+            .handle_vnet_packet_arm(msg::VnetPacket {
+                proxy_name: "unknown".to_string(),
+                data: frp_core::base64::encode(&packet),
+            })
+            .await;
+        assert!(rx.try_recv().is_err(), "an unknown target must not deliver");
+    }
+
+    /// The extracted `VnetRouteAdvertise` arm, driven directly. A route for a
+    /// virtual net this client does not participate in is ignored; one for a
+    /// participating net lands in the shared route table, and (only when a
+    /// local TUN owns that net) is recorded as a peer route and injected at the
+    /// OS level.
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_route_advertise_arm_isolates_vnets_and_records_routes() {
+        let service = vnet_service().await;
+
+        // Foreign virtual net: ignored, route table and peer map untouched.
+        service
+            .handle_vnet_route_advertise_arm(msg::VnetRouteAdvertise {
+                proxy_name: "peer-foreign".to_string(),
+                subnet: "10.9.0.0/24".to_string(),
+                virtual_net: Some("other-net".to_string()),
+            })
+            .await;
+        assert_eq!(
+            service
+                .vnet_controller
+                .route_table()
+                .read()
+                .await
+                .lookup("other-net", &"10.9.0.5".parse().unwrap()),
+            None
+        );
+        assert!(service.vnet_peer_routes.lock().await.is_empty());
+
+        // Participating net, no local TUN: the TX route is inserted and no peer
+        // route is recorded (there is no local interface to inject through).
+        service
+            .handle_vnet_route_advertise_arm(msg::VnetRouteAdvertise {
+                proxy_name: "peer-a".to_string(),
+                subnet: "10.1.0.0/24".to_string(),
+                virtual_net: Some("corp-net".to_string()),
+            })
+            .await;
+        assert_eq!(
+            service
+                .vnet_controller
+                .route_table()
+                .read()
+                .await
+                .lookup("corp-net", &"10.1.0.5".parse().unwrap()),
+            Some("peer-a")
+        );
+        assert!(
+            service.vnet_peer_routes.lock().await.is_empty(),
+            "no local TUN for the net means no OS route to track"
+        );
+
+        // Participating net with a local TUN registered: the peer route is
+        // recorded and the OS route injected (best-effort, so the injected
+        // command's failure is ignored by `add_os_route`). Platform-gated
+        // exactly like the block it exercises.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            service
+                .vnet_tun_names
+                .lock()
+                .await
+                .insert("vnet-a".to_string(), "tun-test0".to_string());
+            service
+                .handle_vnet_route_advertise_arm(msg::VnetRouteAdvertise {
+                    proxy_name: "peer-b".to_string(),
+                    subnet: "10.2.0.0/24".to_string(),
+                    virtual_net: Some("corp-net".to_string()),
+                })
+                .await;
+            let peer_routes = service.vnet_peer_routes.lock().await;
+            let (subnet, tun_name, vnet) = peer_routes
+                .get("peer-b")
+                .expect("a local TUN must record the peer route");
+            assert_eq!(subnet, "10.2.0.0/24");
+            assert_eq!(tun_name, "tun-test0");
+            assert_eq!(vnet, "corp-net");
+        }
+    }
+
+    /// The extracted `VnetRouteRemove` arm, driven directly. A removal for a
+    /// foreign virtual net is ignored; one for a participating net drops the
+    /// peer's OS route, its route-table entry and its visitor route.
+    #[cfg(feature = "vnet")]
+    #[tokio::test]
+    async fn vnet_route_remove_arm_isolates_vnets_and_cleans_state() {
+        let service = vnet_service().await;
+        let (visitor_tx, _visitor_rx) = mpsc::channel::<Vec<u8>>(4);
+        service
+            .vnet_controller
+            .register_visitor_route("peer-a", "100.86.0.1/32", visitor_tx)
+            .await
+            .expect("visitor route registers");
+        service
+            .vnet_controller
+            .route_table()
+            .write()
+            .await
+            .insert("corp-net", "peer-a", "10.1.0.0/24")
+            .expect("route inserts");
+        service.vnet_peer_routes.lock().await.insert(
+            "peer-a".to_string(),
+            (
+                "10.1.0.0/24".to_string(),
+                "tun-test0".to_string(),
+                "corp-net".to_string(),
+            ),
+        );
+
+        // Foreign virtual net: ignored, every piece of state survives.
+        service
+            .handle_vnet_route_remove_arm(msg::VnetRouteRemove {
+                proxy_name: "peer-a".to_string(),
+                virtual_net: Some("other-net".to_string()),
+            })
+            .await;
+        assert!(service.vnet_peer_routes.lock().await.contains_key("peer-a"));
+        assert_eq!(
+            service
+                .vnet_controller
+                .route_table()
+                .read()
+                .await
+                .lookup("corp-net", &"10.1.0.5".parse().unwrap()),
+            Some("peer-a")
+        );
+        assert!(service
+            .vnet_controller
+            .deliver_visitor_packet("peer-a", vec![0x45])
+            .is_ok());
+
+        // Participating net: peer route, route-table entry and visitor route go.
+        service
+            .handle_vnet_route_remove_arm(msg::VnetRouteRemove {
+                proxy_name: "peer-a".to_string(),
+                virtual_net: Some("corp-net".to_string()),
+            })
+            .await;
+        assert!(service.vnet_peer_routes.lock().await.is_empty());
+        assert_eq!(
+            service
+                .vnet_controller
+                .route_table()
+                .read()
+                .await
+                .lookup("corp-net", &"10.1.0.5".parse().unwrap()),
+            None
+        );
+        assert!(service
+            .vnet_controller
+            .deliver_visitor_packet("peer-a", vec![0x45])
+            .is_err());
     }
 }
