@@ -11546,7 +11546,8 @@ other.
   actually carry the claim (the item's first option — naming the old witnesses in prose would have asserted
   something false, since they were `.map_err(|e) {` and a bare `)`): the startup rows now witness
   `frpc/src/main.rs:649-662`, anchored on the unique `init_logging(&args, Some(&cfg));` at `:649` because the
-  warn call's own line text repeats (the `--config-dir` branch at `:545` and the `verify` site at `:847`); the
+  warn call's own line text repeats at `:662` (the `-c` load itself) and `:847` (the `verify` site) — `:545` is a
+  third warn site whose text wraps across three lines, so it is not one of the repetitions; the
   hand-edit rows witness `frp-client/src/admin.rs:771`; the reload site stays `reload_apply.rs:98`. **The `-c`
   site was found by reading `run_normal`'s branch dispatch, not by trusting the comment's number** — the old
   `:621` was a bare `}` occurring 120×. The expectations were re-baked in the same commit, `todo-cite-guard.sh`
