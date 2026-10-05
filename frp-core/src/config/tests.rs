@@ -12525,7 +12525,7 @@ fn test_ini_yes_no_bool_inference() {
 /// The field *set* is the daemon's, but the *condition* is not: this gate
 /// refuses either spelling on `verify` regardless of `auth_method`, while the
 /// daemon gates `auth.tokenSource` unconditionally and `auth.oidc_token_source`
-/// only under `auth_method == AuthMethod::Oidc` (`frp-client/src/service.rs:998-1001`)
+/// only under `auth_method == AuthMethod::Oidc` (`frp-client/src/service.rs:814-817`)
 /// — measured, `frpc -c` on the `method = "token"` OIDC config above starts and
 /// logs its connection attempts where Go's `frpc -c` exits 1 on the gate line.
 /// The third loop arm pins the fail-closed condition.

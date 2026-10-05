@@ -175,7 +175,7 @@ pub fn check_server_unsafe_features(
 /// *condition*: this gate is fail-closed, refusing either spelling on `verify`
 /// regardless of `auth_method`, while the daemon gates `auth.tokenSource`
 /// unconditionally and `auth.oidc_token_source` only inside its
-/// `auth_method == AuthMethod::Oidc` branch (`frp-client/src/service.rs:998-1001`;
+/// `auth_method == AuthMethod::Oidc` branch (`frp-client/src/service.rs:814-817`;
 /// measured: with `method = "token"` plus an exec `auth.oidc.tokenSource`,
 /// `frpc -c` starts and logs its connection attempts, while `frpc verify` and
 /// Go's `frpc -c`/`frpc verify` all exit 1 — the daemon side is the looser of

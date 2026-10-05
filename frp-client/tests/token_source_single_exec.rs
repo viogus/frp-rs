@@ -152,8 +152,8 @@ struct LoginSession {
 
 /// Serve one login on `listener`, complete the handshake the way the real
 /// server does (LoginResp in the clear, everything after it AES-128-CFB keyed
-/// by the resolved token — derived at `frp-client/src/service.rs:1754` and
-/// applied at `:1759-1760` via `stream.into_encrypted(enc_key)`).
+/// by the resolved token — derived at `frp-client/src/service.rs:1570` and
+/// applied at `:1575-1576` via `stream.into_encrypted(enc_key)`).
 async fn serve_one_login(listener: &TcpListener, token: &str) -> LoginSession {
     let (conn, _peer) = listener.accept().await.expect("client did not connect");
     let mut stream = IoStream::Tcp(conn);
