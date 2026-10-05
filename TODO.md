@@ -7532,8 +7532,8 @@ nothing about whether the described behaviour still holds.
   moved text — which both reviewers established **by search**, the same way S1's mandatory `store.rs:592` re-export
   was established. The moved `select!` block (the F10 response loop, now `registration.rs:488`) is unchanged by
   construction: zero `tokio::spawn`, zero `unsafe`, exactly one `select!`, with 5 `break`s and 5 `continue`s all
-  inside it. (An `.await` count was also recorded here and then withdrawn: the two review rounds counted 19 and 20 for
-  the moved text with different scopes, and a figure two careful checkers cannot reconcile is not worth asserting.) Two measured corrections to this seam's brief: its part-1 span `505-687` stopped one line
+  inside it. (An `.await` count is recorded as **19 lines / 20 occurrences** — the two review rounds counted those
+  two ways because `registration.rs:418` carries two awaits on one line, and both are right under their own scope.) Two measured corrections to this seam's brief: its part-1 span `505-687` stopped one line
   before `reg_frame_payload_read`'s closing brace (the coherent block is `505-688`), and its `register_proxies` count
   excluded the doc comment (`1887-2480`/594 reproduces exactly *for that scope*) — both conventions are now stated in
   the plan. **29 expectation rows were re-pointed by content** over nine files, each confirmed against the *old*
