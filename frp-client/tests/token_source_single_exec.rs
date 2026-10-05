@@ -1,7 +1,7 @@
 //! Regression: `frpc` must execute an `auth.tokenSource` `exec` command
 //! **once per client service**, exactly like Go frp — not a second time when it
-//! builds the login (`TODO.md:9389`: "Rust frpc runs the `auth.tokenSource`
-//! builds the login (`TODO.md:9389`: "Rust frpc runs the `auth.tokenSource`
+//! builds the login (`TODO.md:9426`: "Rust frpc runs the `auth.tokenSource`
+//! builds the login (`TODO.md:9426`: "Rust frpc runs the `auth.tokenSource`
 //! `exec` command twice per successful login where Go runs it once").
 //!
 //! Measured on the base commit `9b2acefb` against a live frps with this same
@@ -39,7 +39,7 @@
 //! * an accepted reload (same `[auth]`, a proxy added or moved) never rebuilds
 //!   `Service::auth_cfg`, so `auth.tokenSource` is not resolved again;
 //! * a reload that changes `[auth]` is refused before anything is applied by
-//!   `reload::auth_reload_refusal` (`frp-client/src/service.rs:4505-4508`,
+//!   `reload::auth_reload_refusal` (`frp-client/src/service/reload_apply.rs:120-123`,
 //!   `frp-client/src/reload.rs:30`/`:86`), so it cannot re-read either.
 //!
 //! Order matters: **the refused reload is last and its file is never rewritten
@@ -152,8 +152,8 @@ struct LoginSession {
 
 /// Serve one login on `listener`, complete the handshake the way the real
 /// server does (LoginResp in the clear, everything after it AES-128-CFB keyed
-/// by the resolved token — derived at `frp-client/src/service.rs:1791` and
-/// applied at `:1796-1797` via `stream.into_encrypted(enc_key)`).
+/// by the resolved token — derived at `frp-client/src/service.rs:1754` and
+/// applied at `:1759-1760` via `stream.into_encrypted(enc_key)`).
 async fn serve_one_login(listener: &TcpListener, token: &str) -> LoginSession {
     let (conn, _peer) = listener.accept().await.expect("client did not connect");
     let mut stream = IoStream::Tcp(conn);

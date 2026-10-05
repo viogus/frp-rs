@@ -7489,6 +7489,43 @@ nothing about whether the described behaviour still holds.
   recorded rather than rewritten: the author report's "before 577/109 unchanged" (the base is weak 107, so the count
   is unchanged, but 107 → 107) and its "all whitespace; no token" (contradicted by the one dropped trailing comma).
 
+  **Progress (2026-10-04, code head `741fe738` on `dsh/m22-p2-s1-reload`, PR #492, based on `9346923c`).** The second
+  **P2** seam (S1) landed: `frp-client/src/service/reload_apply.rs` (674 lines, declared `mod reload_apply;`) now holds
+  six items moved byte-for-byte out of `service.rs` — `request_reload`, `close_wire_name_for_reload`, `try_reload`,
+  `reload_from_sources` (540 of the 645 moved lines), `filter_active_proxies` and `filter_active_visitors`;
+  `frp-client/src/service.rs` 5107 → **4467**. The measured payload is **645 lines / 31 533 bytes** (each span joined with a trailing newline; line-joined they
+  total 31 527) — larger than this seam's brief said (620) because **the brief's per-item counts excluded each item's doc comment**, and the brief's
+  sha256 prefixes used a different join convention; the author re-derived every figure from the base revision instead
+  of trusting the brief, and the reviewers confirmed all six blocks are line-for-line identical base↔head **including
+  their doc comments** (only the new `//!` module header is new). The move arithmetic, corrected in review: **five
+  blank lines leave** (one at each of the first two seams, two at the third, one replaced by `mod reload_apply;`) and
+  **ten lines arrive** (the `mod`, seven comment lines, the `pub(crate) use`, one blank), for the net −640. **The
+  re-export is minimal and exactly sufficient, and that was established by search rather than argument:** the only
+  external *path* into the moved set is `crate::service::filter_active_proxies` (`store.rs:592`), so the parent
+  carries `pub(crate) use reload_apply::{filter_active_proxies, filter_active_visitors};`; the other four are inherent
+  `impl Service` methods, whose visibility is per-`fn` rather than per-module-path, so their method callers
+  (`frpc/src/main.rs:702`, the reload tests) stay reachable with no re-export and no visibility keyword changed (the
+  `pub(crate)` on `try_reload`/`reload_from_sources` predates this seam). The plan's claim about the range was
+  **verified true**: zero `tokio::spawn`, no `select!`, no `unsafe`; the constraint to preserve is the phase-A/commit
+  split in `reload_from_sources` (send the CloseProxy/NewProxy batch before resolving wire keys and committing
+  plugin/health state, Step 7 last). **36 expectation rows were re-pointed by content** across 11 citing files, and the
+  checked count rose **577 → 579** — a genuine *extend*, verified by finding both new rows (the new module comment's
+  `store.rs:592` cite and a test comment's extended path) and confirming nothing was dropped; the weak population
+  stayed **107** with `weak_set` re-keyed `f9c334c1…` → `d32d0bec…`, the table re-baked (`03766d54…` at the code
+  seam; it is re-baked again by this very paragraph, so **this record deliberately states no literal for it** — the
+  authoritative value is the step's own `guard_data_pin`, which is the check) and `guard_cites`/`guard_cites_floor`
+  raised with it to 579. No `CHANGELOG.md` bullet, matching the
+  earlier seams. Reviews: verification **MERGE-with-findings** and adversarial **MERGE-with-findings**, every finding
+  being a figure in the *author's report* (the move arithmetic, the payload join basis, a stale-cite count) rather
+  than anything in the tree. Ledger unchanged at **3 open / 232 closed / 235 headers**.
+  *On the stale locators this seam leaves in this file:* `TODO.md` is a point-in-time record, and the pathline guard
+  classifies its source-path locators as point-in-time (`excluded` — counted and reported, never enforced), so its
+  `frp-client/src/service.rs:NNNN` locators are **frozen as history** rather than cascaded —
+  the reviewers agreed that is the right call. Measured with the full pattern
+  (`frp-client/src/service\.rs:[0-9]+(-[0-9]+)?`) the count is **38 locators (32 single-line + 6 line-ranges) across
+  26 distinct tokens**, at both heads; an earlier round's 25/37 came from a single-line-only pattern that dropped the
+  ranges. Only locators inside *open* items' Done-when clauses would need re-pointing, and no open item has one.
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
