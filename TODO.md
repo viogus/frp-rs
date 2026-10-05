@@ -11526,7 +11526,7 @@ other.
   plan's M-19 "Landed so far" entry (`docs/refactor-large-modules.md`, the `http.rs:97-101` clause) — both of
   which were true at `6f712517`: that cite is `http.rs:110-114` as of this PR.
 
-- [ ] **A live cite in `frpc/tests/admin_config_get_warning.rs` aims at incidental lines.**
+- [x] **A live cite in `frpc/tests/admin_config_get_warning.rs` aims at incidental lines.**
   Evidence: the comment's two rows witness lines that do not carry what the prose claims — after the P2 S2 move it
   cites `frp-client/src/service/registration.rs:115` (which is `.map_err(|e| {`) and `frp-client/src/service.rs:599`
   (a line whose text is just `)`, occurring **16×** in that file). The same comment already names better targets
@@ -11542,3 +11542,30 @@ other.
   `101/0` and its current `checked` count, with any `weak`/`weak_set` change explained in the same commit — a
   semantic re-aim to a unique witness will legitimately *shrink* the weak set, since these rows are weak precisely
   because their targets are repeated-text lines.
+  **Done (PR #496, code head `7dde872e`, based on `c0fd5bbc`).** The rows were re-aimed at the lines that
+  actually carry the claim (the item's first option — naming the old witnesses in prose would have asserted
+  something false, since they were `.map_err(|e) {` and a bare `)`): the startup rows now witness
+  `frpc/src/main.rs:649-662`, anchored on the unique `init_logging(&args, Some(&cfg));` at `:649` because the
+  warn call's own line text repeats (the `--config-dir` branch at `:545` and the `verify` site at `:847`); the
+  hand-edit rows witness `frp-client/src/admin.rs:771`; the reload site stays `reload_apply.rs:98`. **The `-c`
+  site was found by reading `run_normal`'s branch dispatch, not by trusting the comment's number** — the old
+  `:621` was a bare `}` occurring 120×. The expectations were re-baked in the same commit, `todo-cite-guard.sh`
+  reports 101/0 and `pathline-cite-guard.sh` 579/0 with `checked` unchanged at 579, and `weak` moved 107 → 105
+  exactly as this item anticipated: the two departing rows are the repeated-text `}` and `)` targets, replaced
+  by unique-start witnesses (no row entered the weak set). One correction to this item's own evidence, found in
+  review: `registration.rs:115` was **already strong** (unique text) — content-stable but semantically empty, so
+  "these rows are weak" held for two of the three, and that row was re-keyed by the M-25 move rather than
+  re-aimed here. Reviews: adversarial **MERGE-with-findings** and verification **MERGE**, the latter checking all
+  four Done-when clauses and recommending closure — done here.
+
+- [ ] **A second live cite in `frpc/tests/admin_config_get_warning.rs` is content-stable but semantically weak.**
+  Evidence: `:53` cites `frp-client/src/admin.rs:2044`, which is the opening `assert_eq!(` — text repeated **17×**
+  in that file, which is why the row sits in the guard's weak set. Unlike the item above, the sentence it backs is
+*not* a call-site claim ("this target stays green while the in-process one reds on the `None` case"), so
+  "the line a failure prints" is a sound justification for aiming there — this is **hardening, not a defect**,
+  and it was deliberately left out of PR #496 to keep that change scoped to the comment it was filed about.
+  **Done-when:** the row witnesses a unique line while keeping the sentence's meaning (the adversarial round
+  proposes `frp-client/src/admin.rs:2045`, the unique `seed_web_server_tls_enable_seen(None),`, which names the
+  `None` case the prose discusses), the expectations are re-baked in the same commit, and any `weak`/`weak_set`
+  change is explained there. Both reviewers of PR #496 independently recommended filing it rather than folding it
+  in, because the guard pins content rather than meaning and nothing else will catch it.
