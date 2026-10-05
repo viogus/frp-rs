@@ -7727,6 +7727,47 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   **MERGE**, which re-derived the same 9 rows and confirmed that the checklist meets the condition the regrouping was
   made conditional on: *a single review pass cannot skip an arm*. Ledger unchanged at **3 open / 234 closed /
   237 headers**; the plan now records **10 arms across 8 rows** remaining (groups B, C, D1, D2).
+  **Progress (2026-10-05, code head `a00bc97b` on `dsh/m32-s3b-group-b`, PR #502, based on `70b50c6b`).** The second
+  **grouped** S3b PR landed: group **B**, the vnet trio — `VnetRouteAdvertise` (base `:336-405`, 70L), `VnetPacket`
+  (`:407-441`, 35L) and `VnetRouteRemove` (`:443-475`, 33L) became three `.await`ed calls to
+  `handle_vnet_route_advertise_arm` / `handle_vnet_packet_arm` / `handle_vnet_route_remove_arm`, taking
+  `message_loop.rs` 1477 → **1725**. This group is where the two group-specific rules had to be settled **by
+  measurement rather than inherited**, and both cut against a naive reading of the earlier groups. **(1) The cfg gates
+  must sit on both the call site and the handler, and the pair is load-bearing only in the non-`vnet` shape:** with
+  `--no-default-features --features tls,tcp-mux`, removing **one** handler gate is rc 101 with 6 errors
+  (`E0425`×3 + `E0609`×3) and **one** call-site gate 2 (`E0599`×2); removing **all three** handler gates is 15
+  (7 `E0425` + 8 `E0609`) and all three call-site gates 6 — so the counts are **scope-dependent** and the record states
+  which scope — while with `vnet` **on** removing either is **rc 0** — the adversarial round's probe; the verifying round's were vnet-off
+  only — so both gates are inert there. The file's gate
+  census went 4 → 11 (production 4 → 7; the rest are the new vnet-only tests). **(2) The `writer`-parameter rule does
+  *not* bite here, and the rule's scope was refined by it:** all three arms are receive-only, so `writer` occurs **0
+  times in their code** (the four textual hits are the handlers' own doc prose), no handler takes it, and no
+  `cfg_attr(not(feature = "vnet"), allow(unused_variables))` was added — the rule now reads "a handler whose **only** use
+  of `writer` sits behind a vnet gate, and a handler that takes no `writer` at all never needs it", settled per case by a
+  removal probe (a *counterfactual* `writer` parameter on one of these handlers is unused even with `vnet` on, so the
+  precondition cannot obtain). **(3) No `continue` here**, verified by census. On the body equivalence, this seam
+  produced the program's cleanest result *and* a claim two review rounds read differently, so it was **re-measured**:
+  a token-level diff of each base arm against its handler shows arms 2 and 3 differ **only in the signature line** (all
+  non-equal opcodes are the pattern→`async fn` transformation), while arm 1 has exactly **three body-level tokens** — the
+  single-expression closure's elided `{`/`}` and a tuple's trailing comma — which is the author's and adversarial round's
+  figure; the other round's "zero body deltas **in all three**" therefore needed that exception, and the record carries
+  the reconciled form rather than either summary. **Coverage: this group closes the lane gap for all three arms** —
+  three new `#[cfg(feature = "vnet")]` tests plus a `vnet_service` helper drive each handler directly
+  (`RUSTFLAGS="-D warnings" cargo test -p frp-client --features vnet --lib service::message_loop` → 4 passed / 0 failed),
+  where group A could only test the one arm that needs no `SessionCtx`. A finding recorded for later groups: a
+  hand-built `ClientConfig` must set `enabled: true` on a pushed `ProxyConfig`, because the derived `Default` is false
+  while serde's default is true and `service.rs` retains only enabled proxies — the first test draft failed on exactly
+  that. Cascade: 12 cites re-pointed in `heartbeat_wire_order.rs`, table re-baked 12/12/567 with `checked`/`weak`
+  unchanged at 579/104, `SCEN10_REGION_SHA` a verified **no-op**, pins 20/20. Gates: fmt, all-features clippy and both
+  feature shapes rc 0; workspace **2693 passed / 2 failed**, both known host failures independently re-triaged (a
+  bare-socket probe for the `127.0.0.2` bind; the all-features `log_completion` case shown not to link `frp-client` with
+  a byte-identical `frps` artifact); **13/13 health step bodies rc 0 before the commit and again on the committed
+  head**; compat **86/0**; protocol-matrix **11/0**. Reviews: adversarial **MERGE-with-findings** (its findings were in
+  this batch's *report and PR body* — the error counts and the missing shape qualifier, both fixed here) and
+  verification **MERGE**, which re-derived the checklist, confirmed the three tests are real per-arm witnesses and the
+  `enabled: true` finding at both citations, and confirmed the rows are independently sufficient again. Ledger unchanged
+  at **3 open / 234 closed / 237 headers**; the plan records **7 arms across 7 rows** remaining (groups C, D1, D2).
+
 
 
 
