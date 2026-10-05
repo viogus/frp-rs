@@ -7519,6 +7519,13 @@ nothing about whether the described behaviour still holds.
   being a figure in the *author's report* (the move arithmetic, the payload join basis, a stale-cite count) rather
   than anything in the tree. Ledger unchanged at **3 open / 232 closed / 235 headers**.
 
+  *On the stale locators this seam leaves in this file:* `TODO.md` is a point-in-time record, and the pathline guard
+  classifies its source-path locators as point-in-time (`excluded` — counted and reported, never enforced), so its
+  `frp-client/src/service.rs:NNNN` locators are **frozen as history** rather than cascaded —
+  the reviewers agreed that is the right call. Measured with the full pattern
+  (`frp-client/src/service\.rs:[0-9]+(-[0-9]+)?`) the count is **38 locators (32 single-line + 6 line-ranges) across
+  26 distinct tokens**, at both heads; an earlier round's 25/37 came from a single-line-only pattern that dropped the
+  ranges. Only locators inside *open* items' Done-when clauses would need re-pointing, and no open item has one.
   **Progress (2026-10-04, code head `f25e4b10` on `dsh/m23-p2-s2-registration`, PR #493, based on `707b826a`).** The
   third **P2** seam (S2) landed: the registration path moved byte-for-byte into the new child module
   `frp-client/src/service/registration.rs` (815 lines) — the frame-plumbing block (base `service.rs:505-688` = **184
@@ -7553,13 +7560,6 @@ nothing about whether the described behaviour still holds.
   re-pointed it by content and deleted one now-false clause, touching no code; both reviewers judged that the right
   scope for a pure-move PR and asked for the item above, which is filed with the correct targets the comment itself
   already names (`frpc/src/main.rs:621`, `frp-client/src/admin.rs:771`).
-  *On the stale locators this seam leaves in this file:* `TODO.md` is a point-in-time record, and the pathline guard
-  classifies its source-path locators as point-in-time (`excluded` — counted and reported, never enforced), so its
-  `frp-client/src/service.rs:NNNN` locators are **frozen as history** rather than cascaded —
-  the reviewers agreed that is the right call. Measured with the full pattern
-  (`frp-client/src/service\.rs:[0-9]+(-[0-9]+)?`) the count is **38 locators (32 single-line + 6 line-ranges) across
-  26 distinct tokens**, at both heads; an earlier round's 25/37 came from a single-line-only pattern that dropped the
-  ranges. Only locators inside *open* items' Done-when clauses would need re-pointing, and no open item has one.
 
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
@@ -7577,6 +7577,37 @@ nothing about whether the described behaviour still holds.
   2726) and `key_tests.rs` / `virtual_ctrl_tests.rs` / `preauth_tests.rs` each read **0** production —
   with the script's existing `tests.rs` / `tests/` behaviour preserved, or the change to it justified
   in the item.
+
+  **Progress (2026-10-04, code head `0de6ae41` on `dsh/m24-p2-s3-messageloop`, PR #494, based on `c7ca363d`).** The
+  fourth **P2** seam (S3) landed — the repository's second-largest function: `run_message_loop` (base
+  `frp-client/src/service.rs:2055-3163` = **1109 lines / 68 389 bytes / sha256 `17ab190868e8c14e…`**) plus its
+  companions (`StunResult`, `LoopExit`, `SessionChannels`, the two retry statics `PROXY_RETRY_INTERVAL` /
+  `WAIT_START_RETRY_TIMEOUT` and the private `const PROXY_RETRY_GRACE`, base `:172-234`) moved into the new child
+  module `frp-client/src/service/message_loop.rs` (1219 lines); `frp-client/src/service.rs` 3681 → **2512**. Across
+  **1181 moved lines the only delta is eleven `pub(super)` tokens** — the loop, the three types, and
+  `SessionChannels`' seven fields, which the parent's field-named struct literal requires (`E0451`, found by
+  compilation rather than assumed); the parent needs only a plain `use message_loop::{…}`, so **no re-export** was
+  needed, and the retry statics keep their original `pub(crate)`. The loop **skeleton is byte-identical** — the
+  persisted partial-frame read, one persistent heartbeat `Sleep` re-armed at the loop top, and deliberately no
+  `biased;` — and because `frp-client/tests/partial_frame_survives_competing_ping_tick.rs` (untouched by this seam)
+  still passes, the behavioural pin holds from the child module; **S3b did not happen** (the new file declares exactly
+  one `fn`, so no `select!` arm was extracted, only moved, and its 49 arms are intact). Two plan-row corrections were
+  made from measurement: `REGISTRATION_RESPONSE_TIMEOUT` does **not** move (zero references inside the moved span; all
+  five production references are in `registration.rs`, the phase it bounds), and `PING_FIRST_BACKOFF` stays put
+  because it is `pub const` API that `frp-client/tests/heartbeat_wire_order.rs` imports by full path — moving it would
+  break a published path. **28 live cites were re-pointed by content** (12 of them into the new file) and the table
+  re-baked with **zero fingerprint changes** (16 same-file re-points, 2 citing-line shifts, `checked`/`weak` unchanged
+  at 579/107, `weak_set` re-keyed only because two already-weak anchors moved with their citing lines);
+  `SCEN10_REGION_SHA` was a **verified no-op for the second seam running** (no `.sh` file changed and no cite inside
+  the region moved), so the region needed no re-bake and the region→pins→sweep order was trivially respected, and the
+  pin audit reports 20/0 after `guard_data_pin` moved to `74eacd74…`. No `CHANGELOG.md` bullet, matching the earlier
+  seams. Reviews: verification **MERGE-with-findings** and adversarial **MERGE-with-findings**, both with the tree
+  clean — every finding was plan-row or brief-level: the row's `5 expect` sites are **7**, its span needed pre-S0
+  re-numbering (the width was already right at 1109), and this seam's own brief named the pinning test in the wrong
+  crate (`frps/tests/…`; it is `frp-client/tests/…`, and the tree was right). Ledger unchanged at **4 open / 232
+  closed / 236 headers**. *On the reviewers' report-missing finding:* both rounds reported the author's report absent;
+  it exists at the coordinator path (`.worktrees/report-m24.md`, 25 778 bytes) — the checks appear to have looked
+  relative to their own detached worktrees, so that finding is refuted rather than recorded as a gap.
 
   **Progress (2026-10-01, code head `a618f281` on `refactor/fileify-proxy-ops`, PR #453).** P4
   (`frp-server/src/control/proxy_ops`) landed Step 0 plus seams 1–2 as three pure-move commits:
