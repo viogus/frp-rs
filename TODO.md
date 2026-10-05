@@ -7805,6 +7805,48 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   **13/13 health step bodies rc 0 before the commit and again on the head**; compat **86/0** (Rust side from this
   worktree's debug binaries via the harness overrides); protocol-matrix **11/0**. Ledger unchanged at **3 open / 234
   closed / 237 headers**; the plan records **5 arms across 5 rows** remaining (groups D1 and D2).
+  **Progress (2026-10-05, code head `c533d0b4` on `dsh/m34-s3b-group-d1`, PR #504, based on `fafbad0f`).** The fourth
+  **grouped** S3b PR landed: group **D1**, the XTCP/NAT-hole cluster — `XTCP notify → STUN` (base `:453-555`, 103L /
+  6464 B / `9d751b69…`), `STUN result` (`:559-589`, 31L / 1927 B / `b774ecdf…`) and `xtcp_cleanup` (`:597-609`, 13L /
+  570 B / `6d…`) — became `handle_xtcp_notify_arm` (`:1335-1449`), `handle_stun_result_arm` (`:1482-1518`) and
+  `handle_xtcp_cleanup_arm` (`:1535-1543`), taking `message_loop.rs` 2129 → **2550**. Deltas are three reflows plus one
+  trailing comma (notify), one reflow plus one comma (STUN) and **zero** (cleanup), with **0 `&` drops**; the third arm
+  is the program's first arm to need no delta at all. **This is the group where spawning is legitimate**, so the
+  property proved was not "never spawn" but that *exactly the same work* is spawned and awaited inline: notify 1/1
+  (the off-loop STUN, with the write handed back on `stun_result_tx` so it stays before the `NatHoleResp`), STUN 1/1
+  (the 15 s cleanup), cleanup 0/0 — all handlers `.await`ed inline at their call sites, and no arm carries a
+  retry-style task-affinity note. **Coverage: the direct-lane gap is closed for all three arms** (a notify test against
+  a real loopback STUN responder that reds if the arm went inline, a STUN-result test in both branches with a paused
+  clock and a timeout guard, and a cleanup test over both maps), where the previous groups could only test the arms
+  that need no peer. **My own two claims about this group were falsified by measurement and are corrected rather than
+  defended:** (1) the M-31 note said D1's rows "have the same shape" as the NatHole rows, i.e. that they list state
+  reached through `&self` — measured, all three base spans and all three handlers contain **zero `self.` uses** (`ctx.`
+  1/4/2), so D1's state arrives through the single `&mut SessionCtx`; the rows' real defects are that they present
+  `ctx` fields as parameters and that the STUN row omits the loop-local `xtcp_cleanup_tx` and `ctx.v2` (both fixed in
+  the table). The adversarial round that first reported the `&self` shape — correctly, for group A's NatHole arms —
+  **retracted its transfer to D1 in the same round**. (2) My brief attributed the file's four `tokio::spawn` grep hits
+  to "a later group's test module"; at base they are **3 production + 1 doc-prose line** with **0** test-module spawns,
+  and this PR's own test adds the first. The brief's candidate lane was also wrong: `reload_vnet_proxy.rs` does **not**
+  reach these arms (0 xtcp tokens). A third counting lesson came from the review: the two rounds reported different
+  `#[cfg]` totals because they counted by different rules (raw `#[cfg(` lines vs real attributes — 9 `#[cfg(…)]` + 3
+  `#[cfg_attr(…)]`), so the plan now requires the rule to be named, exactly as gate-error counts must state their scope.
+  The `writer` rule was probed per handler (only the STUN handler takes one, unconditionally: rc 101 without the
+  attribute, rc 0 with it; a counterfactual on the notify handler is unused in both shapes), and group B's gate rule
+  does not transfer (no `#[cfg]` in any of the three). The branch also carries a **disclosed follow-up commit**
+  (`c533d0b4`) for two **group-C leftovers** found here: the loop-top comment that still described a `continue` group C
+  had removed (reworded, with the replacement claim verified by census — the read arm has 0 `continue`, 0 `break`, 2
+  exits both `return LoopExit::Reconnect`) and a temporary `eprintln!("PROBE2 …")` left in a committed test, after
+  which a probe sweep of the file reads 0 hits. Cascade: 12 cites re-pointed by content, the table re-baked 12/12/567
+  with its **header untouched** — `checked=579 weak=104 weak_set=dbbea851…`, the base values, so no repeat of group C's
+  test-induced weak regression — `SCEN10_REGION_SHA` a verified **no-op**, pins 20/20. Gates: fmt, all-features clippy
+  and both feature shapes rc 0; workspace **2698 passed / 2 failed** (both known host failures re-triaged; no
+  `AddrInUse`); **13/13 health step bodies rc 0 twice** (frozen tree and committed head); compat **86/0** and
+  protocol-matrix **11/0**, both re-run on the frozen tree. Reviews: adversarial **MERGE-with-findings** and
+  verification **MERGE**, both confirming the spawn/await split and the three new tests as real witnesses. *Erratum for
+  the M-33 records commit's message:* it said `TODO.md` went 11731 → 11766; the tree reads **11770** at that head (the
+  plan's 1145 was right). Ledger unchanged at **3 open / 234 closed / 237 headers**; the plan records **2 arms across 2
+  rows** remaining — group D2, the last.
+
 
 
 
