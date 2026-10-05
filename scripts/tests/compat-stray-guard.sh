@@ -40,7 +40,7 @@
 #   9  a `ps` that fails in the exit trap does not turn a live synthetic of ours
 #      into a stranger: an unidentifiable pid we started is still killed.
 #   10 `scripts/compat-test.sh` carries no pattern kill and its XTCP pre-test
-#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:9597).
+#      sweep is the pid-exact `reap_scoped_strays` (TODO.md:9633).
 #   11 that sweep, driven against three real synthetic servers: the
 #      in-`$TEST_DIR` leak started after the baseline is reaped, while the
 #      baseline server and the same-named out-of-tree peer are left alone. This
@@ -112,7 +112,7 @@ fails=0
 # A total is not a *shape* though: deleting N assertions and adding N dummy
 # `ok` lines keeps the total and still exits 0 (measured against the count as
 # the only guard — that mutant is in the batch-E record), which is residue (d)
-# of TODO.md:9730. `SHAPE` below pins the count, the order and the *label* of
+# of TODO.md:9766. `SHAPE` below pins the count, the order and the *label* of
 # every assertion, so a scenario that stops running, a check that is deleted,
 # reordered, or a dummy added anywhere, all red. It compares labels, not bodies:
 # a check whose body is gutted behind an unchanged `ok` label is not a shape
@@ -279,7 +279,7 @@ WORK=""
 # direction. A `ps` probe that cannot run leaves the pid *unidentifiable*, and
 # an unidentifiable live child we started is ours to kill — reading it as "not
 # ours" is how every live synthetic outlived a `ps` failure (residue (a) of
-# TODO.md:9730). A pid the guard already reaped can be recycled before this trap
+# TODO.md:9766). A pid the guard already reaped can be recycled before this trap
 # runs, and killing a stranger is the hazard this suite pins; the probe is what
 # tells those apart, so only a probe we can trust is allowed to *forgive*.
 reap_own_synthetic() {
@@ -339,7 +339,7 @@ enforce_shape() {
 #                Without it, replacing that body with a forged `rc=1`/`out`
 #                behind the identical labels left the suite green (SG-M1,
 #                measured by the adversarial reviewer).
-#   scenario-10  TODO.md:9597's fix: the input derivation (`compat_src=`, the
+#   scenario-10  TODO.md:9633's fix: the input derivation (`compat_src=`, the
 #                comment strip) *and* both assertion blocks. Pinning only the
 #                two verdict blocks left the line that produces the text they
 #                read unpinned, so a forged input — a literal string containing
@@ -369,7 +369,7 @@ enforce_shape() {
 # name, deleting a marker or reassigning `self` all red instead of silently
 # shrinking the guarded set.
 SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
-SCEN10_REGION_SHA='1da5434fce87b03ade45afef2d3af4662b2493e6f9828c8487fc200bd524078a'
+SCEN10_REGION_SHA='2bcc43da2d6fadcb3eedc8eb782a12e736351bd5ac2fdf0725dff464ce9fd50a'
 SCEN12_REGION_SHA='6742cb4ea68f2ecb9baa13910fd0ba250507e44368935085711b4cd68d8fa159'
 SCEN13_REGION_SHA='071ade36c23aa45df0908f633a3e2f9686574fd672c9d83796526bdf0db24a67'
 PINNED_REGIONS='scenario-2 scenario-10 scenario-12 scenario-13'
@@ -1045,7 +1045,7 @@ spawn_fake() {
 # never match. It used to be `basename` of the *resolved* script path, which the
 # child's argv does not carry when the suite is invoked through a symlink with a
 # different name — the match failed before the exec and `wait_exec` returned 0
-# (residue (b) of TODO.md:9730). Nothing here depends on the file's name, so
+# (residue (b) of TODO.md:9766). Nothing here depends on the file's name, so
 # there is no alias to get wrong.
 wait_exec() {
   local pid=$1 i=0 cmd me
@@ -1282,7 +1282,7 @@ case "$out" in
 esac
 
 # --- scenario 7: `wait_exec`'s anchor survives an aliased invocation ---------
-# Residue (b) of TODO.md:9730. The probe child is this same file under a
+# Residue (b) of TODO.md:9766. The probe child is this same file under a
 # different name: `wait_exec "$$"` must still see its own pre-exec fork and
 # return 1. Any anchor derived from the script's own name fails here, which is
 # exactly the latent bug CI (which calls the direct path) could not see.
@@ -1301,7 +1301,7 @@ else
 fi
 
 # --- scenario 8: empty `ps` output is "cannot tell", not "the image changed" -
-# Residue (c) of TODO.md:9730. A probe that exits 0 with no output used to fall
+# Residue (c) of TODO.md:9766. A probe that exits 0 with no output used to fall
 # through to the `*) return 0` arm — an empty string does not contain the anchor
 # — so "the tool told us nothing" was read as "the helper has exec-ed".
 hdr 'scenario 8: wait_exec reads empty ps output as "cannot tell"'
@@ -1345,7 +1345,7 @@ fi
 kill -9 "$child_victim" 2>/dev/null || true
 
 # --- scenario 9: a failed ownership probe does not forgive a live synthetic --
-# Residue (a) of TODO.md:9730. The victim is a real synthetic of this run, under
+# Residue (a) of TODO.md:9766. The victim is a real synthetic of this run, under
 # `$WORK`, so the *real* predicate would match it; the point is that a probe
 # which cannot run must not be read as "not ours" and let it outlive the suite.
 hdr 'scenario 9: a failed ps probe does not turn a live synthetic into a stranger'
@@ -1381,7 +1381,7 @@ else
   kill -9 "$victim9b" 2>/dev/null || true
 fi
 
-# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:9597) ------
+# --- scenario 10: the XTCP pre-test cleanup is pid-exact (TODO.md:9633) ------
 # `run_xtcp_test` used two `pkill -f "frpc -c"` / `pkill -f "frps -c"` calls,
 # which select any process on the host whose command line carries that pattern —
 # a developer's unrelated run, or a sibling worktree's compat run. The
@@ -1411,9 +1411,9 @@ else
   bad "compat-test.sh kills by pattern again: $(printf '%s' "$hits" | tr '\n' ' ')"
 fi
 xtcp_body=$(awk '/^run_xtcp_test\(\)/{f=1} f{print} f&&/^}/{exit}' "$WORK/compat-test.code")
-# TODO.md:9597 replaced *two* pattern kills with a pid-exact pair, so the
+# TODO.md:9633 replaced *two* pattern kills with a pid-exact pair, so the
 # scenario has to see both halves inside `run_xtcp_test`: the tracked-pid reaper
-# (`cleanup_pids`, TODO.md:9597's first replacement) and the guard's baseline-aware
+# (`cleanup_pids`, TODO.md:9633's first replacement) and the guard's baseline-aware
 # census sweep (`reap_scoped_strays`). Pinning only the latter let a mutant that
 # deleted the `cleanup_pids` call stay green (measured, reviewer 1).
 xtcp_calls=$(printf '%s\n' "$xtcp_body" | grep -cE '^[[:space:]]*cleanup_pids([[:space:]]|$)' || true)
@@ -1422,7 +1422,7 @@ case "$xtcp_body" in *'reap_scoped_strays'*) xtcp_sweep=true ;; esac
 if $xtcp_sweep && [ "$xtcp_calls" -ge 1 ]; then
   ok 'compat-test.sh: run_xtcp_test sweeps with cleanup_pids and reap_scoped_strays'
 else
-  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:9597 needs both, one per pkill -f it replaced"
+  bad "compat-test.sh: run_xtcp_test's pre-test cleanup is incomplete (reap_scoped_strays=$xtcp_sweep, cleanup_pids calls=$xtcp_calls) — TODO.md:9633 needs both, one per pkill -f it replaced"
 fi
 # --- end substance pin: scenario-10 ---
 

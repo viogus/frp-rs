@@ -1,7 +1,7 @@
 //! Regression: `frpc` must execute an `auth.tokenSource` `exec` command
 //! **once per client service**, exactly like Go frp — not a second time when it
-//! builds the login (`TODO.md:9461`: "Rust frpc runs the `auth.tokenSource`
-//! builds the login (`TODO.md:9461`: "Rust frpc runs the `auth.tokenSource`
+//! builds the login (`TODO.md:9497`: "Rust frpc runs the `auth.tokenSource`
+//! builds the login (`TODO.md:9497`: "Rust frpc runs the `auth.tokenSource`
 //! `exec` command twice per successful login where Go runs it once").
 //!
 //! Measured on the base commit `9b2acefb` against a live frps with this same
@@ -152,8 +152,8 @@ struct LoginSession {
 
 /// Serve one login on `listener`, complete the handshake the way the real
 /// server does (LoginResp in the clear, everything after it AES-128-CFB keyed
-/// by the resolved token — derived at `frp-client/src/service.rs:1570` and
-/// applied at `:1575-1576` via `stream.into_encrypted(enc_key)`).
+/// by the resolved token — derived at `frp-client/src/service.rs:1506` and
+/// applied at `:1511-1512` via `stream.into_encrypted(enc_key)`).
 async fn serve_one_login(listener: &TcpListener, token: &str) -> LoginSession {
     let (conn, _peer) = listener.accept().await.expect("client did not connect");
     let mut stream = IoStream::Tcp(conn);
