@@ -361,84 +361,7 @@ impl Service {
                         std::future::pending::<()>().await;
                     }
                 } => {
-                    let mut ping_msg = msg::Ping {
-                        privilege_key: None,
-                        timestamp: None,
-                    };
-                    // Go frp v0.71.0: ping auth failures skip this heartbeat
-                    // instead of tearing the session down.
-                    let mut skip_ping = false;
-                    // Auth scopes: unioning the client's own scopes with the
-                    // server-advertised scopes is a Rust-to-Rust extension.
-                    // Go v0.70.1's TokenAuthSetterVerifier.SetPing checks only
-                    // the client's own additionalAuthScopes
-                    // (pkg/auth/token.go:44-51); Go has no
-                    // serverAdditionalAuthScopes field in LoginResp, so the
-                    // server side of this union is ignored by Go peers.
-                    let send_auth = crate::backoff::heartbeat_requires_auth(
-                        &ctx.client_scopes,
-                        &ctx.server_scopes,
-                    );
-                    if send_auth {
-                        if let Some(ref oidc) = self.oidc_client {
-                            if let Err(e) = oidc.set_ping(&mut ping_msg).await {
-                                // Go frp v0.71.0: ping auth failure only
-                                // SKIPS this heartbeat — the session stays
-                                // up and the next heartbeat retries
-                                // (client/control.go "skip sending ping
-                                // message"). A full reconnect is wasted when
-                                // the control link is healthy.
-                                warn!(error = %e, "OIDC ping token failed, skipping this ping");
-                                skip_ping = true;
-                            }
-                        } else {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            match self.auth_cfg.try_generate_login_key(ts) {
-                                Ok(key) => {
-                                    ping_msg.privilege_key = Some(key);
-                                    ping_msg.timestamp = Some(ts);
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "Ping token source failed, skipping this ping");
-                                    skip_ping = true;
-                                }
-                            }
-                        }
-                    }
-                    if skip_ping {
-                        // Go parity (client/control.go:253-265): a ping whose
-                        // auth setup failed is retried on a fast exponential
-                        // backoff instead of at the next interval tick — a
-                        // token outage is probed within ~2s, not after a full
-                        // heartbeat_interval (+watchdog). Go's
-                        // wait.BackoffUntil re-arms the ticker itself, so the
-                        // retry REPLACES the next interval tick: reset_after
-                        // points the existing interval at now + backoff. The
-                        // session stays up (skip, not teardown — a reconnect
-                        // is wasted when the control link is healthy).
-                        if let Some(interval) = ctx.ping_interval.as_mut() {
-                            let delay = next_ping_backoff(ctx.ping_retry_backoff, interval.period());
-                            ctx.ping_retry_backoff = Some(delay);
-                            interval.reset_after(delay);
-                        }
-                        continue;
-                    }
-                    let ping = FrpMessage::Ping(ping_msg);
-                    if let Err(e) = writer.send(ping, ctx.v2) {
-                        warn!(error = %e, "Ping write failed: {}", e);
-                        // Non-fatal: heartbeat timeout will detect actual dead connection.
-                    } else {
-                        debug!("Ping sent");
-                    }
-                    // A non-skipped attempt ends the failure streak (Go's
-                    // sendHeartBeat returns no error here — even a failed
-                    // Send is swallowed with `_ =`, so only auth failures
-                    // engage the backoff). The next attempt runs on the
-                    // interval cadence again.
-                    ctx.ping_retry_backoff = None;
+                    self.handle_ping_tick_arm(ctx, &writer).await;
                 }
 
                 _ = ctx
@@ -446,130 +369,7 @@ impl Service {
                     .as_mut()
                     .expect("proxy retry interval available")
                     .tick() => {
-                    let now = Instant::now();
-                    let mut to_retry: Vec<(String, String)> = {
-                        let map = self.proxy_info_map.read().await;
-                        map.iter()
-                            .filter(|(_, info)| matches!(info.phase, ProxyPhase::StartErr(_)))
-                            // Go frp parity: a StartErr proxy is retried only
-                            // once a full interval has elapsed since ITS last
-                            // error (lastStartErr.Add(startErrTimeout)) — not
-                            // on the tick boundary. A permanently-rejected
-                            // proxy therefore gets at most one NewProxy per
-                            // interval instead of one per tick (which, when
-                            // an error lands just before a tick, re-arms the
-                            // error and re-sends immediately — hammering the
-                            // server). Proxies that entered StartErr during
-                            // registration have no entry here; they are
-                            // eligible at the first tick (pre-loop behavior).
-                            .filter(|(name, _)| {
-                                last_start_err
-                                    .get(*name)
-                                    .is_none_or(|t| now.duration_since(*t) >= *PROXY_RETRY_INTERVAL)
-                            })
-                            .map(|(name, info)| (name.clone(), info.local_addr.clone()))
-                            .collect()
-                    };
-                    // Fold proxies stuck in WaitStart past the
-                    // WaitStart response timeout into the retry set. A NewProxy that is never
-                    // answered (a silent server that still Pongs) keeps the
-                    // proxy in WaitStart — the StartErr transition happens
-                    // only on a NewProxyResp error, so without this check a
-                    // single unanswered retry would stop the retries
-                    // forever. Go frp parity: proxy_wrapper re-arms
-                    // waitResponseTimeout while in waitStart and retries
-                    // indefinitely. `waitstart_seen` records when each
-                    // proxy last entered WaitStart (initial registration or
-                    // a retry send) and is pruned once it leaves WaitStart
-                    // (registered, errored, or closed).
-                    {
-                        let map = self.proxy_info_map.read().await;
-                        ctx.waitstart_seen.retain(|name, _| {
-                            map.get(name).is_some_and(|info| {
-                                info.phase == ProxyPhase::WaitStart
-                            })
-                        });
-                        // Prune StartErr anchors for proxies that left
-                        // StartErr (registered, closed, or re-entered
-                        // WaitStart via a retry send below).
-                        last_start_err.retain(|name, _| {
-                            map.get(name).is_some_and(|info| {
-                                matches!(info.phase, ProxyPhase::StartErr(_))
-                            })
-                        });
-                        for (name, info) in map.iter() {
-                            if info.phase == ProxyPhase::WaitStart
-                                && !ctx.waitstart_seen.contains_key(name)
-                            {
-                                // First observed in WaitStart at this tick
-                                // (e.g. the initial registration left it
-                                // pending past retry setup): start its
-                                // clock now.
-                                ctx.waitstart_seen.insert(name.clone(), now);
-                            }
-                        }
-                        to_retry.extend(map.iter().filter_map(|(name, info)| {
-                            if info.phase == ProxyPhase::WaitStart
-                                && ctx.waitstart_seen.get(name).is_some_and(|first_seen| {
-                                    // saturating_sub: an env-shrunk
-                                    // interval below the 100ms grace must
-                                    // not underflow (panic).
-                                    now.duration_since(*first_seen)
-                                        >= (*WAIT_START_RETRY_TIMEOUT)
-                                            .saturating_sub(PROXY_RETRY_GRACE)
-                                })
-                            {
-                                Some((name.clone(), info.local_addr.clone()))
-                            } else {
-                                None
-                            }
-                        }));
-                    }
-                    if !to_retry.is_empty() {
-                        // Retry candidates come from the LIVE proxy set:
-                        // try_reload refreshes self.proxies, so a proxy
-                        // ADDED by a reload that failed to register
-                        // (StartErr) is retried too — the session-start
-                        // `proxies` snapshot (still used by the
-                        // registration loop above) would miss it.
-                        // Lock order: proxies read then cfg read (the
-                        // session loop takes them in the opposite order).
-                        // Not a deadlock: both locks' writers (try_reload)
-                        // run only in this message-loop task, so these read
-                        // guards never contend with a writer across tasks.
-                        let all_proxies = Arc::clone(&*self.proxies.read().await);
-                        let retry_candidates =
-                            filter_active_proxies(&*self.cfg.read().await, &all_proxies);
-                        // Hoist the wire-name prefix (format! allocates); it is
-                        // loop-invariant within this tick.
-                        let cfg_user_prefix = if ctx.cfg_user.is_empty() {
-                            None
-                        } else {
-                            Some(format!("{}.", ctx.cfg_user))
-                        };
-                        for (name, local_addr) in to_retry {
-                            let bare_name = match &cfg_user_prefix {
-                                Some(prefix) => name.strip_prefix(prefix).unwrap_or(&name),
-                                None => name.as_str(),
-                            };
-                            if let Some(p) = retry_candidates.iter().find(|p| p.name == bare_name) {
-                                let new_proxy = crate::proxy::create_new_proxy_msg(p, &local_addr, &ctx.cfg_user);
-                                if let Err(e) = writer.send(new_proxy, ctx.v2) {
-                                    warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
-                                } else {
-                                    info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
-                                    let mut map = self.proxy_info_map.write().await;
-                                    if let Some(info) = map.get_mut(&name) {
-                                        info.phase = ProxyPhase::WaitStart;
-                                    }
-                                    // Re-arm the WaitStart clock at the send
-                                    // (Go frp's proxy_wrapper re-arms
-                                    // startErrTimeout per NewProxy send).
-                                    ctx.waitstart_seen.insert(name.clone(), Instant::now());
-                                }
-                            }
-                        }
-                    }
+                    self.handle_proxy_retry_tick_arm(ctx, &writer, &mut last_start_err).await;
                 }
 
                 Some(event) = channels.health_rx.recv() => {
@@ -1377,6 +1177,265 @@ impl Service {
                 .await;
         }
     }
+
+    /// Handle one heartbeat ping tick: build the `Ping` (with the auth scope
+    /// union and the Go v0.71.0 auth-failure policy — a failed OIDC token or
+    /// token-source setup SKIPS this heartbeat rather than tearing the session
+    /// down, re-arming `ping_interval` on the exponential backoff), send it,
+    /// and clear the failure streak.
+    ///
+    /// Extracted from the `run_message_loop` ping-tick arm by the P2 S3b seam
+    /// (group C). The arm was terminal — nothing follows the `select!` inside
+    /// the loop, and the `continue` was not inside an inner loop (the arm
+    /// carries zero real `for`/`while`/`loop` tokens), so it bound the message
+    /// `loop` and resumed at the loop top, which is exactly where falling off
+    /// this body lands; it is the `return` here. That was the program's last
+    /// `continue;`. No statement is otherwise added, removed or reordered.
+    ///
+    /// The timer future the arm polls (`_ = async { … }`, the
+    /// `pending::<()>()` disabled-heartbeat shape) stays at the call site
+    /// verbatim: this handler is the arm *body*, not the arm.
+    ///
+    /// `writer` is used unconditionally (the `Ping` send), not behind the
+    /// `vnet` gate, so this handler carries no
+    /// `cfg_attr(not(feature = "vnet"), allow(unused_variables))` — proved by
+    /// a no-vnet removal probe, not inherited.
+    ///
+    /// Called inline from the loop, never spawned: the retry arm's lock-order
+    /// note ("both locks' writers run only in this message-loop task") holds
+    /// only while that stays true.
+    async fn handle_ping_tick_arm(&self, ctx: &mut SessionCtx, writer: &Arc<ControlWriter>) {
+        let mut ping_msg = msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        };
+        // Go frp v0.71.0: ping auth failures skip this heartbeat
+        // instead of tearing the session down.
+        let mut skip_ping = false;
+        // Auth scopes: unioning the client's own scopes with the
+        // server-advertised scopes is a Rust-to-Rust extension.
+        // Go v0.70.1's TokenAuthSetterVerifier.SetPing checks only
+        // the client's own additionalAuthScopes
+        // (pkg/auth/token.go:44-51); Go has no
+        // serverAdditionalAuthScopes field in LoginResp, so the
+        // server side of this union is ignored by Go peers.
+        let send_auth =
+            crate::backoff::heartbeat_requires_auth(&ctx.client_scopes, &ctx.server_scopes);
+        if send_auth {
+            if let Some(ref oidc) = self.oidc_client {
+                if let Err(e) = oidc.set_ping(&mut ping_msg).await {
+                    // Go frp v0.71.0: ping auth failure only
+                    // SKIPS this heartbeat — the session stays
+                    // up and the next heartbeat retries
+                    // (client/control.go "skip sending ping
+                    // message"). A full reconnect is wasted when
+                    // the control link is healthy.
+                    warn!(error = %e, "OIDC ping token failed, skipping this ping");
+                    skip_ping = true;
+                }
+            } else {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                match self.auth_cfg.try_generate_login_key(ts) {
+                    Ok(key) => {
+                        ping_msg.privilege_key = Some(key);
+                        ping_msg.timestamp = Some(ts);
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Ping token source failed, skipping this ping");
+                        skip_ping = true;
+                    }
+                }
+            }
+        }
+        if skip_ping {
+            // Go parity (client/control.go:253-265): a ping whose
+            // auth setup failed is retried on a fast exponential
+            // backoff instead of at the next interval tick — a
+            // token outage is probed within ~2s, not after a full
+            // heartbeat_interval (+watchdog). Go's
+            // wait.BackoffUntil re-arms the ticker itself, so the
+            // retry REPLACES the next interval tick: reset_after
+            // points the existing interval at now + backoff. The
+            // session stays up (skip, not teardown — a reconnect
+            // is wasted when the control link is healthy).
+            if let Some(interval) = ctx.ping_interval.as_mut() {
+                let delay = next_ping_backoff(ctx.ping_retry_backoff, interval.period());
+                ctx.ping_retry_backoff = Some(delay);
+                interval.reset_after(delay);
+            }
+            return;
+        }
+        let ping = FrpMessage::Ping(ping_msg);
+        if let Err(e) = writer.send(ping, ctx.v2) {
+            warn!(error = %e, "Ping write failed: {}", e);
+            // Non-fatal: heartbeat timeout will detect actual dead connection.
+        } else {
+            debug!("Ping sent");
+        }
+        // A non-skipped attempt ends the failure streak (Go's
+        // sendHeartBeat returns no error here — even a failed
+        // Send is swallowed with `_ =`, so only auth failures
+        // engage the backoff). The next attempt runs on the
+        // interval cadence again.
+        ctx.ping_retry_backoff = None;
+    }
+
+    /// Handle one proxy-retry tick: re-send `NewProxy` for proxies stuck in
+    /// `StartErr` past their own retry anchor and for proxies stuck in
+    /// `WaitStart` past the response timeout, pruning the two bookkeeping maps
+    /// first.
+    ///
+    /// Extracted from the `run_message_loop` proxy-retry-tick arm by the P2
+    /// S3b seam (group C). The arm was terminal — nothing follows the `select!`
+    /// inside the loop — and it carried no `continue` and no inner loop, so
+    /// there is no control-flow delta: the body is the de-indented original. It
+    /// carries no `#[cfg]`, matching the original.
+    ///
+    /// The lock-order note inside the body is the reason this extraction must
+    /// keep calling it inline: `self.proxies` is read before `self.cfg` here
+    /// while the session loop takes them in the opposite order, which is sound
+    /// **only** because both locks' writers (`try_reload`) run in this same
+    /// message-loop task. `.await`ing this handler from the loop preserves that
+    /// task affinity; `tokio::spawn`ing it would break the ordering argument
+    /// and is a defect, not a style choice.
+    ///
+    /// The timer future the arm polls (`_ = ctx.proxy_retry_interval…tick()`)
+    /// stays at the call site verbatim: this handler is the arm *body*, not the
+    /// arm.
+    ///
+    /// `writer` is used unconditionally (each retry's `NewProxy` send), not
+    /// behind the `vnet` gate, so this handler carries no
+    /// `cfg_attr(not(feature = "vnet"), allow(unused_variables))` — proved by a
+    /// no-vnet removal probe.
+    async fn handle_proxy_retry_tick_arm(
+        &self,
+        ctx: &mut SessionCtx,
+        writer: &Arc<ControlWriter>,
+        last_start_err: &mut HashMap<String, Instant>,
+    ) {
+        let now = Instant::now();
+        let mut to_retry: Vec<(String, String)> = {
+            let map = self.proxy_info_map.read().await;
+            map.iter()
+                .filter(|(_, info)| matches!(info.phase, ProxyPhase::StartErr(_)))
+                // Go frp parity: a StartErr proxy is retried only
+                // once a full interval has elapsed since ITS last
+                // error (lastStartErr.Add(startErrTimeout)) — not
+                // on the tick boundary. A permanently-rejected
+                // proxy therefore gets at most one NewProxy per
+                // interval instead of one per tick (which, when
+                // an error lands just before a tick, re-arms the
+                // error and re-sends immediately — hammering the
+                // server). Proxies that entered StartErr during
+                // registration have no entry here; they are
+                // eligible at the first tick (pre-loop behavior).
+                .filter(|(name, _)| {
+                    last_start_err
+                        .get(*name)
+                        .is_none_or(|t| now.duration_since(*t) >= *PROXY_RETRY_INTERVAL)
+                })
+                .map(|(name, info)| (name.clone(), info.local_addr.clone()))
+                .collect()
+        };
+        // Fold proxies stuck in WaitStart past the
+        // WaitStart response timeout into the retry set. A NewProxy that is never
+        // answered (a silent server that still Pongs) keeps the
+        // proxy in WaitStart — the StartErr transition happens
+        // only on a NewProxyResp error, so without this check a
+        // single unanswered retry would stop the retries
+        // forever. Go frp parity: proxy_wrapper re-arms
+        // waitResponseTimeout while in waitStart and retries
+        // indefinitely. `waitstart_seen` records when each
+        // proxy last entered WaitStart (initial registration or
+        // a retry send) and is pruned once it leaves WaitStart
+        // (registered, errored, or closed).
+        {
+            let map = self.proxy_info_map.read().await;
+            ctx.waitstart_seen.retain(|name, _| {
+                map.get(name)
+                    .is_some_and(|info| info.phase == ProxyPhase::WaitStart)
+            });
+            // Prune StartErr anchors for proxies that left
+            // StartErr (registered, closed, or re-entered
+            // WaitStart via a retry send below).
+            last_start_err.retain(|name, _| {
+                map.get(name)
+                    .is_some_and(|info| matches!(info.phase, ProxyPhase::StartErr(_)))
+            });
+            for (name, info) in map.iter() {
+                if info.phase == ProxyPhase::WaitStart && !ctx.waitstart_seen.contains_key(name) {
+                    // First observed in WaitStart at this tick
+                    // (e.g. the initial registration left it
+                    // pending past retry setup): start its
+                    // clock now.
+                    ctx.waitstart_seen.insert(name.clone(), now);
+                }
+            }
+            to_retry.extend(map.iter().filter_map(|(name, info)| {
+                if info.phase == ProxyPhase::WaitStart
+                    && ctx.waitstart_seen.get(name).is_some_and(|first_seen| {
+                        // saturating_sub: an env-shrunk
+                        // interval below the 100ms grace must
+                        // not underflow (panic).
+                        now.duration_since(*first_seen)
+                            >= (*WAIT_START_RETRY_TIMEOUT).saturating_sub(PROXY_RETRY_GRACE)
+                    })
+                {
+                    Some((name.clone(), info.local_addr.clone()))
+                } else {
+                    None
+                }
+            }));
+        }
+        if !to_retry.is_empty() {
+            // Retry candidates come from the LIVE proxy set:
+            // try_reload refreshes self.proxies, so a proxy
+            // ADDED by a reload that failed to register
+            // (StartErr) is retried too — the session-start
+            // `proxies` snapshot (still used by the
+            // registration loop above) would miss it.
+            // Lock order: proxies read then cfg read (the
+            // session loop takes them in the opposite order).
+            // Not a deadlock: both locks' writers (try_reload)
+            // run only in this message-loop task, so these read
+            // guards never contend with a writer across tasks.
+            let all_proxies = Arc::clone(&*self.proxies.read().await);
+            let retry_candidates = filter_active_proxies(&*self.cfg.read().await, &all_proxies);
+            // Hoist the wire-name prefix (format! allocates); it is
+            // loop-invariant within this tick.
+            let cfg_user_prefix = if ctx.cfg_user.is_empty() {
+                None
+            } else {
+                Some(format!("{}.", ctx.cfg_user))
+            };
+            for (name, local_addr) in to_retry {
+                let bare_name = match &cfg_user_prefix {
+                    Some(prefix) => name.strip_prefix(prefix).unwrap_or(&name),
+                    None => name.as_str(),
+                };
+                if let Some(p) = retry_candidates.iter().find(|p| p.name == bare_name) {
+                    let new_proxy =
+                        crate::proxy::create_new_proxy_msg(p, &local_addr, &ctx.cfg_user);
+                    if let Err(e) = writer.send(new_proxy, ctx.v2) {
+                        warn!(proxy_name = %name, error = %e, "Proxy '{}' retry: write NewProxy failed: {}", name, e);
+                    } else {
+                        info!(proxy_name = %name, "Proxy '{}' retry: sent NewProxy", name);
+                        let mut map = self.proxy_info_map.write().await;
+                        if let Some(info) = map.get_mut(&name) {
+                            info.phase = ProxyPhase::WaitStart;
+                        }
+                        // Re-arm the WaitStart clock at the send
+                        // (Go frp's proxy_wrapper re-arms
+                        // startErrTimeout per NewProxy send).
+                        ctx.waitstart_seen.insert(name.clone(), Instant::now());
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1399,6 +1458,89 @@ mod tests {
             err: String::new(),
             config_snapshot: String::new(),
             phase,
+        }
+    }
+
+    /// A `ControlWriter` whose receiver the caller keeps, so a test can assert
+    /// on what the handler under test enqueued on the control channel.
+    fn test_control_writer_rx() -> (
+        Arc<ControlWriter>,
+        tokio::sync::mpsc::Receiver<(FrpMessage, bool)>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel::<(FrpMessage, bool)>(16);
+        (
+            Arc::new(ControlWriter {
+                tx,
+                failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                notify: Arc::new(tokio::sync::Notify::new()),
+            }),
+            rx,
+        )
+    }
+
+    /// A minimal `SessionCtx` for tests that drive an extracted arm handler
+    /// directly. The two timer arms reach only a handful of `SessionCtx`
+    /// fields, but the struct has no `Default` and is private to `service`
+    /// (this module is its child, so it can name it), so the literal is
+    /// spelled out. `reader` stays `None`: neither arm touches it.
+    fn test_session_ctx() -> SessionCtx {
+        SessionCtx {
+            control_stream: None,
+            run_id: "test-run-id".to_string(),
+            yamux: None,
+            v2: false,
+            #[cfg(feature = "quic")]
+            quic_conn: None,
+            ping_interval: None,
+            ping_retry_backoff: None,
+            last_pong: Instant::now(),
+            hb_timeout: 30,
+            hb_timeout_dur: Duration::from_secs(30),
+            hb_watchdog_active: false,
+            session_alive: Arc::new(AtomicBool::new(true)),
+            wc_server_addr: "127.0.0.1".to_string(),
+            wc_server_port: 7000,
+            wc_tls_enable: false,
+            wc_tls_server_name: String::new(),
+            wc_tls_ca_file: None,
+            wc_tls_cert_file: None,
+            wc_tls_key_file: None,
+            wc_dns_server: None,
+            wc_udp_packet_size: 1500,
+            wc_udp_packet_codec: String::new(),
+            wc_disable_custom_tls_first_byte: false,
+            wc_keepalive_secs: 7200,
+            wc_bind_addr: None,
+            wc_proxy_url: String::new(),
+            wc_dial_timeout_secs: 10,
+            protocol: TransportProtocol::Tcp,
+            client_scopes: Vec::new(),
+            server_scopes: Vec::new(),
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
+            session_started_at: Instant::now(),
+            pending_proxies: Vec::new(),
+            pending_visitors: Vec::new(),
+            write_failed: false,
+            seen_registration_response: false,
+            req_work_conns_seen: 0,
+            writer: None,
+            control_rx: None,
+            control_failed: None,
+            control_notify: None,
+            reader: None,
+            visitor_shutdown: None,
+            visitor_handles: Vec::new(),
+            work_conn_handles: Vec::new(),
+            control_writer_handle: None,
+            pending_xtcp: HashMap::new(),
+            xtcp_sockets: Default::default(),
+            visitor_pending: HashMap::new(),
+            stun_result_tx: None,
+            stun_result_rx: None,
+            xtcp_cleanup_rx: None,
+            proxy_retry_interval: None,
+            waitstart_seen: HashMap::new(),
+            cfg_user: String::new(),
         }
     }
 
@@ -1754,5 +1896,232 @@ mod tests {
             .vnet_controller
             .deliver_visitor_packet("peer-a", vec![0x45])
             .is_err());
+    }
+
+    /// The extracted ping-tick arm, driven directly. No test puts the arm's
+    /// timer on a live wire, so this is the direct lane for the two behaviours
+    /// the arm owns: an authenticated tick sends one `Ping` and clears the
+    /// failure streak, while a tick whose auth setup fails **skips** the send
+    /// (the session stays up) and re-arms `ping_interval` with the exponential
+    /// backoff, recording it in `ping_retry_backoff`.
+    ///
+    /// `client_scopes` carries `HeartBeats` so `heartbeat_requires_auth` is
+    /// true, which is the precondition for the auth branch the skip path lives
+    /// in.
+    #[tokio::test]
+    async fn ping_tick_arm_sends_ping_and_skips_on_auth_failure() {
+        // Normal path: token auth resolves, so a Ping is enqueued and the
+        // streak is cleared.
+        let service = test_service().await;
+        let (writer, mut rx) = test_control_writer_rx();
+        let mut ctx = test_session_ctx();
+        // `HeartBeats` makes `heartbeat_requires_auth` true, which is the
+        // precondition for the auth branch: the source's token resolves, a
+        // login key is attached, and the streak is cleared.
+        ctx.client_scopes = vec!["HeartBeats".to_string()];
+        let period = Duration::from_millis(1);
+        ctx.ping_interval = Some(tokio::time::interval(period));
+        // Pretend a previous failure was in flight; a non-skipped attempt must
+        // clear it.
+        ctx.ping_retry_backoff = Some(Duration::from_secs(2));
+
+        service.handle_ping_tick_arm(&mut ctx, &writer).await;
+
+        let (msg, v2) = rx
+            .try_recv()
+            .expect("an authenticated tick must enqueue exactly one Ping");
+        match msg {
+            FrpMessage::Ping(p) => {
+                assert!(
+                    p.privilege_key.is_some(),
+                    "token auth must attach a login key to the heartbeat"
+                );
+                assert!(p.timestamp.is_some());
+            }
+            other => panic!("expected Ping, got {other:?}"),
+        }
+        assert!(!v2, "the test ctx negotiates V1");
+        assert!(
+            ctx.ping_retry_backoff.is_none(),
+            "a non-skipped attempt must end the failure streak"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "one tick must enqueue exactly one message"
+        );
+
+        // Skip path: an auth config whose token cannot resolve makes
+        // `try_generate_login_key` fail, so the tick is skipped rather than
+        // tearing the session down.
+        let mut service = test_service().await;
+        {
+            let mut auth = (*service.auth_cfg).clone();
+            auth.token = String::new();
+            service.auth_cfg = Arc::new(auth);
+        }
+        let (writer, mut rx) = test_control_writer_rx();
+        let mut ctx = test_session_ctx();
+        ctx.client_scopes = vec!["HeartBeats".to_string()];
+        let period = Duration::from_millis(10);
+        ctx.ping_interval = Some(tokio::time::interval(period));
+        ctx.ping_retry_backoff = None;
+
+        service.handle_ping_tick_arm(&mut ctx, &writer).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a failed auth setup must skip the heartbeat, not send it"
+        );
+        assert_eq!(
+            ctx.ping_retry_backoff,
+            Some(period),
+            "the skip path must record the (interval-capped) exponential backoff"
+        );
+        assert_eq!(
+            ctx.ping_interval.as_ref().expect("interval armed").period(),
+            period,
+            "reset_after changes the next deadline, not the period"
+        );
+    }
+
+    /// The extracted proxy-retry-tick arm, driven directly. No test drives the
+    /// retry timer's eligibility rules over a live `Service`, so this is the
+    /// direct lane for the three decisions the arm owns: a `StartErr` proxy
+    /// whose own anchor is older than `PROXY_RETRY_INTERVAL` is re-sent (and
+    /// moved to `WaitStart`, re-arming the WaitStart clock), a `StartErr` proxy
+    /// anchored just now is **not** re-sent, and a `WaitStart` proxy past
+    /// `WAIT_START_RETRY_TIMEOUT` is re-sent.
+    #[tokio::test]
+    async fn proxy_retry_tick_arm_retries_by_anchor_and_prunes_maps() {
+        let service = test_service().await;
+        // Two live proxies whose BARE names match the `user.`-prefixed runtime
+        // map keys below: the retry candidate is looked up by stripped name,
+        // so a config missing the bare name silently skips the re-send.
+        let mk = |name: &str, local_port: u16| frp_core::config::ProxyConfig {
+            name: name.to_string(),
+            proxy_type: "tcp".to_string(),
+            local_port,
+            remote_port: 7001,
+            enabled: true,
+            ..Default::default()
+        };
+        let (p1, p2) = (mk("p1", 8080), mk("p2", 8081));
+        *service.proxies.write().await = Arc::new(vec![p1.clone(), p2.clone()]);
+        {
+            let mut cfg = (*service.cfg.read().await).clone();
+            cfg.proxies.push(p1);
+            cfg.proxies.push(p2);
+            *service.cfg.write().await = cfg;
+        }
+        {
+            let mut map = service.proxy_info_map.write().await;
+            map.insert("user.p1".to_string(), proxy_info(ProxyPhase::WaitStart));
+            map.insert(
+                "user.p2".to_string(),
+                proxy_info(ProxyPhase::StartErr("port in use".to_string())),
+            );
+            map.insert(
+                "user.p3".to_string(),
+                proxy_info(ProxyPhase::StartErr("port in use".to_string())),
+            );
+        }
+
+        let (writer, mut rx) = test_control_writer_rx();
+        let mut ctx = test_session_ctx();
+        ctx.cfg_user = "user".to_string();
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        interval.tick().await; // skip the interval's immediate first tick
+        ctx.proxy_retry_interval = Some(interval);
+        // The WaitStart proxy's clock is old enough to be past
+        // WAIT_START_RETRY_TIMEOUT + grace; p1 is not registered in
+        // WaitStart, so p2/p3 carry the StartErr anchors.
+        ctx.waitstart_seen.insert(
+            "user.p1".to_string(),
+            Instant::now() - Duration::from_secs(600),
+        );
+        let mut last_start_err: HashMap<String, Instant> = HashMap::new();
+        let stale_anchor = Instant::now() - Duration::from_secs(600);
+        let fresh_anchor = Instant::now();
+        last_start_err.insert("user.p2".to_string(), stale_anchor);
+        last_start_err.insert("user.p3".to_string(), fresh_anchor);
+
+        service
+            .handle_proxy_retry_tick_arm(&mut ctx, &writer, &mut last_start_err)
+            .await;
+
+        // Collect first: the valid `to_retry` list is filled from a `HashMap`
+        // walk, so the two eligible proxies may be enqueued in either order.
+        let mut sent: Vec<String> = Vec::new();
+        while let Ok((msg, v2)) = rx.try_recv() {
+            assert!(!v2, "the test ctx negotiates V1");
+            match msg {
+                FrpMessage::NewProxy(np) => {
+                    // `create_new_proxy_msg` strips `local_str` for Go frps
+                    // compatibility, so the local address travels through the
+                    // retry candidate, not through this field.
+                    assert!(np.local_str.is_none());
+                    sent.push(np.proxy_name);
+                }
+                other => panic!("expected NewProxy, got {other:?}"),
+            }
+        }
+        sent.sort();
+        assert_eq!(
+            sent,
+            vec!["user.p1".to_string(), "user.p2".to_string()],
+            "the stuck WaitStart proxy and the StartErr proxy past its anchor \
+             must be re-sent in one tick; the freshly-anchored StartErr proxy \
+             must not"
+        );
+
+        eprintln!(
+            "PROBE2 phase_p2={:?} last_start_err_keys={:?}",
+            service
+                .proxy_info_map
+                .read()
+                .await
+                .get("user.p2")
+                .map(|i| i.phase.clone()),
+            last_start_err.keys().collect::<Vec<_>>()
+        );
+        {
+            let map = service.proxy_info_map.read().await;
+            assert_eq!(
+                map.get("user.p1").expect("p1 present").phase,
+                ProxyPhase::WaitStart
+            );
+            assert_eq!(
+                map.get("user.p2").expect("p2 present").phase,
+                ProxyPhase::WaitStart,
+                "a retry send moves the proxy to WaitStart"
+            );
+            assert!(
+                matches!(
+                    map.get("user.p3").expect("p3 present").phase,
+                    ProxyPhase::StartErr(_)
+                ),
+                "the freshly-anchored StartErr proxy keeps its phase"
+            );
+        }
+        assert!(
+            ctx.waitstart_seen.contains_key("user.p1"),
+            "p1's WaitStart clock must be re-armed at the retry send"
+        );
+        // The prune pass runs before the sends, so p2 is still in StartErr
+        // when it runs and its anchor survives it. That anchor is NOT re-armed
+        // by the retry send: `waitstart_seen` is re-armed (the WaitStart clock
+        // above), while a `last_start_err` entry is only ever written by the
+        // `NewProxyResp` error path. The stale anchor is what made p2 eligible
+        // and the entry is left exactly as it was.
+        assert_eq!(
+            last_start_err.get("user.p2").copied(),
+            Some(stale_anchor),
+            "the retry send must not rewrite the StartErr anchor"
+        );
+        assert_eq!(
+            last_start_err.get("user.p3").copied(),
+            Some(fresh_anchor),
+            "the still-StartErr proxy keeps its original anchor"
+        );
     }
 }
