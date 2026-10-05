@@ -20,7 +20,7 @@
 //! (`frp-client/src/service.rs`) awaited every `JoinHandle` a second time after
 //! `join_all` had already driven the finished ones to `Ready`; tokio panics on
 //! that second poll. The in-process unit pin for the same mechanism is
-//! `frp-client/src/service.rs`'s
+//! `frp-client/src/service/tests.rs`'s
 //! `shutdown_visitor_tasks_tolerates_a_completed_handle`.
 //!
 //! These cases spawn the real binaries because the defect is an exit code and a

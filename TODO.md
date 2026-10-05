@@ -7445,6 +7445,50 @@ nothing about whether the described behaviour still holds.
   **4 open / 231 closed / 235 headers**. **The item stays open**: P1 is done, but the same item's scope continues into
   P2 (`frp-client/src/service.rs`), which the plan splits into S0–S5.
 
+  **Progress (2026-10-04, code head `e3ab91ff` on `dsh/m21-p2-s0-tests`, PR #491, based on `42799e08`).** The first
+  **P2** seam (S0) landed: the inline test module of `frp-client/src/service.rs` is now the child module
+  `frp-client/src/service/tests.rs` — `service.rs` 6855 → 5107 lines, the new file 1742, with `#[cfg(test)] mod
+  tests;` where the inline module was. The parent keeps `Service`/`SessionCtx` and their privacy, and the file-ified
+  module's test scope is unchanged (`cargo test -p frp-client --lib` is 281 passed / 0 failed, and the module path is
+  still `service::tests`). Because the `mod tests { … }` wrapper became the file's top level, the body is de-indented
+  one level, so the claim is a **census rather than "byte-identical"**: 1741 body lines = **1640 exactly one-level
+  de-indented + 101 byte-verbatim (99 blank, 2 beginning inside a backslash-continued string literal, where stripping
+  four columns would rewrite the literal) + 0 anything else**, after which `cargo fmt` re-joined four over-wrapped
+  expressions (three token-preserving; the fourth drops one trailing comma inside a nested generic, which is inert).
+  Re-inserting the six moved lines reproduces the 5111-line production head. **Two clauses of the plan's S0 row were
+  falsified, and the row is corrected:** the two test-only imports do **not** "become dead in the parent" — both are
+  `#[cfg(all(feature = "vnet", test))]` and a child's `use super::*;` marks the parent's import used, proved by a
+  shape-identical probe *and* by `cargo clippy -p frp-client --all-features --lib --tests -- -D warnings` being rc 0
+  **with them left behind** — and moving them **is** a six-line production change, so "no production line changes" was
+  wrong as written. The move remains right and in scope (a test-only gate does not belong in production), and the
+  author flagged the judgement call rather than silently following the brief. `scripts/large-functions.sh` reports the
+  plan's `5108 / 6856` figures **exactly** at base; after the move `service.rs` is 5106 production / 5108 total / 2
+  test, and the new `tests.rs` is classified as a whole-file test module (0 production, hence absent from the printed table; 1743 total) — which also exercises the
+  earlier item that taught that tool to classify file-ified test modules. **37 live cites were re-pointed by content**
+  (35 shift −6; 2 that pointed into the test module now point at `service/tests.rs`); the table was re-baked
+  (`guard_data_pin` `e76b9fb4…` → `a69297ce…` at the code seam, re-baked here to `f635d02bdbfa…`; an opcode diff of the base
+  against this head is 41 removed / 41 added / 558 unchanged lines = 40 changed record lines plus the single `# pins:`
+  header line, leaving 537 unchanged records — 35 target-line+raw shifts, 2 target-file moves into `service/tests.rs`,
+  2 citing-line shifts and 1 fingerprint-only re-bake, of which 37 are the content re-points above) with `checked`
+  still 577 and no cite added or removed, and the weak
+  population is **107 → 107** (`weak_set` `67578c6b…` → `f9c334c1…`): by `(target, fp)` one key left and one entered
+  (the same fingerprint moving file), keyed by (citing file, line, target) three left and three entered, and on the
+  guard's own key (`target:line-end`, the one `weak_set` hashes) four left and four entered. No
+  `CHANGELOG.md` bullet, matching the earlier seams. Reviews: verification **MERGE** at the tip; adversarial
+  **DO-NOT-MERGE → MERGE**. Ledger unchanged at **3 open / 232 closed / 235 headers** (the P2 item stays open).
+
+  *Process note, recorded deliberately.* The first review dispatch named `a55adb82`, an in-flight pre-rebase commit
+  that was briefly the pushed head; at it the adversarial found the pathline guard **red** (the table had been
+  regenerated but `guard_data_pin` not re-baked — table `347e9e4a…` vs pin `85e74799…`, plus a stale `weak_set`) and
+  correctly returned **DO-NOT-MERGE** with the remediation. The author then committed the re-derivation as
+  `e3ab91ff` (table == pin == `a69297ce…`, guards 577/0 and 101/0 in a fresh checkout) and both reviewers re-verified
+  that tip, the adversarial confirming F1 resolved and nothing new appearing. The coordinator's error was twofold:
+  dispatching reviews before the author reported its final head, and verifying the author's **working tree** rather
+  than a fresh checkout of the pushed commit — which is why the two reports briefly disagreed. Reviews are now
+  dispatched only after the author's final report *and* a fresh-checkout verification. Two report-only residues are
+  recorded rather than rewritten: the author report's "before 577/109 unchanged" (the base is weak 107, so the count
+  is unchanged, but 107 → 107) and its "all whitespace; no token" (contradicted by the one dropped trailing comma).
+
 - [x] **`scripts/large-functions.sh` cannot classify file-ified test modules.**
   Evidence: the test-module filter at `scripts/large-functions.sh:155` excludes only a file named
   exactly `tests.rs` or one under a `tests/` directory, so three of the modules this refactor just
