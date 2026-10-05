@@ -7767,6 +7767,45 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   verification **MERGE**, which re-derived the checklist, confirmed the three tests are real per-arm witnesses and the
   `enabled: true` finding at both citations, and confirmed the rows are independently sufficient again. Ledger unchanged
   at **3 open / 234 closed / 237 headers**; the plan records **7 arms across 7 rows** remaining (groups C, D1, D2).
+  **Progress (2026-10-05, code head `30f30246` on `dsh/m33-s3b-group-c`, PR #503, based on `4c754a02`).** The third
+  **grouped** S3b PR landed — and with it **the program's last `continue;`**: group **C**, the two timer arms, `ping tick`
+  (base `:357-442`, 86L / 4982 B / `85979b12…`) and `proxy retry tick` (`:444-573`, 130L / 8103 B / `f1daa5a5…`), became
+  `handle_ping_tick_arm` (`:1207-1283`) and `handle_proxy_retry_tick_arm` (`:1313-1437`), taking `message_loop.rs`
+  1758 → **2127**. The ping arm's `continue;` (base `:427` → `:1269`) was proved terminal for that arm on its own
+  evidence, so the code census is now **0** — stated in all three scopes, since the raw-text count stays 1 (the new
+  handler's doc prose mentions it). **0 statements added, removed or reordered and 0 `&` drops**, and the only remaining edits are
+  **named rather than counted**: a dropped trailing comma in the ping arm (besides the `continue;` → `return;`) and two
+  elided closure-brace pairs in the retry arm's `map.get(name).is_some_and(|info| { … })`. **The character-count
+  denominators are deliberately not recorded** — the author, the adversarial round and the verification round each
+  produced a different basis (1027/1950, 348/681 raw tokens, 2857/4562 whitespace-normalized), and a figure three
+  careful measurers cannot agree on is not worth asserting; the named edits plus the statement-level claims are what
+  this extraction actually turns on. This is the group the plan kept
+  separate for its **documented ordering invariant** (the lock-order note plus the retry arm's task-affinity
+  obligation), so the extraction preserved exactly which work is spawned and which awaited inline: 0 `tokio::spawn` in
+  either handler or at either call site, both `.await`ed inline, the lock-order note verbatim, and the timer futures
+  untouched. The `writer` rule was settled per handler by a removal probe in the **no-vnet** shape (replacing each
+  handler's one `writer.send` gives rc 101 `unused variable: writer`; re-adding the `cfg_attr` gives rc 0), so neither
+  handler carries it; group B's gate-placement rule does not transfer (0 `#[cfg]` in either arm). **Coverage: both arms
+  gained direct tests** (`ping_tick_arm_sends_ping_and_skips_on_auth_failure`, `proxy_retry_tick_arm_retries_by_anchor_and_prunes_maps`),
+  passing in both shapes, plus four named existing lanes re-run. **The most valuable outcome of this seam was caught in
+  review, not written by the author:** the new ping test re-assigned a value its own helper already set, which duplicated
+  the handler's line `ctx.ping_retry_backoff = None;`; because nine `heartbeat_wire_order.rs` cites land on that line the
+  guard's weak count went **104 → 113** — nine *production* witnesses degraded by a *test*. The author's first framing
+  offered "accept the re-bake or edit the handler body", and the report even claimed the base had already counted those
+  cites as weak; **both review rounds rejected the trade independently**, one showing the duplication was redundant and
+  the other that `take()` would also work, and the author removed it at zero cost — the occurrence count is back to 1 and
+  the header to **`weak=104 weak_set=dbbea851…`**, exactly the pre-seam value. That is recorded in the plan as its own
+  lesson, because `--write` **hides** this class rather than removing it. Two further findings: the retry call-site row
+  in the checklist did **not** reproduce (the author's `:367-375` 8/342/`e02a64b8` matches no window; the measured row is
+  **`:367-374` = 8L / 305B / `413e1954`**, caught by one round and re-measured by the coordinator), and the retry
+  candidate lookup matches on the **stripped bare name**, so a mismatched `Config` name silently skips the re-send
+  (also: `create_new_proxy_msg` strips `local_str`). Cascade: 12 cites re-pointed by fingerprint, table re-baked
+  12/12/567 with `checked` 579, `SCEN10_REGION_SHA` a verified **no-op**, pins 20/20. Gates: fmt, all-features clippy and
+  the no-vnet shape rc 0; workspace **2695 passed / 2 failed** (both known host failures); no `AddrInUse` flake;
+  **13/13 health step bodies rc 0 before the commit and again on the head**; compat **86/0** (Rust side from this
+  worktree's debug binaries via the harness overrides); protocol-matrix **11/0**. Ledger unchanged at **3 open / 234
+  closed / 237 headers**; the plan records **5 arms across 5 rows** remaining (groups D1 and D2).
+
 
 
 

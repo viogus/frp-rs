@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=579 weak=104 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=dbbea8513634ee3b ambiguous_set=3343d4d37da5672a excluded_set=482811e32c2ded85
+#   pins: checked=579 weak=104 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=dbbea8513634ee3b ambiguous_set=3343d4d37da5672a excluded_set=ef514b0e053ff3e1
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -84,18 +84,18 @@ frp-client/src/service.rs	661	664	3ca2d4168f3db816	861f7b5363f16196	absolute	frp
 frp-client/src/service.rs	661	664	3ca2d4168f3db816	861f7b5363f16196	absolute	frp-core/src/config/tests.rs	frp-client/src/service.rs:661-664	12528
 frp-client/src/service.rs	715	-	43feb4bbe9547cd8	-	absolute	docs/developing.md	frp-client/src/service.rs:715	919
 frp-client/src/service.rs	931	-	f66788f1f98e2b1f	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/service.rs:931	10
-frp-client/src/service/message_loop.rs	383	393	8243eda4b254d94a	d10b36aa74a59bcf	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:383-393	634
-frp-client/src/service/message_loop.rs	411	428	5d4818ea5df98806	d10b36aa74a59bcf	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:411-428	629
-frp-client/src/service/message_loop.rs	425	-	170dbe5405e7d948	-	shorthand	frp-client/tests/heartbeat_wire_order.rs	:425	630
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:441	545
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:441	557
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:441	641
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:441	700
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:441	655
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:441	843
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:441	880
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:441	896
-frp-client/src/service/message_loop.rs	441	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:441	911
+frp-client/src/service/message_loop.rs	1225	1235	8243eda4b254d94a	d10b36aa74a59bcf	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:1225-1235	634
+frp-client/src/service/message_loop.rs	1253	1270	5d4818ea5df98806	d10b36aa74a59bcf	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:1253-1270	629
+frp-client/src/service/message_loop.rs	1267	-	170dbe5405e7d948	-	shorthand	frp-client/tests/heartbeat_wire_order.rs	:1267	630
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:1283	545
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:1283	557
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:1283	641
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-client/src/service/message_loop.rs:1283	700
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:1283	655
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:1283	843
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:1283	880
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:1283	896
+frp-client/src/service/message_loop.rs	1283	-	0b863e73f6466a07	-	absolute	frp-client/tests/heartbeat_wire_order.rs	message_loop.rs:1283	911
 frp-client/src/service/reload_apply.rs	120	123	05b30098a28e064a	abfa59370983ca52	absolute	frp-client/tests/token_source_single_exec.rs	frp-client/src/service/reload_apply.rs:120-123	42
 frp-client/src/service/reload_apply.rs	29	32	bbbe79a003995e74	e52a1813c4604951	absolute	frp-client/tests/reload_malformed_config.rs	reload_apply.rs:29-32	13
 frp-client/src/service/reload_apply.rs	619	-	f2b7922dacaf8895	-	absolute	docs/developing.md	frp-client/src/service/reload_apply.rs:619	487
@@ -160,7 +160,7 @@ frp-core/src/cli.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes
 frp-core/src/cli.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli.rs:3157	266
 frp-core/src/cli.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli.rs:5090-5097	705
 frp-core/src/cli.rs	5095	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:5095	1884
-frp-core/src/cli.rs	590	-	192e3119d1d90ebf	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
+frp-core/src/cli.rs	590	-	8e0f685df83b8080	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
 frp-core/src/cli.rs	6244	6246	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli.rs:6244-6246	399
 frp-core/src/cli.rs	930	-	a298ba38f2e79bca	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:930	2459
 frp-core/src/config/client.rs	256	-	044d5563c14d5e76	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/client.rs:256	483
