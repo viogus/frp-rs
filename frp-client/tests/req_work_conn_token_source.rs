@@ -7,7 +7,7 @@
 //! `spawn_work_conn` seam (`frp-client/src/work_conn.rs:2524`,
 //! `oidc_token_source_fills_new_work_conn_privilege_key` builds its own
 //! `WorkConnConfig`), so `handle_req_work_conn`
-//! (`frp-client/src/service.rs:3356`) — the only production call site that
+//! (`frp-client/src/service.rs:2173`) — the only production call site that
 //! constructs that config — was off-path: dropping
 //! `oidc_client: self.oidc_client.clone()`,
 //! `client_auth_scopes: ctx.client_scopes.clone()`, or
@@ -19,7 +19,7 @@
 //! tests exercise the two halves of `scope_requires_auth`'s OR
 //! (`frp-client/src/work_conn.rs:252`) — the scope can arrive from the client
 //! config (`additional_auth_scopes`) or from the server's LoginResp
-//! (`server_additional_auth_scopes`, read at `frp-client/src/service.rs:1563`
+//! (`server_additional_auth_scopes`, read at `frp-client/src/service.rs:1499`
 //! and threaded through `SessionCtx.server_scopes`) — so emptying EITHER
 //! threading in `handle_req_work_conn` reds exactly one of them.
 //!
@@ -149,7 +149,7 @@ async fn drive_one_req_work_conn(
         server_additional_auth_scopes: server_scopes,
     });
     // The OIDC config carries no `auth.token`, so the control-stream key is
-    // derive_key("") (service.rs:1570).
+    // derive_key("") (service.rs:1506).
     let enc_key = frp_core::encryption::derive_key("");
 
     let mock = tokio::spawn(async move {
