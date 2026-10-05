@@ -680,7 +680,8 @@ site and the extracted handler, and the pair is load-bearing **only in the non-`
 `--no-default-features --features tls,tcp-mux`, removing **one** handler gate gives rc 101 with 6 errors
 (`E0425`×3 + `E0609`×3) and **one** call-site gate 2 (`E0599`×2), while removing **all three** handler gates gives 15
 (7 `E0425` + 8 `E0609`) and all three call-site gates 6 — the counts are scope-dependent, so state which. With `vnet`
-**on**, removing either is **rc 0**: both gates are inert there. That is also why a gate census must be reported per
+**on**, removing either is **rc 0** — the adversarial round's measurement; the verification round's probes were in the vnet-off
+shape only — so both gates are inert there. That is also why a gate census must be reported per
 shape rather than as one number.
 
 Order: `CloseProxy` (landed, PR #498) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`; **landed, PR #501**) →

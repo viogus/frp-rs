@@ -7737,7 +7737,8 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `--no-default-features --features tls,tcp-mux`, removing **one** handler gate is rc 101 with 6 errors
   (`E0425`×3 + `E0609`×3) and **one** call-site gate 2 (`E0599`×2); removing **all three** handler gates is 15
   (7 `E0425` + 8 `E0609`) and all three call-site gates 6 — so the counts are **scope-dependent** and the record states
-  which scope — while with `vnet` **on** removing either is **rc 0** (both gates are inert there). The file's gate
+  which scope — while with `vnet` **on** removing either is **rc 0** — the adversarial round's probe; the verifying round's were vnet-off
+  only — so both gates are inert there. The file's gate
   census went 4 → 11 (production 4 → 7; the rest are the new vnet-only tests). **(2) The `writer`-parameter rule does
   *not* bite here, and the rule's scope was refined by it:** all three arms are receive-only, so `writer` occurs **0
   times in their code** (the four textual hits are the handlers' own doc prose), no handler takes it, and no
