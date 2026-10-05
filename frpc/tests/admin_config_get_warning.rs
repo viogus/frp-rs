@@ -528,7 +528,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// answer to the no-dashboard one reds **2 of the 4** (`test result: FAILED. 2
 /// passed; 2 failed`) — the startup rows witness
 /// `frp-client/src/service/registration.rs:115`, the hand-edit rows witness
-/// `frp-client/src/service.rs:535`; the reload site is
+/// `frp-client/src/service/session.rs:55`; the reload site is
 /// `service/reload_apply.rs:98`.
 fn assert_clause_is_the_dashboard_one(tag: &str, out: &str) {
     assert!(

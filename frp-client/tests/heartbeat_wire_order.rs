@@ -122,7 +122,7 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         // (service.rs: register_proxies Phase 4 -> run_message_loop
         // Phase 6 — pings physically cannot leave before this point, the
         // writer task is not spawned until Phase 5). The heartbeat interval
-        // is armed at login success (service.rs:1539-1542, tokio `interval()`:
+        // is armed at login success (session.rs:664-667, tokio `interval()`:
         // tick 1's deadline is the arm instant) and polled for the first
         // time at loop start, so tick 1 fires immediately: Ping#1 must
         // reach the wire ~ms after this write.
@@ -380,7 +380,7 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
             .expect("write LoginResp");
 
         // Oracle-1 immediacy anchor: the client arms its heartbeat interval
-        // when it processes this LoginResp (service.rs:1539-1542, tokio
+        // when it processes this LoginResp (session.rs:664-667, tokio
         // `interval()`: tick 1's deadline is the arm instant). This session
         // has no proxies or visitors, so the registration phase
         // (service.rs register_proxies — nothing pending) and the loop
@@ -744,7 +744,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         server_additional_auth_scopes: None,
     });
     // The OIDC config carries no `auth.token`, so `AuthConfig.token` is empty
-    // and the control-stream key is derive_key("") (service.rs:739 + :1506).
+    // and the control-stream key is derive_key("") (service.rs:650 + session.rs:631).
     let enc_key = frp_core::encryption::derive_key("");
     let pong = FrpMessage::Pong(msg::Pong { error: None });
 
