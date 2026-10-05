@@ -112,7 +112,7 @@ fails=0
 # A total is not a *shape* though: deleting N assertions and adding N dummy
 # `ok` lines keeps the total and still exits 0 (measured against the count as
 # the only guard — that mutant is in the batch-E record), which is residue (d)
-# of TODO.md:9936. `SHAPE` below pins the count, the order and the *label* of
+# of TODO.md:9975. `SHAPE` below pins the count, the order and the *label* of
 # every assertion, so a scenario that stops running, a check that is deleted,
 # reordered, or a dummy added anywhere, all red. It compares labels, not bodies:
 # a check whose body is gutted behind an unchanged `ok` label is not a shape
@@ -279,7 +279,7 @@ WORK=""
 # direction. A `ps` probe that cannot run leaves the pid *unidentifiable*, and
 # an unidentifiable live child we started is ours to kill — reading it as "not
 # ours" is how every live synthetic outlived a `ps` failure (residue (a) of
-# TODO.md:9936). A pid the guard already reaped can be recycled before this trap
+# TODO.md:9975). A pid the guard already reaped can be recycled before this trap
 # runs, and killing a stranger is the hazard this suite pins; the probe is what
 # tells those apart, so only a probe we can trust is allowed to *forgive*.
 reap_own_synthetic() {
@@ -1045,7 +1045,7 @@ spawn_fake() {
 # never match. It used to be `basename` of the *resolved* script path, which the
 # child's argv does not carry when the suite is invoked through a symlink with a
 # different name — the match failed before the exec and `wait_exec` returned 0
-# (residue (b) of TODO.md:9936). Nothing here depends on the file's name, so
+# (residue (b) of TODO.md:9975). Nothing here depends on the file's name, so
 # there is no alias to get wrong.
 wait_exec() {
   local pid=$1 i=0 cmd me
@@ -1282,7 +1282,7 @@ case "$out" in
 esac
 
 # --- scenario 7: `wait_exec`'s anchor survives an aliased invocation ---------
-# Residue (b) of TODO.md:9936. The probe child is this same file under a
+# Residue (b) of TODO.md:9975. The probe child is this same file under a
 # different name: `wait_exec "$$"` must still see its own pre-exec fork and
 # return 1. Any anchor derived from the script's own name fails here, which is
 # exactly the latent bug CI (which calls the direct path) could not see.
@@ -1301,7 +1301,7 @@ else
 fi
 
 # --- scenario 8: empty `ps` output is "cannot tell", not "the image changed" -
-# Residue (c) of TODO.md:9936. A probe that exits 0 with no output used to fall
+# Residue (c) of TODO.md:9975. A probe that exits 0 with no output used to fall
 # through to the `*) return 0` arm — an empty string does not contain the anchor
 # — so "the tool told us nothing" was read as "the helper has exec-ed".
 hdr 'scenario 8: wait_exec reads empty ps output as "cannot tell"'
@@ -1345,7 +1345,7 @@ fi
 kill -9 "$child_victim" 2>/dev/null || true
 
 # --- scenario 9: a failed ownership probe does not forgive a live synthetic --
-# Residue (a) of TODO.md:9936. The victim is a real synthetic of this run, under
+# Residue (a) of TODO.md:9975. The victim is a real synthetic of this run, under
 # `$WORK`, so the *real* predicate would match it; the point is that a probe
 # which cannot run must not be read as "not ours" and let it outlive the suite.
 hdr 'scenario 9: a failed ps probe does not turn a live synthetic into a stranger'

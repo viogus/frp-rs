@@ -585,8 +585,8 @@ terminal, so its `continue` becomes a plain `return`.
 | Arm (lines) | LOC | Coupling to pass |
 |---|---:|---|
 | ~~`CloseProxy`~~ **landed** (PR #498) | 116 | **`&mut SessionCtx` — not `&SessionCtx`** (see the correction below), `proxy_info_map`, `health_cancels`, `p2p_bridge_tokens`, the seven vnet fields, `plugin_handles`, writer, **plus `self.cfg`** (which this row omitted; read once in the vnet teardown) |
-| proxy retry tick 3422–3551 | 130 | `&mut SessionCtx` (`waitstart_seen`), `&mut last_start_err`, `proxies`, `cfg`, `proxy_info_map`, writer |
-| ping tick 3335–3420 | 86 | `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, writer |
+| ~~proxy retry tick~~ **landed** (PR #503) | 130 | base `:444-573` / 8103 B / `f1daa5a5…` → `handle_proxy_retry_tick_arm` (`:1313-1437`), call `:367-374` **8L/305B/`413e1954…`**; coupling `&mut SessionCtx` (`waitstart_seen`), `&mut last_start_err`, `&self` for `proxies`/`cfg`/`proxy_info_map`, `writer` |
+| ~~ping tick~~ **landed** (PR #503) | 86 | base `:357-442` / 4982 B / `85979b12…` → `handle_ping_tick_arm` (`:1207-1283`), call `:357-366` 10L/367B/`2dd834a5…`; **this arm held the program's last `continue;`** (base `:427` → `:1269`); coupling `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, `writer` |
 | XTCP notify → STUN 3631–3733 | 103 | `xtcp_sockets`, `stun_result_tx`, `nat_hole_stun_server`; spawns |
 | health event 3553–3613 | 61 | `p2p_bridge_tokens`, `proxy_info_map`, `health_proxy_configs`, `v2`, `cfg_user`, writer |
 | ~~`NewProxyResp`~~ **landed** (PR #501) | 42 | base `:387-428` / 2881 B / `41fc390d…` → `handle_new_proxy_resp_arm`; coupling: `&mut last_start_err` only — **no `ctx` at all**; `proxy_info_map` reached via `&self`; and it gains the **first direct test** of these arms (the inline `mod tests`) |
@@ -683,6 +683,15 @@ site and the extracted handler, and the pair is load-bearing **only in the non-`
 **on**, removing either is **rc 0** — the adversarial round's measurement; the verification round's probes were in the vnet-off
 shape only — so both gates are inert there. That is also why a gate census must be reported per
 shape rather than as one number.
+
+**Test-induced weak cites, from group C (PR #503).** A new direct test that re-assigned a value the test helper
+already set duplicated the handler's own line `ctx.ping_retry_backoff = None;`, and because nine `heartbeat_wire_order.rs`
+cites land on that line the guard's weak count went **104 → 113** — nine *production* witnesses degraded by a *test*.
+Both review rounds rejected accepting it: the assignment was redundant, and replacing it with a comment restored the
+unique occurrence and the header to `weak=104 weak_set=dbbea851…` at zero test cost. The lesson is worth the space
+because `--write` **hides** this class rather than removing it — a weak cite is by construction one that no longer
+witnesses a unique line — and the earlier claim that the base already counted those cites as weak was false (at the
+base, **zero** weak rows targeted this file).
 
 Order: `CloseProxy` (landed, PR #498) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`; **landed, PR #501**) →
 **B** (vnet trio — the next group) → **C**
