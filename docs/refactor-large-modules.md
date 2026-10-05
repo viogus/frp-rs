@@ -588,10 +588,10 @@ terminal, so its `continue` becomes a plain `return`.
 | ~~proxy retry tick~~ **landed** (PR #503) | 130 | base `:444-573` / 8103 B / `f1daa5a5…` → `handle_proxy_retry_tick_arm` (`:1313-1437`), call `:367-374` **8L/305B/`413e1954…`**; coupling `&mut SessionCtx` (`waitstart_seen`), `&mut last_start_err`, `&self` for `proxies`/`cfg`/`proxy_info_map`, `writer` |
 | ~~ping tick~~ **landed** (PR #503) | 86 | base `:357-442` / 4982 B / `85979b12…` → `handle_ping_tick_arm` (`:1207-1283`), call `:357-366` 10L/367B/`2dd834a5…`; **this arm held the program's last `continue;`** (base `:427` → `:1269`); coupling `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, `writer` |
 | ~~XTCP notify → STUN~~ **landed** (PR #504) | 103 | base `:453-555` / 6464 B / `9d751b69…` → `handle_xtcp_notify_arm` (`:1335-1449`), call `:453-456` 4L/165B/`f7aae8af…`; coupling `&mut SessionCtx` (`xtcp_sockets`), `stun_result_tx`, `nat_hole_stun_server`; **spawns 1** (off-loop STUN, write handed back on `stun_result_tx`) |
-| health event 3553–3613 | 61 | `p2p_bridge_tokens`, `proxy_info_map`, `health_proxy_configs`, `v2`, `cfg_user`, writer |
+| ~~health event~~ **landed** (PR #505) | 61 | base `:375-435` / 4154 B / `708b6b21…` → `handle_health_event_arm` (`:1506-1575`), call `:375-378` 4L/157B/`3139a0e2…`; 2 rustfmt reflows only (tokens 633 = 633); **reaches state through `&self`** (5 uses / 3 fields: `p2p_bridge_tokens`, `proxy_info_map`×2, `health_proxy_configs`), so the M-31 correction applies **here**; **carries the lock-order obligation** — it takes `p2p_bridge_tokens` then writes `proxy_info_map`, the inverse of `handle_close_proxy`, so it must stay inline |
 | ~~`NewProxyResp`~~ **landed** (PR #501) | 42 | base `:387-428` / 2881 B / `41fc390d…` → `handle_new_proxy_resp_arm`; coupling: `&mut last_start_err` only — **no `ctx` at all**; `proxy_info_map` reached via `&self`; and it gains the **first direct test** of these arms (the inline `mod tests`) |
 | ~~`NatHoleResp`~~ **landed** (PR #501) | 39 | base `:348-386` / 2625 B / `1fdfffd5…` → `handle_nat_hole_resp_arm`; coupling: `&mut SessionCtx` (`&mut pending_xtcp`, `&mut visitor_pending`, `&xtcp_sockets`, `session_alive`) and `writer`; **`p2p_bridge_tokens` is reached via `&self`, not passed** (the row listed it as a parameter, which is what sent this group's brief wrong) |
-| visitor request 3792–3826 | 35 | `&mut visitor_pending`, `xtcp_cleanup_tx`, `v2`, writer; spawns |
+| ~~visitor request~~ **landed** (PR #505) | 35 | base `:484-518` / 2285 B / `af0bd955…` → `handle_visitor_request_arm` (`:1620-1660`), call `:426-429` 4L/177B/`11c82ac9…`; **0 deltas** (the program's second zero-delta arm); `self.` = 0, so the **D1 form** applies here; spawns 1 (the 20 s cleanup, off-loop) |
 | ~~STUN result~~ **landed** (PR #504) | 31 | base `:559-589` / 1927 B / `b774ecdf…` → `handle_stun_result_arm` (`:1482-1518`), call `:459-466` 8L/338B/`fa1b9b3a…`; coupling `&mut SessionCtx` (`&mut pending_xtcp`, `&xtcp_sockets`, `stun_result_rx`, `v2`) **plus the loop-local `xtcp_cleanup_tx`**, which this row previously omitted; **spawns 1** (the 15 s cleanup) |
 | ~~`NatHoleClient`~~ **landed** (PR #501) | 22 | base `:326-347` / 1498 B / `f4ff263c…` → `handle_nat_hole_client_arm`; coupling: `&mut SessionCtx`, `writer`, `punch_proxy_still_live`, `session_alive`; **`p2p_bridge_tokens` via `&self`** (split `self` / `.p2p_bridge_tokens` / `.lock()` across lines at `:1197-1199`, which is why a joined-literal grep misses it) |
 | ~~vnet trio~~ **landed** (PR #502) | 138 measured (70+35+33; the row's 141 counts the three separator lines between the arms) | base `:336-405` / `:407-441` / `:443-475` → `handle_vnet_route_advertise_arm` / `handle_vnet_packet_arm` / `handle_vnet_route_remove_arm`; each arm keeps its call-site `#[cfg(feature = "vnet")]` **and** the handler gains one; coupling `&self` only (`cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`) |
@@ -608,15 +608,19 @@ suppresses a genuine future warning rather than documenting a constraint, and it
 touched. Group A is also the precedent for the checklist: each arm's row carries its own `continue` census, its own
 `LoopExit::` count and its own stripped inner-loop scan, with only the loop-level "nothing follows the `select!`" fact
 shared — which is what makes a grouped PR reviewable arm by arm.
-**This correction does *not* generalise to every later group, and the earlier claim that it did was wrong.** An M-31 draft
-said it was "not cosmetic for group **D1**" because those rows "have the same shape" (state reached through `&self`).
-Measured when D1 actually landed (PR #504): all three of its base spans and all three handlers contain **zero** `self.`
-uses -- while `ctx.` counts **1/4/2 occurrences, or 4/4/2 distinct fields** (the two bases differ, so both are named) --
-so D1's state does arrive through the single `&mut SessionCtx`. Its rows' real defects are narrower —
-they present `ctx` fields as if they were separate parameters, and the STUN row omits the **loop-local** `xtcp_cleanup_tx`
-(which that handler's signature carries as `xtcp_cleanup_tx: &mpsc::Sender<String>`) and `ctx.v2`. Both the adversarial round that first reported the `&self` shape (about group A's NatHole arms, where
-`self.p2p_bridge_tokens` really is used) and this record now say so: the clause was dropped rather than defended, because
-a mechanism measured in one group is not evidence about another.
+**The correction applies per row, and *neither* generalisation of it is right.** The M-31 note said D1's rows "have the
+same shape" as the NatHole rows (state reached through `&self`); measured, every D1 span and handler has **zero** `self.`
+uses. But the opposite conclusion — "the correction does not generalise" — is one over-generalisation too far, because
+group D2 landed **one row of each shape in a single PR**: its **health** row uses `self.` (5 uses over 3 fields:
+`p2p_bridge_tokens`, `proxy_info_map`×2, `health_proxy_configs`) exactly as group A's NatHole rows do, while its
+**visitor** row is `ctx.`-only (`self.` = 0), exactly as D1's three are. So the rows must be read one at a time: the
+M-31 correction is *right* for the rows that reach state through `self.` (group A, D2's health row) and the D1 form is
+right for the rows that do not (D1, D2's visitor row). Both rows also needed a second fix — the health row presented
+`ctx` fields as parameters and the visitor row omitted the loop-owned `xtcp_cleanup_tx`, which its handler's signature
+carries as `&mpsc::Sender<String>`. **Rule: derive each row's mechanism from the arm, never from another group.** The verification round put the pattern
+sharply: *three consecutive grouped PRs found this column wrong in three different directions* — group A's rows reach state
+through `self.`, D1's present `ctx` fields as parameters, and D2's two rows are one of each shape — and every one of those
+came from reading the coupling column **as a spec rather than a plan**. A row's mechanism belongs to the landed handler.
 
 **Regrouping (decided after arm 1 landed, 2026-10-04).** The row's original "one per PR" predates the first arm, when
 the recipe, the signature constraint and the coverage gap were all unknown. Arm 1 (`CloseProxy`, PR #498) established
@@ -704,6 +708,18 @@ unique occurrence and the header to `weak=104 weak_set=dbbea851…` at zero test
 because `--write` **hides** this class rather than removing it — a weak cite is by construction one that no longer
 witnesses a unique line — and the earlier claim that the base already counted those cites as weak was false (at the
 base, **zero** weak rows targeted this file).
+
+**S3b complete (2026-10-05, `fac8511b`).** All **12 data rows / 14 arms** are landed — `CloseProxy` (#498), A (#501),
+B (#502), C (#503), D1 (#504) and D2 (#505). Nothing in the table is unlanded; what remains inline in `run_message_loop`
+is exactly what the plan excludes: the six small `match msg` arms (`Pong` `:293`, `Ping` `:303`, `CloseProxyResp` `:317`,
+`Error` `:323`, `Ok(_)` `:347`, `Err` `:350`), `reload` `:379`, `stop` `:430`, the watchdog `:449`, `writer.wait_failed`
+`:456`, the read arm's own plumbing (`:280`) and the two timer futures whose bodies are now handler calls. This was
+verified **three times independently of this table**: by the group D2 author's census, by the adversarial round walking the
+12 rows against the merged tree, and by the verification round counting the merged `select!` directly — it holds exactly
+**14 handler calls** (`handle_close_proxy` at `:315` plus thirteen `*_arm` calls), i.e. exactly the 14 arms, with no row's
+body left inline. **The `run_message_loop` body is therefore no longer a large function:**
+`frp-client/src/service/message_loop.rs` is 2917 lines of which the loop itself is a dispatch skeleton, and the extracted
+handlers plus their direct tests account for the rest.
 
 Order: `CloseProxy` (landed, PR #498) → **A** (`NatHoleClient`/`NatHoleResp`/`NewProxyResp`; **landed, PR #501**) →
 **B** (vnet trio — the next group) → **C**
