@@ -7919,10 +7919,15 @@ nothing about whether the described behaviour still holds.
   no stable 0.24 exists.**
   Re-checked on crates.io 2026-09-17 (`https://crates.io/api/v1/crates/rustls`):
   `max_stable_version` = `0.23.45`, `newest_version` = `0.23.45`,
-  `max_version` = `0.24.0-dev.1`. The only 0.24 artifact is a **prerelease**
-  (`0.24.0-dev.1`, published 2026-07-23, `edition = "2024"`,
-  `rust_version = "1.85"`); `[patch.crates-io]` pins a path, so a prerelease is
-  not an option for the shipped TLS stack.
+  `max_version` = `0.24.0-dev.1`. The only 0.24 artifacts are the **prereleases**
+  `0.24.0-dev.0` (`rust_version = "1.83"`, published 2026-01-28) and `0.24.0-dev.1` (`edition = "2024"`,
+  `rust_version = "1.85"`, published 2026-07-23), both unyanked — so the earlier wording here, which said
+  "the only 0.24 artifact **is**" the dev.1 release, was already wrong at its own 2026-09-17 date and is
+  corrected by this re-check. A 0.24 pre-release is not an option for the shipped TLS stack because the
+  workspace requires `rustls ^0.23` and the vendored tree patches 0.23.45 specifically, so moving to a dev
+  release would mean depending on a pre-release **and** re-applying the SNI patch to unreleased source (the
+  `edition = "2024"` / `rust_version = "1.85"` metadata is *not* the obstacle — the toolchain is pinned well
+  above it).
   **Re-checked again 2026-10-04** against the same endpoint: `max_stable_version` and
   `newest_version` are still **`0.23.45`** (published 2026-09-14 — the `GHSA-2mjx-qc3c-rqvc` fix, so the
   0.23.x line is still current and the interim-risk paragraph below is unchanged), `max_version` is still
