@@ -281,9 +281,9 @@ impl Service {
                     // Detach the completed future before handling the
                     // message: the select has dropped the branch future,
                     // and the loop-top `if pending_read.is_none()` above
-                    // recreates a fresh one for the next frame. A
-                    // `continue` inside the message match below therefore
-                    // also restarts the read at the next frame boundary.
+                    // recreates a fresh one for the next frame. Every
+                    // non-terminal path in the match below falls off this arm
+                    // body, which restarts the read at the next boundary.
                     pending_read = None;
                     match msg {
                         Ok(FrpMessage::ReqWorkConn(_)) => {
@@ -451,107 +451,7 @@ impl Service {
                 }
 
                 Some(xtcp_notif) = channels.xtcp_rx.recv() => {
-                    let XtcpNotification { sid, proxy_name } = xtcp_notif;
-                    info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
-                    // STUN discovery runs off the control loop: two STUN
-                    // round-trips can stall up to ~10s and would block the
-                    // message loop (heartbeats, work conns, reloads). The
-                    // spawned task does the STUN, persists the socket, and
-                    // hands the finished NatHoleClient back for the loop to
-                    // write + bookkeep, preserving the write-before-NatHoleResp
-                    // ordering.
-                    let stun_server = channels.nat_hole_stun_server.to_string();
-                    let stun_sockets = Arc::clone(&ctx.xtcp_sockets);
-                    let stun_tx = ctx
-                        .stun_result_tx
-                        .as_ref()
-                        .expect("stun_result_tx available before STUN spawn")
-                        .clone();
-                    tokio::spawn(async move {
-                        // 1. Do STUN discovery on a persistent UDP socket.
-                        //    Go frps needs ≥2 mapped addresses for NAT classification.
-                        let mut mapped_addrs = Vec::new();
-                        let stun_socket = match frp_core::stun::stun_binding_with_details(&stun_server).await {
-                            Ok((sock, result1)) => {
-                                let addr1 = result1.mapped_addr;
-                                debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
-                                mapped_addrs.push(addr1);
-                                // Use OTHER-ADDRESS as second STUN target if available
-                                // (Go frp v0.70 discovery.go:137 dual-server probing).
-                                // This gives the server a second mapped address for NAT
-                                // classification (RFC 5780, detects endpoint-independent
-                                // vs address-dependent mapping).
-                                let second_target =
-                                    result1.other_addr.as_deref().unwrap_or(&stun_server);
-                                match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
-                                    Ok(addr2) => {
-                                        debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
-                                        // Go frps NAT classifier needs ≥2 addresses.
-                                        // Always push — Go frp doesn't dedup.
-                                        mapped_addrs.push(addr2);
-                                    }
-                                    Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
-                                }
-                                Some(sock)
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "XTCP STUN failed: {}", e);
-                                None
-                            }
-                        };
-                        // Get the local port from the STUN socket for assisted_addrs.
-                        // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
-                        // mapped addresses. The server uses assisted_addrs as localIPs
-                        // parameter to ClassifyNATFeature — STUN addresses would never
-                        // match local interfaces, causing misclassification.
-                        let local_port = stun_socket
-                            .as_ref()
-                            .and_then(|sock| sock.local_addr().ok())
-                            .map(|addr| addr.port());
-                        // Save socket for later UDP+KCP hole punch.
-                        if let Some(sock) = stun_socket {
-                            stun_sockets
-                                .lock()
-                                .await
-                                .insert(sid.clone(), std::sync::Arc::new(sock));
-                        }
-                        // Build assisted_addrs from local IPs + STUN port.
-                        // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
-                        // IPv4 addresses filtered from all network interfaces.
-                        let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
-                            let local_ips = crate::nat_hole::list_local_ips_for_nat_hole(10);
-                            if local_ips.is_empty() {
-                                None
-                            } else {
-                                Some(
-                                    local_ips
-                                        .iter()
-                                        .map(|ip| format!("{}:{}", ip, port))
-                                        .collect(),
-                                )
-                            }
-                        });
-                        // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
-                        // Use a unique transaction_id per request (Go frp compat: UUID).
-                        let txn_id = uuid::Uuid::new_v4().to_string();
-                        let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
-                            transaction_id: txn_id.clone(),
-                            proxy_name: proxy_name.clone(),
-                            sid: Some(sid.clone()),
-                            protocol: Some("kcp".to_string()),
-                            mapped_addrs: if mapped_addrs.is_empty() { None } else { Some(mapped_addrs) },
-                            assisted_addrs,
-                            visitor_addr: None,
-                        }));
-                        // Hand the finished message back to the control loop.
-                        if stun_tx
-                            .send(StunResult { sid, proxy_name, msg: client_msg })
-                            .await
-                            .is_err()
-                        {
-                            warn!("XTCP: control loop dropped STUN result channel");
-                        }
-                    });
+                    self.handle_xtcp_notify_arm(xtcp_notif, ctx, channels).await;
                 }
 
                 // STUN finished off-loop: write NatHoleClient on the control
@@ -561,31 +461,7 @@ impl Service {
                     .as_mut()
                     .expect("stun_result_rx available before STUN result recv")
                     .recv() => {
-                    let StunResult { sid, proxy_name, msg } = stun_result;
-                    if let Err(e) = writer.send(msg, ctx.v2) {
-                        warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
-                        // The STUN socket was stored in xtcp_sockets but no
-                        // pending_xtcp entry was created; reclaim it now so it
-                        // does not sit until control-loop teardown.
-                        ctx.xtcp_sockets.lock().await.remove(&sid);
-                    } else {
-                        ctx.pending_xtcp.insert(sid.clone(), proxy_name);
-                        // Defensive cleanup: if the server never sends
-                        // NatHoleResp for this sid, the socket + pending_xtcp
-                        // entry would leak until the control loop tears down.
-                        // Reclaim them after the server's NAT session window
-                        // (NAT_HOLE_TIMEOUT = 10s) plus margin. If NatHoleResp
-                        // arrives in time, handle_nat_hole_resp already removed
-                        // both entries and these removes are no-ops.
-                        let cleanup_sockets = Arc::clone(&ctx.xtcp_sockets);
-                        let cleanup_tx = xtcp_cleanup_tx.clone();
-                        let cleanup_sid = sid.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_secs(15)).await;
-                            cleanup_sockets.lock().await.remove(&cleanup_sid);
-                            let _ = cleanup_tx.send(cleanup_sid).await;
-                        });
-                    }
+                    self.handle_stun_result_arm(stun_result, ctx, &writer, &xtcp_cleanup_tx).await;
                 }
 
                 // A NatHoleResp never arrived within the timeout window:
@@ -599,13 +475,7 @@ impl Service {
                     .as_mut()
                     .expect("xtcp_cleanup_rx available before cleanup recv")
                     .recv() => {
-                    if reclaim_stale_xtcp_entry(
-                        &mut ctx.pending_xtcp,
-                        &mut ctx.visitor_pending,
-                        &cleanup_sid,
-                    ) {
-                        debug!(sid = %cleanup_sid, "XTCP: reclaimed stale entry for '{}'", cleanup_sid);
-                    }
+                    self.handle_xtcp_cleanup_arm(cleanup_sid, ctx).await;
                 }
 
                 // Visitor requests: send NatHoleVisitor on control connection.
@@ -1436,6 +1306,241 @@ impl Service {
             }
         }
     }
+
+    /// Handle one XTCP provider notification (`NatHoleSid`): spawn the STUN
+    /// discovery whose finished `NatHoleClient` this session must send.
+    ///
+    /// Extracted from the `run_message_loop` XTCP-notify arm by the P2 S3b
+    /// seam (group D1) as a de-indented pure move — no statement is added,
+    /// removed or reordered. The arm carried no `continue` (the program's last
+    /// one left with group C) and no `LoopExit::`, so its terminality is the
+    /// shared "nothing follows the `select!` inside the loop" fact.
+    ///
+    /// This handler **spawns**, and the spawn is the arm's own, deliberately:
+    /// two STUN round-trips can stall up to ~10s and would block the message
+    /// loop (heartbeats, work conns, reloads). The spawned task does the STUN,
+    /// persists the socket in `ctx.xtcp_sockets`, and hands the finished
+    /// `NatHoleClient` back on `ctx.stun_result_tx` so the write and the
+    /// `pending_xtcp` bookkeeping stay on the loop, preserving the
+    /// write-before-`NatHoleResp` ordering. The handler is itself called
+    /// inline from the loop and is never spawned; it is the thing that spawns.
+    ///
+    /// It reaches no `Service` state: measured (this arm's own census), the
+    /// base span has **zero** `self.` occurrences, so `&self` is unused. It
+    /// takes no `writer` — the arm writes nothing on the control connection
+    /// (that send is the `stun_result` arm's) — so the
+    /// `cfg_attr(not(feature = "vnet"), allow(unused_variables))` rule cannot
+    /// obtain here, and a handler that takes no `writer` never needs it. It
+    /// carries no `#[cfg]`, matching the original arm.
+    async fn handle_xtcp_notify_arm(
+        &self,
+        xtcp_notif: XtcpNotification,
+        ctx: &mut SessionCtx,
+        channels: &SessionChannels<'_>,
+    ) {
+        let XtcpNotification { sid, proxy_name } = xtcp_notif;
+        info!(proxy_name = %proxy_name, "XTCP provider: received NatHoleSid for '{}'", proxy_name);
+        // STUN discovery runs off the control loop: two STUN
+        // round-trips can stall up to ~10s and would block the
+        // message loop (heartbeats, work conns, reloads). The
+        // spawned task does the STUN, persists the socket, and
+        // hands the finished NatHoleClient back for the loop to
+        // write + bookkeep, preserving the write-before-NatHoleResp
+        // ordering.
+        let stun_server = channels.nat_hole_stun_server.to_string();
+        let stun_sockets = Arc::clone(&ctx.xtcp_sockets);
+        let stun_tx = ctx
+            .stun_result_tx
+            .as_ref()
+            .expect("stun_result_tx available before STUN spawn")
+            .clone();
+        tokio::spawn(async move {
+            // 1. Do STUN discovery on a persistent UDP socket.
+            //    Go frps needs ≥2 mapped addresses for NAT classification.
+            let mut mapped_addrs = Vec::new();
+            let stun_socket = match frp_core::stun::stun_binding_with_details(&stun_server).await {
+                Ok((sock, result1)) => {
+                    let addr1 = result1.mapped_addr;
+                    debug!(addr = %addr1, "XTCP STUN #1: {}", addr1);
+                    mapped_addrs.push(addr1);
+                    // Use OTHER-ADDRESS as second STUN target if available
+                    // (Go frp v0.70 discovery.go:137 dual-server probing).
+                    // This gives the server a second mapped address for NAT
+                    // classification (RFC 5780, detects endpoint-independent
+                    // vs address-dependent mapping).
+                    let second_target = result1.other_addr.as_deref().unwrap_or(&stun_server);
+                    match frp_core::stun::stun_binding_on_socket(&sock, second_target).await {
+                        Ok(addr2) => {
+                            debug!(addr = %addr2, "XTCP STUN #2 from '{}': {}", second_target, addr2);
+                            // Go frps NAT classifier needs ≥2 addresses.
+                            // Always push — Go frp doesn't dedup.
+                            mapped_addrs.push(addr2);
+                        }
+                        Err(e) => warn!(error = %e, "XTCP STUN #2 failed: {}", e),
+                    }
+                    Some(sock)
+                }
+                Err(e) => {
+                    warn!(error = %e, "XTCP STUN failed: {}", e);
+                    None
+                }
+            };
+            // Get the local port from the STUN socket for assisted_addrs.
+            // Go frp compat: assisted_addrs = local IPs + STUN port, NOT STUN
+            // mapped addresses. The server uses assisted_addrs as localIPs
+            // parameter to ClassifyNATFeature — STUN addresses would never
+            // match local interfaces, causing misclassification.
+            let local_port = stun_socket
+                .as_ref()
+                .and_then(|sock| sock.local_addr().ok())
+                .map(|addr| addr.port());
+            // Save socket for later UDP+KCP hole punch.
+            if let Some(sock) = stun_socket {
+                stun_sockets
+                    .lock()
+                    .await
+                    .insert(sid.clone(), std::sync::Arc::new(sock));
+            }
+            // Build assisted_addrs from local IPs + STUN port.
+            // Go frp v0.69.1: ListLocalIPsForNatHole returns non-loopback
+            // IPv4 addresses filtered from all network interfaces.
+            let assisted_addrs: Option<Vec<String>> = local_port.and_then(|port| {
+                let local_ips = crate::nat_hole::list_local_ips_for_nat_hole(10);
+                if local_ips.is_empty() {
+                    None
+                } else {
+                    Some(
+                        local_ips
+                            .iter()
+                            .map(|ip| format!("{}:{}", ip, port))
+                            .collect(),
+                    )
+                }
+            });
+            // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
+            // Use a unique transaction_id per request (Go frp compat: UUID).
+            let txn_id = uuid::Uuid::new_v4().to_string();
+            let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
+                transaction_id: txn_id.clone(),
+                proxy_name: proxy_name.clone(),
+                sid: Some(sid.clone()),
+                protocol: Some("kcp".to_string()),
+                mapped_addrs: if mapped_addrs.is_empty() {
+                    None
+                } else {
+                    Some(mapped_addrs)
+                },
+                assisted_addrs,
+                visitor_addr: None,
+            }));
+            // Hand the finished message back to the control loop.
+            if stun_tx
+                .send(StunResult {
+                    sid,
+                    proxy_name,
+                    msg: client_msg,
+                })
+                .await
+                .is_err()
+            {
+                warn!("XTCP: control loop dropped STUN result channel");
+            }
+        });
+    }
+
+    /// Handle one `StunResult` handed back by the off-loop STUN task: write
+    /// the `NatHoleClient` on the control connection and track
+    /// `sid -> proxy_name` in `ctx.pending_xtcp` for `NatHoleResp` routing.
+    ///
+    /// Extracted from the `run_message_loop` STUN-result arm by the P2 S3b
+    /// seam (group D1) as a de-indented pure move — no statement is added,
+    /// removed or reordered. The arm carries no `continue` and no
+    /// `LoopExit::`, so the shared script-level terminality fact ("nothing
+    /// follows the `select!` inside the loop") is all this arm needs.
+    ///
+    /// This handler **spawns** the arm's own defensive cleanup task: on the
+    /// success path the socket in `ctx.xtcp_sockets` and the `pending_xtcp`
+    /// entry are reclaimed after 15s (the server's 10s NAT session window plus
+    /// margin) and the sid is handed to the `xtcp_cleanup` arm through
+    /// `xtcp_cleanup_tx`. The handler is called inline from the loop, never
+    /// spawned.
+    ///
+    /// Coupling, derived from this arm: `&mut SessionCtx` (`ctx.v2`,
+    /// `ctx.xtcp_sockets`, `ctx.pending_xtcp` are used here; the
+    /// `ctx.stun_result_rx` receive stays at the call site as the arm's future),
+    /// `writer`, and the loop-local `xtcp_cleanup_tx` sender. No `Service`
+    /// state is reached: measured, the base span has zero `self.`
+    /// occurrences. The `&mut pending_xtcp` / `xtcp_sockets` /
+    /// `stun_result_rx` of the plan's row are not three parameters — they are
+    /// fields of the one `&mut SessionCtx` parameter, and `xtcp_cleanup_tx`
+    /// (a caller-owned local) was missing from that row.
+    ///
+    /// `writer` is used unconditionally (the `NatHoleClient` send), not behind
+    /// the `vnet` gate, so this handler carries no
+    /// `cfg_attr(not(feature = "vnet"), allow(unused_variables))` — proved by
+    /// a no-vnet removal probe, not inherited. It carries no `#[cfg]`.
+    async fn handle_stun_result_arm(
+        &self,
+        stun_result: StunResult,
+        ctx: &mut SessionCtx,
+        writer: &Arc<ControlWriter>,
+        xtcp_cleanup_tx: &mpsc::Sender<String>,
+    ) {
+        let StunResult {
+            sid,
+            proxy_name,
+            msg,
+        } = stun_result;
+        if let Err(e) = writer.send(msg, ctx.v2) {
+            warn!(error = %e, "XTCP: failed to send NatHoleClient: {}", e);
+            // The STUN socket was stored in xtcp_sockets but no
+            // pending_xtcp entry was created; reclaim it now so it
+            // does not sit until control-loop teardown.
+            ctx.xtcp_sockets.lock().await.remove(&sid);
+        } else {
+            ctx.pending_xtcp.insert(sid.clone(), proxy_name);
+            // Defensive cleanup: if the server never sends
+            // NatHoleResp for this sid, the socket + pending_xtcp
+            // entry would leak until the control loop tears down.
+            // Reclaim them after the server's NAT session window
+            // (NAT_HOLE_TIMEOUT = 10s) plus margin. If NatHoleResp
+            // arrives in time, handle_nat_hole_resp already removed
+            // both entries and these removes are no-ops.
+            let cleanup_sockets = Arc::clone(&ctx.xtcp_sockets);
+            let cleanup_tx = xtcp_cleanup_tx.clone();
+            let cleanup_sid = sid.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                cleanup_sockets.lock().await.remove(&cleanup_sid);
+                let _ = cleanup_tx.send(cleanup_sid).await;
+            });
+        }
+    }
+
+    /// Handle one stale XTCP entry from the cleanup channel: reclaim the
+    /// provider `sid` or the visitor txn_id from both NAT-hole maps.
+    ///
+    /// Extracted from the `run_message_loop` `xtcp_cleanup` arm by the P2 S3b
+    /// seam (group D1) as a de-indented pure move — no statement is added,
+    /// removed or reordered. The arm carries no `continue` and no
+    /// `LoopExit::`, so falling off this body lands at the loop top exactly
+    /// where the arm's end did.
+    ///
+    /// Coupling, derived from this arm: `&mut SessionCtx` only —
+    /// `ctx.pending_xtcp` and `ctx.visitor_pending`, reached through the one
+    /// parameter rather than passed as two. The arm reaches no `Service`
+    /// state (measured: zero `self.` occurrences in the base span), takes no
+    /// `writer`, and does not name `xtcp_cleanup_tx` (its sender side is the
+    /// `stun_result` / visitor arms'). It carries no `#[cfg]`.
+    async fn handle_xtcp_cleanup_arm(&self, cleanup_sid: String, ctx: &mut SessionCtx) {
+        if reclaim_stale_xtcp_entry(
+            &mut ctx.pending_xtcp,
+            &mut ctx.visitor_pending,
+            &cleanup_sid,
+        ) {
+            debug!(sid = %cleanup_sid, "XTCP: reclaimed stale entry for '{}'", cleanup_sid);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1479,10 +1584,10 @@ mod tests {
     }
 
     /// A minimal `SessionCtx` for tests that drive an extracted arm handler
-    /// directly. The two timer arms reach only a handful of `SessionCtx`
-    /// fields, but the struct has no `Default` and is private to `service`
-    /// (this module is its child, so it can name it), so the literal is
-    /// spelled out. `reader` stays `None`: neither arm touches it.
+    /// directly. The extracted arms reach only a handful of `SessionCtx`
+    /// fields between them, but the struct has no `Default` and is private to
+    /// `service` (this module is its child, so it can name it), so the literal
+    /// is spelled out. `reader` stays `None`: no arm touches it.
     fn test_session_ctx() -> SessionCtx {
         SessionCtx {
             control_stream: None,
@@ -2076,16 +2181,6 @@ mod tests {
              must not"
         );
 
-        eprintln!(
-            "PROBE2 phase_p2={:?} last_start_err_keys={:?}",
-            service
-                .proxy_info_map
-                .read()
-                .await
-                .get("user.p2")
-                .map(|i| i.phase.clone()),
-            last_start_err.keys().collect::<Vec<_>>()
-        );
         {
             let map = service.proxy_info_map.read().await;
             assert_eq!(
@@ -2124,6 +2219,332 @@ mod tests {
             last_start_err.get("user.p3").copied(),
             Some(fresh_anchor),
             "the still-StartErr proxy keeps its original anchor"
+        );
+    }
+    /// The extracted `xtcp_cleanup` arm, driven directly. No lane puts a
+    /// cleanup key on the channel to a client `Service`, so this is the direct
+    /// witness for the reclaim rule the arm owns: the key is removed from
+    /// **both** NAT-hole maps (the provider `sid` and the visitor txn_id
+    /// namespaces are independent, which is what makes the one lookup correct
+    /// for either), unrelated keys are untouched, and an absent key is a
+    /// silent no-op.
+    #[tokio::test]
+    async fn xtcp_cleanup_arm_reclaims_both_nat_hole_maps() {
+        let service = test_service().await;
+        let mut ctx = test_session_ctx();
+        ctx.pending_xtcp
+            .insert("sid-a".to_string(), "user.p1".to_string());
+        let (visitor_tx, _visitor_rx) = oneshot::channel::<Result<msg::NatHoleResp, String>>();
+        ctx.visitor_pending.insert("sid-a".to_string(), visitor_tx);
+        ctx.pending_xtcp
+            .insert("txn-b".to_string(), "user.p2".to_string());
+        let (visitor_tx_b, _visitor_rx_b) = oneshot::channel::<Result<msg::NatHoleResp, String>>();
+        ctx.visitor_pending
+            .insert("txn-b".to_string(), visitor_tx_b);
+
+        service
+            .handle_xtcp_cleanup_arm("sid-a".to_string(), &mut ctx)
+            .await;
+        assert!(
+            !ctx.pending_xtcp.contains_key("sid-a") && !ctx.visitor_pending.contains_key("sid-a"),
+            "the reclaimed key must leave the provider and the visitor map"
+        );
+        assert!(
+            ctx.pending_xtcp.contains_key("txn-b") && ctx.visitor_pending.contains_key("txn-b"),
+            "an unrelated key must be left alone"
+        );
+
+        service
+            .handle_xtcp_cleanup_arm("txn-b".to_string(), &mut ctx)
+            .await;
+        assert!(
+            !ctx.pending_xtcp.contains_key("txn-b") && !ctx.visitor_pending.contains_key("txn-b"),
+            "the visitor txn_id namespace is reclaimed by the same lookup"
+        );
+
+        service
+            .handle_xtcp_cleanup_arm("absent".to_string(), &mut ctx)
+            .await;
+        assert!(
+            ctx.pending_xtcp.is_empty() && ctx.visitor_pending.is_empty(),
+            "an absent key must be a no-op"
+        );
+    }
+
+    /// The extracted STUN-result arm, driven directly. This arm owns the
+    /// provider write, the `pending_xtcp` bookkeeping and the defensive 15s
+    /// cleanup spawn; its input's producer is the off-loop STUN task, which the
+    /// XTCP-notify test below drives for real.
+    #[tokio::test(start_paused = true)]
+    async fn stun_result_arm_writes_client_and_reclaims_socket_on_write_failure() {
+        let service = test_service().await;
+        let mut ctx = test_session_ctx();
+        let (writer, mut written) = test_control_writer_rx();
+        let (cleanup_tx, mut cleanup_rx) = mpsc::channel::<String>(4);
+
+        // Success path: the `NatHoleClient` is enqueued on the control writer
+        // and the sid is tracked for `NatHoleResp` routing.
+        let probe = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a STUN probe socket");
+        ctx.xtcp_sockets
+            .lock()
+            .await
+            .insert("s-ok".to_string(), Arc::new(probe));
+        service
+            .handle_stun_result_arm(
+                StunResult {
+                    sid: "s-ok".to_string(),
+                    proxy_name: "user.p1".to_string(),
+                    msg: FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
+                        transaction_id: "txn-1".to_string(),
+                        proxy_name: "user.p1".to_string(),
+                        sid: Some("s-ok".to_string()),
+                        protocol: Some("kcp".to_string()),
+                        mapped_addrs: None,
+                        assisted_addrs: None,
+                        visitor_addr: None,
+                    })),
+                },
+                &mut ctx,
+                &writer,
+                &cleanup_tx,
+            )
+            .await;
+        let (frame, v2) = written
+            .try_recv()
+            .expect("a successful write must enqueue the NatHoleClient");
+        assert!(!v2, "the test ctx negotiates V1");
+        assert!(matches!(frame, FrpMessage::NatHoleClient(_)));
+        assert_eq!(
+            ctx.pending_xtcp.get("s-ok").map(String::as_str),
+            Some("user.p1"),
+            "the success path tracks sid -> proxy_name for NatHoleResp routing"
+        );
+        assert!(
+            ctx.xtcp_sockets.lock().await.contains_key("s-ok"),
+            "the write itself must not reclaim the socket"
+        );
+        // The success branch spawned the arm's defensive cleanup task. With the
+        // clock paused, waiting on the channel advances time to its 15s
+        // deadline, so the assertion is on the task's real effect rather than
+        // on a sleep: the socket is reclaimed and the sid is handed to the
+        // cleanup arm.
+        let cleaned = tokio::time::timeout(Duration::from_secs(60), cleanup_rx.recv())
+            .await
+            .expect("the success branch must spawn the defensive cleanup task")
+            .expect("cleanup_tx is still held by this test");
+        assert_eq!(
+            cleaned, "s-ok",
+            "the spawned cleanup task must hand the sid back after the NAT window"
+        );
+        assert!(
+            !ctx.xtcp_sockets.lock().await.contains_key("s-ok"),
+            "the cleanup task must reclaim the persisted socket"
+        );
+
+        // Failure path: nothing is enqueued, no pending entry is created, and
+        // the socket the STUN task stored is reclaimed immediately — it would
+        // otherwise sit until control-loop teardown.
+        let probe2 = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind a second STUN probe socket");
+        ctx.xtcp_sockets
+            .lock()
+            .await
+            .insert("s-fail".to_string(), Arc::new(probe2));
+        writer
+            .failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .handle_stun_result_arm(
+                StunResult {
+                    sid: "s-fail".to_string(),
+                    proxy_name: "user.p2".to_string(),
+                    msg: FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
+                        transaction_id: "txn-2".to_string(),
+                        proxy_name: "user.p2".to_string(),
+                        sid: Some("s-fail".to_string()),
+                        protocol: Some("kcp".to_string()),
+                        mapped_addrs: None,
+                        assisted_addrs: None,
+                        visitor_addr: None,
+                    })),
+                },
+                &mut ctx,
+                &writer,
+                &cleanup_tx,
+            )
+            .await;
+        assert!(
+            written.try_recv().is_err(),
+            "a failed control write must enqueue nothing"
+        );
+        assert!(
+            !ctx.xtcp_sockets.lock().await.contains_key("s-fail"),
+            "the socket of a failed NatHoleClient send must not leak"
+        );
+        assert!(
+            !ctx.pending_xtcp.contains_key("s-fail"),
+            "the failure path must not create a pending_xtcp entry"
+        );
+    }
+
+    /// The extracted XTCP-notify arm, driven directly against a loopback STUN
+    /// responder. This is the arm that **spawns**, so the test is built to
+    /// witness the split rather than the code text: the handler must return
+    /// with the result not yet produced (the message loop cannot stall for the
+    /// STUN round-trips), the spawned task must persist the STUN socket under
+    /// the sid, and the finished `NatHoleClient` must come back on
+    /// `stun_result_tx` for the loop to write — the write-before-`NatHoleResp`
+    /// ordering the arm's comment relies on.
+    ///
+    /// The responder is the minimal RFC 5389 shape of the integration lane's
+    /// (`frp-client/tests/xtcp_pair_e2e.rs`, `run_mock_stun_server`): it echoes
+    /// the request txid and reports the OBSERVED SOURCE as MAPPED-ADDRESS, with
+    /// no OTHER-ADDRESS, so the arm's second probe re-queries this same server.
+    /// A unit test cannot import an integration test's module, so this copy is
+    /// the only way to drive the spawned STUN task directly.
+    #[tokio::test]
+    async fn xtcp_notify_arm_spawns_stun_and_hands_back_nat_hole_client() {
+        // Written with `while let` + nested `if let` rather than the
+        // integration lane's early-return-on-invalid shape, so this test adds
+        // no loop-continue token: the file's executable-continue census stays
+        // 0 (group C removed the last one) and its only textual hit stays the
+        // ping handler's doc prose.
+        async fn responder(socket: tokio::net::UdpSocket) {
+            let mut buf = vec![0u8; 512];
+            while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+                if n >= 20
+                    && u16::from_be_bytes([buf[0], buf[1]]) == 0x0001
+                    && buf[4..8] == 0x2112_A442u32.to_be_bytes()
+                {
+                    if let std::net::IpAddr::V4(ip) = src.ip() {
+                        let mut resp = Vec::with_capacity(32);
+                        resp.extend_from_slice(&0x0101u16.to_be_bytes());
+                        resp.extend_from_slice(&12u16.to_be_bytes());
+                        resp.extend_from_slice(&0x2112_A442u32.to_be_bytes());
+                        resp.extend_from_slice(&buf[8..20]);
+                        resp.extend_from_slice(&0x0001u16.to_be_bytes());
+                        resp.extend_from_slice(&8u16.to_be_bytes());
+                        resp.push(0x00);
+                        resp.push(0x01);
+                        resp.extend_from_slice(&src.port().to_be_bytes());
+                        resp.extend_from_slice(&ip.octets());
+                        let _ = socket.send_to(&resp, src).await;
+                    }
+                }
+            }
+        }
+
+        let service = test_service().await;
+        let mut ctx = test_session_ctx();
+        let (stun_tx, mut stun_rx) = mpsc::channel::<StunResult>(4);
+        ctx.stun_result_tx = Some(stun_tx);
+
+        let stun_socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock STUN responder");
+        let stun_server = stun_socket
+            .local_addr()
+            .expect("responder addr")
+            .to_string();
+        let _responder = tokio::spawn(responder(stun_socket));
+
+        // `SessionChannels` borrows its receivers, so the literal is built here
+        // rather than returned from a helper.
+        let (_health_tx, mut health_rx) = mpsc::channel::<HealthEvent>(1);
+        let (_reload_tx, mut reload_rx) = mpsc::channel::<ReloadRequest>(1);
+        let (_xtcp_tx, mut xtcp_rx) = mpsc::channel::<XtcpNotification>(1);
+        let (_visitor_tx, mut visitor_rx) = mpsc::channel::<VisitorRequest>(1);
+        let (_stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let health_cancels = Arc::new(Mutex::new(HashMap::new()));
+        let channels = SessionChannels {
+            health_rx: &mut health_rx,
+            reload_rx: &mut reload_rx,
+            xtcp_rx: &mut xtcp_rx,
+            visitor_rx: &mut visitor_rx,
+            stop_rx: &mut stop_rx,
+            health_cancels: &health_cancels,
+            nat_hole_stun_server: &stun_server,
+        };
+
+        service
+            .handle_xtcp_notify_arm(
+                XtcpNotification {
+                    sid: "sid-1".to_string(),
+                    proxy_name: "user.p1".to_string(),
+                },
+                &mut ctx,
+                &channels,
+            )
+            .await;
+        // The spawn/await split, witnessed: on a current-thread runtime the
+        // spawned STUN task cannot have run yet (the handler body has no
+        // yield point of its own), so a result already here would mean the arm
+        // did the STUN inline and blocked the message loop.
+        assert!(
+            stun_rx.try_recv().is_err(),
+            "the STUN work must be spawned off-loop, not awaited by the handler"
+        );
+
+        let stun = tokio::time::timeout(Duration::from_secs(10), stun_rx.recv())
+            .await
+            .expect("the spawned STUN task must hand a result back within 10s")
+            .expect("stun_result_tx is still held by this test");
+        assert_eq!(stun.sid, "sid-1");
+        assert_eq!(stun.proxy_name, "user.p1");
+        match stun.msg {
+            FrpMessage::NatHoleClient(nhc) => {
+                assert_eq!(nhc.proxy_name, "user.p1");
+                assert_eq!(nhc.sid.as_deref(), Some("sid-1"));
+                assert_eq!(
+                    nhc.protocol.as_deref(),
+                    Some("kcp"),
+                    "Go frp v0.70 compat: the provider announces protocol \"kcp\""
+                );
+                // frp-client forwards `frp-core/stun` from its `kcp` and
+                // `vnet` features; in a shape with neither, `frp_core::stun`
+                // is the stub that errors without touching the network, so
+                // the arm stores no socket and builds the message with no
+                // mapped address. Both shapes are asserted, and `cfg!` is the
+                // compiled truth: if it ever disagrees with what the arm
+                // actually did (a forwarding change in either direction),
+                // this test reds instead of skipping.
+                if cfg!(any(feature = "kcp", feature = "vnet")) {
+                    let mapped = nhc
+                        .mapped_addrs
+                        .expect("both STUN probes must report a mapped address");
+                    assert_eq!(
+                        mapped.len(),
+                        2,
+                        "no OTHER-ADDRESS in the response -> the second probe re-queries the same server"
+                    );
+                    // The persisted socket is the one the probes ran on, so the
+                    // mapped port must equal its bound port.
+                    let sockets = ctx.xtcp_sockets.lock().await;
+                    let persisted = sockets
+                        .get("sid-1")
+                        .expect("the STUN socket must be persisted under the sid");
+                    let local_port = persisted.local_addr().expect("bound").port();
+                    assert_eq!(mapped[0], format!("127.0.0.1:{local_port}"));
+                    assert_eq!(mapped[1], format!("127.0.0.1:{local_port}"));
+                } else {
+                    assert!(
+                        nhc.mapped_addrs.is_none(),
+                        "without frp-core/stun the probe fails, so no mapped address may be reported"
+                    );
+                    assert!(
+                        ctx.xtcp_sockets.lock().await.is_empty(),
+                        "a failed probe must not persist a socket"
+                    );
+                }
+            }
+            other => panic!("expected NatHoleClient, got {other:?}"),
+        }
+        assert!(
+            !ctx.pending_xtcp.contains_key("sid-1"),
+            "pending_xtcp is the STUN-result arm's bookkeeping, not this arm's"
         );
     }
 }

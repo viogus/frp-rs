@@ -587,15 +587,15 @@ terminal, so its `continue` becomes a plain `return`.
 | ~~`CloseProxy`~~ **landed** (PR #498) | 116 | **`&mut SessionCtx` — not `&SessionCtx`** (see the correction below), `proxy_info_map`, `health_cancels`, `p2p_bridge_tokens`, the seven vnet fields, `plugin_handles`, writer, **plus `self.cfg`** (which this row omitted; read once in the vnet teardown) |
 | ~~proxy retry tick~~ **landed** (PR #503) | 130 | base `:444-573` / 8103 B / `f1daa5a5…` → `handle_proxy_retry_tick_arm` (`:1313-1437`), call `:367-374` **8L/305B/`413e1954…`**; coupling `&mut SessionCtx` (`waitstart_seen`), `&mut last_start_err`, `&self` for `proxies`/`cfg`/`proxy_info_map`, `writer` |
 | ~~ping tick~~ **landed** (PR #503) | 86 | base `:357-442` / 4982 B / `85979b12…` → `handle_ping_tick_arm` (`:1207-1283`), call `:357-366` 10L/367B/`2dd834a5…`; **this arm held the program's last `continue;`** (base `:427` → `:1269`); coupling `&mut SessionCtx` (ping fields, scopes, `v2`), `oidc_client`, `auth_cfg`, `writer` |
-| XTCP notify → STUN 3631–3733 | 103 | `xtcp_sockets`, `stun_result_tx`, `nat_hole_stun_server`; spawns |
+| ~~XTCP notify → STUN~~ **landed** (PR #504) | 103 | base `:453-555` / 6464 B / `9d751b69…` → `handle_xtcp_notify_arm` (`:1335-1449`), call `:453-456` 4L/165B/`f7aae8af…`; coupling `&mut SessionCtx` (`xtcp_sockets`), `stun_result_tx`, `nat_hole_stun_server`; **spawns 1** (off-loop STUN, write handed back on `stun_result_tx`) |
 | health event 3553–3613 | 61 | `p2p_bridge_tokens`, `proxy_info_map`, `health_proxy_configs`, `v2`, `cfg_user`, writer |
 | ~~`NewProxyResp`~~ **landed** (PR #501) | 42 | base `:387-428` / 2881 B / `41fc390d…` → `handle_new_proxy_resp_arm`; coupling: `&mut last_start_err` only — **no `ctx` at all**; `proxy_info_map` reached via `&self`; and it gains the **first direct test** of these arms (the inline `mod tests`) |
 | ~~`NatHoleResp`~~ **landed** (PR #501) | 39 | base `:348-386` / 2625 B / `1fdfffd5…` → `handle_nat_hole_resp_arm`; coupling: `&mut SessionCtx` (`&mut pending_xtcp`, `&mut visitor_pending`, `&xtcp_sockets`, `session_alive`) and `writer`; **`p2p_bridge_tokens` is reached via `&self`, not passed** (the row listed it as a parameter, which is what sent this group's brief wrong) |
 | visitor request 3792–3826 | 35 | `&mut visitor_pending`, `xtcp_cleanup_tx`, `v2`, writer; spawns |
-| STUN result 3737–3767 | 31 | `&mut pending_xtcp`, `xtcp_sockets`, `stun_result_rx`, writer; spawns |
+| ~~STUN result~~ **landed** (PR #504) | 31 | base `:559-589` / 1927 B / `b774ecdf…` → `handle_stun_result_arm` (`:1482-1518`), call `:459-466` 8L/338B/`fa1b9b3a…`; coupling `&mut SessionCtx` (`&mut pending_xtcp`, `&xtcp_sockets`, `stun_result_rx`, `v2`) **plus the loop-local `xtcp_cleanup_tx`**, which this row previously omitted; **spawns 1** (the 15 s cleanup) |
 | ~~`NatHoleClient`~~ **landed** (PR #501) | 22 | base `:326-347` / 1498 B / `f4ff263c…` → `handle_nat_hole_client_arm`; coupling: `&mut SessionCtx`, `writer`, `punch_proxy_still_live`, `session_alive`; **`p2p_bridge_tokens` via `&self`** (split `self` / `.p2p_bridge_tokens` / `.lock()` across lines at `:1197-1199`, which is why a joined-literal grep misses it) |
 | ~~vnet trio~~ **landed** (PR #502) | 138 measured (70+35+33; the row's 141 counts the three separator lines between the arms) | base `:336-405` / `:407-441` / `:443-475` → `handle_vnet_route_advertise_arm` / `handle_vnet_packet_arm` / `handle_vnet_route_remove_arm`; each arm keeps its call-site `#[cfg(feature = "vnet")]` **and** the handler gains one; coupling `&self` only (`cfg`, `vnet_controller`, `vnet_tun_names`, `vnet_peer_routes`, `vnet_tun_tx`) |
-| `xtcp_cleanup` 3775–3787 | 13 | `&mut pending_xtcp`, `&mut visitor_pending`, `xtcp_cleanup_rx` |
+| ~~`xtcp_cleanup`~~ **landed** (PR #504) | 13 | base `:597-609` / 570 B / `6fd91bf5…` → `handle_xtcp_cleanup_arm` (`:1535-1543`), call `:473-480` 8L/310B/`8f2e26d0…`; coupling `&mut SessionCtx` (`&mut pending_xtcp`, `&mut visitor_pending`); **0 deltas**, spawns 0 / awaits 0 |
 
 **`writer`-parameter rule, from groups A and B (PRs #501, #502).** A handler needs
 `#[cfg_attr(not(feature = "vnet"), allow(unused_variables))]` **only when its only use of `writer` sits behind a
@@ -608,9 +608,15 @@ suppresses a genuine future warning rather than documenting a constraint, and it
 touched. Group A is also the precedent for the checklist: each arm's row carries its own `continue` census, its own
 `LoopExit::` count and its own stripped inner-loop scan, with only the loop-level "nothing follows the `select!`" fact
 shared — which is what makes a grouped PR reviewable arm by arm.
-This correction is not cosmetic for group **D1**: its `xtcp_cleanup` and STUN rows have the same shape as the two NatHole
-rows (they list state that is in fact reached through `&self`), so without it D1's brief would have sent its author hunting
-parameters that must not exist.
+**This correction does *not* generalise to every later group, and the earlier claim that it did was wrong.** An M-31 draft
+said it was "not cosmetic for group **D1**" because those rows "have the same shape" (state reached through `&self`).
+Measured when D1 actually landed (PR #504): all three of its base spans and all three handlers contain **zero** `self.`
+uses -- while `ctx.` counts **1/4/2 occurrences, or 4/4/2 distinct fields** (the two bases differ, so both are named) --
+so D1's state does arrive through the single `&mut SessionCtx`. Its rows' real defects are narrower —
+they present `ctx` fields as if they were separate parameters, and the STUN row omits the **loop-local** `xtcp_cleanup_tx`
+(which that handler's signature carries as `xtcp_cleanup_tx: &mpsc::Sender<String>`) and `ctx.v2`. Both the adversarial round that first reported the `&self` shape (about group A's NatHole arms, where
+`self.p2p_bridge_tokens` really is used) and this record now say so: the clause was dropped rather than defended, because
+a mechanism measured in one group is not evidence about another.
 
 **Regrouping (decided after arm 1 landed, 2026-10-04).** The row's original "one per PR" predates the first arm, when
 the recipe, the signature constraint and the coverage gap were all unknown. Arm 1 (`CloseProxy`, PR #498) established
@@ -683,6 +689,12 @@ site and the extracted handler, and the pair is load-bearing **only in the non-`
 **on**, removing either is **rc 0** — the adversarial round's measurement; the verification round's probes were in the vnet-off
 shape only — so both gates are inert there. That is also why a gate census must be reported per
 shape rather than as one number.
+
+**Counting `#[cfg]` — name the rule (from group D1's review, PR #504).** Two careful rounds reported different totals for
+the same file because they counted by different rules: raw `#[cfg(` lines (10 before the test module, one of which is a doc
+comment quoting `#[cfg(test)]`) versus real attributes (**9** `#[cfg(…)]` = 8 vnet + 1 `any(target_os)`, plus **3**
+`#[cfg_attr(…)]`). The delta that mattered was zero at both ends either way; the lesson is that a `#[cfg]` census should say
+which rule it uses, exactly as gate-error counts must state their scope and byte counts their basis.
 
 **Test-induced weak cites, from group C (PR #503).** A new direct test that re-assigned a value the test helper
 already set duplicated the handler's own line `ctx.ping_retry_backoff = None;`, and because nine `heartbeat_wire_order.rs`
