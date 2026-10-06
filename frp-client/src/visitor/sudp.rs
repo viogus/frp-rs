@@ -6,8 +6,8 @@
 //!
 //! Split out of `frp-client/src/visitor.rs` by the plan's P3 seam 3
 //! (`docs/refactor-large-modules.md` P3, `visitor/sudp.rs`) as a pure move: the
-//! six moved items are byte-for-byte identical to their base text (evidence in
-//! `/tmp/m38-author-report.md`). This module is a *child* of `visitor`, so
+//! six moved items are byte-for-byte identical to their base text (the seam-3
+//! report carries the per-span sha1s). This module is a *child* of `visitor`, so
 //! through `use super::*;` it reaches the parent-private items it needs —
 //! `VisitorListenerConfig`, `VisitorTransportConfig` and `plan_visitor_dial` —
 //! plus the parent's own imports, with no visibility change on any of them.
