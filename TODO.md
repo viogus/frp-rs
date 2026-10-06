@@ -8261,7 +8261,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `registry.rs`), and its `//!` header restates the two-port-map lock rule.
   Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests: 13
   `unregister_generation_tests::*` callers, 5 idle-reap, 3 `cleanup_*`, `partial_read_tests` and the
-  SSH-gateway control-exit test — all through `handle_control` — so the moved body is
+  SSH-gateway control-exit test, so the moved body is
   exercised. Code-head gates: fmt; `clippy -D warnings` (0, all-targets/all-features);
   `cargo check -p frps -p frpc --no-default-features --features tiny`/`micro`; `cargo test -p frp-server --lib
   --all-features` 525/0 (= base); `repo-health.sh` invariants; the 13-step health corpus is 13/0. **All cites
