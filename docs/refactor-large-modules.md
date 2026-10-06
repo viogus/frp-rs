@@ -988,6 +988,107 @@ forces a parked reader, so its abort effect is unverified.
    spurious "the window mapping is off by one" reading from `sed` on the working tree, while the committed
    mapping (`git show <rev>:<path>`) was byte-exact. Seal span measurements to revisions, not to files.
 
+**Seam 4 landed (2026-10-06, PR #509, base `9441317e`, head `7d6a1d50`) — `visitor/vnet.rs`.**
+The `virtual_net` visitor cluster of `frp-client/src/visitor.rs` moved into a new **child** module
+`frp-client/src/visitor/vnet.rs` as **five byte-identical windows**, the first non-contiguous seam: the
+`bridge_until_cancelled` bridge and `list_local_ips` sit between the windows and stay in the parent (Corrections
+1–2). W1 `VnetTunTxMap`/`VnetTunSubnetMap` base `:22-26` (5 lines / 152 B / `d03e3f7f…`) → child `:34-38`;
+W2 `VirtualNetVisitorConfig` `:98-147` (50 / 2 177 / `bf0d5675…`) → `:39-88`; W3 `run_virtual_net_tunnel_io`
+`:715-806` (92 / 3 857 / `a65dc297…`) → `:89-180`; W4 `run_virtual_net_visitor` + `deliver_tunnel_ingress` +
+both shutdown waiters `:833-1167` (335 / 12 934 / `8c664335…`) → `:181-515`; W5
+`#[cfg(all(test, feature = "vnet"))] mod tests` `:1263-1524` (262 / 11 321 / `a0e31630…`) → `:516-777`.
+744 lines / 30 441 B in total (hash = SHA-1 of the newline-joined window text, seams 1–3's recipe), each span
+occurring **once** in the child and **zero** times in the parent, so the child is a pure copy of base text. The
+child is exactly a **33-line prelude** (29 `//!` lines, the separating blank, `use super::*;`, and the two-line
+`#[cfg(all(feature = "vnet", test))] use std::collections::HashMap;` re-add) followed by the five windows with
+**no separator lines** — 33 + 744 = **777** lines / 32 432 B. `visitor.rs` 2301 → **1569** (67 663 B); the
+crate's `src/**` row **38 / 40 779 → 39 / 40 824** (measured file-by-file over `git ls-tree`, not by a glob). 751
+parent lines are deleted — the 744 moved lines, five separating blanks and the two-line `HashMap` import pair at
+base `:1-2` — and 19 added: the 14-line explainer comment `:117-130` and the gated declaration
+`#[cfg(feature = "vnet")]` `:131`, `mod vnet;` `:132`, `#[cfg(feature = "vnet")]` `:133`,
+`pub(crate) use vnet::{run_virtual_net_visitor, VirtualNetVisitorConfig};` `:134`.
+
+**Zero visibility change, and the module itself is gated.** All eight moved items keep their base tokens:
+`pub(crate) struct VirtualNetVisitorConfig` (child `:41`) and `pub(crate) async fn run_virtual_net_visitor`
+(`:190`) are `pub(crate)` at base, and the two aliases (`:35`, `:38`) plus the four helpers (`:95`, `:405`,
+`:492`, `:508`) are private at base — line-level byte identity is the proof. `use super::*;` reaches only three
+parent names: `VisitorTransportConfig` (2 uses), `plan_visitor_dial` (2) and, in the moved tests,
+`clamp_hp_timeout` (6); the aliases are the child's own local copies of `crate::vnet::{VnetTunTxMap,
+VnetTunSubnetMap}` (the same aliasing `frp-client/src/work_conn.rs:42` uses). The only external caller is the
+`virtual_net` visitor spawn at `frp-client/src/service/session.rs:909-910`, spelled
+`crate::visitor::run_virtual_net_visitor` / `crate::visitor::VirtualNetVisitorConfig`, which the parent's
+`pub(crate) use` keeps reachable — no `pub(super)`, no widening, no extra re-export. Unlike the
+stcp/xtcp/sudp children, which are unconditional, both `mod vnet;` and the re-export carry
+`#[cfg(feature = "vnet")]` because `vnet` is **not** a default feature (`frp-client/Cargo.toml`), so the child
+stays out of non-vnet builds entirely. The admitted `module_path!()` side effect is seams 1–3's: the tracing
+target becomes `frp_client::visitor::vnet`.
+
+**Census.** `grep -Ec '^[[:space:]]*#\[cfg\(' frp-client/src/visitor/vnet.rs` counts **13** with **0**
+`#[cfg_attr]`: the **12** gate lines the five windows carried plus the re-added `HashMap` gate at `:32`. The
+parent goes 28 → **17** (−12 moved, −1 `HashMap` gate, +2 declaration gates), so no gate is lost or invented.
+
+**Coverage.** The moved tests travel with the code (W5) and the feature lane discriminates them:
+`cargo test -p frp-client --lib --features vnet visitor` reads `36 passed; 0 failed` at head, identical to the
+base count, with the test ids now `visitor::vnet::tests::*`; the default lane `--lib visitor` stays 29/0 and
+`--test reload_vnet_proxy` (not feature-gated — it runs in the default suite as the M6 reload regression) stays
+1/0. One one-line `panic!` witness kills: M1 at the first statement of `deliver_tunnel_ingress` (child `:413`)
+reddens four tests at `vnet.rs:413` and fails `virtual_net_tunnel_io_wraps_encrypted_compressed_bytes` through
+the same call, the lane going rc 101. Two witnesses survive, and survive because nothing reaches them, not
+because the code is stripped — M1 proves the same file, feature set and lane compile and call into the module:
+M2 at the first statement of `run_virtual_net_visitor` (child `:225`, after the config destructure at `:223`) and M3 at
+the first statement of `wait_for_shutdown_or_delay` (child `:493`) both leave the lane at 36/0 (and
+`reload_vnet_proxy` green, since it runs with `vnet` off and fails its controller setup before the spawn).
+Unreached, by static enumeration rather than instrumentation (no `cargo-llvm-cov` on this toolchain), so
+cross-checked by M1–M3: **all** of `run_virtual_net_visitor` `:190-398` — its only caller is the feature-gated
+`virtual_net` spawn and no test starts a real client session with a `virtual_net` plugin proxy;
+`wait_for_shutdown_or_delay` `:492-504` and `wait_for_shutdown_signal` `:508-515`, used only from that function
+and from `run_virtual_net_tunnel_io`'s select arm; inside `run_virtual_net_tunnel_io` `:95-180` (partially
+reached by the one encryption/compression test) the split-failure arms `:108-111`, the plain-writer `else`
+`:131-133`, the flush-failure arms `:134-137`, the shutdown select arm `:142-145`, the channel-closed arm
+`:154-157`, the peer-closed `Ok(None)` `:162-165` and the packet-read `Err` `:171-174`; and inside
+`deliver_tunnel_ingress` `:405-487` (four tests cover delivery, subnet direction, shared-buffer fan-out and the
+ambiguous fallback drop) the queue-full `Err(TrySendError::Full)` `:434-440`, the closed-channel arms `:441` and
+`:455-461`, and the re-`try_send` failure `:470-474`.
+
+**Corrections this seam forced:**
+
+1. **The plan row's `list_local_ips` stays in the parent — a deliberate plan/reality mismatch.**
+   `docs/refactor-large-modules.md:756` lists `list_local_ips` under `visitor/vnet.rs`, but it carries no
+   `#[cfg]` and its only caller is `frp-client/src/visitor/xtcp.rs:171`, which is always compiled; moving it
+   into the feature-gated child would break that call site in default builds (or force a second always-compiled
+   module). It is left at `visitor.rs:706`, and the point-in-time row is left as written.
+2. **`bridge_until_cancelled` stays too, and is not a deviation.** Base `:808-831` (now `:675-698`): six call
+   sites in `frp-client/src/visitor/stcp.rs` (`:342`, `:364`, `:502`, `:523`, `:637`, `:658`) plus a test in
+   the parent — shared STCP/tunnel-session machinery the plan row does not name.
+3. **The batch report's byte ledger overstated the child by one term.** It read "30-line prelude + 5 windows +
+   4 blank separator lines = 777"; the child has **no** separator lines (W1 ends `:38` and W2 starts `:39`; W2
+   ends `:88`/W3 `:89`; W3 ends `:180`/W4 `:181`; W4 ends `:515`/W5 `:516`) and the ledger is a 33-line
+   prelude + the 744 moved lines. Re-measured at the coordinator from `git show <rev>:<path>`, not from the
+   working tree.
+4. **One host-load flake, not reproduced.** A first run of the `--lib --features vnet visitor` lane read
+   `35 passed; 1 failed` on the sibling
+   `proxy::tests::test_visitor_auth_debug_log_does_not_leak_secret_or_replay_proof` — a file this move does not
+   touch, filtered in only because its name contains "visitor" — while two clean re-runs read `36 passed;
+   0 failed`. Recorded as a measurement note; nothing in this seam depends on a single lane run.
+5. **One pathline expectation is re-baked.** The parent's comment citing `service/session.rs:1030` moved from
+   `visitor.rs:156` to `:97` with the deletions above; the cite text (and its token `b8c5f28b2dca68a3`) is
+   unchanged: the first `--write` reported 1 added / 1 removed / 579 unchanged, and the second — after the
+   drift fixes below — 0 added / 0 removed / 580 unchanged, because only the table's point-in-time cite-set
+   digest moved.
+6. **The adversarial round caught a citation drift the guard cannot see.** A re-point driven by
+   `todo-cite-guard`'s FAIL lines moves only cites whose target stopped being an *item header*; a cite whose
+   base target moved by 45 lines onto *another* item's header stays green and stays stale. Three sites were
+   left behind: `frp-core/src/cli.rs:5072` (R2 — drift introduced by this seam, since its base target `:10759`
+   is now the `[common]` strict-mode item while the R2 item moved to `:10804`) and two **pre-existing**
+   mis-aims that name the R5 `-l`-shorthand item while pointing at R2's header
+   (`frps/tests/cli_exit_codes.rs:2454`, `.github/workflows/ci.yml:2033`). All three now read `:10804`, so the
+   cascade sentence's 58 holds. **The residual pre-existing drift class is six sites, not two:** besides that R5
+   pair (correct target `:10837`), four R1-subject cites point at the `[common]` item — `frps/tests/log_completion.rs:655`,
+   `frps/src/main.rs:422`, `frps/src/main.rs:471` and `.github/workflows/ci.yml:3057` — and all four already
+   pointed at that unrelated header at base (`:10714`, shifted arithmetically correctly to `:10759`), while R1 is
+   at `:10784`. All six are left for the class-wide drift repair first surfaced in seam 3's adversarial round, so
+   that one pass fixes every known mis-aim (these six plus the #508 clusters) together instead of site by site.
+
 ### P4 — `frp-server/src/control/proxy_ops/` (3610 production lines at base, 34 production fns)
 
 At base, production code was lines 1–3610 and the remaining 4444 lines were inline
