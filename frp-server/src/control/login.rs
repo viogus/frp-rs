@@ -2358,7 +2358,7 @@ mod oidc_throttle_tests {
     /// other `oidc` test green — measured: on the pre-pin tree all 19 `oidc`
     /// tests stayed green with the accessor body replaced by
     /// `MOCK_REQUEST_HEAD_TIMEOUT` (there are 20 at this head, this pin
-    /// included; TODO.md:9298 (b)).
+    /// included; TODO.md:9331 (b)).
     /// Three **distinct** overrides keep that mutant red three times over: a
     /// distilled accessor can return at most one of the three values, so
     /// `125 ms`, `60 s` or `31.337 ms` fails whichever value it happened to pick.
@@ -2942,7 +2942,7 @@ mod oidc_throttle_tests {
     }
 }
 
-/// PR #454 login auth-method split: ordering pins (`TODO.md:11153`).
+/// PR #454 login auth-method split: ordering pins (`TODO.md:11186`).
 ///
 /// Each test below reds under the specific reordering it names. The two
 /// gate-order mutants (the throttle gate moved after the plugin hook, and
@@ -3150,7 +3150,7 @@ mod login_order_tests {
         );
     }
 
-    /// `TODO.md:11153` Done-when: "`throttled_login_error`'s LoginResp message
+    /// `TODO.md:11186` Done-when: "`throttled_login_error`'s LoginResp message
     /// text asserted like the gate's in `frp-server/tests/login_replay_throttle.rs`".
     /// The gate's copy of the literal is asserted end-to-end there; this pins
     /// the OTHER producer (`frp-server/src/control/login/throttle.rs:58`),

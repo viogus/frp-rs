@@ -6947,10 +6947,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops/mod.rs:954`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
+  `proxy_ops/mod.rs:515`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
   `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/registry.rs:127`;
-  `setup_proxy_listeners` `proxy_ops/mod.rs:561`; `listen_and_proxy`
-  `proxy_ops/mod.rs:1886`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `setup_proxy_listeners` `proxy_ops/mod.rs:122`; `listen_and_proxy`
+  `proxy_ops/mod.rs:1447`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -8213,6 +8213,39 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `pathline-cite-guard` was red at the code head (580/29: the 28 `docs/developing.md` cite lines plus the weak-anchor
   set pin), and is repaired by this records commit.
 
+  **Seam 5 landed (2026-10-06, code head `359a031e`, base `d361af45`, PR #512).** `proxy_ops/ports.rs`
+  (523 lines / 24 509 B) took base `mod.rs:101-409`, `:411-546` and `:2369-2429` as three
+  byte-identical windows: `first_bindable` (`ports.rs:19`), `PortError` and its `client_text`
+  (`:51`, `:64`), `allocate_proxy_port` (`:86`) and the port/rollback helpers
+  `udp_port_has_other_owner` (`:333`), `free_replaced_port` (`:365`),
+  `release_udp_port_with_owner_check` (`:437`) and `proxy_consumes_client_port` (`:458`) in the
+  first two, and `prune_expired_reservations_inner` (`:468`) with the `impl AppState`
+  periodic-cleanup block (`:479`) in the third. Each window carried its doc block and the blank
+  that separated it from the next item; the seam kept exactly one blank. The only change inside
+  the moved text is `pub(super) ` on five items (window A 1, B 3, C 1); the parent went 2439 →
+  1938 lines (8 insert / 509 delete), took a private `use` of the four names it still calls, a
+  `#[cfg(test)] use` of `prune_expired_reservations_inner` (a plain `use` is a clippy
+  `unused_imports` error, and `pub(super)`/`pub(crate)` does not silence it) and `pub(crate) use
+  ports::release_udp_port_with_owner_check` — the one moved item with an external caller
+  (`proxy.rs:132`, `dashboard.rs:1152`, through `control/mod.rs:23`), which is why its visibility
+  and the parent re-export had to stay. This is the third seam that moved lines above the live
+  cites, so **25** cites into `mod.rs` were re-pointed on 24 lines — the 18 in the 17
+  fingerprint-checked `docs/developing.md` lines (20 FAIL lines; the three ranges report both
+  endpoints), `docs/refactor-large-modules.md:24` and `:536`, and the five in this file (`:6950`,
+  `:6952`, `:6953` and the two `#[path]` sites) — and four of them now name `ports.rs`
+  (`developing.md:297`, `:329`, `:351` and plan `:536`). Coverage is asymmetric: W1 — a `panic!`
+  at `release_udp_port_with_owner_check` (`ports.rs:442`) — reddens only the lib target (`--lib`
+  522 passed / 3 failed; the dashboard lane 494/3) and leaves integration (1+13+3) and both compat
+  scenarios green; W2 — a `panic!` at `allocate_proxy_port` (`ports.rs:94`) — reddens every lane
+  (`--lib` 484/41; dashboard lane 460/37; 26 of the 41 integration targets under `--no-fail-fast`;
+  both compat scenarios), because `handle_new_proxy` calls the allocator on the admission path.
+  Code-head gates: fmt; clippy `-D warnings` 0 (all-targets / all-features); `--lib` 525/0
+  (= base); `server_protocol` + `relay_integrity` + `vhost_http_group` 17/0; compat
+  `go-to-rust-http-group` + `go-to-rust-tcp-plain` 1/0 each; `repo-health.sh` invariants;
+  `large-functions.sh` sizes unchanged; `todo-cite-guard` 101/0; release build.
+  `pathline-cite-guard` was red at the code head (580/21: the 20 `docs/developing.md` cite lines
+  plus the weak-anchor set pin) and is repaired by this records commit.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8302,7 +8335,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:2434-2436`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:1933-1935`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8361,7 +8394,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:2434-2436`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:1933-1935`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
