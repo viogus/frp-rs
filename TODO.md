@@ -8191,7 +8191,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `remove_proxy_and_release_client_counts` (668–702), `rollback_vhost_conflict` (704–729),
   `rollback_udp_bind_failure` (731–748), `rollback_tcp_bind_failure` (750–770) and `register_proxy_entry` (772–874)
   in the second. Each window carried its doc block and the blank that separated it from the next item, so the parent
-  kept exactly one blank at each seam. The only change inside the moved text is `pub(super) ` on the eight signatures
+  kept exactly one blank at each seam. The only change inside the moved text is `pub(super) ` on seven signatures
   (window A +33 B, window B +44 B); the parent went 2767 → 2439 lines (7 insert / 335 delete), gaining `mod registry;`,
   a private `use` of the five names it still calls, and `pub(crate) use registry::remove_proxy_and_release_client_counts;`
   — the one moved item with an external caller (`dashboard.rs:1227`, `:1312`), which is why both its own `pub(crate)`
@@ -8199,12 +8199,12 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   child, so re-importing them in the parent is a clippy `unused imports` error; the child imports `free_replaced_port`,
   `proxy_consumes_client_port` and `udp_port_has_other_owner` from `super`. This is the second seam whose insertion sits
   above the live cites, so **35** cites into `mod.rs` were re-pointed: the 26 fingerprint-checked ones in
-  `docs/developing.md` (28 FAIL lines — a range reports both endpoints; seven of those lines now name `registry.rs`),
-  together with `docs/refactor-large-modules.md:24` (−328) and `:536` (`:2713` → `:2385`), the two cites of the
+  `docs/developing.md` (28 FAIL lines — a range reports both endpoints; eight of those rows now name `registry.rs`,
+  seven distinct targets), together with `docs/refactor-large-modules.md:24` (−328) and `:536` (`:2713` → `:2385`), the two cites of the
   `#[path]` site in this file (`:2762-2764` → `:2434-2436`), the five point-in-time cites here (`:6950-6953`), and the plan's rows 5–8.
   Coverage is unchanged and asymmetric: M1 — a `panic!` at `remove_proxy_and_release_client_counts` entry
-  (`registry.rs:190`) — reddens **only** the lib-test lane (`--lib --all-features` 522 passed / 3 failed;
-  `server_protocol`, `relay_integrity` and both compat scenarios stay green), while M2 — a `panic!` before
+  (`registry.rs:190`) — reddens the lib-test lane (`--lib --all-features` 522 passed / 3 failed) and the
+  server-integration lane (`--features dashboard -j 1`: dashboard_integration 18/2, tcpmux_httpconnect 3/1), while M2 — a `panic!` before
   `build_proxy_info` inside `register_proxy_entry` (`registry.rs:299`) — reddens every lane (lib 491/34, the
   `relay_integrity` byte-exact test, both compat scenarios). Code-head gates: fmt; clippy `-D warnings` (0);
   all-targets/all-features; `--no-default-features`; `--lib --all-features` 525/0 (= base); `server_protocol` +
