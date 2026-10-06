@@ -1295,10 +1295,14 @@ nothing about them.
    `| head -20`, which cut exactly those hits. The rule is the map, not the FAIL list: enumerate every
    cite class (full path, `<dir>/mod.rs:N`, `<a>/<b>/mod.rs:N`, `mod.rs:N`, bare `:N` continuations,
    `A-B`/`A–B` ranges) with no output cap, then validate every endpoint by base/head line-text identity.
-8. **The plan's own seam table is a third guard-blind class.** Rows 4–8 name their targets as bare
-   `mod.rs:N` / `mod.rs:A–B` with no directory prefix — a token the guard does not resolve as a cite
-   (the token must name a tracked path) and the seam's script did not enumerate — so the 26 endpoints in
-   those rows were re-pointed by hand under the same explicit map and each verified with `grep -n` of the
+8. **The plan's own seam table hid 26 endpoints — the same point-in-time class as Correction 7, not a
+   third one.** Rows 4–8 name their targets as bare `mod.rs:N` / `mod.rs:A–B` with no directory prefix.
+   The guard *does* parse that token: it resolves to more than one tracked `mod.rs`, so in a scanned file
+   it is reported as ambiguous and reddens the ambiguous-path set pin (measured by appending a bare
+   `mod.rs:1282` cite to `docs/developing.md` in a scratch tree: `FAIL the ambiguous-path set changed
+   (pinned 3343d4d37da5672a, measured ad51951a0fbd3a52)`, 580 checked / 1 violation). Rows 4–8 escape
+   only because this plan is in `PIT_FILES`, exactly like the six cites in Correction 7. The 26 endpoints
+   were therefore re-pointed by hand under the same explicit map, each verified with `grep -n` of the
    named symbol at the head. Row 3 also changed convention without saying so: it now states both the moved
    window (`:2696`/`:2858`) and the `fn` declaration lines (`:2703`/`:2867`) that rows 4–8 use.
 9. **The move changed the operator-visible `tracing` target.** The eight event sites in the moved window
@@ -1323,15 +1327,15 @@ nothing about them.
     `mod.rs:1139-1140`. The same correction is applied to `TODO.md:8179-8182`,
     to the W2 scope (every lib-running job, not the lib lane alone; both witnesses are ungated
     `#[tokio::test]`s), and to the PR body's Coverage section.
-11. **The moved module doc mis-attributes its own call sites (pre-existing; deliberately not fixed
-    here).** `tcp_group.rs:7-8` names the callers as `handle_new_proxy` (base lines 1072, 1186, 1505) and
+11. **The new module doc's call sites were swapped, and `tcp_group.rs:7-8` is fixed here.** That
+    sentence named the callers as `handle_new_proxy` (base lines 1072, 1186, 1505) and
     `setup_proxy_listeners` (base line 1137); the enclosing-function scan shows base `1072`, `1137` and
     `1186` all sit inside `setup_proxy_listeners` (base `:886`) and only `1505` inside `handle_new_proxy`
-    (base `:1279`) — the numbers are right, the owners are swapped. That comment travelled byte-identical
-    with the window, and this seam's contract is byte-identity, so correcting it here would break the
-    round-trip claim it is the evidence for. It belongs in a follow-up touch of `proxy_ops`; no guard and
-    no test sees it.
-
+    (base `:1279`) — the numbers were right, the owners swapped. The mis-attribution is new prose written
+    by this seam (the `//!` block at `tcp_group.rs:1-8` does not exist at `bcdad888`) and it sits outside
+    the byte-identical window (`:22-303` == base `:2696-2977`), so editing it cannot disturb the round-trip
+    hashes — the adversarial delta review rejected the original "pre-existing, deferred for byte-identity"
+    rationale and the owners are swapped in the records commit. No guard and no test sees the sentence.
 
 ### P5 — `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs`
 

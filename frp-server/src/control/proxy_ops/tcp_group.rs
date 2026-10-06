@@ -4,8 +4,8 @@
 //! privately, so `proxy_ops::tcp_group_listener` /
 //! `proxy_ops::handle_tcp_group_member_registration` keep their paths and
 //! private visibility for every existing caller. The only callers are inside
-//! `mod.rs` — `handle_new_proxy` (base lines 1072, 1186, 1505) and
-//! `setup_proxy_listeners` (base line 1137).
+//! `mod.rs` — `setup_proxy_listeners` (base lines 1072, 1137, 1186) and
+//! `handle_new_proxy` (base line 1505).
 
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
