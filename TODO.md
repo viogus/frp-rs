@@ -8237,8 +8237,8 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   at `release_udp_port_with_owner_check` (`ports.rs:442`) — reddens only the lib target (`--lib`
   522 passed / 3 failed; the dashboard lane 494/3) and leaves every integration target green, as do the
   TCP/HTTP compat scenarios; W2 — a `panic!` at `allocate_proxy_port` (`ports.rs:94`) — reddens every lane
-  (`--lib` 484/41; dashboard lane 460/37; 23 of the 42 integration targets under `--all-features -j 1
-  `--no-fail-fast`; both compat scenarios), because `handle_new_proxy` calls the allocator on admission.
+  (`--lib` 484/41; dashboard lane 460/37; 22 of the 41 integration targets; both compat scenarios),
+  because `handle_new_proxy` calls the allocator on admission (Reviewer 2's `--all-features -j 1 --no-fail-fast` sweep).
   Code-head gates: fmt; clippy `-D warnings` 0 (all-targets / all-features); `--lib` 525/0
   (= base); `server_protocol` + `relay_integrity` + `vhost_http_group` 17/0; compat
   `go-to-rust-http-group` + `go-to-rust-tcp-plain` 1/0 each; `repo-health.sh` invariants;
