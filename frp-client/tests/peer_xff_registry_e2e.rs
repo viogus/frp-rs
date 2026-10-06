@@ -18,9 +18,12 @@
 //! coverage — only unit pins in plugin/mod.rs.
 //!
 //! The trick that makes a registry hit distinguishable from the loopback
-//! fallback: the user socket is BOUND to 127.0.0.2 before dialing the frps
-//! proxy port (Linux/macOS treat all of 127.0.0.0/8 as loopback). The frps
-//! therefore sees src_addr 127.0.0.2 and the backend must receive exactly
+//! fallback: the user socket is BOUND to one of `XFF_SOURCES` before dialing
+//! the frps proxy port. Linux routes all of 127.0.0.0/8 to `lo` so every
+//! address in it is bindable; stock macOS has only 127.0.0.1 on `lo0` and
+//! rejects the rest with `EADDRNOTAVAIL` unless each is aliased, so the test
+//! skips (and fails closed under CI) on a host that cannot bind them all. The
+//! frps therefore sees src_addr 127.0.0.2 and the backend must receive exactly
 //! `X-Forwarded-For: 127.0.0.2`. If the registry were broken the captured
 //! head would say `127.0.0.1` (fallback) or carry no XFF line at all — both
 //! failure modes are asserted against.
@@ -124,10 +127,45 @@ async fn start_capture_backend() -> (SocketAddr, tokio::sync::mpsc::UnboundedRec
     (addr, rx)
 }
 
+/// Source addresses the four request tasks bind before dialing. Shared by the
+/// skip guard and the request loop so the two cannot drift.
+const XFF_SOURCES: [&str; 4] = ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"];
+
+/// The first source address in [`XFF_SOURCES`] this host cannot bind, if any.
+///
+/// Linux routes all of 127.0.0.0/8 to `lo`, so every address in it is
+/// bindable; stock macOS has only 127.0.0.1 on `lo0` and rejects the rest with
+/// `EADDRNOTAVAIL` unless each is aliased (`sudo ifconfig lo0 alias
+/// 127.0.0.2`, one alias per address). This test distinguishes a real
+/// XFF-registry hit from the 127.0.0.1 fallback by sourcing its connections
+/// from those addresses, so it can only run where *all* of them are bindable
+/// (a host limitation recorded in the backlog item on the `127.0.0.2` alias).
+fn unbindable_source() -> Option<&'static str> {
+    XFF_SOURCES
+        .iter()
+        .copied()
+        .find(|ip| std::net::TcpListener::bind((*ip, 0)).is_err())
+}
+
 /// End-to-end: https2http plugin behind a full frps+frpc tunnel must append
 /// the REAL user IP (as seen by the frps) to X-Forwarded-For.
 #[tokio::test]
 async fn test_https2http_xff_carries_real_user_ip_through_tunnel() {
+    // Skip on a host that cannot bind every source address (stock macOS has
+    // only 127.0.0.1 on lo0). Fail closed under CI so a runner that cannot
+    // bind them is never a silent pass: the Linux CI lane must run the body,
+    // which is the only witness of the XFF-registry fix.
+    if let Some(missing) = unbindable_source() {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "{missing} is not bindable: the XFF-registry e2e must run in CI, not skip"
+        );
+        eprintln!(
+            "skipping: {missing} is not bindable on this host (stock macOS has \
+             only 127.0.0.1 on lo0)"
+        );
+        return;
+    }
     init_tracing();
     let server_port = allocate_port();
     let proxy_port = allocate_port();
@@ -364,7 +402,7 @@ async fn test_https2http_xff_carries_real_user_ip_through_tunnel() {
     //    it, so if the register->take path works every capture must mirror
     //    its own source, while a structural break collapses all four onto
     //    the 127.0.0.1 fallback.
-    let sources = ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5"];
+    let sources = XFF_SOURCES;
     let connector = http1_connector(&cert_der);
     let mut request_tasks = Vec::new();
     for src in sources {

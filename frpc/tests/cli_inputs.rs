@@ -247,7 +247,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Option<std::proces
 /// Panics if it does not exit — for these cases that means it is parked on a
 /// connection it should not have open.
 fn run_frpc(args: &[&str]) -> Output {
-    let mut child = Command::new(BIN)
+    let mut child = proxy_free_command(BIN)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1308,7 +1308,7 @@ fn subcommand_after_leading_root_flags_reaches_that_command() {
 /// subcommand (whose fallback would wait on the network instead of exiting)
 /// fails the test rather than the suite's wall clock.
 fn run_frpc_brief(args: &[&str]) -> Output {
-    let mut child = Command::new(BIN)
+    let mut child = proxy_free_command(BIN)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1789,4 +1789,28 @@ fn a_word_after_bare_strict_config_is_not_resolved_as_a_subcommand() {
         "the tcp proxy must not start: {text:?}"
     );
     canary.assert_silent("a refused `--strict-config true tcp …` must not dial");
+}
+
+/// Build the `frpc` child command with ambient proxy variables removed.
+///
+/// `frpc`'s config completion inherits `http_proxy`/`HTTP_PROXY` when
+/// `transport.proxyURL` is unset (`frp-core/src/config/client.rs`),
+/// matching Go frp v0.71.0. On a host that exports one — and Go frp ignores
+/// `no_proxy` too — the child tunnels every dial, so a test asserting a direct
+/// loopback dial (or `connection refused` on `127.0.0.1:1`) observes a proxy
+/// error instead. The tests in this file pin CLI parsing, not proxy handling,
+/// so the child runs with a proxy-free environment.
+fn proxy_free_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    for var in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ] {
+        cmd.env_remove(var);
+    }
+    cmd
 }

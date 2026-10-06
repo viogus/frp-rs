@@ -340,11 +340,11 @@ frp-core/src/transport/mod.rs	2254	-	ece8f0b0300abc24	-	absolute	frp-core/src/tr
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2437
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	frp-core/src/config/tests.rs	frp-core/src/unsafe_features.rs:10	11792
 frp-core/src/xtcp_session.rs	40	-	4d7dad4bb69affff	-	absolute	frp-core/tests/xtcp_p2p.rs	frp-core/src/xtcp_session.rs:40	19
-frp-server/Cargo.toml	43	-	7fd8440b0bf7bf6c	-	absolute	docs/developing.md	frp-server/Cargo.toml:43	4023
-frp-server/Cargo.toml	44	-	5f892a3adab944b5	-	absolute	docs/developing.md	frp-server/Cargo.toml:44	4022
-frp-server/Cargo.toml	45	-	517eb8fa69c9ff42	-	absolute	docs/developing.md	frp-server/Cargo.toml:45	4020
-frp-server/Cargo.toml	67	-	7beb050a2fe3096c	-	absolute	.github/workflows/ci.yml	frp-server/Cargo.toml:67	4135
-frp-server/Cargo.toml	67	-	7beb050a2fe3096c	-	absolute	docs/developing.md	frp-server/Cargo.toml:67	1080
+frp-server/Cargo.toml	45	-	7fd8440b0bf7bf6c	-	absolute	docs/developing.md	frp-server/Cargo.toml:45	4023
+frp-server/Cargo.toml	46	-	5f892a3adab944b5	-	absolute	docs/developing.md	frp-server/Cargo.toml:46	4022
+frp-server/Cargo.toml	47	-	517eb8fa69c9ff42	-	absolute	docs/developing.md	frp-server/Cargo.toml:47	4020
+frp-server/Cargo.toml	69	-	7beb050a2fe3096c	-	absolute	.github/workflows/ci.yml	frp-server/Cargo.toml:69	4135
+frp-server/Cargo.toml	69	-	7beb050a2fe3096c	-	absolute	docs/developing.md	frp-server/Cargo.toml:69	1080
 frp-server/src/control/bridge.rs	2430	-	574cd08384c40fbb	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:2430	470
 frp-server/src/control/bridge.rs	3117	-	71bfc8393d65b736	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:3117	469
 frp-server/src/control/login.rs	302	-	ad991b5380f15db1	-	absolute	frp-server/tests/http_plugin.rs	frp-server/src/control/login.rs:302	297
@@ -502,7 +502,7 @@ frp-server/tests/slowloris.rs	383	-	2129d628afd5f617	-	absolute	frp-server/tests
 frp-server/tests/vhost_https_sni.rs	221	-	e4cbaf4dc301543a	-	absolute	frp-server/tests/vhost_https_sni.rs	vhost_https_sni.rs:221	21
 frp-server/tests/vhost_https_sni.rs	331	-	e6a43fe20ae1f84b	-	shorthand	frp-server/tests/vhost_https_sni.rs	:331	23
 frp-server/tests/vhost_https_sni.rs	469	-	e4cbaf4dc301543a	-	shorthand	frp-server/tests/vhost_https_sni.rs	:469	21
-frpc/Cargo.toml	23	-	be4e2a5eeb66b362	-	absolute	.github/workflows/ci.yml	frpc/Cargo.toml:23	4177
+frpc/Cargo.toml	25	-	be4e2a5eeb66b362	-	absolute	.github/workflows/ci.yml	frpc/Cargo.toml:25	4177
 frpc/src/main.rs	367	371	f0733919e8b6ec90	9d8b2b5670d18da8	absolute	.github/workflows/ci.yml	frpc/src/main.rs:367-371	2816
 frpc/src/main.rs	367	371	f0733919e8b6ec90	9d8b2b5670d18da8	absolute	frpc/tests/log_completion.rs	frpc/src/main.rs:367-371	14
 frpc/src/main.rs	544	-	cdb87d227d5ee3a7	-	absolute	.github/workflows/ci.yml	frpc/src/main.rs:544	3309
@@ -524,7 +524,7 @@ frpc/tests/admin_cli.rs	50	-	ffa8604d50d83e5f	-	absolute	.github/workflows/ci.ym
 frpc/tests/admin_cli.rs	521	-	c104da8a892956f0	-	shorthand	.github/workflows/ci.yml	:521	2714
 frpc/tests/admin_cli.rs	663	-	c104da8a892956f0	-	shorthand	.github/workflows/ci.yml	:663	2714
 frpc/tests/cli_exit_codes.rs	112	-	441c8fc8febef5ba	-	absolute	frpc/tests/cli_exit_codes.rs	frpc/tests/cli_exit_codes.rs:112	110
-frps/Cargo.toml	24	-	9da90c79245a19b6	-	absolute	.github/workflows/ci.yml	frps/Cargo.toml:24	4248
+frps/Cargo.toml	26	-	9da90c79245a19b6	-	absolute	.github/workflows/ci.yml	frps/Cargo.toml:26	4248
 frps/src/main.rs	1068	1070	d523d9585825e36f	7d6a697ed272b22d	absolute	frp-core/src/logging.rs	frps/src/main.rs:1068-1070	86
 frps/src/main.rs	1068	1070	d523d9585825e36f	7d6a697ed272b22d	absolute	frps/src/main.rs	frps/src/main.rs:1068-1070	425
 frps/src/main.rs	1068	1070	d523d9585825e36f	7d6a697ed272b22d	absolute	frps/tests/log_completion.rs	frps/src/main.rs:1068-1070	660

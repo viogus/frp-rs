@@ -3,6 +3,8 @@ name = "frpc"
 version = "0.71.0"
 edition = "2021"
 license = "MIT"
+description = "frp-rs client binary (frpc) — protocol-compatible with Go frp"
+repository = "https://github.com/viogus/frp-rs"
 
 [features]
 default = ["full"]

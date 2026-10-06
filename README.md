@@ -9,6 +9,11 @@
     <a href="#documentation">Documentation</a> •
     <a href="#developing">Developing</a>
   </p>
+  <p>
+    <a href="https://github.com/viogus/frp-rs">GitHub</a> •
+    <a href="https://github.com/viogus/frp-rs/issues">Issues</a> •
+    <a href="https://github.com/viogus/frp-rs/releases">Releases</a>
+  </p>
 </div>
 
 ---
@@ -355,7 +360,7 @@ Release history: [CHANGELOG.md](CHANGELOG.md).
 ```bash
 cargo build --release                  # frps + frpc → target/release/
 cargo test --workspace --all-features  # needs an all-features frps binary
-cargo clippy --workspace --all-targets --all-features -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 bash scripts/repo-health.sh            # invariants: version, unsafe, doc paths and figures
 bash scripts/compat-test.sh            # Go↔Rust cross-compat suite (needs Go frp)
 ```
