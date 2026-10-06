@@ -3,7 +3,7 @@
 //! dial a work connection whose `NewWorkConn` carries the RAW token from that
 //! source — not a cached md5 key, and not nothing at all.
 //!
-//! `TODO.md:10136` residue: the OIDC NewWorkConn path was pinned only at the
+//! `TODO.md:10159` residue: the OIDC NewWorkConn path was pinned only at the
 //! `spawn_work_conn` seam (`frp-client/src/work_conn.rs:2524`,
 //! `oidc_token_source_fills_new_work_conn_privilege_key` builds its own
 //! `WorkConnConfig`), so `handle_req_work_conn`

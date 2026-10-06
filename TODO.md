@@ -6947,10 +6947,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops/mod.rs:1279`; `register_proxy_entry` `proxy_ops/mod.rs:784`;
-  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/mod.rs:483`;
-  `setup_proxy_listeners` `proxy_ops/mod.rs:886`; `listen_and_proxy`
-  `proxy_ops/mod.rs:2211`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `proxy_ops/mod.rs:1282`; `register_proxy_entry` `proxy_ops/mod.rs:787`;
+  `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/mod.rs:486`;
+  `setup_proxy_listeners` `proxy_ops/mod.rs:889`; `listen_and_proxy`
+  `proxy_ops/mod.rs:2214`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -8162,6 +8162,29 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `subdomain_conflict_tests`' module path — and its 11 test names (12 `fn`s, one a helper) — intact. The plan's
   `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4444 / 3610, and seams 3–8 re-anchored.
 
+  **Seam 3 landed (2026-10-06, PR #510, code head `d90a834f`).** `proxy_ops/tcp_group.rs` (303 lines / 14 065 B) took base
+  `mod.rs:2696-2856` + `:2858-2977` as two byte-identical windows (combined `:2696-2977` = 282 lines / 13 270 B / `455e0a56…`;
+  the only change is `pub(super) ` on the two signatures), with the single blank at `:2857` as child `:183`. The parent went
+  3049 → 2767 lines (`+3/−285`), gaining `mod tcp_group;` plus a private `use` at `:23-24`. This is the first seam whose
+  insertion sits **above** the live cites, so **35** cites into `mod.rs` were re-pointed: 26 in `docs/developing.md` and
+  `docs/refactor-large-modules.md:24` moved +3, the two `TODO.md` cites of the `#[path]` sites moved −282 (`:3044-3046` →
+  `:2762-2764`), and six written from point-in-time documents (five in `TODO.md:6950-6953`, one in plan `:536`) were missed
+  by the first pass and repaired in review (plan Correction 7). Only the 26 are visible to `pathline-cite-guard`, so its
+  FAIL list is not the cascade criterion; the re-bake also moved the weak population 104 → 103 (set pin `dbbea8513634ee3b`
+  → `564fea99514dcb24`). Code-head gates: fmt; clippy `-D warnings` (0); all-targets/all-features; `--no-default-features`;
+  `--lib --all-features` 525/0 (plain `--lib` is 472/0 at both heads); `server_protocol` + `relay_integrity` +
+  `vhost_http_group` 17/0; compat `go-to-rust-http-group` + `go-to-rust-tcp-plain`; `repo-health.sh` invariants;
+  `todo-cite-guard` 101/0; `large-functions.sh` sizes unchanged (path and line only); release build of both binaries.
+  `pathline-cite-guard` was red at the code head (580/30) and is repaired by this records commit. Coverage is unchanged,
+  and its failure mode is worse than an empty lane: W1 — a `panic!` at `tcp_group_listener` entry — survives every lane
+  because the listener is a detached `tokio::spawn` task whose panic nothing observes. The lane *does* reach the
+  function (the `http_plugin` new-proxy-with-group test enters it; an `eprintln!` at that site prints once under
+  `--nocapture`), so a listener-body panic is unobservable in every lane. W2 — a `panic!` at
+  `handle_tcp_group_member_registration` entry — reddens every lib-running job (both witnesses are ungated
+  `#[tokio::test]`s), the two failures being `unregister_generation_tests::tcp_group_auto_assign_handler_walk_declared_zero_semantics`
+  and `...::group_create_bind_race_joins_existing_group`. The function takes **12** parameters, not the 13 the brief
+  said, and **no compat scenario covers the TCP-group shared listener** — that gate cannot witness this seam.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8251,7 +8274,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:3044-3046`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:2762-2764`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8310,7 +8333,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:3044-3046`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:2762-2764`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
