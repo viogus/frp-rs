@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use frp_client::service::Service as ClientService;
 use frp_core::config::{ClientConfig, ProxyConfig, VisitorConfig};
 
-use common::{allocate_port, start_echo_server, start_frps, wait_for_port};
+use common::{allocate_port, start_echo_server, start_frps_with_mux, wait_for_port};
 
 /// End-to-end STCP relay test (plaintext):
 /// 1. Start echo server (provider's local service)
@@ -52,6 +52,18 @@ async fn test_stcp_e2e_relay_encrypted_compressed() {
 }
 
 async fn run_stcp_relay(use_encryption: bool, use_compression: bool) {
+    run_stcp_relay_mux(use_encryption, use_compression, false).await;
+}
+
+/// Same relay with `tcp_mux = true` on both ends, so the visitor's
+/// `crate::control::wrap_client_mux` arm (`visitor/stcp.rs`) is exercised —
+/// the other four cases in this file all run with it off.
+#[tokio::test]
+async fn test_stcp_e2e_relay_tcp_mux() {
+    run_stcp_relay_mux(false, false, true).await;
+}
+
+async fn run_stcp_relay_mux(use_encryption: bool, use_compression: bool, mux: bool) {
     let echo_port = allocate_port();
     let server_port = allocate_port();
     let visitor_port = allocate_port();
@@ -63,7 +75,7 @@ async fn run_stcp_relay(use_encryption: bool, use_compression: bool) {
     let _echo_handle = start_echo_server(echo_port);
 
     // 2. Start frps
-    let _server_handle = start_frps(server_port, "test-token").await;
+    let _server_handle = start_frps_with_mux(server_port, "test-token", mux).await;
     let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     wait_for_port(server_addr, Duration::from_secs(5))
         .await
@@ -75,7 +87,7 @@ async fn run_stcp_relay(use_encryption: bool, use_compression: bool) {
         server_port,
         token: "test-token".into(),
         login_fail_exit: false,
-        tcp_mux: false,
+        tcp_mux: mux,
         tls_enable: false,
         pool_count: 2, // pre-spawn work connections for the STCP relay
         proxies: vec![ProxyConfig {

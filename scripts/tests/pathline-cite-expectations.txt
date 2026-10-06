@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=579 weak=104 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=dbbea8513634ee3b ambiguous_set=3343d4d37da5672a excluded_set=a5e90a77556e5dde
+#   pins: checked=580 weak=104 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=dbbea8513634ee3b ambiguous_set=3343d4d37da5672a excluded_set=f538319a62c30655
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -103,6 +103,7 @@ frp-client/src/service/reload_apply.rs	96	97	c8048d4676282e14	e44c5a040931a2d2	a
 frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frp-client/tests/reload_warning_delivery.rs	frp-client/src/service/reload_apply.rs:98	100
 frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/service/reload_apply.rs:98	527
 frp-client/src/service/reload_apply.rs	98	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	service/reload_apply.rs:98	536
+frp-client/src/service/session.rs	1030	-	b8c5f28b2dca68a3	-	absolute	frp-client/src/visitor.rs	service/session.rs:1030	156
 frp-client/src/service/session.rs	1357	-	c3a2715e37dc9808	-	absolute	.github/workflows/ci.yml	frp-client/src/service/session.rs:1357	2130
 frp-client/src/service/session.rs	1357	-	c3a2715e37dc9808	-	absolute	.github/workflows/ci.yml	frp-client/src/service/session.rs:1357	3350
 frp-client/src/service/session.rs	1357	-	c3a2715e37dc9808	-	absolute	frpc/tests/cli_inputs.rs	frp-client/src/service/session.rs:1357	1488
@@ -124,9 +125,9 @@ frp-client/src/work_conn.rs	1806	-	245f4243880a7cbb	-	absolute	frp-server/src/co
 frp-client/src/work_conn.rs	252	-	45ec674bb06e64bd	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/work_conn.rs:252	20
 frp-client/src/work_conn.rs	2524	-	884b6cce68864d19	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/work_conn.rs:2524	7
 frp-client/tests/common/mod.rs	15	-	42dd4051ed45c470	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:15	551
-frp-client/tests/common/mod.rs	172	-	9ef47191021cf9d5	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:172	612
-frp-client/tests/common/mod.rs	235	-	a18339c5dc11cf25	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:235	532
-frp-client/tests/common/mod.rs	302	-	6c5aa683e16978df	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:302	535
+frp-client/tests/common/mod.rs	177	-	9ef47191021cf9d5	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:177	612
+frp-client/tests/common/mod.rs	240	-	a18339c5dc11cf25	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:240	532
+frp-client/tests/common/mod.rs	307	-	6c5aa683e16978df	-	absolute	docs/developing.md	frp-client/tests/common/mod.rs:307	535
 frp-client/tests/common/mod.rs	38	-	53fedd6fbbb50f7c	-	shorthand	docs/developing.md	:38	552
 frp-client/tests/end_to_end.rs	223	-	014552031b30a7ba	-	absolute	frp-client/tests/end_to_end.rs	frp-client/tests/end_to_end.rs:223	109
 frp-client/tests/plugin_static_file.rs	153	-	a38302f709b598e3	-	absolute	frp-client/src/plugin/static_file.rs	frp-client/tests/plugin_static_file.rs:153	365
@@ -160,7 +161,7 @@ frp-core/src/cli.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes
 frp-core/src/cli.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli.rs:3157	266
 frp-core/src/cli.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli.rs:5090-5097	705
 frp-core/src/cli.rs	5095	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:5095	1884
-frp-core/src/cli.rs	590	-	eee40119501934df	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
+frp-core/src/cli.rs	590	-	4689a8dbe04a22eb	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
 frp-core/src/cli.rs	6244	6246	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli.rs:6244-6246	399
 frp-core/src/cli.rs	930	-	a298ba38f2e79bca	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:930	2459
 frp-core/src/config/client.rs	256	-	044d5563c14d5e76	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/client.rs:256	483

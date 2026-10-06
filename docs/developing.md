@@ -529,10 +529,10 @@ in 2.2).
 **End-to-end — the test that actually proves the listener.** The in-process client
 harness is `frp-client/tests/common/mod.rs`. It builds a full
 `ClientService` + `ServerService` pair with an echo server; `new_inner`
-(`frp-client/tests/common/mod.rs:235`) hard-codes `proxy_type: "tcp"`, so **either
+(`frp-client/tests/common/mod.rs:240`) hard-codes `proxy_type: "tcp"`, so **either
 add a constructor that takes a proxy type, or build the config explicitly in your
 test file**. Note that the harness's own `ProxyConfig` literal sets
-`enabled: true` explicitly (`frp-client/tests/common/mod.rs:302`) — that is not
+`enabled: true` explicitly (`frp-client/tests/common/mod.rs:307`) — that is not
 decoration, see 2.4. The shape that worked — this is the whole file, copy-pasteable:
 
 ```rust
@@ -609,7 +609,7 @@ async fn mytcp_round_trip() {
 ```
 
 ```bash
-# No build step: `start_frps` boots frps in-process (`frp-client/tests/common/mod.rs:172`),
+# No build step: `start_frps` boots frps in-process (`frp-client/tests/common/mod.rs:177`),
 # so this test needs no frps/frpc binary on disk at all.
 cargo test -j 2 -p frp-client --test mytcp_throwaway -- --nocapture
 ```

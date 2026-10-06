@@ -151,6 +151,11 @@ pub fn start_udp_echo_server(port: u16) -> JoinHandle<()> {
 
 /// Start the frps server on the given port with an optional auth token.
 pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
+    start_frps_with_mux(port, token, false).await
+}
+
+/// Start the frps server with an explicit `tcp_mux` setting.
+pub async fn start_frps_with_mux(port: u16, token: &str, mux: bool) -> JoinHandle<()> {
     let cfg = ServerConfig {
         bind_addr: "127.0.0.1".into(),
         bind_port: port,
@@ -164,7 +169,7 @@ pub async fn start_frps(port: u16, token: &str) -> JoinHandle<()> {
         allow_port_start: 0,
         allow_port_end: 0,
         transport: frp_core::config::ServerTransportConfig {
-            tcp_mux: Some(false),
+            tcp_mux: Some(mux),
             ..Default::default()
         },
         ..Default::default()
