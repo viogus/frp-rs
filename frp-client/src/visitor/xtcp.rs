@@ -5,12 +5,12 @@
 //!
 //! Split out of `frp-client/src/visitor.rs` by the plan's P3 seam 2
 //! (`docs/refactor-large-modules.md` P3, `visitor/xtcp.rs`) as a pure move:
-//! both spans travel verbatim and their bodies are byte-for-byte identical to
-//! the base revision. This module is a *child* of `visitor`, which is what lets
-//! it keep reaching every parent-private item it needs (`TunnelSession`,
-//! `clamp_hp_timeout`, and the parent's imports — `mpsc`, `oneshot`, `Duration`,
-//! `debug`/`info`/`warn`, `CancellationToken`, ...) through `use super::*;`
-//! with no visibility change on any parent item.
+//! every moved line is byte-for-byte identical to its base text; the doc
+//! comment straddling `do_hole_punch`/`clamp_hp_timeout` was split there: the
+//! punch half is here, the clamp half stayed with `clamp_hp_timeout` in the
+//! parent. This module is a *child* of `visitor`, so through `use super::*;`
+//! it reaches every parent-private item it needs (`TunnelSession`,
+//! `clamp_hp_timeout`, ...) with no visibility change on any parent item.
 //!
 //! Visibility: the two items this module *defines* (`XtcpPunchConfig` and
 //! `do_hole_punch`) were private items of `visitor.rs` — reachable from
