@@ -6947,10 +6947,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops/mod.rs:515`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
+  `proxy_ops/mod.rs:518`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
   `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/registry.rs:127`;
-  `setup_proxy_listeners` `proxy_ops/mod.rs:122`; `listen_and_proxy`
-  `proxy_ops/mod.rs:1447`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `setup_proxy_listeners` `proxy_ops/mod.rs:125`; `listen_and_proxy`
+  `proxy_ops/mod.rs:1450`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -8259,17 +8259,17 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   narrowed to `GroupPortQuery`; `teardown.rs` imports `AppState`, `ControlTx` and the parent's
   `super::{proxy_consumes_client_port, udp_port_has_other_owner}` (the parent keeps re-importing both for
   `registry.rs`), and its `//!` header states the `used_ports → port_reservations` lock order.
-  Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests, including
-  direct `unregister_generation_tests` calls and the `Service::run` control-exit path
-  (`ssh_gateway::tests::test_control_exit_terminates_session_and_releases_permit`), so the moved body is
+  Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests: every
+  `unregister_generation_tests::*` that calls the function, `control::proxy::tests::cleanup_*`, the idle-reap
+  tests (several of which reach it through `Service::run`) and `ssh_gateway::tests::test_control_exit_terminates_session_and_releases_permit`, so the moved body is
   exercised. Code-head gates: fmt; `clippy -D warnings` (0, all-targets/all-features);
   `cargo check -p frps -p frpc --no-default-features --features tiny`/`micro`; `cargo test -p frp-server --lib
-  --all-features` 525/0 (= base); `repo-health.sh` invariants; the 13-step health corpus is 13/0. **17 cite
-  endpoints into `mod.rs` were re-pointed** under the explicit map (`:41-1525` +3, `:1526-1928` → teardown,
-  below −400): the 14 lines in `docs/developing.md` (one now naming `teardown.rs:179-180`) plus
-  `docs/refactor-large-modules.md:24` (`:515` → `:518`); the plan's rows 7 and 8 were re-anchored with the
-  same map, and the 58-cite `TODO.md` cascade is applied. `pathline-cite-guard` was red at the code head
-  and is re-baked to 580/0; the weak-anchor set digest moved with it.
+  --all-features` 525/0 (= base); `repo-health.sh` invariants; the 13-step health corpus is 13/0. **All cites
+  into `mod.rs` were re-pointed** under the explicit map (`:41-1525` +3, `:1526-1928` → teardown, below
+  −400): the 14 `docs/developing.md` diff lines (one now naming `teardown.rs:179-180`), the plan's `:24`
+  (`:515` → `:518`) and its rows 7/8, plus five point-in-time cites in this file (`:6950`/`:6952`/`:6953`,
+  `:8363` and `:8422`). The 58-cite `TODO.md` cascade is applied. `pathline-cite-guard` was red at
+  the code head and is re-baked to 580/0 (weak anchors 103 → 101); the set digest moved with it.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
@@ -8360,7 +8360,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:1933-1935`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:1533-1535`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8419,7 +8419,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:1933-1935`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:1533-1535`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`

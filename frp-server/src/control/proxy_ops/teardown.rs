@@ -5,9 +5,9 @@
 //! `unregister_control` so its `crate::control::proxy_ops::unregister_control`
 //! callers keep resolving unchanged.
 //!
-//! Lock order: `used_ports` is always acquired before `port_reservations`
-//! (never the reverse), and the cross-lock mutations run with `used_ports`
-//! dropped; `allocate_proxy_port` in `ports.rs` depends on the same order.
+//! Lock order: `used_ports` is dropped before the phase-3 `port_reservations`
+//! mutations below, so the two port maps are never held at the same time —
+//! the rule the plan records as `used_ports → port_reservations`.
 
 use std::sync::Arc;
 
