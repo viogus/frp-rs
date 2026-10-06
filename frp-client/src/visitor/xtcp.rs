@@ -62,15 +62,6 @@ pub(super) struct XtcpPunchConfig {
 /// Full XTCP hole punch (Go `makeNatHole`): PreCheck → STUN → NatHoleVisitor
 /// exchange → MakeHole → session creation. Returns the persistent session —
 /// NO stream is opened here (streams are opened per user connection).
-/// Server-supplied `read_timeout_ms` → punch timeout (ms). Go MakeHole
-/// floors the guard at 5s (`timeout := 5*time.Second; if
-/// m.DetectBehavior.ReadTimeoutMs > 0`, nathole.go:248-250) — a
-/// hostile/misbehaving server sending 0 or negative must not make the punch
-/// fail instantly. Capped at
-/// [`frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS`] (60s): Go's analyzer
-/// emits ReadTimeoutMs ≤ ~45s, so anything above is a hostile server
-/// stretching the punch (`read_timeout_ms` is i32 — uncapped it would wait
-/// ~24.8 days before the visitor could re-punch).
 pub(super) async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
     // 1. PreCheck: validate proxy existence/permissions before STUN (Go
     //    nathole.PreCheck, 5s timeout). A timeout proceeds with the full
