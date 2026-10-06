@@ -8274,9 +8274,9 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   **Seam 7 landed (2026-10-07, PR #515 `dsh/m44-p4-listener` @ `ccf2da75`, base `7fe2c01c`) — `proxy_ops/listener.rs`.**
   The per-proxy listener half of `frp-server/src/control/proxy_ops/mod.rs` moved into a new **child** module
   `frp-server/src/control/proxy_ops/listener.rs` (665 lines) as two byte-identical windows: W1
-  `setup_proxy_listeners` base `mod.rs:112-508` (397 lines / 19 947 B / sha1 `97b3bd7c…`) → `listener.rs:42-425`,
+  `setup_proxy_listeners` base `mod.rs:112-508` (397 lines / 19 947 B / sha1 `97b3bd7c…`) → `listener.rs:29-425` (fn at `:42`),
   and W2 `bind_proxy_listener` + `TCP_AUTO_BIND_MAX_ATTEMPTS` + `bind_tcp_proxy_with_retry` + `listen_and_proxy`
-  base `:1290-1528` (239 lines / 11 702 B / sha1 `6bf84a44…`) → `listener.rs:434-665`; the only byte change is
+  base `:1290-1528` (239 lines / 11 702 B / sha1 `6bf84a44…`) → `listener.rs:427-665` (fn at `:587`); the only byte change is
   `pub(super) ` on `setup_proxy_listeners`. The parent went 1538 → **899** lines, gaining `mod listener;`,
   `use listener::setup_proxy_listeners;` and `#[cfg(test)] use listener::listen_and_proxy;`; its prelude lost
   `TcpListener`/`UdpSocket`/`oneshot`/`debug`/`format_socket_addr`/`IoStream` plus the `tcp_group_listener`
