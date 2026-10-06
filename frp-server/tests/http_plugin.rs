@@ -290,7 +290,7 @@ async fn test_plugin_reject_rejects_login() {
 /// the throttle gate and never reaches the plugin.
 ///
 /// This is ALSO the only lane that pins the pre-auth throttle gate's *position*
-/// in the login sequence (`TODO.md:10997`, PR #454 auth-method split). The
+/// in the login sequence (`TODO.md:11057`, PR #454 auth-method split). The
 /// `assert_eq!` on the plugin request count below is an observable that the
 /// in-crate tests cannot see, because their state has no login plugins: the
 /// gate is the only thing standing between the hook and a throttled attempt.
