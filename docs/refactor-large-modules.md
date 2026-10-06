@@ -533,7 +533,7 @@ verify the module rules rather than assume them:
 So: use a `frp-client/src/service/` **directory of children** and **keep
 `SessionCtx` and `Service` in `service.rs`**. This mirrors what `frp-server`
 already does (`service.rs` + `control/*.rs` re-opening `impl Service`; see
-`control/proxy_ops/mod.rs:2995`) — except the server's `AppState` fields happen to be
+`control/proxy_ops/mod.rs:2713`) — except the server's `AppState` fields happen to be
 `pub` already, so that precedent does not cover the privacy point.
 
 Corrected spans (the earlier table in this document used distance-to-next-`fn`,
@@ -1097,7 +1097,8 @@ tests. **Step 0 landed in PR #453** (`aae3a484`): `proxy_ops.rs` (8054 lines) be
 to 3610 lines with no logic and no path change. Re-measured figures are
 8054 / 4444 / 3610 (same boundary as the provenance note above) — not the originally
 recorded 8044 / 4432 / 3612. Seams 1 and 2 then landed as `92a454b3` and
-`a618f281`, taking `mod.rs` to 3049 lines (3043 production).
+`a618f281`, taking `mod.rs` to 3049 lines (3043 production); seam 3 landed as `d90a834f`,
+taking it to 2767 lines (2761 production).
 
 Two structural facts dominate everything after that:
 
@@ -1118,14 +1119,14 @@ path, so the originals' visibility carries over unchanged. Measured in PR #453 �
 no `unsafe` in the file.
 
 Seams, in the order they should be attempted (line numbers for the remaining rows
-are current `mod.rs` positions at `a618f281`):
+are current `mod.rs` positions at `d90a834f`):
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
 | 0 | *(directory + test modules)* — **landed `aae3a484`** | see Step 0: `mod.rs` + `unregister_generation_tests.rs`, `subdomain_conflict_tests.rs`, `tcp_auto_bind_retry_tests.rs` | **lowest** |
 | 1 | `proxy_ops/validate.rs` — **landed `92a454b3`** | `validate_new_proxy` (was 891–961, pure), `duplicate_domain` (was 68–77) + its test module (now `validate/subdomain_conflict_tests.rs`) | low — zero `AppState` coupling, self-testing |
 | 2 | `proxy_ops/vhost.rs` — **landed `a618f281`** | `register_http_vhost` (was 968–1213), `register_https_vhost` (was 1221–1441) | low — already fully extracted; no test region references them |
-| 3 | `proxy_ops/tcp_group.rs` — **landed `d90a834f`** | `tcp_group_listener` (was `mod.rs:2696–2856`), `handle_tcp_group_member_registration` (was `mod.rs:2858–2977`) | low — leaves, owned args |
+| 3 | `proxy_ops/tcp_group.rs` — **landed `d90a834f`** | `tcp_group_listener` (was window `mod.rs:2696–2856`, fn at `:2703`), `handle_tcp_group_member_registration` (was window `mod.rs:2858–2977`, fn at `:2867`) | low — leaves, owned args |
 | 4 | `proxy_ops/registry.rs` | `build_proxy_info` (`mod.rs:407`), `register_sk_index` (`mod.rs:486`), `register_proxy_entry` (`mod.rs:787–874`), the three `rollback_*` (`mod.rs:505`, `713`, `734`, `756`), `remove_proxy_and_release_client_counts` (`mod.rs:682–702`) | medium-low |
 | 5 | `proxy_ops/ports.rs` | `PortError`, `allocate_proxy_port` (`mod.rs:164–402`), the rollback/free helpers, the reservation pruner + its `impl AppState` (`mod.rs:2702`, `2713`) | medium-low |
 | 6 | `proxy_ops/teardown.rs` | `unregister_control` (`mod.rs:2302–2695`) — one function, 394 lines | medium |
@@ -1203,7 +1204,8 @@ windows: W1 `tcp_group_listener` base `:2696-2856` (161 lines / `2740987a…`) �
 blank separator at base `:2857` travelling as child `:183` (combined `:2696-2977`, 282 lines / 13 270 B /
 `455e0a56…`). The parent went 3049 → 2767 lines (`+3/−285`): it gains `mod tcp_group;` and a private
 `use tcp_group::{handle_tcp_group_member_registration, tcp_group_listener};` at `:23-24`, and loses base
-`:2693-2977` including the `// ---- TCP group shared listener ----` marker at `:2694`. Both functions
+`:2694-2978` (285 lines: the `// ---- TCP group shared listener ----` marker at `:2694`, its
+following blank `:2695`, the 282 moved lines `:2696-2977`, and the trailing blank `:2978`). Both functions
 became `pub(super)` — the only byte change to the moved text (11 B each) — so the child's unprefixed
 `:22-303` round-trips to `455e0a56…` exactly. Unlike seams 1 and 2, **no import needed pruning** from the
 parent; the child's own prelude is `std`/`tokio`/`tracing`, `frp_core::msg`, `crate::service::{AppState,
@@ -1211,7 +1213,7 @@ InternalMsg}` and a depth-1 `super::{build_proxy_info, err_msg, free_replaced_po
 write_resp}`.
 
 Code-head gates: fmt; `clippy -D warnings` (0 warnings); `check --all-targets --all-features`; `check
---no-default-features`; `--lib` 525/0 (= base); `server_protocol` + `relay_integrity` + `vhost_http_group`
+--no-default-features`; `--lib --all-features` 525/0 (= base; plain `--lib` is 472/0 at both heads); `server_protocol` + `relay_integrity` + `vhost_http_group`
 17/0; compat `go-to-rust-http-group` + `go-to-rust-tcp-plain`; `repo-health.sh` invariants;
 `todo-cite-guard` 101/0; `large-functions.sh` sizes unchanged (path and line only: `tcp_group_listener`
 111 code / 154 total / 27 % comments at the new `tcp_group.rs:29`, `handle_tcp_group_member_registration`
@@ -1219,16 +1221,23 @@ Code-head gates: fmt; `clippy -D warnings` (0 warnings); `check --all-targets --
 `pathline-cite-guard` was **red at the code head** — 580 checked / 30 violations against a base of 580/0,
 proven attributable by restoring the base state — and is repaired by this records commit (Correction 3).
 
-**Coverage is unchanged by the move, and one half of it is empty** (two witnesses, each reverted with a
-matching `git hash-object`, gate-7 binaries rebuilt from the mutated source and injected through
-`FRP_COMPAT_RUST_FRPS`/`FRP_COMPAT_RUST_FRPC`). W1 — `panic!("M1")` at `tcp_group_listener` entry —
-**survives every lane**: an `eprintln!("M1-ENTERED")` probe printed 0 times, so no lane ever enters
-`tcp_group.rs:29-182` (the function is spawned only from `setup_proxy_listeners`, base `mod.rs:1139-1140`).
-W2 — `panic!` at `handle_tcp_group_member_registration` entry — reddens the lib lane only (exit 101,
-523 passed / 2 failed, panic at `tcp_group.rs:207:5`), the two failures being
+**Coverage is unchanged by the move, and its failure mode is worse than an empty lane** (two witnesses,
+each reverted with a matching `git hash-object`, gate-7 binaries rebuilt from the mutated source and
+injected through `FRP_COMPAT_RUST_FRPS`/`FRP_COMPAT_RUST_FRPC`). W1 — `panic!("M1")` at
+`tcp_group_listener` entry — **survives every lane, but not because the lane is empty**: the function is
+spawned from `setup_proxy_listeners` (base `mod.rs:1136-1138`, head `:1139-1141`), and an
+`eprintln!("M1-ENTERED")` probe at its entry prints **once** under `--nocapture` in
+`http_plugin::test_plugin_new_proxy_content_user_object_and_fields`, so the listener body *is* entered;
+the mutation still leaves that lane green because the listener runs in a detached `tokio::spawn` task
+whose panic nothing observes. The original reading ("printed 0 times, so no lane ever enters
+`tcp_group.rs:29-182`") was a libtest output-capture artifact and is corrected here (Correction 10). A
+failure of that task is therefore unobserved by every lane, even though the lane reaches the code.
+W2 — `panic!` at `handle_tcp_group_member_registration` entry — reddens **every lib-running job** (both
+witnesses are ungated `#[tokio::test]`s), the two failures being
 `control::proxy_ops::unregister_generation_tests::tcp_group_auto_assign_handler_walk_declared_zero_semantics`
-and `...::group_create_bind_race_joins_existing_group`; gates 6/7 survive. Both readings are identical at
-the base, so this seam changes nothing about them.
+and `...::group_create_bind_race_joins_existing_group` (exit 101, 523 passed / 2 failed, panic at
+`tcp_group.rs:207:5`); gates 6/7 survive. Both readings are identical at the base, so this seam changes
+nothing about them.
 
 **Corrections this seam forced:**
 
@@ -1241,18 +1250,22 @@ the base, so this seam changes nothing about them.
    `test_g2r_http_group` for *HTTP* groups and nothing for TCP groups, and `frp-server/tests/` has no
    tcp-group integration file, so the compat gate witnesses only that the two neighbouring scenarios still
    pass — it cannot witness this seam. The lib lane is the only end-to-end witness (W2 above).
-3. **Every cite into `mod.rs` moves, and the guard sees only some of them.** The 3-line parent prelude
+3. **35 cites into `mod.rs` move, and the guard sees only 26 of them.** The 3-line parent prelude
    (`:23-25`) shifts every cite below it by **+3**, and the 282 deleted lines shift every cite below the
    window by **−282**. The re-point was driven by that explicit old→new map, never by the guard's FAIL
    list: 26 `docs/developing.md` cites and `docs/refactor-large-modules.md:24` (`:1279` → `:1282`) moved
    +3, while the two `TODO.md` cites of the `#[path]` sites moved −282 (`:3044-3046` → `:2762-2764`). Only
    the 26 are in the guard's scan — cites *written in* `TODO.md` and in this plan are excluded from it
    (the guard-blind class first surfaced in seam 4's adversarial round), which is why its FAIL list must
-   never be used as the cascade criterion.
+   never be used as the cascade criterion. That first pass still missed six of the 35: five in
+   `TODO.md:6950-6953` (`:1279`→`:1282`, `:784`→`:787`, `:483`→`:486`, `:886`→`:889`, `:2211`→`:2214`) and one at
+   `docs/refactor-large-modules.md:536` (`control/proxy_ops/mod.rs:2995` → `:2713`, which had also gone past
+   EOF at the head). Both were caught in review rather than by the guard; the completeness scan that
+   should have found them had been capped with `| head -20` (Correction 7).
 4. **The re-bake moved the weak-anchor population.** The table's pins went `checked=580 weak=104` →
    `weak=103` with the set pin `dbbea8513634ee3b` → `564fea99514dcb24`, because one re-pointed cite now lands on text
    unique within its target file; `ambiguous=3`, `excluded=101` and the 580 total are unchanged. The
-   re-bake rewrote 27 citation rows (the table diff is 27/27) and is idempotent afterwards (`0 added,
+   re-bake rewrote 27 citation rows plus the pins header line (the table diff is 28/28) and is idempotent afterwards (`0 added,
    0 removed, 580 unchanged`), with `ci.yml`'s `guard_data_pin` re-baked to `294f26cb5c534900d021efc138c46f4b26b5d61f2f650b6b81a95248663de67f`.
 5. **`scripts/large-functions.sh` ignores `--top` unless it is the first argument.** The brief's
    `large-functions.sh --all --top 20` silently ran the default list; use `--top N --all`. No measurement
@@ -1272,7 +1285,53 @@ the base, so this seam changes nothing about them.
    region (`SCEN10_REGION_SHA`), and the table's own `guard_data_pin` moved to the value in Correction 4.
    The deferred class-wide repair of the six mis-aimed R1/R5 cites must use their post-cascade numbers:
    the cites now read `TODO.md:10782` (×4) and `:10827` (×2), and the correct targets are `:10807` and
-   `:10860`.
+   `:10860`. (`:10827` has three raw occurrences: `frp-core/src/cli.rs:5072` is correctly aimed at the R2
+   entry, so only the other two are in the mis-aimed R5 subset.)
+
+7. **The six cites written from point-in-time documents are a second guard-blind class, and a
+   completeness scan must never be capped.** `pathline-cite-guard` skips every cite *written in* a
+   point-in-time file, so `TODO.md:6950-6953` and this plan's own `:536` were invisible to it; the
+   seam's shift script inherited that blind spot **and** its partial-path scan was piped through
+   `| head -20`, which cut exactly those hits. The rule is the map, not the FAIL list: enumerate every
+   cite class (full path, `<dir>/mod.rs:N`, `<a>/<b>/mod.rs:N`, `mod.rs:N`, bare `:N` continuations,
+   `A-B`/`A–B` ranges) with no output cap, then validate every endpoint by base/head line-text identity.
+8. **The plan's own seam table is a third guard-blind class.** Rows 4–8 name their targets as bare
+   `mod.rs:N` / `mod.rs:A–B` with no directory prefix — a token the guard does not resolve as a cite
+   (the token must name a tracked path) and the seam's script did not enumerate — so the 26 endpoints in
+   those rows were re-pointed by hand under the same explicit map and each verified with `grep -n` of the
+   named symbol at the head. Row 3 also changed convention without saying so: it now states both the moved
+   window (`:2696`/`:2858`) and the `fn` declaration lines (`:2703`/`:2867`) that rows 4–8 use.
+9. **The move changed the operator-visible `tracing` target.** The eight event sites in the moved window
+   and its `#[instrument(skip(...))]` span carry no explicit `target:`, so they now render
+   `target: frp_server::control::proxy_ops::tcp_group`, and a panic in the moved code reports
+   `tcp_group.rs:`+line. No test pins that string and no gate asserts a log target, so every lane stayed
+   green; `RUST_LOG` directives are unaffected because `frp-core/src/logging.rs:396` (`filter_from_env`)
+   builds a static `Targets` filter, whose `a::b=level` directives prefix-match the longer module path.
+   PR #453 recorded this class for the log sites it moved into `vhost.rs`; recording it here keeps the
+   two seams consistent.
+10. **Adversarial review falsified the W1 coverage wording.** The paragraph above originally read "an
+    `eprintln!("M1-ENTERED")` probe printed 0 times, so no lane ever enters `tcp_group.rs:29-182`". At
+    head `e2b0dc45` the probe prints **once** (`1 passed; 0 failed`, exit 0) when the lane's own test runs
+    with `--nocapture` (`cargo test -p frp-server --features dashboard --test http_plugin
+    test_plugin_new_proxy_content_user_object_and_fields`) — and 0 times without it, because libtest
+    captures a passing test's output. The mutation's conclusion (a `panic!` at that entry survives every
+    lane) still holds, but for the real reason: the listener is a detached `tokio::spawn` task whose panic
+    nothing observes, so the *task's* failure is unobservable in every lane. The lane does reach the
+    function — `frp-server/tests/http_plugin.rs:552` (`full_new_proxy`) builds a `tcp` proxy with
+    `group: Some("g1")` (`:563`/`:566`), the test calls it at `:637`, and the control connection drives
+    `mod.rs:1461-1462` `is_tcp_group` → the `:1471` branch → the spawn in `setup_proxy_listeners` at
+    `mod.rs:1139-1140`. The same correction is applied to `TODO.md:8179-8182`,
+    to the W2 scope (every lib-running job, not the lib lane alone; both witnesses are ungated
+    `#[tokio::test]`s), and to the PR body's Coverage section.
+11. **The moved module doc mis-attributes its own call sites (pre-existing; deliberately not fixed
+    here).** `tcp_group.rs:7-8` names the callers as `handle_new_proxy` (base lines 1072, 1186, 1505) and
+    `setup_proxy_listeners` (base line 1137); the enclosing-function scan shows base `1072`, `1137` and
+    `1186` all sit inside `setup_proxy_listeners` (base `:886`) and only `1505` inside `handle_new_proxy`
+    (base `:1279`) — the numbers are right, the owners are swapped. That comment travelled byte-identical
+    with the window, and this seam's contract is byte-identity, so correcting it here would break the
+    round-trip claim it is the evidence for. It belongs in a follow-up touch of `proxy_ops`; no guard and
+    no test sees it.
+
 
 ### P5 — `frp-server/src/control/login.rs::authenticate` (492) and `frp-client/src/work_conn.rs`
 
