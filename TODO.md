@@ -8258,15 +8258,15 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `frp-server/src/service/tasks.rs:222`). The parent's `use crate::state::{ControlTx, GroupPortQuery};`
   narrowed to `GroupPortQuery`; `teardown.rs` imports `AppState`, `ControlTx` and the parent's
   `super::{proxy_consumes_client_port, udp_port_has_other_owner}` (the parent keeps re-importing both for
-  `registry.rs`), and its `//!` header states the `used_ports → port_reservations` lock order.
-  Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests: every
-  `unregister_generation_tests::*` that calls the function, `control::proxy::tests::cleanup_*`, the idle-reap
-  tests (several of which reach it through `Service::run`) and `ssh_gateway::tests::test_control_exit_terminates_session_and_releases_permit`, so the moved body is
+  `registry.rs`), and its `//!` header restates the two-port-map lock rule.
+  Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests: 13
+  `unregister_generation_tests::*` callers, 5 idle-reap, 3 `cleanup_*`, `partial_read_tests` and the
+  SSH-gateway control-exit test — all through `handle_control` — so the moved body is
   exercised. Code-head gates: fmt; `clippy -D warnings` (0, all-targets/all-features);
   `cargo check -p frps -p frpc --no-default-features --features tiny`/`micro`; `cargo test -p frp-server --lib
   --all-features` 525/0 (= base); `repo-health.sh` invariants; the 13-step health corpus is 13/0. **All cites
   into `mod.rs` were re-pointed** under the explicit map (`:41-1525` +3, `:1526-1928` → teardown, below
-  −400): the 14 `docs/developing.md` diff lines (one now naming `teardown.rs:179-180`), the plan's `:24`
+  −400): the `docs/developing.md` cite lines (one now naming `teardown.rs:179-180`), the plan's `:24`
   (`:515` → `:518`) and its rows 7/8, plus five point-in-time cites in this file (`:6950`/`:6952`/`:6953`,
   `:8363` and `:8422`). The 58-cite `TODO.md` cascade is applied. `pathline-cite-guard` was red at
   the code head and is re-baked to 580/0 (weak anchors 103 → 101); the set digest moved with it.
