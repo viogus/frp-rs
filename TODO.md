@@ -6947,10 +6947,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops/mod.rs:515`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
+  `proxy_ops/mod.rs:518`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
   `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/registry.rs:127`;
-  `setup_proxy_listeners` `proxy_ops/mod.rs:122`; `listen_and_proxy`
-  `proxy_ops/mod.rs:1447`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `setup_proxy_listeners` `proxy_ops/mod.rs:125`; `listen_and_proxy`
+  `proxy_ops/mod.rs:1450`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -8246,6 +8246,31 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `pathline-cite-guard` was red at the code head (580/21: the 20 `docs/developing.md` cite lines
   plus the weak-anchor set pin) and is repaired by this records commit.
 
+  **Seam 6 landed (2026-10-07, PR #514 `dsh/m43-p4-teardown` @ `10fd4809`, base `9b5ab8c1`) — `proxy_ops/teardown.rs`.**
+  The teardown (`unregister_control`) moved out of `frp-server/src/control/proxy_ops/mod.rs` into a new
+  **child** module `frp-server/src/control/proxy_ops/teardown.rs` (420 lines) as one byte-identical window:
+  base `mod.rs:1527-1928` = the doc block (`:1527-1534`) plus `pub(crate) async fn unregister_control(`
+  (`:1535`, closing `}` at `:1928`), **402 lines / 19 041 B / sha1 `4e95977645898e4c1ef6605c5e7a610e17f0b994`**,
+  now `teardown.rs:19-420` (the `fn` at `:27`). The parent went 1938 → **1538** lines (`+3/−403`), gaining
+  `mod teardown;` and `pub(crate) use teardown::unregister_control;` — the function keeps `pub(crate)` and the
+  re-export keeps `crate::control::proxy_ops::unregister_control` resolving at its external callers
+  (`frp-server/src/control/login.rs:35` plus its six call sites, `frp-server/src/control/proxy.rs:553`,
+  `frp-server/src/service/tasks.rs:222`). The parent's `use crate::state::{ControlTx, GroupPortQuery};`
+  narrowed to `GroupPortQuery`; `teardown.rs` imports `AppState`, `ControlTx` and the parent's
+  `super::{proxy_consumes_client_port, udp_port_has_other_owner}` (the parent keeps re-importing both for
+  `registry.rs`), and its `//!` header restates the two-port-map lock rule.
+  Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests: 13
+  `unregister_generation_tests::*` callers, 5 idle-reap, 3 `cleanup_*`, `partial_read_tests` and the
+  SSH-gateway control-exit test, so the moved body is
+  exercised. Code-head gates: fmt; `clippy -D warnings` (0, all-targets/all-features);
+  `cargo check -p frps -p frpc --no-default-features --features tiny`/`micro`; `cargo test -p frp-server --lib
+  --all-features` 525/0 (= base); `repo-health.sh` invariants; the 13-step health corpus is 13/0. **All cites
+  into `mod.rs` were re-pointed** under the explicit map (`:41-1525` +3, `:1526-1928` → teardown, below
+  −400): the `docs/developing.md` cite lines (one now naming `teardown.rs:179-180`), the plan's `:24`
+  (`:515` → `:518`) and its rows 7/8, plus five point-in-time cites in this file (`:6950`/`:6952`/`:6953`,
+  `:8363` and `:8422`). The 58-cite `TODO.md` cascade is applied. `pathline-cite-guard` was red at
+  the code head and is re-baked to 580/0 (weak anchors 103 → 101); the set digest moved with it.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8335,7 +8360,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:1933-1935`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:1533-1535`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8394,7 +8419,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:1933-1935`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:1533-1535`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
