@@ -3,6 +3,8 @@ name = "frp-server"
 version = "0.71.0"
 edition = "2021"
 license = "MIT"
+description = "frps server logic for frp-rs — control handler, proxy registration and bridging"
+repository = "https://github.com/viogus/frp-rs"
 
 [dependencies]
 bytes = { workspace = true }

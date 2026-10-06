@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Virtual network (L3 VPN) TUN device and routing for frp-rs"
+repository = "https://github.com/viogus/frp-rs"
 
 [dependencies]
 frp-core = { path = "../frp-core", default-features = false, features = ["vnet"] }

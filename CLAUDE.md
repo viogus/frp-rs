@@ -168,7 +168,7 @@ not be cited for them.
 |--------|----------------------|
 | **Version alignment (mandatory)** | `bash scripts/repo-health.sh` — gate; exits 1 on drift. All 5 crates + `VERSION` + download script + README at `0.71.0` (frp-vnet `0.1.0` by design) |
 | `cargo fmt --all -- --check` | zero diffs |
-| `cargo clippy --workspace --all-targets --all-features -D warnings` | zero warnings (pinned toolchain) |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | zero warnings (pinned toolchain) |
 | `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** The in-tree test-function total is not stable either — it changes with every test-adding PR, and the same tree has measured differently in CI vs locally — so read it from `bash scripts/repo-health.sh` ("Tests") instead of storing it |
 | `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
 | `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 1 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |

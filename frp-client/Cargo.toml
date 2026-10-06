@@ -3,6 +3,8 @@ name = "frp-client"
 version = "0.71.0"
 edition = "2021"
 license = "MIT"
+description = "frpc client logic for frp-rs — service lifecycle, work connections and plugins"
+repository = "https://github.com/viogus/frp-rs"
 
 [dev-dependencies]
 frp-server = { path = "../frp-server" }

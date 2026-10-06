@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=f1b97ae3d23cb5f740a17883de6a7b004166e4616d1d79d3664c8ee4e73f2564
+          guard_data_pin=60f361d80c81e408d0142f24745df079fe3b36244a3cf751228695a52914a251
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -4132,7 +4132,7 @@ jobs:
         # NO --all-targets here, deliberately. On a --workspace invocation every
         # member is a root, so all dev-dependency edges enter the graph, and
         # frp-server's dev-dependency on frp-client (default features,
-        # frp-server/Cargo.toml:67) plus frp-client's on frp-server re-enable
+        # frp-server/Cargo.toml:69) plus frp-client's on frp-server re-enable
         # both crates' `default` sets. Measured with --all-targets: the micro
         # step compiles frp-client as
         # chacha20,compression,default,http2http,kcp,oidc,quic,tcp-mux,tls,websocket
@@ -4174,7 +4174,7 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings"
       - name: Check frp-client tiny test targets compile (isolated, tls+tcp-mux)
-        # frp-client's tiny tier is exactly `tls,tcp-mux` (frpc/Cargo.toml:23
+        # frp-client's tiny tier is exactly `tls,tcp-mux` (frpc/Cargo.toml:25
         # `tiny = ["frp-client/tls", "frp-client/tcp-mux"]`), so `http2http` is
         # OFF here while `tls` is ON. Any test target whose imports come from
         # `http2http` but whose gate only names `tls` therefore fails to compile
@@ -4245,7 +4245,7 @@ jobs:
       - name: Check frp-server tiny test targets compile (isolated, tls+http-proxy+tcp-mux)
         # The frp-server sibling of the frp-client tiny step above. frps's tiny
         # tier is `["frp-server/tls", "frp-server/http-proxy",
-        # "frp-server/tcp-mux"]` (frps/Cargo.toml:24), a non-empty feature set
+        # "frp-server/tcp-mux"]` (frps/Cargo.toml:26), a non-empty feature set
         # that no other step compiles frp-server's test targets with — the step
         # immediately above is tls OFF and http-proxy OFF. Without this, a future
         # frp-server test whose gate names one of these three but whose imports

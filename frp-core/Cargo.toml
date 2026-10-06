@@ -3,6 +3,8 @@ name = "frp-core"
 version = "0.71.0"
 edition = "2021"
 license = "MIT"
+description = "Shared protocol, transport and configuration library for frp-rs"
+repository = "https://github.com/viogus/frp-rs"
 
 [dependencies]
 tokio.workspace = true
