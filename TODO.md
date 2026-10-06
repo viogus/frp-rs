@@ -8246,6 +8246,31 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `pathline-cite-guard` was red at the code head (580/21: the 20 `docs/developing.md` cite lines
   plus the weak-anchor set pin) and is repaired by this records commit.
 
+  **Seam 6 landed (2026-10-07, PR #514 `dsh/m43-p4-teardown` @ `10fd4809`, base `9b5ab8c1`) — `proxy_ops/teardown.rs`.**
+  The teardown (`unregister_control`) moved out of `frp-server/src/control/proxy_ops/mod.rs` into a new
+  **child** module `frp-server/src/control/proxy_ops/teardown.rs` (420 lines) as one byte-identical window:
+  base `mod.rs:1527-1928` = the doc block (`:1527-1534`) plus `pub(crate) async fn unregister_control(`
+  (`:1535`, closing `}` at `:1928`), **402 lines / 19 041 B / sha1 `4e95977645898e4c1ef6605c5e7a610e17f0b994`**,
+  now `teardown.rs:19-420` (the `fn` at `:27`). The parent went 1938 → **1538** lines (`+3/−403`), gaining
+  `mod teardown;` and `pub(crate) use teardown::unregister_control;` — the function keeps `pub(crate)` and the
+  re-export keeps `crate::control::proxy_ops::unregister_control` resolving at its external callers
+  (`frp-server/src/control/login.rs:35` plus its six call sites, `frp-server/src/control/proxy.rs:553`,
+  `frp-server/src/service/tasks.rs:222`). The parent's `use crate::state::{ControlTx, GroupPortQuery};`
+  narrowed to `GroupPortQuery`; `teardown.rs` imports `AppState`, `ControlTx` and the parent's
+  `super::{proxy_consumes_client_port, udp_port_has_other_owner}` (the parent keeps re-importing both for
+  `registry.rs`), and its `//!` header states the `used_ports → port_reservations` lock order.
+  Mutation **M1** (a `panic!` at the function entry, `teardown.rs:34`) reds **23** lib tests, including
+  direct `unregister_generation_tests` calls and the `Service::run` control-exit path
+  (`ssh_gateway::tests::test_control_exit_terminates_session_and_releases_permit`), so the moved body is
+  exercised. Code-head gates: fmt; `clippy -D warnings` (0, all-targets/all-features);
+  `cargo check -p frps -p frpc --no-default-features --features tiny`/`micro`; `cargo test -p frp-server --lib
+  --all-features` 525/0 (= base); `repo-health.sh` invariants; the 13-step health corpus is 13/0. **17 cite
+  endpoints into `mod.rs` were re-pointed** under the explicit map (`:41-1525` +3, `:1526-1928` → teardown,
+  below −400): the 14 lines in `docs/developing.md` (one now naming `teardown.rs:179-180`) plus
+  `docs/refactor-large-modules.md:24` (`:515` → `:518`); the plan's rows 7 and 8 were re-anchored with the
+  same map, and the 58-cite `TODO.md` cascade is applied. `pathline-cite-guard` was red at the code head
+  and is re-baked to 580/0; the weak-anchor set digest moved with it.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.

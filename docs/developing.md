@@ -282,7 +282,7 @@ it is a deliberate Rust-only extension, say so explicitly in the PR and in
 The registration call chain is:
 
 ```
-handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:515
+handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:518
   └─ build_proxy_info       frp-server/src/control/proxy_ops/registry.rs:48
   └─ register_proxy_entry   frp-server/src/control/proxy_ops/registry.rs:291
        ├─ register_sk_index frp-server/src/control/proxy_ops/registry.rs:127   (stcp/xtcp/sudp only)
@@ -295,7 +295,7 @@ registry (`remove` at `frp-server/src/proxy.rs:363`).
 
 **Where the port is actually reserved.** `allocate_proxy_port`
 (`frp-server/src/control/proxy_ops/ports.rs:86`), called from `handle_new_proxy` at
-`frp-server/src/control/proxy_ops/mod.rs:775`, is the allocator — and it takes
+`frp-server/src/control/proxy_ops/mod.rs:778`, is the allocator — and it takes
 `consumes_port` as an argument:
 
 ```rust
@@ -330,8 +330,8 @@ optional:
 | 2 | `frp-server/src/control/proxy_ops/registry.rs:318` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
 | 3 | `frp-server/src/control/proxy_ops/registry.rs:349` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
 | 4 | `frp-server/src/control/proxy_ops/registry.rs:374` | the `client_ports_used` increment (`*c += 1`, under the guard at `:368`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
-| 5 | `frp-server/src/control/proxy_ops/mod.rs:610` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
-| 6 | `frp-server/src/control/proxy_ops/mod.rs:459` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
+| 5 | `frp-server/src/control/proxy_ops/mod.rs:613` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
+| 6 | `frp-server/src/control/proxy_ops/mod.rs:462` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
 
 Do not pattern-match this table blindly; decide by asking what your type *is*.
 The neighbouring types show the branches that exist: `register_sk_index`
@@ -350,8 +350,8 @@ the group, so missing one releases them while a sibling is still live:
 - the replacement release in `free_replaced_port`
   (`frp-server/src/control/proxy_ops/ports.rs:375`);
 - the join check in `handle_new_proxy`
-  (`frp-server/src/control/proxy_ops/mod.rs:694-695`);
-- the `unregister_control` sweep (`frp-server/src/control/proxy_ops/mod.rs:1687-1688`);
+  (`frp-server/src/control/proxy_ops/mod.rs:697-698`);
+- the `unregister_control` sweep (`frp-server/src/control/proxy_ops/teardown.rs:179-180`);
 - the close handler `handle_close_proxy`, both its membership check
   (`frp-server/src/control/proxy.rs:79-80`) and its port snapshot
   (`frp-server/src/control/proxy.rs:108-109`);
@@ -390,7 +390,7 @@ without the change.
 **There are no listener traits.** This surprises people, so it is worth being
 literal: there is no `trait Listener` in `frp-server/src` or `frp-core/src`.
 Listeners are plain `tokio::spawn` tasks. The TCP accept loop is
-`listen_and_proxy` (`frp-server/src/control/proxy_ops/mod.rs:1447`):
+`listen_and_proxy` (`frp-server/src/control/proxy_ops/mod.rs:1450`):
 
 ```rust
 pub(crate) async fn listen_and_proxy(
@@ -411,22 +411,22 @@ stored in `ControlState::listener_handles` under the proxy name; UDP listeners
 keep their socket in `AppState::udp_sockets`. That is the whole lifecycle: spawn,
 register the handle, drop the handle to stop it.
 
-`setup_proxy_listeners` (`frp-server/src/control/proxy_ops/mod.rs:122`) is where a
+`setup_proxy_listeners` (`frp-server/src/control/proxy_ops/mod.rs:125`) is where a
 type chooses its shape, and the shape is a raw `if`/`else if` chain, not a list of
 peer branches. It has three *type* branches, a group branch, and a fall-through:
 
-- `udp` / `sudp` (`frp-server/src/control/proxy_ops/mod.rs:150`) — bind an
+- `udp` / `sudp` (`frp-server/src/control/proxy_ops/mod.rs:153`) — bind an
   `Arc<UdpSocket>` and pull work connections with
   `InternalMsg::UdpNeedsWorkConn`; SUDP reuses the socket on `EADDRINUSE`.
 - the `is_nat_hole` predicate — `stcp`/`xtcp`/`tcpmux`
-  (`frp-server/src/control/proxy_ops/mod.rs:136-137`, branch at `:254`) — no remote
+  (`frp-server/src/control/proxy_ops/mod.rs:139-140`, branch at `:257`) — no remote
   port and no per-proxy listener; STCP/XTCP visitors connect back over a work
   connection, and TCPMux routes by `HTTP CONNECT` host
   (`frp-server/src/tcpmux.rs:34`).
-- `tcp` (`frp-server/src/control/proxy_ops/mod.rs:459`, after the group branch at
-  `:256`) — bind a per-proxy `TcpListener` via `bind_tcp_proxy_with_retry`, then
+- `tcp` (`frp-server/src/control/proxy_ops/mod.rs:462`, after the group branch at
+  `:259`) — bind a per-proxy `TcpListener` via `bind_tcp_proxy_with_retry`, then
   spawn `listen_and_proxy` and record the handle. **Your TCP-like type goes here.**
-- the `} else {` fall-through (`frp-server/src/control/proxy_ops/mod.rs:493`) —
+- the `} else {` fall-through (`frp-server/src/control/proxy_ops/mod.rs:496`) —
   everything else, including `http` and `https`. There is no per-proxy listener:
   the shared VHost listener routes by host/domain
   (`frp-server/src/vhost.rs:271`).
@@ -437,7 +437,7 @@ that could have rejected it.
 
 **The listener site fails silently, and this is the trap worth internalising.**
 There is no `else` that errors. The fall-through branch
-(`frp-server/src/control/proxy_ops/mod.rs:498`) logs:
+(`frp-server/src/control/proxy_ops/mod.rs:501`) logs:
 
 ```
 "{} proxy '{}' registered (shared listener, port {})"

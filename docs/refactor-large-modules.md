@@ -21,7 +21,7 @@ lines), yet it contains the largest production function in the repository:
 |---|---|---|---:|
 | 1 | **`run`** | **`frp-server/src/service.rs:308`** | **1291** |
 | 2 | `run_message_loop` | `frp-client/src/service.rs:2890` | 697 |
-| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:515` | 546 |
+| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:518` | 546 |
 | 4 | `authenticate` | `frp-server/src/control/login.rs:617` | 510 |
 | 5 | `run_visitor_listener` | `frp-client/src/visitor.rs:1141` | 502 |
 | 6 | `spawn_work_conn` | `frp-client/src/work_conn.rs:1634` | 469 |
@@ -1107,7 +1107,7 @@ Two structural facts dominate everything after that:
 `unregister_control`, `release_udp_port_with_owner_check`,
 `remove_proxy_and_release_client_counts`) and seven test importers of
 `crate::control::proxy_ops::unregister_generation_tests::{proxy_info, test_state}`
-(there is also an eighth production caller, `frp-server/src/service.rs:1678`
+(there is also an eighth production caller, `frp-server/src/service/tasks.rs:222`
 `crate::control::proxy_ops::unregister_control(`). Converting the file to a
 directory keeps **every external path byte-identical** *without* any
 `pub(crate) use` re-export: a file module and an inline module have the same module
@@ -1129,9 +1129,9 @@ are current `mod.rs` positions at `359a031e`):
 | 3 | `proxy_ops/tcp_group.rs` — **landed `d90a834f`** | `tcp_group_listener` (was window `mod.rs:2696–2856`, fn at `:2703`), `handle_tcp_group_member_registration` (was window `mod.rs:2858–2977`, fn at `:2867`) | low — leaves, owned args |
 | 4 | `proxy_ops/registry.rs` — **landed `cbb9d4b3`** | `build_proxy_info` (was `mod.rs:407`, now `registry.rs:48`), `register_sk_index` (was `mod.rs:486`, now `:127`), `register_proxy_entry` (was `mod.rs:787–874`, now `:291–378`), the four `rollback_*` (was `mod.rs:505`, `713`, `734`, `756`, now `:146`, `217`, `238`, `260`), `remove_proxy_and_release_client_counts` (was `mod.rs:682–702`, now `:172–206`) | medium-low |
 | 5 | `proxy_ops/ports.rs` — **landed `359a031e`** | `first_bindable` (now `ports.rs:19`), `PortError` (`:51`), `allocate_proxy_port` (was `mod.rs:171–409`, now `:86–324`), the rollback/free helpers (`udp_port_has_other_owner` `:333`, `free_replaced_port` `:365`, `release_udp_port_with_owner_check` `:437` — keeps `pub(crate)`, `proxy_consumes_client_port` `:458`), the reservation pruner + its `impl AppState` (`:468`, `:479`) | medium-low |
-| 6 | `proxy_ops/teardown.rs` | `unregister_control` (`mod.rs:1535–1928`) — one function, 394 lines | medium |
-| 7 | `proxy_ops/listener.rs` | `bind_proxy_listener` (`mod.rs:1294–1316`), `bind_tcp_proxy_with_retry` (`mod.rs:1350–1441`), `setup_proxy_listeners` (`mod.rs:122–505`), `listen_and_proxy` (`mod.rs:1447–1525`) | medium — largest move, 13-arg interface |
-| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (was 2267–2546, 276 lines) inside `handle_new_proxy` (`mod.rs:515–1285`) | **medium — the only seam that rewrites control flow** |
+| 6 | `proxy_ops/teardown.rs` — **landed PR #514** (code `10fd4809`) | `unregister_control` (was `mod.rs:1527–1928`, now `teardown.rs:19–420`, fn at `:27`) — one function, 394 code lines (402 with its doc) | medium |
+| 7 | `proxy_ops/listener.rs` | `bind_proxy_listener` (`mod.rs:1297–1319`), `bind_tcp_proxy_with_retry` (`mod.rs:1353–1444`), `setup_proxy_listeners` (`mod.rs:125–508`), `listen_and_proxy` (`mod.rs:1450–1528`) | medium — largest move, 13-arg interface |
+| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (now `mod.rs:940–1215`, 276 lines) inside `handle_new_proxy` (`mod.rs:518–1288`) | **medium — the only seam that rewrites control flow** |
 
 Notes on the hardest ones:
 
