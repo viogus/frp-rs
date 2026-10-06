@@ -822,6 +822,87 @@ coverage, not for the moved body). **The real client-side lanes are `frp-client/
 `:181`), which runs entirely in-tree when `--frps-remote` is absent and expands to 17 `test_xtcp_*` wrappers — it was run
 (**17/0**) and belongs in any P3 sweep as its own step.
 
+**Seam 2 landed (2026-10-06, PR #507, base `2aaeed0c`, head `4c8cc0f7`) — `visitor/xtcp.rs`.**
+The XTCP half of `frp-client/src/visitor.rs` moved into a new **child** module `frp-client/src/visitor/xtcp.rs`
+in four commits: `224a9637` (the move), `521c3a12` (the window ended at the doc comment's end instead of
+inside it), `7ea97808` (that mixed comment split at its semantic boundary), `4c8cc0f7` (the child module's
+`//!` header reworded to state that split — the one review finding against the branch, a doc-text fix that
+left the file at 344 lines). Four windows, every one
+byte-identical to its base text after normalising the added visibility tokens. **Basis of every figure below:**
+the normalisation is `sed -e 's/^pub(super) //' -e 's/^    pub(super) /    /'`, the hash is the **SHA-1 of the
+newline-terminated window text** (not a git blob id and not SHA-256), and the byte count includes the final
+newline, so a raw head window reads larger by exactly 11 B per `pub(super) ` prefix. `XtcpPunchConfig` doc+struct
+base `:339-366` (28 L / 1274 B / `60f5e283…`) → `xtcp.rs:33-60`; the punch doc base `:368-370` (3 L / 236 B /
+`c8b93bba…`) → `:62-64`; `do_hole_punch` base `:389-668` (280 L / 12 217 B / `0c7e6f7e…`) → `:65-344`; and
+the clamp doc base `:371-379` (9 L / 582 B / `452baefe…`), which **stayed in the parent** at `:341-349`.
+`visitor.rs` 3215 → **2983**; the new child is **344** lines; the crate's `src/**` row 36 files / 40 633 →
+**37 / 40 745**. `clamp_hp_timeout` itself stayed in the parent (`:350`) because its only non-XTCP user is the
+`vnet`-gated test `hp_timeout_floor_and_cap`: moving it would have needed a wider token plus a `#[cfg]`-gated
+re-import for zero cohesion gain — that alternative was **executed and measured** (+3 lines, +1 token,
++1 `#[cfg]`, both checks rc 0) and rejected on the evidence, not dismissed. The only added text is module
+plumbing — the child's `//!` header (`:1-29`, then the separating blank at `:30`) and `use super::*;` (`:31`), the parent's `mod xtcp;` +
+`use xtcp::{do_hole_punch, XtcpPunchConfig};` (`:161-162`) — plus one 79-line test
+(`tunnel_session_tests::do_hole_punch_precheck_channel_and_cancel_arms`, parent `:2862-2940`).
+
+**Why this seam's visibility change is the reusable part, and why seam 1's zero-change claim cannot be
+reused.** Rust privacy is downward-only, so a parent cannot name a child's private items; the move's first cut
+failed with 2× `E0603` + 6× `E0616` at the parent `use`, and the honest fix is `pub(super)` on the struct, its
+nine fields and the function — 11 tokens, counted. Inside a **private child module** `pub(super)` is exactly
+`pub(in crate::visitor)`, the original reachable set, so nothing widened; `pub`/`pub(crate)` and any re-export
+were both refused, and no code outside `frp-client/src/visitor*` names either item (only doc comments at
+`frp-client/tests/xtcp_visitor_failure_e2e.rs:10,255,310` and `frp-client/src/service/session.rs:1002-1003`).
+Seam 1 could claim zero visibility changes only because its moved item was already `pub(crate)` and a re-export
+preserved the spelled path at its call site; for the remaining seams the rule is "the minimum token, stated"
+rather than "no token". The other admitted side effect is the same as seam 1's: `module_path!()` makes the
+`tracing` target `frp_client::visitor::xtcp`, which `RUST_LOG` prefix-matching covers and which nothing in the
+tree filters on.
+
+**Coverage.** `--lib visitor` **29/0** (one new), `xtcp_pair_e2e` **2/0**, `xtcp_visitor_failure_e2e` **3/0**,
+`stcp_e2e` 5/0, `sudp_e2e` 7/0, and the XTCP matrix `scripts/compat-test.sh --xtcp-only` **17/0**. Mutation
+witnesses: **M1** (panic at the handler entry `xtcp.rs:66`) reds the lib lane **28/1** and `xtcp_pair_e2e`
+**0/2**, and its `RUST_LOG=frp_client::visitor=debug` trace prints the moved body under the new target;
+**M2** (`cfg.vtx.is_closed()` → `true`) and **M3** (the pre_check cancel arm → `pending()`) each red the new
+test (panics at parent `:2925`/`:2934`); **M4** shortened `frp-core/src/stun.rs:192`'s 5 s timeout in a probe
+to show the dead-STUN lane's topology reaches the two STUN-failure returns that the stock timeout outlives. One
+real gap closed: the PreCheck closed/backlogged split and its cancel arm had no lane, so the new test drives
+them. The remaining unlaned branches are enumerated with line numbers in the batch report (the PreCheck
+timeout/server-error/channel-closed returns, the STUN cancel and `other_addr = Some` arms, both NatHoleResp
+error/closed/timeout paths, the `sid` / `p2p_key` / `p2p_sid` / `detect_behavior` None arms, and the
+punch-cancel and `session_fut` Err arms), and `xtcp_visitor_failure_e2e` enters the moved body under M1 yet
+still passes — its three cases are not discriminating for the body as a whole, which is why the new unit test
+exists.
+
+**Four corrections this seam forced on this document and on the closed items:**
+
+1. **This section's proposal row is point-in-time and stays.** The `visitor/xtcp.rs` row (`:754`) proposes
+   "`do_hole_punch` (395), plus the STUN/punch helpers"; at this seam's base the function measures **280 raw
+   lines**, its "helpers" are in-body arms, and `clamp_hp_timeout` is a separate 8-line helper that stayed in
+   the parent. The four-modules table's `:26` row likewise gives `run_visitor_listener` at `visitor.rs:1141`
+   (where it lived when the plan was written; seam 1 moved it to `visitor/stcp.rs:56`). Both tables describe
+   the plan as proposed, so neither is edited — the landed windows above are the record.
+2. **The closed XTCP/quic items' `frp-client/src/visitor.rs:N` cites were already stale at this seam's base,
+   and that is not this PR's drift.** They are keyed to seam 1's base `345776b9` (3864 lines); measured against
+   `2aaeed0c` (3215 lines) only `:94-95` and `:1` still resolved, and two values (`TODO.md:2079`'s `:371` and
+   `:2082`'s `:2900-2901`) quote compiler diagnostics from an even older tree. `TODO.md` is point-in-time by
+   `scripts/tests/todo-cite-guard.sh`'s own skip list, so they are documented here rather than rewritten.
+   **This seam breaks no `TODO.md` cite that was correct at its base.**
+3. **The `#[cfg]` census needs its rule named, and the first one mixed two heads.** At the head the child
+   carries **3** `#[cfg(...)]` (`:55`, `:306`, `:322`) and **0** `#[cfg_attr]` under
+   `grep -Ec '^[[:space:]]*#\[cfg\(' frp-client/src/visitor/xtcp.rs` — the same three gates the base window
+   carried, so the move adds none (the gate at `:55` is the `quic_params` field's
+   `#[cfg(all(feature = "quic", feature = "kcp"))]`, the pair at `:306`/`:322` the KCP/QUIC data-plane arms).
+   The earlier report's ±1 "drift" was a mixed-tree count, not drift, and the POSIX-BRE spelling of that
+   pattern is unbalanced and needs `grep -E`.
+4. **A straddled doc comment is a real cost, and its accounting has two forms.** The base's single 12-line
+   comment (`:368-379`) was attached to `fn clamp_hp_timeout` although its first three lines describe
+   `do_hole_punch`, so *both* of this seam's first two windows mis-assigned text: the original window ended
+   inside the comment (leaving a half-sentence orphaned in the parent) and the corrected window attached all
+   12 lines to `do_hole_punch` (leaving `clamp_hp_timeout` undocumented). The landed split gives each function
+   its own comment, both byte-identical to their base text. Consequently the `~24.8 days` grep has two correct
+   totals: the parent's **anchored doc-form** `^/// ~24\.8` count is **1** (the restored clamp doc) and its
+   unanchored count is **2** (that line plus the pre-existing self-contained `//` copy inside
+   `hp_timeout_floor_and_cap`, base `:2279` → head `:1968`, text unchanged); the child's count is **0**.
+
 ### P4 — `frp-server/src/control/proxy_ops/` (3610 production lines at base, 34 production fns)
 
 At base, production code was lines 1–3610 and the remaining 4444 lines were inline
