@@ -331,7 +331,7 @@ optional:
 | 3 | `frp-server/src/control/proxy_ops/registry.rs:349` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
 | 4 | `frp-server/src/control/proxy_ops/registry.rs:374` | the `client_ports_used` increment (`*c += 1`, under the guard at `:368`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
 | 5 | `frp-server/src/control/proxy_ops/mod.rs:610` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
-| 6 | `frp-server/src/control/proxy_ops/mod.rs:459` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
+| 6 | `frp-server/src/control/proxy_ops/mod.rs:459` | the `tcp` arm of `handle_new_proxy` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
 
 Do not pattern-match this table blindly; decide by asking what your type *is*.
 The neighbouring types show the branches that exist: `register_sk_index`

@@ -8215,13 +8215,13 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
 
   **Seam 5 landed (2026-10-06, code head `359a031e`, base `d361af45`, PR #512).** `proxy_ops/ports.rs`
   (523 lines / 24 509 B) took base `mod.rs:101-409`, `:411-546` and `:2369-2429` as three
-  byte-identical windows: `first_bindable` (`ports.rs:19`), `PortError` and its `client_text`
-  (`:51`, `:64`), `allocate_proxy_port` (`:86`) and the port/rollback helpers
+  byte-identical windows: `first_bindable` (`ports.rs:19`), `PortError` and `client_text`
+  (`:51`, `:67`), `allocate_proxy_port` (`:86`) and the port/rollback helpers
   `udp_port_has_other_owner` (`:333`), `free_replaced_port` (`:365`),
   `release_udp_port_with_owner_check` (`:437`) and `proxy_consumes_client_port` (`:458`) in the
   first two, and `prune_expired_reservations_inner` (`:468`) with the `impl AppState`
-  periodic-cleanup block (`:479`) in the third. Each window carried its doc block and the blank
-  that separated it from the next item; the seam kept exactly one blank. The only change inside
+  periodic-cleanup block (`:479`) in the third. Each window carried its doc block, while the
+  separating blank stayed in the parent; the seam kept exactly one blank. The only change inside
   the moved text is `pub(super) ` on five items (window A 1, B 3, C 1); the parent went 2439 →
   1938 lines (8 insert / 509 delete), took a private `use` of the four names it still calls, a
   `#[cfg(test)] use` of `prune_expired_reservations_inner` (a plain `use` is a clippy
@@ -8235,10 +8235,10 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `:6952`, `:6953` and the two `#[path]` sites) — and four of them now name `ports.rs`
   (`developing.md:297`, `:329`, `:351` and plan `:536`). Coverage is asymmetric: W1 — a `panic!`
   at `release_udp_port_with_owner_check` (`ports.rs:442`) — reddens only the lib target (`--lib`
-  522 passed / 3 failed; the dashboard lane 494/3) and leaves integration (1+13+3) and both compat
-  scenarios green; W2 — a `panic!` at `allocate_proxy_port` (`ports.rs:94`) — reddens every lane
-  (`--lib` 484/41; dashboard lane 460/37; 26 of the 41 integration targets under `--no-fail-fast`;
-  both compat scenarios), because `handle_new_proxy` calls the allocator on the admission path.
+  522 passed / 3 failed; the dashboard lane 494/3) and leaves every integration target green, as do the
+  TCP/HTTP compat scenarios; W2 — a `panic!` at `allocate_proxy_port` (`ports.rs:94`) — reddens every lane
+  (`--lib` 484/41; dashboard lane 460/37; 23 of the 42 integration targets under `--all-features -j 1
+  `--no-fail-fast`; both compat scenarios), because `handle_new_proxy` calls the allocator on admission.
   Code-head gates: fmt; clippy `-D warnings` 0 (all-targets / all-features); `--lib` 525/0
   (= base); `server_protocol` + `relay_integrity` + `vhost_http_group` 17/0; compat
   `go-to-rust-http-group` + `go-to-rust-tcp-plain` 1/0 each; `repo-health.sh` invariants;
