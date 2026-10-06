@@ -777,7 +777,8 @@ struct alone (`:104-123`, 20 L / 493 B / `e757b095…`) does too. `visitor.rs` 3
 `XtcpPunchConfig`, `TunnelSession`, `open_tunnel`, `process_tunnel_start_events`, `run_sudp_visitor_listener`, …) and
 `use super::*` carries the parent's imports; the re-export keeps `crate::visitor::run_visitor_listener` as the spelled
 path at its only call site, so `frp-client/src/service/session.rs` is **not in the diff**. A byte-identical span admits
-no interior edit, and the review confirmed no resolution change: the child has 0 `#[cfg]`, the parent module is ungated,
+no interior edit, and the review confirmed no resolution change: the child **adds** no `#[cfg]` — it carries the **2** its byte-identical span brought with it
+(`#[cfg(all(feature = "quic", feature = "kcp"))]` at `stcp.rs:107` and `:158`, so "0 `#[cfg]`" would be wrong) — and the parent module is ungated,
 and `cargo check -p frp-client --all-targets` is rc 0 in both the all-features and default shapes (no glob ambiguity or
 shadowing). **The one behavioural side effect, admitted rather than hidden:** the `tracing` target becomes
 `frp_client::visitor::stcp` (`module_path!()`), which `RUST_LOG` prefix-matching still covers and which nothing in the
@@ -798,13 +799,18 @@ and the XTCP encrypted P2P bridge.
 
 **Three corrections this seam forced on this document, all of which the code won:**
 
-1. **This section's cfg figure was stale.** It says "lower cfg entanglement (17)"; measured at this base, **with the
-basis stated because two review rounds split it differently**: the **production region** (lines before the first
-`#[cfg(test)]`) holds **28 real `#[cfg(…)]`, none of them `#[cfg(test)]`, with 30 raw lines containing `#[cfg`** (2 of
-those are doc/inline quotes), and the **whole file** holds **33 real (31 non-test), 35 raw-containing**; `#[cfg_attr]`
-is 0. The split conserves the gates — 26 + 2 = 28 — and the review's alternative division (23 production + 8 test-module
-= the same 31 non-test attributes) counts by a different boundary. Both are named rather than one being called wrong,
-which is the sixth case in this program of two correct-but-different totals for one quantity.
+1. **This section's cfg figure was stale — and the count needs *three* named axes, because two review rounds and the
+coordinator each measured a different, correct number.** The rule and the axes: **file** (`frp-client/src/visitor.rs`),
+**tree** (before or after the move), **boundary** (the first `#[cfg(test)]` line, or the `mod tests {` line), and
+**counting** (a line whose `lstrip()` starts with `#[cfg(` = "real"; a line merely containing `#[cfg` = "raw").
+Measured: on the **base tree** `345776b9` (3865 lines, tests from `:3168`) the production region holds **28 real / 30
+raw** and the whole file **33 real / 35 raw**; on the **post-move tree** (3216 lines, tests from `:2519`) the same rules
+give **26 real / 28 raw** and **31 real / 33 raw**; using the `mod tests {` boundary instead gives **25** (base) and
+**23** (post-move) real. The two trees differ by **exactly the two gates the byte-identical move carried** —
+`#[cfg(all(feature = "quic", feature = "kcp"))]` at `stcp.rs:107` and `:158` — which is why 28−2=26 and 33−2=31, and
+which *demonstrates* the "adds no gate" claim rather than asserting it. `#[cfg_attr]` is 0 everywhere. All three
+numbers were right; only the axes were unstated, and this program has now had six cases of correct-but-different
+totals for one quantity.
 2. **The two suites this section names as P3's XTCP validation do not reach the moved code at all.**
 `frp-server/tests/xtcp_hole_punch.rs` and `frp-core/tests/xtcp_p2p.rs` contain **0** references to
 `frp_client`/`ClientService`/`VisitorConfig`; `xtcp_pair_e2e.rs` contains 0 `run_visitor_listener` references and

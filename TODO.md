@@ -7910,7 +7910,9 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   sits inside `visitor`, every private callee keeps its token and `use super::*` carries the parent's imports, while the
   re-export keeps `crate::visitor::run_visitor_listener` as the spelled path at its only call site — so
   `frp-client/src/service/session.rs` is **not in the diff**. A byte-identical span admits no interior edit, and the
-  review additionally checked that no resolution changed (the child has 0 `#[cfg]`, the parent module is ungated, and
+  review additionally checked that no resolution changed (the child **adds** no `#[cfg]` — it carries the **2** its
+  byte-identical span brought with it, `#[cfg(all(feature = "quic", feature = "kcp"))]` at `stcp.rs:107` and `:158`; the
+  parent module is ungated; and
   `cargo check -p frp-client --all-targets` is rc 0 in both the all-features and the default shape, so no glob
   ambiguity). **One behavioural side effect is admitted rather than hidden:** the `tracing` target becomes
   `frp_client::visitor::stcp` (`module_path!()`), which `RUST_LOG` prefix-matching still covers — the review searched
@@ -7927,12 +7929,15 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   failure, accept error, the dial errors, response-read failures, unexpected response frame, the `user_conn missing`
   arm, three "shutting down, abandoning" arms, the fallback yamux arm and the XTCP encrypted P2P bridge). **The seam
   forced three corrections on the plan, all decided by the code:** (1) this section's "lower cfg entanglement (17)" was
-  stale — measured at this base with the basis stated, because the two review rounds split it differently: the production
-  region (lines before the first `#[cfg(test)]`) has **28 real `#[cfg(…)]` lines, 0 of them `#[cfg(test)]`, with 30 raw
-  lines containing `#[cfg`** (2 are doc/inline quotes) and **0 `#[cfg_attr]`**, while the **whole file** has **33 real
-  (31 non-test), 35 raw-containing**. The split conserves the gates — 26 + 2 = 28 across the two files — and the review's
-  alternative division (23 production + 8 test-module = the same 31 non-test attributes) counts by a different boundary,
-  so both are named rather than one being called wrong; (2) the two suites the plan names as P3's XTCP validation do **not reach the moved
+  stale, and the replacement count needed **three named axes** before it reproduced — file, **tree** (before or after the
+  move) and **boundary** (first `#[cfg(test)]` vs `mod tests {`), counting "real" as a line whose `lstrip()` starts with
+  `#[cfg(` and "raw" as one merely containing `#[cfg`: on the **base tree** `345776b9` the production region (tests from
+  `:3168`) holds **28 real / 30 raw** and the whole file **33 real / 35 raw**, while on the **post-move tree** (tests from
+  `:2519`) the same rules give **26 real / 28 raw** and **31 real / 33 raw**, and the `mod tests {` boundary gives 25 and
+  23. The two trees differ by **exactly the two gates the byte-identical move carried**
+  (`#[cfg(all(feature = "quic", feature = "kcp"))]` at `stcp.rs:107` and `:158`), i.e. 28 − 2 = 26 and 33 − 2 = 31 —
+  which *demonstrates* that the child adds no gate instead of asserting it. `#[cfg_attr]` is 0 everywhere, so all three
+  numbers were right and only the axes were unstated; (2) the two suites the plan names as P3's XTCP validation do **not reach the moved
   code at all** (`frp-server/tests/xtcp_hole_punch.rs` and `frp-core/tests/xtcp_p2p.rs` have 0 references to
   `frp_client`/`ClientService`/`VisitorConfig`, and neither `xtcp_pair_e2e.rs` nor `xtcp_visitor_failure_e2e.rs` calls the
   moved function) — **the real client-side lanes are `frp-client/tests/xtcp_pair_e2e.rs` and
