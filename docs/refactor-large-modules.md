@@ -903,6 +903,91 @@ exists.
    unanchored count is **2** (that line plus the pre-existing self-contained `//` copy inside
    `hp_timeout_floor_and_cap`, base `:2279` → head `:1968`, text unchanged); the child's count is **0**.
 
+**Seam 3 landed (2026-10-06, PR #508, base `a0debc74`, head `ac43aee8`) — `visitor/sudp.rs`.**
+The SUDP cluster of `frp-client/src/visitor.rs` moved into a new **child** module
+`frp-client/src/visitor/sudp.rs` as a single **byte-identical** window: base `:821-1513` (693 lines / 30 058 B /
+`39d89e02…`) → child `:24-716`, and `cmp` of the two raw ranges passes. `git diff -U0` is exactly three hunks
+(`@@ -163,0 +164,12 @@`, `@@ -821,694 +832,0 @@`, `@@ -0,0 +1,716 @@`) with **zero** context lines; numstat is
+`visitor.rs` 12/694 and `sudp.rs` 716/0. Each of the six items reproduces its base SHA-1 on its own
+(hash = SHA-1 of the newline-terminated window text, seams 1/2's recipe): doc + `run_sudp_visitor_listener`
+base `:821-1098` → child `:24-301` `8b5fea00…`; `sudp_next_datagram` `:1100-1120` → `:303-323` `ef60562b…`;
+`connect_sudp_visitor_stream` `:1122-1231` → `:325-434` `0c9a7b5c…`; `run_sudp_worker` `:1233-1494` →
+`:436-697` `ea08ccd3…`; `SudpReaderAbort` + `impl Drop` `:1496-1503` → `:699-706` `f77fac38…`;
+`wait_sudp_shutdown` `:1505-1513` → `:708-716` `1319bad5…`. The parent's deleted region is base `:821-1514`
+(694 lines = the 693-line window plus the separating blank; 30 059 B / `3fee5069…` — *not* `39d89e02…`, which
+is the window itself: an earlier draft of the batch report conflated the two through a command-substitution
+trailing-newline strip, corrected at the coordinator's request). `visitor.rs` 2983 → **2301**; the new child is
+**716** lines; the crate's `src/**` row 37 files / 40 745 → **38 / 40 779**. Added text is plumbing only: the
+child's `//!` header `:1-20`, blank `:21`, `use super::*;` `:22`, blank `:23`; the parent's 9-line explainer
+comment, `mod sudp;` (`:173`) and `pub(crate) use sudp::run_sudp_visitor_listener;` (`:174`) inserted at
+`:164-174` (12 lines with the trailing blank `:175`).
+
+**This seam is seam 1's zero-visibility-change case, not seam 2's token case.** All six items keep their base
+tokens — the listener stays `pub(crate)` (`sudp.rs:42`), the other five stay private (`:310`, `:329`, `:458`,
+`:700`, `:702`, `:709`) — because the cluster's only cross-module caller is
+`frp-client/src/visitor/stcp.rs:61` (`return run_sudp_visitor_listener(config).await;`, reached through that
+file's `use super::*;`), and the parent re-export preserves the spelled path at its only call site; no
+`crate::visitor::run_sudp_visitor_listener` path exists anywhere in the tree. So `pub(super)` (seam 2's answer),
+a `pub(crate)` widening and any further re-export were all unnecessary, the first compile needed no privacy
+fixup, and the reusable rule stays "the minimum token, stated" — this seam's minimum is zero. `use super::*`
+reaches `VisitorListenerConfig` (3 uses), `VisitorTransportConfig` (3) and `plan_visitor_dial` (2), and 0 uses
+of `VisitorConnCtx` / `TunnelSession` / `open_tunnel` / `process_tunnel_start_events` / `bridge_until_cancelled`
+/ `clamp_hp_timeout` / `run_visitor_listener` / `do_hole_punch` / `XtcpPunchConfig`. The admitted
+`module_path!()` side effect is the same as seams 1/2: the `tracing` target becomes `frp_client::visitor::sudp`.
+
+**Census.** `grep -Ec '^[[:space:]]*#\[cfg\(' frp-client/src/visitor/sudp.rs` counts **1** — `sudp.rs:85`'s
+`#[cfg(all(feature = "quic", feature = "kcp"))]` on a `quic_params` destructure arm — with **0** `#[cfg_attr]`,
+i.e. exactly the gate the base window carried, so the move adds none. Unlike seam 2 no moved item is gated:
+there is no `#[cfg(feature = "sudp")]` anywhere, so the cluster compiles in every feature shape.
+
+**Coverage.** Both SUDP lanes discriminate the moved body: `cargo test -p frp-client --test sudp_e2e` 7/0 and
+`--test sudp_worker_partial_frame` 1/0 at head, and four one-line `panic!` insertions — M1 at `sudp.rs:43:5`
+(first statement of `run_sudp_visitor_listener`), M2 at `sudp.rs:640:25` (the `Some(p) =>` arm that writes a
+datagram to the server connection in `run_sudp_worker`), M3a at `sudp.rs:315:5` (`sudp_next_datagram`'s entry)
+and M3b at `sudp.rs:710:5` (`wait_sudp_shutdown`'s entry) — each turn **both** lanes red (0/7 and 0/1,
+`rc=101`, crate panic at the inserted line) while `stcp_e2e` stays 5/0 and `--lib visitor` 29/0 under every
+one of them. So nothing in the moved body is lane-dead, and the STCP lane plus the unit suite are regression
+**controls, not SUDP witnesses**. A fifth probe at `sudp.rs:476:9` (the `Some(udp_packet_codec)` arm) reddens
+exactly one test, `test_sudp_e2e_v2_roundtrip`, which falsified the author's own "no lane sets
+`udp_packet_codec`" judgement: that arm is covered by a single test — a thin lane, not a gap — and is recorded
+as such. `sudp.rs:85`'s `#[cfg(all(feature = "quic", feature = "kcp"))]` is compiled in under frp-client's
+default features and *is* executed (a discarded pattern field, not a branch). Uncovered, by judgement rather
+than instrumentation (no coverage tool was run): bind failure `:99-101`; reader `send_to` failure `:146-148`;
+the unparseable and absent `remote_addr` drops `:149-151`/`:152-154`; the inner channel-closed arms
+`:156-158`/`:199-201`; `recv_from` error `:204-206`; first-packet `None` `:237-240`; the connect-failure
+recovery arm `:269-277`; the seven `connect_sudp_visitor_stream` error/early-return arms `:356-360`,
+`:366-371`, `:399-401`, `:413-415`, `:420-422`, `:424-426`, `:428-430` (including the timeout waiting for
+`NewVisitorConnResp`); `split_work_conn_halves` failure `:480-484`; the two `CipherWriter::new` IV failures
+`:510-514`/`:524-528`; the 60 s idle timeout `:633-636` (the whole lane runs ~16 s); worker channel-closed
+`:664-666`; the `Ping`/`Pong` arm `:679-681`; an unexpected message `:682-684`; and reader read-error /
+end-of-stream `:685-687`/`:689-691`. Option-matrix gap: no lane samples v2 with compression (either `enc`
+value) or v2 with encryption — the (v2, comp, enc) cells (T,T,T), (T,T,F) and (T,F,T) are unexercised (the
+matrix read off `sudp_e2e.rs:23-24`/`:39-40` defaults, `:167-171` enc+comp, `:231-233` comp only, `:418` v2
+plain). `SudpReaderAbort`'s `Drop` (`:700-706`) is entered on every `run_sudp_worker` return, but no lane
+forces a parked reader, so its abort effect is unverified.
+
+**Corrections this seam forced:**
+
+1. **This section's proposal row for `visitor/sudp.rs` is point-in-time and stays.** Its three parenthesised
+   numbers (`run_sudp_visitor_listener (1791)`, `run_sudp_worker (2207)`, `connect_sudp_visitor_stream (2078)`)
+   are each exactly **952** lines above this seam's base (measured `:839`, `:1255`, `:1126`), so the row is
+   coherent with the plan-time tree and the landed windows above are the record. The row's "cohesive UDP
+   family" is confirmed: the cluster was contiguous (`:821-1513`) with nothing else inside it, which is why
+   this seam is the only one so far that needed **one** window (seam 1 needed two, seam 2 four).
+2. **This seam stales one `TODO.md` cite that was correct at its base — unlike seam 2.** `TODO.md:2822` cites
+   `frp-client/src/visitor.rs:1203-1208` for the dial-timeout arm; that text (SHA-1 `b61aa5ab…`) is byte-equal
+   at base `:1203-1208` and child `:406-411`, so the cite was accurate at `a0debc74` and is not after the move.
+   `TODO.md` is point-in-time by `scripts/tests/todo-cite-guard.sh`'s own skip list, so it is documented here
+   rather than rewritten; the parent `:1203-1208` now holds unrelated `list_local_ips` text. The older
+   point-in-time audit/archive docs cite eight more numbers inside the moved window
+   (`docs/archive/plans/audit-fix-2026-08-12.md:117`: `:835`, `:940`, `:1353`, `:1647`;
+   `docs/audit/2026-08-09-0.70.1-release-audit.md:59,60,176`: `:1107`, `:1283`, `:1149`, `:1465`, `:1087`), all
+   keyed to pre-seam trees and out of both guards' scope.
+3. **A measurement-surface lesson.** The working tree is not a stable measurement surface while an author is
+   running mutation witnesses: a mid-mutation `sudp.rs` shifts every child line by one, which produced a
+   spurious "the window mapping is off by one" reading from `sed` on the working tree, while the committed
+   mapping (`git show <rev>:<path>`) was byte-exact. Seal span measurements to revisions, not to files.
+
 ### P4 — `frp-server/src/control/proxy_ops/` (3610 production lines at base, 34 production fns)
 
 At base, production code was lines 1–3610 and the remaining 4444 lines were inline

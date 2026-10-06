@@ -8031,6 +8031,66 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   the lanes above, `compat-test.sh --xtcp-only` 17/0, `repo-health.sh` → "invariants hold", and the workspace
   test run per the sweep (the two known host failures only).
 
+  **Progress (2026-10-06, code head `ac43aee8` on `dsh/m38-p3-visitor-sudp`, PR #508, based on `a0debc74`).** P3
+  seam 3 (`frp-client/src/visitor/sudp.rs`) landed as two commits: `4b3918f6` moved the file's contiguous SUDP
+  cluster — `run_sudp_visitor_listener` with its doc, `sudp_next_datagram`, `connect_sudp_visitor_stream`,
+  `run_sudp_worker`, `SudpReaderAbort` with its `impl Drop`, and `wait_sudp_shutdown` — out of
+  `frp-client/src/visitor.rs` (`:821-1513`, 693 lines / 30 058 B / `39d89e02…`) into the new child module
+  `frp-client/src/visitor/sudp.rs` (`:24-716`), and `ac43aee8` reworded two `//!` lines that had cited a `/tmp`
+  report path. The window is **byte-identical**: `cmp` of the two raw ranges passes, `git diff -U0` is exactly
+  three hunks (`@@ -163,0 +164,12 @@`, `@@ -821,694 +832,0 @@`, `@@ -0,0 +1,716 @@`) with **zero** context lines,
+  numstat `visitor.rs` 12/694 and `sudp.rs` 716/0, and every item reproduces its base SHA-1
+  (doc+listener `:821-1098` → `:24-301` `8b5fea00…`; `sudp_next_datagram` `:1100-1120` → `:303-323` `ef60562b…`;
+  `connect_sudp_visitor_stream` `:1122-1231` → `:325-434` `0c9a7b5c…`; `run_sudp_worker` `:1233-1494` →
+  `:436-697` `ea08ccd3…`; `SudpReaderAbort`+drop `:1496-1503` → `:699-706` `f77fac38…`; `wait_sudp_shutdown`
+  `:1505-1513` → `:708-716` `1319bad5…`; hash = SHA-1 of the newline-terminated window text, seams 1/2's
+  recipe). `visitor.rs` 2983 → **2301**; the crate's `src/**` row 37 files / 40 745 → **38 / 40 779**. The
+  parent's deleted region is base `:821-1514` (694 lines with the separating blank / 30 059 B / `3fee5069…`); the
+  batch report first gave `39d89e02…` for that region — a command-substitution trailing-newline artifact — and
+  the coordinator's re-measure caught it. **This is seam 1's zero-visibility case, not seam 2's token case:**
+  all six items keep their base tokens (the listener `pub(crate)` at `sudp.rs:42`; the other five private at
+  `:310`, `:329`, `:458`, `:700`, `:702`, `:709`) because the only cross-module caller is
+  `frp-client/src/visitor/stcp.rs:61` (`return run_sudp_visitor_listener(config).await;`, through that file's
+  `use super::*;`) and the parent's `pub(crate) use sudp::run_sudp_visitor_listener;` (`visitor.rs:174`)
+  preserves the spelled path; no `crate::visitor::run_sudp_visitor_listener` path exists in the tree. Added
+  text is plumbing only: the child's `//!` header `:1-20` + `use super::*;` `:22`, and the parent's 9-line
+  comment + `mod sudp;` + re-export at `:164-174`. The child carries **1** `#[cfg(...)]` (`sudp.rs:85`, the
+  `quic_params` destructure's `#[cfg(all(feature = "quic", feature = "kcp"))]`) and **0** `#[cfg_attr]` — the
+  one gate the base window carried, so the move adds none — and no item is feature-gated (there is no
+  `#[cfg(feature = "sudp")]` anywhere). `use super::*` reaches `VisitorListenerConfig` (3 uses),
+  `VisitorTransportConfig` (3) and `plan_visitor_dial` (2) and 0 of `VisitorConnCtx`/`TunnelSession`/
+  `open_tunnel`/`process_tunnel_start_events`/`bridge_until_cancelled`/`clamp_hp_timeout`/
+  `run_visitor_listener`/`do_hole_punch`/`XtcpPunchConfig`; the admitted `module_path!()` side effect is
+  unchanged from seams 1/2 (the tracing target is now `frp_client::visitor::sudp`). Coverage and witnesses:
+  Both SUDP lanes discriminate the moved body (`sudp_e2e` 7/0, `sudp_worker_partial_frame` 1/0 at
+  head); four one-line `panic!` probes (`sudp.rs:43`, `:640`, `:315`, `:710`) each redden **both** lanes (0/7,
+  0/1, rc 101) while `stcp_e2e` 5/0 and `--lib visitor` 29/0 stay green under all four — so the STCP lane and
+  the unit suite are controls, not SUDP witnesses, and nothing in the moved body is lane-dead. A fifth probe at
+  `sudp.rs:476` (the `Some(udp_packet_codec)` arm) reddens exactly one test, `test_sudp_e2e_v2_roundtrip`: a
+  one-test lane, not a gap. The uncovered branches and the v2×compression/encryption option-matrix gap are
+  enumerated with line numbers in the plan's seam-3 record.
+  *Corrections this seam forced:* (1) the plan's `visitor/sudp.rs` row is point-in-time — its three
+  parenthesised numbers (`run_sudp_visitor_listener (1791)`, `run_sudp_worker (2207)`,
+  `connect_sudp_visitor_stream (2078)`) are each exactly **952** above this base (measured `:839`, `:1255`,
+  `:1126`), and its "cohesive UDP family" is confirmed: the cluster was contiguous (`:821-1513`) with nothing
+  else inside it, which is why this is the only seam so far to need one window (seam 1 needed two, seam 2 four).
+  (2) Unlike seam 2, this seam **does** stale one `TODO.md` cite that was correct at its base: `TODO.md:2822`
+  cites `frp-client/src/visitor.rs:1203-1208` for the dial-timeout arm, whose text (SHA-1 `b61aa5ab…`) is
+  byte-equal at base `:1203-1208` and at the child's `:406-411`; `TODO.md` is point-in-time, so it is documented
+  rather than rewritten (the parent `:1203-1208` now holds unrelated `list_local_ips` code), and the eight
+  `visitor.rs:N` numbers the point-in-time audit/archive docs cite inside the window are likewise left alone.
+  (3) A measurement lesson now recorded in the plan: reading the *working tree* while the author was running
+  mutation witnesses shifted child lines by one and produced a spurious off-by-one reading; span checks are
+  sealed to `git show <rev>:<path>`. Cascade: the records insertion (`TODO.md` 12025 → 12085 lines, +60)
+  re-pointed **58** live cites across **24 citing files**, every one exactly +60 onto its text-identical item
+  header (verified by the difflib line map, not by arithmetic), re-baked **1** pathline expectation and re-pinned
+  **8** digests: the seven `<name>_pin=` literals the audit flagged in `.github/workflows/ci.yml` (`:167`,
+  `:419`, `:1200`, `:1567`, `:1571`, `:1573`, `:1772`) plus the `SCEN10_REGION_SHA` window in
+  `scripts/tests/compat-stray-guard.sh:372` (a region of `scripts/compat-test.sh` this cascade moved).
+  Gates: all 13 `health` step bodies ran rc 0 on the records head (02: 32 checks, pins 2/2; 03: 40 checks,
+  pins 4/4; 10: 101 live cites; 12: 53 checks, pins 4/4; 13: 86 checks, 580 cites, 0 violations), with
+  `cargo fmt --all -- --check` and `bash scripts/repo-health.sh` (`RESULT: invariants hold`) green as well.
+
 
 
 
