@@ -7898,6 +7898,73 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   rounds (M-29 step 9, M-33 step 6, M-35 step 11 "canaries seen: 8/11"), each passing on isolated re-runs and on the
   next full sweep. Ledger unchanged at **3 open / 234 closed / 237 headers**; the plan's S3b section now states that all
   12 rows are landed and that `run_message_loop` is a dispatch skeleton rather than a large function.
+  **Progress (2026-10-05, code head `91ac57a4` on `dsh/m36-p3-visitor-stcp`, PR #506, based on `345776b9`) — P3 seam 1.**
+  The plan's **P3** is the other large `frp-client` module, `visitor.rs`: four parallel listener implementations in one
+  file, which the plan orders **stcp first**. This PR moves exactly one of them. `run_visitor_listener` (base
+  `:1146-1779` = 634 raw lines / 33 199 B / `7373ce44…`) and `VisitorConnCtx` with its doc comment (`:98-123` = 26 L /
+  910 B / `7c1d8427…`) became a new **child** module `frp-client/src/visitor/stcp.rs`, as a **byte-identical** move: both
+  spans reproduce their base sha in the new file (`stcp.rs:53-686`, `:26-51`), and the struct alone (`:104-123`, 20 L /
+  493 B / `e757b095…`) does too. The only added text is the child's `use super::*;` plus the parent's `mod stcp;` and
+  `pub(crate) use stcp::run_visitor_listener;`. `visitor.rs` 3864 → **3215**; the crate's `src/**` row 35 files / 40 596
+  → **36 / 40 633**. **The reusable trick is that a child module needs no visibility changes at all:** because `stcp.rs`
+  sits inside `visitor`, every private callee keeps its token and `use super::*` carries the parent's imports, while the
+  re-export keeps `crate::visitor::run_visitor_listener` as the spelled path at its only call site — so
+  `frp-client/src/service/session.rs` is **not in the diff**. A byte-identical span admits no interior edit, and the
+  review additionally checked that no resolution changed (the child has 0 `#[cfg]`, the parent module is ungated, and
+  `cargo check -p frp-client --all-targets` is rc 0 in both the all-features and the default shape, so no glob
+  ambiguity). **One behavioural side effect is admitted rather than hidden:** the `tracing` target becomes
+  `frp_client::visitor::stcp` (`module_path!()`), which `RUST_LOG` prefix-matching still covers — the review searched
+  `*.rs`/`*.md`/`*.sh`/`*.yml`/`*.toml` for the old path and found nothing that filters on it. **Coverage is half the
+  deliverable here**, because the plan warns this is the least-tested large file in the repo: `stcp_e2e` **5/0** (four
+  pre-existing plus one new), `xtcp_pair_e2e` 2/0, `xtcp_visitor_failure_e2e` 3/0, `sudp_e2e` 7/0,
+  `stcp_visitor_reject` 1/0, `visitor_response_timeout` 1/0, `xtcp_p2p` 12/0, with two **mutation witnesses** proving the
+  lanes execute the moved code (a panic in the accepted-connection arm reds **all five** `stcp_e2e` tests while
+  `sudp_e2e` stays 7/0 under the same mutation — so that arm is load-bearing for STCP and not SUDP; a panic replacing the
+  SUDP dispatch reds all seven `sudp_e2e` tests). One **real gap was closed**: every pre-existing lane ran with
+  `tcp_mux = false`, so the moved `wrap_client_mux` arms had no lane at all; a new mutation-witnessed
+  `test_stcp_e2e_relay_tcp_mux` (with a `start_frps_with_mux` helper) reds **only** when that code is unwrapped. The
+  remaining unlaned branches are enumerated with line numbers in the batch report instead of being waved at (bind
+  failure, accept error, the dial errors, response-read failures, unexpected response frame, the `user_conn missing`
+  arm, three "shutting down, abandoning" arms, the fallback yamux arm and the XTCP encrypted P2P bridge). **The seam
+  forced three corrections on the plan, all decided by the code:** (1) this section's "lower cfg entanglement (17)" was
+  stale — measured at this base with the basis stated, because the two review rounds split it differently: the production
+  region (lines before the first `#[cfg(test)]`) has **28 real `#[cfg(…)]` lines, 0 of them `#[cfg(test)]`, with 30 raw
+  lines containing `#[cfg`** (2 are doc/inline quotes) and **0 `#[cfg_attr]`**, while the **whole file** has **33 real
+  (31 non-test), 35 raw-containing**. The split conserves the gates — 26 + 2 = 28 across the two files — and the review's
+  alternative division (23 production + 8 test-module = the same 31 non-test attributes) counts by a different boundary,
+  so both are named rather than one being called wrong; (2) the two suites the plan names as P3's XTCP validation do **not reach the moved
+  code at all** (`frp-server/tests/xtcp_hole_punch.rs` and `frp-core/tests/xtcp_p2p.rs` have 0 references to
+  `frp_client`/`ClientService`/`VisitorConfig`, and neither `xtcp_pair_e2e.rs` nor `xtcp_visitor_failure_e2e.rs` calls the
+  moved function) — **the real client-side lanes are `frp-client/tests/xtcp_pair_e2e.rs` and
+  `xtcp_visitor_failure_e2e.rs`**; and (3) "the XTCP matrix" is **not** `protocol-matrix.sh` (its rows are the eleven
+  transport rows and it contains zero `xtcp` references) but `scripts/compat-test.sh --xtcp-only`, which runs in-tree
+  when `--frps-remote` is absent and expands to 17 `test_xtcp_*` wrappers — run here at **17/0** and now a sweep step.
+  **Three general findings belong to future seams:** (a) `ci.yml` gates the cite inventory **twice** — besides the
+  table's `guard_data_pin` there is `guard_cites`/`guard_cites_floor`, which moved 579 → 580 with this PR and which no
+  earlier round had named; (b) `cli_empty_log_file_keeps_the_files_destination` is **deterministic in isolation, and only its
+  appearance in the full workspace run varies** — this was first recorded as a flake on the strength of three full-tree runs
+  (2690/2, 2691/2, 2702/1, i.e. it did not fail every time *in that context*), and the verifying round then falsified that
+  reading by running the test alone **6/6 red** with the same assertion (`log_completion.rs:935`, "the empty flag diverted
+  the log to `console`") against its own `CARGO_BIN_EXE_frps`, which matches the older "deterministic on a re-run"
+  triage. The record therefore keeps both observations and the stronger claim, since a context-dependent failure is not
+  a flake; and (c) **`pathline-cite-guard.sh` scans `git ls-files`, so a brand-new untracked source file is invisible to
+  it** — the author nearly recorded a two-cite `foreign_reported` drift before tracing it to that artefact, which matters
+  for any future seam that adds a file. On the evidence itself, one correction of mine: the checklist row I first
+  published for `VisitorConnCtx` ("`:98-123`, 20 L, 911 B, `89f11063…`") was an **adjacent-window mix** — the adversarial
+  round swept both files and showed `89f11063…`/911 B belong to the 27-line window `:98-124` while 20 lines is the struct
+  alone at 493 B — so the move is byte-identical under **every** candidate window, which is a stronger statement than
+  "the figures were wrong". Cascade: table 579 → 580 (one new cite at `service/session.rs:1030`, plus three
+  `common/mod.rs` rows shifting +5) with every pinned set byte-identical (`weak_set=dbbea851…`), `SCEN10_REGION_SHA` a
+  verified **no-op**, pins **20/20**, **13/13 health step bodies rc 0 on the frozen tree before the commit and again on
+  the head**. Gates: workspace **2702 passed / 1 failed** (the deterministic `127.0.0.2` bind; `log_completion` flaked
+  red twice earlier and green here), compat **86/0**, protocol-matrix **11/0**, XTCP pairwise **17/0**, fmt/clippy and
+  the no-vnet, tiny and micro shapes rc 0. **The sweep's design earned its keep:** it is one `set -e` script whose last
+  step is the commit, and it **aborted twice before any commit existed** — clippy caught an `unused_imports` the author
+  had introduced, and the cascade caught a cite table that had been re-baked — which is the gate added after this
+  program's own red-tree mistake. *Erratum:* the dispatch I sent for this PR stated the ledger as "3 open / 234 closed /
+  237 headers"; the tree reads **4 open / 234 closed / 238 headers** with `TODO.md` at 11892 (the health-fixture flake
+  item filed earlier this round is the fourth), and the adversarial round caught the stale figure.
+
 
 
 

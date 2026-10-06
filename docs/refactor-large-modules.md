@@ -764,6 +764,58 @@ little to catch a mistake in the moved code. Recommend doing this **after**
 (`frp-server/tests/xtcp_hole_punch.rs`, `frp-core/tests/xtcp_p2p.rs`) and the daily
 `xtcp-compat.yml` matrix.
 
+**Seam 1 landed (2026-10-05, PR #506, base `345776b9`, head `91ac57a4`) — `visitor/stcp.rs`.**
+`run_visitor_listener` (base `:1146-1779` = 634 raw lines / 33 199 B / `7373ce44…`) and `VisitorConnCtx` with its doc
+comment (base `:98-123` = 26 L / 910 B / `7c1d8427…`) moved into a new **child** module `frp-client/src/visitor/stcp.rs`
+as a **byte-identical** move: both spans reproduce their base sha in the new file (`stcp.rs:53-686` and `:26-51`), and the
+struct alone (`:104-123`, 20 L / 493 B / `e757b095…`) does too. `visitor.rs` 3864 → **3215**; the crate's `src/**` row
+35 files / 40 596 → **36 / 40 633**. The only added text is the child's `use super::*;` and the parent's `mod stcp;` +
+`pub(crate) use stcp::run_visitor_listener;`.
+
+**Why this seam needed *zero* visibility changes, which is the reusable part.** Because `stcp.rs` is a child of
+`visitor`, every private callee keeps its token (`plan_visitor_dial`, `VisitorTransportConfig`, `bridge_until_cancelled`,
+`XtcpPunchConfig`, `TunnelSession`, `open_tunnel`, `process_tunnel_start_events`, `run_sudp_visitor_listener`, …) and
+`use super::*` carries the parent's imports; the re-export keeps `crate::visitor::run_visitor_listener` as the spelled
+path at its only call site, so `frp-client/src/service/session.rs` is **not in the diff**. A byte-identical span admits
+no interior edit, and the review confirmed no resolution change: the child has 0 `#[cfg]`, the parent module is ungated,
+and `cargo check -p frp-client --all-targets` is rc 0 in both the all-features and default shapes (no glob ambiguity or
+shadowing). **The one behavioural side effect, admitted rather than hidden:** the `tracing` target becomes
+`frp_client::visitor::stcp` (`module_path!()`), which `RUST_LOG` prefix-matching still covers and which nothing in the
+tree filters on — the review checked `*.rs`/`*.md`/`*.sh`/`*.yml`/`*.toml` for the old path and found none.
+
+**Coverage, which is half the deliverable for this file** (the plan warns P3 is the least-tested large file in the
+repo): `stcp_e2e` **5/0** (four pre-existing plus one new), `xtcp_pair_e2e` 2/0, `xtcp_visitor_failure_e2e` 3/0,
+`sudp_e2e` 7/0, `stcp_visitor_reject` 1/0, `visitor_response_timeout` 1/0, `xtcp_p2p` 12/0. Two **mutation witnesses**
+prove the lanes execute the moved code: a panic in the accepted-connection arm reds **all five** `stcp_e2e` tests while
+`sudp_e2e` stays 7/0 under the same mutation (so that arm is load-bearing for STCP and not for SUDP), and a panic
+replacing the SUDP dispatch reds all seven `sudp_e2e` tests. One **real gap was closed**: every pre-existing lane ran
+`tcp_mux = false`, so the moved `wrap_client_mux` arms had no lane at all — `stcp_e2e.rs` gains a mutation-witnessed
+`test_stcp_e2e_relay_tcp_mux` (with a `start_frps_with_mux` helper, the old `start_frps` becoming a delegate) that reds
+**only** when the moved `wrap_client_mux` is unwrapped. The remaining unlaned branches are enumerated with line numbers
+in the batch report rather than waved at: bind failure, accept error, the dial errors, response-read failures,
+unexpected response frame, the `user_conn missing` arm, three "shutting down, abandoning" arms, the fallback yamux arm,
+and the XTCP encrypted P2P bridge.
+
+**Three corrections this seam forced on this document, all of which the code won:**
+
+1. **This section's cfg figure was stale.** It says "lower cfg entanglement (17)"; measured at this base, **with the
+basis stated because two review rounds split it differently**: the **production region** (lines before the first
+`#[cfg(test)]`) holds **28 real `#[cfg(…)]`, none of them `#[cfg(test)]`, with 30 raw lines containing `#[cfg`** (2 of
+those are doc/inline quotes), and the **whole file** holds **33 real (31 non-test), 35 raw-containing**; `#[cfg_attr]`
+is 0. The split conserves the gates — 26 + 2 = 28 — and the review's alternative division (23 production + 8 test-module
+= the same 31 non-test attributes) counts by a different boundary. Both are named rather than one being called wrong,
+which is the sixth case in this program of two correct-but-different totals for one quantity.
+2. **The two suites this section names as P3's XTCP validation do not reach the moved code at all.**
+`frp-server/tests/xtcp_hole_punch.rs` and `frp-core/tests/xtcp_p2p.rs` contain **0** references to
+`frp_client`/`ClientService`/`VisitorConfig`; `xtcp_pair_e2e.rs` contains 0 `run_visitor_listener` references and
+`xtcp_visitor_failure_e2e.rs` 0 of that function (with 4 other visitor references — enough for prefix/sibling
+coverage, not for the moved body). **The real client-side lanes are `frp-client/tests/xtcp_pair_e2e.rs` and
+`xtcp_visitor_failure_e2e.rs`**, plus the STCP ones above.
+3. **"The XTCP matrix" is not `protocol-matrix.sh`.** That script's rows are the eleven transport rows and it contains
+**zero** `xtcp` references. The XTCP matrix is `scripts/compat-test.sh --xtcp-only` (flag at `:166`, documented at
+`:181`), which runs entirely in-tree when `--frps-remote` is absent and expands to 17 `test_xtcp_*` wrappers — it was run
+(**17/0**) and belongs in any P3 sweep as its own step.
+
 ### P4 — `frp-server/src/control/proxy_ops/` (3610 production lines at base, 34 production fns)
 
 At base, production code was lines 1–3610 and the remaining 4444 lines were inline
