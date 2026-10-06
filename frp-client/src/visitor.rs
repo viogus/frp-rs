@@ -338,7 +338,6 @@ impl TunnelSession {
     }
 }
 
-/// ~24.8 days before the visitor could re-punch).
 fn clamp_hp_timeout(read_timeout_ms: i32) -> u64 {
     // DEFAULT_HOLE_PUNCH_TIMEOUT_MS <= MAX_HOLE_PUNCH_TIMEOUT_MS (constant
     // invariant), so `clamp` cannot panic.

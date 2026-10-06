@@ -70,6 +70,7 @@ pub(super) struct XtcpPunchConfig {
 /// [`frp_core::xtcp_p2p::MAX_HOLE_PUNCH_TIMEOUT_MS`] (60s): Go's analyzer
 /// emits ReadTimeoutMs ≤ ~45s, so anything above is a hostile server
 /// stretching the punch (`read_timeout_ms` is i32 — uncapped it would wait
+/// ~24.8 days before the visitor could re-punch).
 pub(super) async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession, String> {
     // 1. PreCheck: validate proxy existence/permissions before STUN (Go
     //    nathole.PreCheck, 5s timeout). A timeout proceeds with the full
