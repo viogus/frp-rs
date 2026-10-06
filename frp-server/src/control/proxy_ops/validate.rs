@@ -2,9 +2,9 @@
 //! `proxy_ops/mod.rs`. These checks have zero `AppState` coupling, so they
 //! are self-contained and self-testing.
 //!
-//! `mod.rs` re-imports both items privately, so the paths
-//! `proxy_ops::validate_new_proxy` / `proxy_ops::duplicate_domain` and their
-//! private visibility are unchanged for every existing caller. The test
+//! `mod.rs` re-imports `validate_new_proxy` privately, so that path and its
+//! private visibility are unchanged for every existing caller; `tcpmux.rs`
+//! reaches `duplicate_domain` directly through `super::validate`. The test
 //! module that covers them (`subdomain_conflict_tests`) is declared by
 //! `proxy_ops/mod.rs` with a `#[path]` pointing into this directory, so its
 //! `control::proxy_ops::subdomain_conflict_tests::*` test names are
