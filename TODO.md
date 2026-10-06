@@ -11374,6 +11374,33 @@ section; ledger now **24 open / 104 closed**.**
   **Updated (2026-10-04, at `1347221e` on `dsh/m9-compat-flake`, PR #479, based on `633df10f`) — the red rate over the post-round-5 window is measured and the readiness class now has a mechanism-level re-drive; the item stays open.**
   The recorded baseline reproduces under its own convention (`gh run list --workflow compat.yml --limit 100`, all branches, before 2026-10-02T12:10Z): 86 success / 3 failure / 11 cancelled = **3/89**. Since the round-5 harness fix landed (`37029135574`, 2026-10-02T15:44:49Z) there are **67 completed runs / 68 attempts with 0 run-level failures and 1 attempt-level red** (`37050182340` attempt 1), and on `main` alone **16 completed runs, 0 red** — so the ≥30 clause holds only on the all-branch convention the 3/89 itself used, and 0/67 vs 3/89 is statistically **consistent, not an improvement** (p ≈ 0.10; rule-of-three upper bound 4.5% > 3.37%). Both post-baseline reds are the **address-collision** class diagnosed from the round-5 dump (`TCPMux HTTP CONNECT listener failed: Address already in use (os error 98)`; `bind: address already in use` then `Unexpected response to login`) and both pre-date the ledger/ownership fix `0a4761a8` — so no red `compat` run occurred **on `main`**, and no lateness-class red exists to attribute to runner contention or a stalled dial. The readiness class now has the mechanism-level re-drive recorded in the item above (bound default 1, cap 5, class-scoped, reported once), but `FRP_COMPAT_READY_MIN` (20 s) was **not** replaced, so the Done-when's alternative branch is only partially met. Closing this item needs one of: a red `compat` run on `main` diagnosed from the round-5 dump with the lateness attributed, a ≥30-completed-run window on `main` alone (16 today) compared against 3/89, or a deliberate re-scoping of this Done-when.
 
+- [ ] **The `health` job's fixture steps flake against ambient machine state, once per suite, and pass only on retry.**
+
+  **Filed by the coordinator (Batch M-35 records round), base `05c19121`.** Across the last four S3b rounds the same
+  class was seen three times, each time in a *different* fixture step, each time green on the next attempt:
+
+  - M-29 sweep — step 9 flaked once, passed on isolated re-run.
+  - M-33 sweep — step 6 (RSS soak) exited 1 while its own log printed `RESULT: 269 fixture check(s) hold`; two isolated
+    re-runs gave rc 0.
+  - M-35 sweep — step 11 red once with `canaries seen: 8/11`, then passed three isolated re-runs and a fresh full sweep.
+  - The verifying round's own clean pass was **12/13**: step 2 failed with `must print 32 '  ok' lines`, and running that
+    step alone immediately afterwards gave **rc 0 twice** (`32 checks hold, pins verified 2/2, enforcer canary live`).
+
+  **Diagnosis (offered by the verifying round, consistent with the measurements):** the fixture steps are sensitive to
+  **ambient machine state**, and this host runs several agents' test suites concurrently, which also explains why the
+  flaking step differs each time. It is not the tree: every occurrence passed in isolation, and the committed heads were
+  verified independently (13/13 step bodies rc 0 in clean checkouts at `f35b8dd8`, `a75affaa` and `c762c007`).
+
+  **Why it is worth an item rather than a note:** a one-off red in a fixture step costs a full re-run plus a triage
+  discussion every time, and the program has now paid that cost three times in four rounds. The failure mode also
+  *inverts* the usual signal — the fixture steps exist to make the tree's health legible, so a step that reds on a busy
+  host teaches the reader to distrust a green sweep.
+
+  **Done-when:** either the fixture steps are made independent of ambient state (or explicitly retry-tolerant, the way
+  `compat` needed its stray-process guard), or the ambient-state dependence is *measured*: a flake rate for these steps
+  over ≥20 consecutive sweeps on a contended host, with the offending step named and the mechanism attributed — and a
+  full sweep then passes on a contended host without a spurious red.
+
 - [x] **`scripts/compat-test.sh --list` prints `run_test` function names while `--test` selects display names, so a name taken from `--list` runs nothing and still reports success.**
 
   Filed by the Batch K author after PR #463 review round 1. The selector compares the caller's display name
