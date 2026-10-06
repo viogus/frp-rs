@@ -282,7 +282,7 @@ it is a deliberate Rust-only extension, say so explicitly in the PR and in
 The registration call chain is:
 
 ```
-handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:119
+handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:122
   └─ build_proxy_info       frp-server/src/control/proxy_ops/registry.rs:48
   └─ register_proxy_entry   frp-server/src/control/proxy_ops/registry.rs:291
        ├─ register_sk_index frp-server/src/control/proxy_ops/registry.rs:127   (stcp/xtcp/sudp only)
@@ -295,7 +295,7 @@ registry (`remove` at `frp-server/src/proxy.rs:363`).
 
 **Where the port is actually reserved.** `allocate_proxy_port`
 (`frp-server/src/control/proxy_ops/ports.rs:86`), called from `handle_new_proxy` at
-`frp-server/src/control/proxy_ops/mod.rs:379`, is the allocator — and it takes
+`frp-server/src/control/proxy_ops/mod.rs:382`, is the allocator — and it takes
 `consumes_port` as an argument:
 
 ```rust
@@ -330,7 +330,7 @@ optional:
 | 2 | `frp-server/src/control/proxy_ops/registry.rs:318` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
 | 3 | `frp-server/src/control/proxy_ops/registry.rs:349` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
 | 4 | `frp-server/src/control/proxy_ops/registry.rs:374` | the `client_ports_used` increment (`*c += 1`, under the guard at `:368`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
-| 5 | `frp-server/src/control/proxy_ops/mod.rs:214` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
+| 5 | `frp-server/src/control/proxy_ops/mod.rs:217` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
 | 6 | `frp-server/src/control/proxy_ops/listener.rs:379` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
 
 Do not pattern-match this table blindly; decide by asking what your type *is*.
@@ -350,7 +350,7 @@ the group, so missing one releases them while a sibling is still live:
 - the replacement release in `free_replaced_port`
   (`frp-server/src/control/proxy_ops/ports.rs:375`);
 - the join check in `handle_new_proxy`
-  (`frp-server/src/control/proxy_ops/mod.rs:298-299`);
+  (`frp-server/src/control/proxy_ops/mod.rs:301-302`);
 - the `unregister_control` sweep (`frp-server/src/control/proxy_ops/teardown.rs:179-180`);
 - the close handler `handle_close_proxy`, both its membership check
   (`frp-server/src/control/proxy.rs:79-80`) and its port snapshot

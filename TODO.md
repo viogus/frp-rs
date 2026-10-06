@@ -6947,7 +6947,7 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops/mod.rs:119`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
+  `proxy_ops/mod.rs:122`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
   `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/registry.rs:127`;
   `setup_proxy_listeners` `proxy_ops/listener.rs:42`; `listen_and_proxy`
   `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
@@ -8287,6 +8287,20 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   re-pointed by content** under the explicit map (the `setup_proxy_listeners` family now cites `listener.rs`),
   and `pathline-cite-guard` is re-baked to 580/0.
 
+  **Seam 8 landed (2026-10-07, PR #516 `dsh/m45-p4-tcpmux` @ `a2e1609d`, base `5d36743f`) — `proxy_ops/tcpmux.rs`.**
+  The inline tcpmux arm of `handle_new_proxy` became `pub(super) async fn register_tcpmux_proxy(...)`
+  `-> bool` in a new child module `frp-server/src/control/proxy_ops/tcpmux.rs` (309 lines), mirroring
+  `register_http_vhost`/`register_https_vhost`; the arm's `return false`s stay and the call site is
+  `if np.proxy_type == "tcpmux" && !register_tcpmux_proxy(...).await { return false; }`. **This is a
+  restructuring, not a pure move**: the body is de-indented one level and token-for-token identical
+  (whitespace-stripped stream 7201 == 7201 chars, in order; the only new tokens are the `true` tail,
+  the signature and `#[inline(never)]`; one rustfmt reflow splits the already-long subdomain
+  `.into()`). `mod.rs` 899 → **631**; the parent drops `duplicate_domain` from `use validate::…` and
+  gains `mod tcpmux;` + `use tcpmux::register_tcpmux_proxy;`. Mutation **M1** (a `panic!` at the
+  function entry, `tcpmux.rs:33`) reds **11** lib tests. Code-head gates: fmt; `clippy -D warnings`
+  (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites into
+  `mod.rs` re-pointed (+3 above the arm, −268 below); `pathline-cite-guard` re-baked to 580/0.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8376,7 +8390,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:894-896`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:626-628`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8435,7 +8449,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:894-896`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:626-628`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
