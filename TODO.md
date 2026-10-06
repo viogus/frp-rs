@@ -8162,6 +8162,29 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `subdomain_conflict_tests`' module path — and its 11 test names (12 `fn`s, one a helper) — intact. The plan's
   `8044 / 4432 / 3612` proved stale: re-measured 8054 / 4444 / 3610, and seams 3–8 re-anchored.
 
+  **Seam 3 landed (2026-10-06, PR #510, code head `d90a834f`).** `proxy_ops/tcp_group.rs`
+  (303 lines / 14 065 B) took base `mod.rs:2696-2856` + `:2858-2977` as two byte-identical windows
+  (the combined `:2696-2977` round-trips to `455e0a56…`; the only change is `pub(super) ` on the two
+  signatures), with the single blank at `:2857` travelling as child `:183`. The parent went
+  3049 → 2767 lines (`+3/−285`), gaining `mod tcp_group;` plus a private `use` at `:23-24`. This is the
+  first seam whose insertion sits **above** the live cites, so 29 cites into `mod.rs` were re-pointed
+  from an explicit old→new map (+3 below `:25`, −282 below the deleted window): 26 `docs/developing.md`
+  cites and `docs/refactor-large-modules.md:24` (`:1279` → `:1282`) moved +3, while the two `TODO.md`
+  cites of the `#[path]` sites moved **−282** (`:3044-3046` → `:2762-2764`), not +3. Only the 26 were
+  visible to `pathline-cite-guard` — cites written in `TODO.md` and in this plan are excluded from its
+  scan, so its FAIL list is not the cascade criterion. The re-bake moved the weak population 104 → 103
+  and its set pin `dbbea8513634ee3b` → `564fea99514dcb24`. Code-head gates: fmt; clippy `-D warnings` (0);
+  all-targets/all-features; `--no-default-features`; `--lib` 525/0 (= base); `server_protocol` +
+  `relay_integrity` + `vhost_http_group` 17/0; compat `go-to-rust-http-group` + `go-to-rust-tcp-plain`;
+  `repo-health.sh` invariants; `todo-cite-guard` 101/0; `large-functions.sh` sizes unchanged (path and
+  line only); release build of both binaries. `pathline-cite-guard` was red at the code head (580/30)
+  and is repaired by this records commit. Coverage is unchanged and half-empty: a `panic!` at
+  `tcp_group_listener` entry survives every lane (an `eprintln!` probe printed 0 times, proving nothing
+  enters `tcp_group.rs:29-182` — it is spawned only from `setup_proxy_listeners`), while a `panic!` at
+  `handle_tcp_group_member_registration` entry reddens only the lib lane (523 passed / 2 failed, both in
+  `unregister_generation_tests`). The function takes **12** parameters, not the 13 the brief said, and
+  **no compat scenario covers the TCP-group shared listener** — that gate cannot witness this seam.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8251,7 +8274,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:3044-3046`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:2762-2764`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8310,7 +8333,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:3044-3046`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:2762-2764`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
