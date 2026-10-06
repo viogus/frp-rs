@@ -8090,6 +8090,51 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   Gates: all 13 `health` step bodies ran rc 0 on the records head (02: 32 checks, pins 2/2; 03: 40 checks,
   pins 4/4; 10: 101 live cites; 12: 53 checks, pins 4/4; 13: 86 checks, 580 cites, 0 violations), with
   `cargo fmt --all -- --check` and `bash scripts/repo-health.sh` (`RESULT: invariants hold`) green as well.
+  **Progress (2026-10-06, code head `7d6a1d50` on `dsh/m39-p3-visitor-vnet`, PR #509, based on `9441317e`).** P3
+  seam 4 (`frp-client/src/visitor/vnet.rs`) landed as one commit, `7d6a1d50`: the file's five non-contiguous
+  `virtual_net` windows moved out of `frp-client/src/visitor.rs` into the new child module
+  `frp-client/src/visitor/vnet.rs` — `VnetTunTxMap`/`VnetTunSubnetMap` (base `:22-26`, 5 lines / 152 B /
+  `d03e3f7f…`), `VirtualNetVisitorConfig` (`:98-147`, 50 / 2 177 / `bf0d5675…`), `run_virtual_net_tunnel_io`
+  (`:715-806`, 92 / 3 857 / `a65dc297…`), `run_virtual_net_visitor` + `deliver_tunnel_ingress` + both shutdown
+  waiters (`:833-1167`, 335 / 12 934 / `8c664335…`) and the `#[cfg(all(test, feature = "vnet"))] mod tests`
+  (`:1263-1524`, 262 / 11 321 / `a0e31630…`), landing at child `:34-38`, `:39-88`, `:89-180`, `:181-515` and
+  `:516-777`. 744 lines / 30 441 B are **byte-identical**: each span occurs once in the child and zero times in
+  the parent, and each reproduces its base SHA-1; the child is a 33-line prelude plus those five windows with no
+  separator lines, 777 lines / 32 432 B. This is the first non-contiguous seam: `bridge_until_cancelled` (base
+  `:808-831`, now `:675-698`) and `list_local_ips` (base `:1169-1261`, now `:706`) stay in the parent — the
+  bridge is shared with six `frp-client/src/visitor/stcp.rs` call sites, and `list_local_ips` carries no
+  `#[cfg]` and is called only from the always-compiled `frp-client/src/visitor/xtcp.rs:171`, so the plan row's
+  `visitor/vnet.rs` grouping for it is recorded as a deliberate mismatch rather than executed. `visitor.rs`
+  2301 → **1569**; the crate's `src/**` row **38 / 40 779 → 39 / 40 824**. **Zero visibility change:** all eight
+  moved items keep their base tokens (`pub(crate)` on `VirtualNetVisitorConfig` and `run_virtual_net_visitor`,
+  private on the two aliases and four helpers); `use super::*` reaches only `VisitorTransportConfig` (2 uses),
+  `plan_visitor_dial` (2) and, in the moved tests, `clamp_hp_timeout` (6); and the two names the outside world
+  spells (`crate::visitor::run_virtual_net_visitor` / `crate::visitor::VirtualNetVisitorConfig` at the
+  `virtual_net` spawn, `frp-client/src/service/session.rs:909-910`) stay reachable through the parent's
+  `pub(crate) use`. Because `vnet` is **not** a default feature, both `mod vnet;` and the re-export are
+  `#[cfg(feature = "vnet")]`-gated, unlike the unconditional stcp/xtcp/sudp children. The child carries **13**
+  `#[cfg(...)]` and 0 `#[cfg_attr]` (the 12 the windows had plus the re-added `HashMap` gate) and the parent
+  goes 28 → 17. Coverage: the `--lib --features vnet visitor` lane reads 36/0 (== base, ids now
+  `visitor::vnet::tests::*`), the default `--lib visitor` 29/0 and `reload_vnet_proxy` 1/0; the M1 `panic!` at
+  `deliver_tunnel_ingress`'s entry (child `:413`) reddens four tests plus the tunnel-io test (rc 101), while M2
+  (`run_virtual_net_visitor`'s entry, `:225`) and M3 (`wait_for_shutdown_or_delay`'s entry, `:493`) survive —
+  because nothing reaches them, not because the code is stripped: `run_virtual_net_visitor` `:190-398` has
+  **zero** dynamic coverage, its only caller being the feature-gated `virtual_net` spawn, and no test starts a
+  real client session with a `virtual_net` plugin proxy. The unreached-branch list is in the plan's seam-4
+  record.
+  *Corrections this seam forced:* (1) the plan's `list_local_ips` grouping stays a documented mismatch (above);
+  (2) `bridge_until_cancelled` staying is not a deviation — the row never named it; (3) the batch report's byte
+  ledger ("30-line prelude and four separator blanks") was re-measured at the coordinator: the child has **no**
+  separator lines and its prelude is 33 lines (33 + 744 = 777), measurements sealed to `git show <rev>:<path>`;
+  (4) one host-load flake in the `--features vnet` filter lane
+  (`proxy::tests::test_visitor_auth_debug_log_does_not_leak_secret_or_replay_proof`, a file this move does not
+  touch) read 35/1 once and 36/0 on two clean re-runs; (5) **1** pathline expectation was re-baked — the
+  parent's `service/session.rs:1030` comment cite moved `visitor.rs:156` → `:97`, its token `b8c5f28b2dca68a3`
+  unchanged. Cascade: the records insertion (`TODO.md` 12085 → 12130 lines, +45) re-pointed 58 live cites
+  across 24 citing files, every one exactly +45 onto its text-identical item header (verified by the difflib
+  line map, not by arithmetic), re-baked **1** pathline expectation and re-pinned 8 digests: `ci.yml:167` `scripts/tests/repo-health-fixtures.sh` `c44cd7e3…`, `:419` `scripts/tests/compat-stray-guard.sh` `5712dc13…`, `:1200` `scripts/tests/remote-frps-reap.sh` `e837c8f0…`, `:1567` `scripts/tests/ab-measurable-delta.sh` `eec154e0…`, `:1571` `scripts/ab-measurable-delta.sh` `2ceaac97…`, `:1573` `scripts/ab-matrix.sh` `eb6f71bb…`, `:1772` `scripts/tests/pathline-cite-expectations.txt` `3ce919b3…` (re-bumped a second time after the drift fixes) and `scripts/tests/compat-stray-guard.sh:372` `SCEN10_REGION_SHA` `ff7838b2…`. Gates:
+  the 13 extracted health steps all rc 0 (`HEALTH STEPS: 13 rc=0, 0 failed`: 01 `RESULT: invariants hold`; 02 32 checks + pins 2/2; 03 40 + 4/4; 04 61 + 2/2; 05 40 + 1/1; 06 269 checks; 07 166 + classifier pins; 08 257; 09 37 + decoy witness; 10 101 live cites; 11 60 + 11 canaries; 12 53 + pins 4/4; 13 86 + the real tree's 580 cites 0 violations), with `cargo fmt --all -- --check`, clippy under `-D warnings`, the four `cargo check -p frp-client` shapes and the four test lanes green at the head, and the 26-digest pin audit clean (`pairs checked=20 mismatches=0`).
+
 
 
 
