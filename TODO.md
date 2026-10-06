@@ -7970,6 +7970,67 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   237 headers"; the tree reads **4 open / 234 closed / 238 headers** with `TODO.md` at 11892 (the health-fixture flake
   item filed earlier this round is the fourth), and the adversarial round caught the stale figure.
 
+  **Progress (2026-10-06, code head `4c8cc0f7` on `dsh/m37-p3-visitor-xtcp`, PR #507, based on `2aaeed0c`).** P3
+  seam 2 (`frp-client/src/visitor/xtcp.rs`) landed as four commits on top of seam 1: `224a9637`
+  moved the `XtcpPunchConfig` doc+struct and `do_hole_punch` out of `frp-client/src/visitor.rs` (3215 → **2983**
+  lines) into the new child module `frp-client/src/visitor/xtcp.rs` (**344** lines), `521c3a12` ended the struct
+  window at the doc comment's end instead of inside it, and `7ea97808` split that mixed 12-line comment at its
+  semantic boundary — its three `do_hole_punch` lines (base `:368-370`) now sit above
+  `pub(super) async fn do_hole_punch`, its nine `clamp_hp_timeout` policy lines (base `:371-379`) stayed in the
+  parent above `fn clamp_hp_timeout` (`:341-349`), both byte-identical to their base text. `4c8cc0f7` then
+  reworded the child module's `//!` header to state that split (the one review finding against the branch:
+  six lines replaced, the file still 344 lines, so no line number moved). Four windows, all
+  byte-identical after normalising the added visibility tokens (hash = SHA-1 of the newline-terminated window text; the exact `sed` and the raw head shas are in the plan's seam-2 record): `XtcpPunchConfig` doc+struct base `:339-366`
+  (28 L / 1274 B / `60f5e283…`) → child `:33-60`; punch doc `:368-370` (3 L / 236 B / `c8b93bba…`) → `:62-64`;
+  `do_hole_punch` `:389-668` (280 L / 12217 B / `0c7e6f7e…`) → `:65-344`; clamp doc `:371-379` (9 L / 582 B /
+  `452baefe…`) → parent `:341-349` (raw identical). `clamp_hp_timeout` itself deliberately stayed in the parent
+  because its only non-XTCP user is the `vnet`-gated `hp_timeout_floor_and_cap`, and moving it would have needed
+  a wider token plus a `#[cfg]`-gated re-import for zero cohesion gain — that alternative was executed and
+  measured (+3 lines, +1 token, +1 `#[cfg]`, both checks rc 0) and rejected on the evidence. **The one deviation
+  is visibility, and it is stated, not hidden:** a parent cannot name a child's private items (the first cut
+  failed with 2× `E0603` + 6× `E0616` at the parent `use`), so the struct, its nine fields and the function
+  carry `pub(super)` — 11 tokens — which inside a private child module is exactly `pub(in crate::visitor)`, the
+  original reachable set; `pub`/`pub(crate)` and any re-export were refused, and no code outside
+  `frp-client/src/visitor*` names either item. Seam 1's "zero visibility change" claim therefore does not
+  generalise (its moved item was already `pub(crate)`); the reusable rule for the remaining seams is "the
+  minimum token, stated", and the admitted `module_path!()` side effect is the same — the tracing target becomes
+  `frp_client::visitor::xtcp`, which nothing in the tree filters on. The only added text is module plumbing (the
+  child's `//!` header `:1-29` (the separating blank is `:30`) and `use super::*;` `:31`; the parent's `mod xtcp;` + `use xtcp::{do_hole_punch,
+  XtcpPunchConfig};` at `:161-162`) plus one 79-line test
+  (`tunnel_session_tests::do_hole_punch_precheck_channel_and_cancel_arms`, parent `:2862-2940`), which mutation
+  witnesses M2/M3 bite and which closes the PreCheck closed/backlogged + cancel arm gap seam 1 recorded as
+  unlaned. Coverage and witnesses: `--lib visitor` **29/0** (one new), `xtcp_pair_e2e` **2/0**,
+  `xtcp_visitor_failure_e2e` **3/0**, `stcp_e2e` 5/0, `sudp_e2e` 7/0, the XTCP matrix
+  `compat-test.sh --xtcp-only` **17/0**; M1 (panic at the entry, `xtcp.rs:66`) reds the lib lane **28/1** and
+  `xtcp_pair_e2e` **0/2**, and its `RUST_LOG=frp_client::visitor=debug` trace shows the moved body running under
+  the new target; M2 (`cfg.vtx.is_closed()` → `true`) and M3 (pre_check cancel → `pending()`) each red the new
+  test at parent `:2925`/`:2934`; M4 shortened `frp-core/src/stun.rs:192`'s 5 s timeout in a probe to show the
+  dead-STUN lane's topology reaches two STUN-failure returns the stock timeout outlives. The unlaned branches
+  are enumerated in the batch report (PreCheck timeout/server-error/channel-closed, the STUN cancel and
+  `other_addr = Some` arms, both NatHoleResp error/closed/timeout paths, the `sid`/`p2p_key`/`p2p_sid`/
+  `detect_behavior` None arms, punch-cancel, `session_fut` Err), and `xtcp_visitor_failure_e2e` enters the moved
+  body under M1 yet still passes, so its three cases are not body-discriminating — the reason the new unit test
+  exists. **This seam's census rule:** the child carries **3** real `#[cfg(...)]` (`:55`, `:306`, `:322`) and
+  **0** `#[cfg_attr]` under `grep -Ec '^[[:space:]]*#\[cfg\(' frp-client/src/visitor/xtcp.rs` (the POSIX-BRE
+  spelling of that pattern is unbalanced; use `grep -E`), i.e. exactly the three gates the base window carried —
+  the move adds none. *Corrections this seam forced:* (1) the base's single 12-line comment was attached to
+  `clamp_hp_timeout` although its first three lines describe `do_hole_punch`, so both earlier windows
+  mis-assigned text and the landed split (both halves byte-identical) is the fix; the `~24.8 days` grep
+  therefore has two correct parent totals — anchored doc-form **1**, unanchored **2** (the second is the
+  pre-existing self-contained `//` copy inside `hp_timeout_floor_and_cap`, base `:2279` → head `:1968`, text
+  unchanged), child **0**. (2) This document's own XTCP/quic items cite `frp-client/src/visitor.rs:N` at seam
+  1's base `345776b9`; measured at `2aaeed0c` only `:94-95` and `:1` still resolved, and `:2079`'s `:371` and
+  `:2082`'s `:2900-2901` quote compiler diagnostics from an older tree — documented, not rewritten, because
+  `todo-cite-guard.sh` treats this file as point-in-time; **this seam breaks no cite that was correct at its
+  base.** (3) The plan's P3 tables are point-in-time: the `visitor/xtcp.rs` row's "`do_hole_punch` (395)"
+  overstates this base's 280 raw lines and calls the in-body arms "helpers", and the four-modules table still
+  puts `run_visitor_listener` in `visitor.rs`, where it lived when the plan was written. Cascade: both cite
+  guards were green at the pre-cascade head (**101/0** and **580/0**) because neither scans point-in-time files;
+  the records commit re-points the 58 live TODO cites at or below the insertion point by content and re-bakes
+  the pathline table wherever its pinned token set moves. Gates: fmt/clippy rc 0, the six feature shapes rc 0,
+  the lanes above, `compat-test.sh --xtcp-only` 17/0, `repo-health.sh` → "invariants hold", and the workspace
+  test run per the sweep (the two known host failures only).
+
 
 
 
