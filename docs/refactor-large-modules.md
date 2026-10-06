@@ -21,7 +21,7 @@ lines), yet it contains the largest production function in the repository:
 |---|---|---|---:|
 | 1 | **`run`** | **`frp-server/src/service.rs:308`** | **1291** |
 | 2 | `run_message_loop` | `frp-client/src/service.rs:2890` | 697 |
-| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:954` | 546 |
+| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:515` | 546 |
 | 4 | `authenticate` | `frp-server/src/control/login.rs:617` | 510 |
 | 5 | `run_visitor_listener` | `frp-client/src/visitor.rs:1141` | 502 |
 | 6 | `spawn_work_conn` | `frp-client/src/work_conn.rs:1634` | 469 |
@@ -533,7 +533,7 @@ verify the module rules rather than assume them:
 So: use a `frp-client/src/service/` **directory of children** and **keep
 `SessionCtx` and `Service` in `service.rs`**. This mirrors what `frp-server`
 already does (`service.rs` + `control/*.rs` re-opening `impl Service`; see
-`control/proxy_ops/mod.rs:2385`) — except the server's `AppState` fields happen to be
+`control/proxy_ops/ports.rs:479`) — except the server's `AppState` fields happen to be
 `pub` already, so that precedent does not cover the privacy point.
 
 Corrected spans (the earlier table in this document used distance-to-next-`fn`,
@@ -1098,7 +1098,7 @@ to 3610 lines with no logic and no path change. Re-measured figures are
 8054 / 4444 / 3610 (same boundary as the provenance note above) — not the originally
 recorded 8044 / 4432 / 3612. Seams 1 and 2 then landed as `92a454b3` and
 `a618f281`, taking `mod.rs` to 3049 lines (3043 production); seam 3 landed as `d90a834f`,
-taking it to 2767 lines (2761 production); seam 4 landed as `cbb9d4b3`, taking it to 2439 lines (2433 production).
+taking it to 2767 lines (2761 production); seam 4 landed as `cbb9d4b3`, taking it to 2439 lines (2433 production); seam 5 landed as `359a031e`, taking it to 1938 lines (1930 production).
 
 Two structural facts dominate everything after that:
 
@@ -1119,7 +1119,7 @@ path, so the originals' visibility carries over unchanged. Measured in PR #453 �
 no `unsafe` in the file.
 
 Seams, in the order they should be attempted (line numbers for the remaining rows
-are current `mod.rs` positions at `cbb9d4b3`):
+are current `mod.rs` positions at `359a031e`):
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
@@ -1128,10 +1128,10 @@ are current `mod.rs` positions at `cbb9d4b3`):
 | 2 | `proxy_ops/vhost.rs` — **landed `a618f281`** | `register_http_vhost` (was 968–1213), `register_https_vhost` (was 1221–1441) | low — already fully extracted; no test region references them |
 | 3 | `proxy_ops/tcp_group.rs` — **landed `d90a834f`** | `tcp_group_listener` (was window `mod.rs:2696–2856`, fn at `:2703`), `handle_tcp_group_member_registration` (was window `mod.rs:2858–2977`, fn at `:2867`) | low — leaves, owned args |
 | 4 | `proxy_ops/registry.rs` — **landed `cbb9d4b3`** | `build_proxy_info` (was `mod.rs:407`, now `registry.rs:48`), `register_sk_index` (was `mod.rs:486`, now `:127`), `register_proxy_entry` (was `mod.rs:787–874`, now `:291–378`), the four `rollback_*` (was `mod.rs:505`, `713`, `734`, `756`, now `:146`, `217`, `238`, `260`), `remove_proxy_and_release_client_counts` (was `mod.rs:682–702`, now `:172–206`) | medium-low |
-| 5 | `proxy_ops/ports.rs` | `PortError`, `allocate_proxy_port` (`mod.rs:171–409`), the rollback/free helpers, the reservation pruner + its `impl AppState` (`mod.rs:2374`, `2385`) | medium-low |
-| 6 | `proxy_ops/teardown.rs` | `unregister_control` (`mod.rs:1974–2367`) — one function, 394 lines | medium |
-| 7 | `proxy_ops/listener.rs` | `bind_proxy_listener` (`mod.rs:1733–1755`), `bind_tcp_proxy_with_retry` (`mod.rs:1789–1880`), `setup_proxy_listeners` (`mod.rs:561–944`), `listen_and_proxy` (`mod.rs:1886–1964`) | medium — largest move, 13-arg interface |
-| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (was 2267–2546, 276 lines) inside `handle_new_proxy` (`mod.rs:954–1724`) | **medium — the only seam that rewrites control flow** |
+| 5 | `proxy_ops/ports.rs` — **landed `359a031e`** | `first_bindable` (now `ports.rs:19`), `PortError` (`:51`), `allocate_proxy_port` (was `mod.rs:171–409`, now `:86–324`), the rollback/free helpers (`udp_port_has_other_owner` `:333`, `free_replaced_port` `:365`, `release_udp_port_with_owner_check` `:437` — keeps `pub(crate)`, `proxy_consumes_client_port` `:458`), the reservation pruner + its `impl AppState` (`:468`, `:479`) | medium-low |
+| 6 | `proxy_ops/teardown.rs` | `unregister_control` (`mod.rs:1535–1928`) — one function, 394 lines | medium |
+| 7 | `proxy_ops/listener.rs` | `bind_proxy_listener` (`mod.rs:1294–1316`), `bind_tcp_proxy_with_retry` (`mod.rs:1350–1441`), `setup_proxy_listeners` (`mod.rs:122–505`), `listen_and_proxy` (`mod.rs:1447–1525`) | medium — largest move, 13-arg interface |
+| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (was 2267–2546, 276 lines) inside `handle_new_proxy` (`mod.rs:515–1285`) | **medium — the only seam that rewrites control flow** |
 
 Notes on the hardest ones:
 
