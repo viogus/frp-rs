@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=580 weak=101 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=25dceb806c2128fd ambiguous_set=3343d4d37da5672a excluded_set=9587429438339073
+#   pins: checked=580 weak=101 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=25dceb806c2128fd ambiguous_set=3343d4d37da5672a excluded_set=b83100a52d7a0413
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -161,7 +161,7 @@ frp-core/src/cli.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes
 frp-core/src/cli.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli.rs:3157	266
 frp-core/src/cli.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli.rs:5090-5097	705
 frp-core/src/cli.rs	5095	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:5095	1884
-frp-core/src/cli.rs	590	-	c78320dbc0fcc3e1	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
+frp-core/src/cli.rs	590	-	64f5dcc110f150ef	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
 frp-core/src/cli.rs	6244	6246	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli.rs:6244-6246	399
 frp-core/src/cli.rs	930	-	a298ba38f2e79bca	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:930	2459
 frp-core/src/config/client.rs	256	-	044d5563c14d5e76	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/client.rs:256	483
@@ -391,10 +391,10 @@ frp-server/src/control/proxy_ops/listener.rs	42	-	8e7eb595a8559c8d	-	absolute	do
 frp-server/src/control/proxy_ops/listener.rs	56	57	05623eb437552a51	f8f55adc39482622	absolute	docs/developing.md	frp-server/src/control/proxy_ops/listener.rs:56-57	422
 frp-server/src/control/proxy_ops/listener.rs	587	-	53af932e819d3cb0	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/listener.rs:587	393
 frp-server/src/control/proxy_ops/listener.rs	70	-	f29f2238704ca3eb	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/listener.rs:70	418
-frp-server/src/control/proxy_ops/mod.rs	119	-	554a88c364372fd9	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:119	285
-frp-server/src/control/proxy_ops/mod.rs	214	-	58c3468d66d09c7d	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:214	333
-frp-server/src/control/proxy_ops/mod.rs	298	299	bbb5660d746e725b	c9a9807e0ce10e25	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:298-299	353
-frp-server/src/control/proxy_ops/mod.rs	379	-	d109d40073e9fe4c	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:379	298
+frp-server/src/control/proxy_ops/mod.rs	122	-	554a88c364372fd9	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:122	285
+frp-server/src/control/proxy_ops/mod.rs	217	-	58c3468d66d09c7d	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:217	333
+frp-server/src/control/proxy_ops/mod.rs	301	302	bbb5660d746e725b	c9a9807e0ce10e25	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:301-302	353
+frp-server/src/control/proxy_ops/mod.rs	382	-	d109d40073e9fe4c	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/mod.rs:382	298
 frp-server/src/control/proxy_ops/ports.rs	375	-	54f58e12d1e46b96	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/ports.rs:375	351
 frp-server/src/control/proxy_ops/ports.rs	458	-	2779fffa78efdc0d	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/ports.rs:458	329
 frp-server/src/control/proxy_ops/ports.rs	86	-	6e2e7df7014e2ec5	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/ports.rs:86	297

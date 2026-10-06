@@ -21,7 +21,7 @@ lines), yet it contains the largest production function in the repository:
 |---|---|---|---:|
 | 1 | **`run`** | **`frp-server/src/service.rs:308`** | **1291** |
 | 2 | `run_message_loop` | `frp-client/src/service.rs:2890` | 697 |
-| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:119` | 546 |
+| 3 | `handle_new_proxy` | `frp-server/src/control/proxy_ops/mod.rs:122` | 546 |
 | 4 | `authenticate` | `frp-server/src/control/login.rs:617` | 510 |
 | 5 | `run_visitor_listener` | `frp-client/src/visitor.rs:1141` | 502 |
 | 6 | `spawn_work_conn` | `frp-client/src/work_conn.rs:1634` | 469 |
@@ -1131,7 +1131,7 @@ are current `mod.rs` positions at `359a031e`):
 | 5 | `proxy_ops/ports.rs` — **landed `359a031e`** | `first_bindable` (now `ports.rs:19`), `PortError` (`:51`), `allocate_proxy_port` (was `mod.rs:171–409`, now `:86–324`), the rollback/free helpers (`udp_port_has_other_owner` `:333`, `free_replaced_port` `:365`, `release_udp_port_with_owner_check` `:437` — keeps `pub(crate)`, `proxy_consumes_client_port` `:458`), the reservation pruner + its `impl AppState` (`:468`, `:479`) | medium-low |
 | 6 | `proxy_ops/teardown.rs` — **landed PR #514** (code `10fd4809`) | `unregister_control` (was `mod.rs:1527–1928`, now `teardown.rs:19–420`, fn at `:27`) — one function, 394 code lines (402 with its doc) | medium |
 | 7 | `proxy_ops/listener.rs` — **landed** | `setup_proxy_listeners` (was `mod.rs:112–508`, now `listener.rs:29–425`, fn at `:42`), `bind_proxy_listener` (`:434`), `TCP_AUTO_BIND_MAX_ATTEMPTS` (`:463`), `bind_tcp_proxy_with_retry` (`:490`), `listen_and_proxy` (was `mod.rs:1290–1528`, now `listener.rs:427–665`, fn at `:587`) | medium — largest move, 13-arg interface |
-| 8 | `proxy_ops/tcpmux.rs` | the inline tcpmux arm (now `mod.rs:541–816`, 276 lines) inside `handle_new_proxy` (`mod.rs:119–889`) | **medium — the only seam that rewrites control flow** |
+| 8 | `proxy_ops/tcpmux.rs` — **landed PR #516** | the inline tcpmux arm (was `mod.rs:541–816`, 276 lines) became `register_tcpmux_proxy` (`tcpmux.rs:25`, 309-line module) called from `handle_new_proxy` (`mod.rs:122`) | **medium — the only seam that rewrites control flow** |
 
 Notes on the hardest ones:
 
