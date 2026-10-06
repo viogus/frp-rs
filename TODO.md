@@ -6947,10 +6947,10 @@ nothing about whether the described behaviour still holds.
   carried the authoritative version. The other **8 carry 13 `file:line` anchors
   naming the symbol**, each verified by opening that exact line in this worktree
   (`ProxyConfig` at `frp-core/src/config/client.rs:585`; `handle_new_proxy`
-  `proxy_ops/mod.rs:518`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
+  `proxy_ops/mod.rs:119`; `register_proxy_entry` `proxy_ops/registry.rs:291`;
   `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/registry.rs:127`;
-  `setup_proxy_listeners` `proxy_ops/mod.rs:125`; `listen_and_proxy`
-  `proxy_ops/mod.rs:1450`; `ProxyManager` `proxy.rs:116`; `VhostManager`
+  `setup_proxy_listeners` `proxy_ops/listener.rs:42`; `listen_and_proxy`
+  `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
   `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
@@ -8271,6 +8271,22 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `:8363` and `:8422`). The 58-cite `TODO.md` cascade is applied. `pathline-cite-guard` was red at
   the code head and is re-baked to 580/0 (weak anchors 103 → 101); the set digest moved with it.
 
+  **Seam 7 landed (2026-10-07, PR #515 `dsh/m44-p4-listener` @ `ccf2da75`, base `7fe2c01c`) — `proxy_ops/listener.rs`.**
+  The per-proxy listener half of `frp-server/src/control/proxy_ops/mod.rs` moved into a new **child** module
+  `frp-server/src/control/proxy_ops/listener.rs` (665 lines) as two byte-identical windows: W1
+  `setup_proxy_listeners` base `mod.rs:112-508` (397 lines / 19 947 B / sha1 `97b3bd7c…`) → `listener.rs:42-425`,
+  and W2 `bind_proxy_listener` + `TCP_AUTO_BIND_MAX_ATTEMPTS` + `bind_tcp_proxy_with_retry` + `listen_and_proxy`
+  base `:1290-1528` (239 lines / 11 702 B / sha1 `6bf84a44…`) → `listener.rs:434-665`; the only byte change is
+  `pub(super) ` on `setup_proxy_listeners`. The parent went 1538 → **899** lines, gaining `mod listener;`,
+  `use listener::setup_proxy_listeners;` and `#[cfg(test)] use listener::listen_and_proxy;`; its prelude lost
+  `TcpListener`/`UdpSocket`/`oneshot`/`debug`/`format_socket_addr`/`IoStream` plus the `tcp_group_listener`
+  and `rollback_{tcp,udp}_bind_failure` re-imports. Mutation **M1** (a `panic!` at the function entry,
+  `listener.rs:56`) reds **26** lib tests, so the moved body is exercised. Code-head gates: fmt;
+  `clippy -D warnings` (0, all-targets/all-features); `tiny`/`micro`; `cargo test -p frp-server --all-features`
+  **778/0**; `repo-health.sh` invariants; `todo-cite-guard` 101/0. **All cites into `mod.rs`/`listener.rs` were
+  re-pointed by content** under the explicit map (the `setup_proxy_listeners` family now cites `listener.rs`),
+  and `pathline-cite-guard` is re-baked to 580/0.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8360,7 +8376,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   - **`#[path]` ordering.** The attribute is collected only from its own line between
     `#[cfg(test)]` and the `mod` line. `#[cfg(test)] #[path = "x.rs"] mod x;` on one line (not even
     seen as a declaration) and `#[path]` *before* `#[cfg(test)]` both leave the target at
-    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:1533-1535`)
+    4 / 4 / 0. The tree's only `#[path]` site (`frp-server/src/control/proxy_ops/mod.rs:894-896`)
     is in the supported order.
   - **The name rule is unconditional.** `is_test_file()` excludes `tests.rs` / `test.rs` /
     `*_tests.rs` / `*_test.rs` by name alone (the item asks for the pattern; the script cannot tell
@@ -8419,7 +8435,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   M1–M5 still pass); `#[cfg(all(test, …))]` is recognised. The fourth (`#[path]`) is closed for the one-line,
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
-  `frp-server/src/control/proxy_ops/mod.rs:1533-1535`, is in the supported order. The item's "the tree's only
+  `frp-server/src/control/proxy_ops/mod.rs:894-896`, is in the supported order. The item's "the tree's only
   `#[path]` site" is loose: `frp-server/src/vhost.rs:24` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
