@@ -8418,16 +8418,19 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
 
   **P7 seam 5 landed (2026-10-07, PR #525 `dsh/m54-p7-https` @ `bd250060`, base `d1757f53`) — `vhost/https.rs`.**
   One byte-identical window of `frp-server/src/vhost.rs` moved into the child module
-  `frp-server/src/vhost/https.rs` (379 lines, window at `https.rs:14-379`): base `vhost.rs:843-1208`
-  (366 lines / sha256 `3fc4d90d…`) — the `#[cfg(feature = "tls")]` HTTPS/SNI listener and the
+  `frp-server/src/vhost/https.rs` (383 lines, window at `https.rs:18-383`): base `vhost.rs:843-1208`
+  (366 lines / sha256 `5641e3cb…`) — the `#[cfg(feature = "tls")]` HTTPS/SNI listener and the
   `#[cfg(not(feature = "tls"))]` same-signature stub (moved as a pair), `read_client_hello_prefix`,
-  `extract_sni_from_client_hello`. The only byte changes are the module header and the required
-  imports (`tokio::io::AsyncWriteExt`, `tokio::net::TcpListener`, `tracing::{debug, info, instrument,
-  warn}`, `crate::service::InternalMsg`); the parent drops its now-unused `#[cfg(feature = "tls")]`
+  `extract_sni_from_client_hello`. The only byte changes are the module header, the four `#[cfg(feature = "tls")]`-gated imports
+  (`tokio::io::AsyncWriteExt`, `tokio::net::TcpListener`, `tracing::{debug, info, instrument, warn}`,
+  `crate::service::InternalMsg` — all unused by the `not(tls)` stub, so gating keeps micro/tiny clean
+  under `-D warnings`), and consequently the moved `#[instrument]` target (`frp_server::vhost` →
+  `frp_server::vhost::https`); the parent drops its now-unused `#[cfg(feature = "tls")]`
   `AsyncWriteExt` import and re-exports `run_vhost_https_listener` (the `service/listeners.rs:1132`
   call) and `extract_sni_from_client_hello` (`vhost/tests.rs` + `frp-server/tests/vhost_https_sni.rs`).
   Parent 1211 → **840** lines. This completes P7. Mutation: a `panic!` at
-  `extract_sni_from_client_hello` reds **3** vhost tests. Gates: fmt; `clippy -D warnings` (0);
+  `extract_sni_from_client_hello` reds **7** tests (3 vhost lib tests + 4 integration tests across two
+  binaries). Gates: fmt; `clippy -D warnings` (0);
   tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed into
   `https.rs`; `pathline-cite-guard` 580/0.
 

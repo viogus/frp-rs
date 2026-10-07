@@ -1531,7 +1531,7 @@ Remaining seams, in order:
 | 2 | `src/vhost/head.rs` — **landed PR #522** | head parsing / request line / byte sets / basic-auth extraction / authority + host extraction (was `vhost.rs:1846–2329` + `:2845–3068`, 708 lines, now `head.rs:8–491` + `:493–716`); parent 3179 → 2477 | low |
 | 3 | `src/vhost/router.rs` — **landed PR #523** | routing table: `VhostRoute`, `VhostRouteMatch`, `RouterConfigConflict`, `find_matching_route`, `get_locked`, `sort_by_longest_location`, `VhostTables`, `VhostManager` (was `vhost.rs:35–581`, 547 lines, now `router.rs:14–564`); parent 2477 → 1932 | low-medium |
 | 4 | `src/vhost/forward.rs` — **landed PR #524** | `resolve_vhost_request`, `VhostForward`, `VhostResolveError`, rewrite/inject (was `vhost.rs:772–984` + `:1309–1821`, 726 lines, now `forward.rs:10–222` + `:224–736`); parent 1932 → 1211 | low-medium |
-| 5 | `src/vhost/https.rs` — **landed PR #525** | HTTPS/SNI listener + not-TLS stub (**moved as a pair**), `read_client_hello_prefix`, `extract_sni_from_client_hello` (was `vhost.rs:843–1208`, 366 lines, now `https.rs:14–379`); parent 1211 → 840. **P7 complete** | medium |
+| 5 | `src/vhost/https.rs` — **landed PR #525** | HTTPS/SNI listener + not-TLS stub (**moved as a pair**), `read_client_hello_prefix`, `extract_sni_from_client_hello` (was `vhost.rs:843–1208`, 366 lines, sha256 `5641e3cb…`, now `https.rs:18–383`); parent 1211 → 840; moved `#[instrument]` target is now `frp_server::vhost::https`. **P7 complete** | medium |
 
 **Seam 2 landed (2026-10-07, PR #522) — `vhost/head.rs`.** Two byte-identical windows (base
 `vhost.rs:1846–2329`, 484 lines, sha1 `340883c4…`; and `:2845–3068`, 224 lines, sha1 `efe43f17…`) →
@@ -1558,11 +1558,11 @@ under `#[cfg(test)]`, `VhostForward`/`inject_vhost_request_headers`/`rewrite_hos
 `panic!` at `resolve_vhost_request` reds 8 vhost tests. Seam 5 (`https.rs`) remains.
 
 **Seam 5 landed (2026-10-07, PR #525) — `vhost/https.rs`.** One byte-identical window (base
-`vhost.rs:843–1208`, 366 lines, sha256 `3fc4d90d…`) → `https.rs:14–379`, carrying the TLS listener and
+`vhost.rs:843–1208`, 366 lines, sha256 `5641e3cb…`) → `https.rs:18–383`, carrying the TLS listener and
 its `#[cfg(not(feature = "tls"))]` stub as a pair plus `read_client_hello_prefix` and
 `extract_sni_from_client_hello`; the parent drops its now-unused tls-gated `AsyncWriteExt` import and
-re-exports the listener (service call site) and the SNI parser (tests). Mutation: a `panic!` at
-`extract_sni_from_client_hello` reds 3 vhost tests. **This completes P7 — `vhost.rs` is now 840 lines
+re-exports the listener (service call site) and the SNI parser (tests). The four imports are `#[cfg(feature = "tls")]`-gated (unused by the `not(tls)` stub). Mutation: a
+`panic!` at `extract_sni_from_client_hello` reds 7 tests (3 lib + 4 integration). **This completes P7 — `vhost.rs` is now 840 lines
 (was 3179 at seam 1), with `vhost/{head,router,forward,https,tests}.rs`.**
 
 External re-export paths that must be preserved (each verified against a caller):

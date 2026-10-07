@@ -8,11 +8,11 @@
 // This file is mixed, so the gate is per item rather than whole-file:
 // `test_hello_construction_extracts_sni` needs no feature — it exercises
 // `frp_server::vhost::extract_sni_from_client_hello`
-// (frp-server/src/vhost/https.rs:277), which is not feature-gated — while the three
+// (frp-server/src/vhost/https.rs:281), which is not feature-gated — while the three
 // e2e cases connect to the HTTPS vhost port, which is only served under `tls`:
 // `run_vhost_https_listener`'s real body is `#[cfg(feature = "tls")]`
-// (frp-server/src/vhost/https.rs:21) while the `not(feature = "tls")` stub
-// (frp-server/src/vhost/https.rs:264) never binds and returns
+// (frp-server/src/vhost/https.rs:25) while the `not(feature = "tls")` stub
+// (frp-server/src/vhost/https.rs:268) never binds and returns
 // `Err("TLS feature not enabled")`; the call site in the service is not itself
 // gated (the `crate::vhost::run_vhost_https_listener(...)` call is at
 // frp-server/src/service/listeners.rs:1132). Measured with no features:

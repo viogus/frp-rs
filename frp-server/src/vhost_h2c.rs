@@ -129,7 +129,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
 /// `Instant::now() + from_secs` idiom). An unauthenticated client that sends
 /// the 24-byte preface and then goes silent must not park a task, an fd, and
 /// — when `max_connections` is configured — a `conn_semaphore` permit (held
-/// by `let _permit = permit;` in the spawned task at https.rs:64) forever.
+/// by `let _permit = permit;` in the spawned task at https.rs:68) forever.
 /// Only the pre-first-stream phase is bounded: once the first stream is
 /// established, later accepts are deliberately NOT deadlined, since a
 /// legitimately idle keep-alive h2c connection between requests is normal

@@ -5,10 +5,14 @@
 //! `run_vhost_https_listener` (service listener call site) and
 //! `extract_sni_from_client_hello` (`vhost/tests.rs` and the e2e test).
 
+#[cfg(feature = "tls")]
 use tokio::io::AsyncWriteExt;
+#[cfg(feature = "tls")]
 use tokio::net::TcpListener;
+#[cfg(feature = "tls")]
 use tracing::{debug, info, instrument, warn};
 
+#[cfg(feature = "tls")]
 use crate::service::InternalMsg;
 
 /// Run an HTTPS VHost listener on the given address.
