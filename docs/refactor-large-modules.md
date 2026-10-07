@@ -1382,6 +1382,15 @@ low for the work-conn pair.
 exact error text; run the OIDC scenarios specifically
 (`compat-test.sh --test go-to-rust-oidc-proxy`).
 
+**P5 client landed (2026-10-07, PR #517) — `work_conn/udp.rs`.** The UDP/SUDP work-connection
+family moved out of `frp-client/src/work_conn.rs` into the child module
+`frp-client/src/work_conn/udp.rs` as one moved window (base `work_conn.rs:411-1442`, 1032 lines, sha1
+`eadd1c10…` → `udp.rs:9-1043`), differing only by `pub(super)` on the 17 declarations the inline test
+module still drives plus one rustfmt signature reflow; parent 3030 → 2006 lines. The moved log sites
+now render `target: frp_client::work_conn::udp` (`RUST_LOG` prefix matching still covers
+`frp_client::work_conn=…`). Mutation witness: `UDP_SESSION_IDLE_TIMEOUT` 30 s → 31 s reds
+`udp_session_idle_timeout_is_go_parity_30s`.
+
 ### P6 — `frp-server/src/control/bridge.rs` (3323 production lines, 41 production fns, 0 cfg gates)
 
 **First, a correction to an assumption this document started with:** the actual
