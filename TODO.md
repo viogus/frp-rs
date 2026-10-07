@@ -8364,8 +8364,9 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `bridge.rs:717-972` (256 lines / sha1 `8ebfb378…`) → `sudp.rs:5-260` — with only `pub(super)` added
   (its sole caller is the parent's `run_work_bridge`, now `bridge.rs:313`). Parent 975 → **721** lines.
   Gates: fmt; `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
-  `repo-health.sh`. **Coverage caveat kept open**: no unit test reaches the mixed-encoding routing this
-  function exists for, so the evidence is byte identity + the suite, not a mutation witness. Cites
+  `repo-health.sh`. No unit test calls the function directly, but the mixed-encoding routing **is**
+  compat-covered (`go-to-rust-sudp-mixed` / `go-to-rust-sudp-v2-v1`); the one moved `warn!` now renders
+  `target: frp_server::control::bridge::sudp`. Cites
   re-pointed (`run_work_bridge` → `bridge.rs:313`); `pathline-cite-guard` re-baked to 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the

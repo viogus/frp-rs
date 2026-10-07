@@ -1443,12 +1443,14 @@ re-exports the already-`pub(crate)` `assign_work_to_proxy` for `pool.rs` and imp
 `log_bridge_panic` stays in `bridge.rs` (it is used by the `assign.rs` spawn wrapper and `udp.rs`),
 so this seam is three windows, not two. The moved `debug!`/`warn!` sites now render
 `target: frp_server::control::bridge::udp`; `RUST_LOG` parent directives still match.
+`assign_udp_work_conn` keeps `pub(crate)` + parent re-export.
 
 **Seam 4 landed (2026-10-07, PR #521) — `bridge/sudp.rs`.** `run_sudp_message_bridge`
 (base `bridge.rs:717–972`, 256 lines, sha1 `8ebfb378…` → `sudp.rs:5–260`) moved with only
-`pub(super)` added; its only caller is the parent's `run_work_bridge` at `bridge.rs:313`.
-The gap this seam records stays open: no unit test reaches the mixed-encoding routing, so the
-evidence is byte identity plus the full suite, not a mutation witness. `assign_udp_work_conn` keeps `pub(crate)` + parent re-export.
+`pub(super)` added; its only caller is the parent's `run_work_bridge` at `bridge.rs:313`. No unit
+test calls the function directly, but the mixed-encoding routing it exists for **is** compat-covered:
+`go-to-rust-sudp-mixed` and `go-to-rust-sudp-v2-v1` both drive it (the "untested" caveat elsewhere
+in this section was wrong). The one moved `warn!` now renders `target: frp_server::control::bridge::sudp`.
 
 **Do not split `poll_read`** (905–1543). It is 236 code lines inside one `AsyncRead`
 state machine whose four sections (complete gate 916–951, emission gate 977–1010,
@@ -1458,10 +1460,10 @@ filled the caller's `ReadBuf` must never return `Pending` (comment 989–1009).
 Extracting helpers would have to thread that invariant through a params struct;
 that is how this file's historical bugs happened.
 
-**Verification gap worth fixing before seam 4:** `run_sudp_message_bridge` has no
-unit test and, per `scripts/compat-test.sh`, only the same-encoding go→rust SUDP
-path is covered — the mixed-codec routing at 2461–2490 is untested. A pure move is
-still safe, but there is nothing to catch a mistake in the moved code.
+**Coverage (seam 4):** `run_sudp_message_bridge` has no unit test that calls it
+directly, but the mixed-codec routing it exists for **is** exercised end to end by
+`scripts/compat-test.sh`'s `go-to-rust-sudp-mixed` and `go-to-rust-sudp-v2-v1`
+(registered in the V2 block; the Rust frps logs the message-level bridge on both).
 
 Hazards to preserve exactly (from a read of the file):
 
@@ -1625,8 +1627,8 @@ Every seam is a **pure move**. The bar:
    covers only the SSH gateway's banner and auth-rejection surface
    (`scripts/compat-test.sh:7871` and `:7933`, both Rust-frps; the `:8001` scenario is
    Go-frps), so the decisive gates are `frp-server/tests/ssh_gateway.rs` (17 tests, 13
-   through `Service::run`) and the 70 in-file unit tests under `frp-server/src/ssh_gateway/`. Likewise
-   `run_sudp_message_bridge` has no compat coverage for the mixed-codec path.
+   through `Service::run`) and the 70 in-file unit tests under `frp-server/src/ssh_gateway/`. (`run_sudp_message_bridge`'s mixed-codec
+   path, by contrast, IS compat-covered by `go-to-rust-sudp-mixed` / `go-to-rust-sudp-v2-v1`.)
 6. For `bridge.rs` seams: `scripts/ab-matrix.sh` if the move touches anything on
    the pump path. A pure file move should not, but verify rather than assume.
 7. Prefer `git mv`-style moves that keep the diff *visibly* a move, so a reviewer

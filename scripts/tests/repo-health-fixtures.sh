@@ -49,7 +49,7 @@ set -uo pipefail
 # path resolution, the two preflights and the first `ok`/`bad` — so an early
 # `exit 0` anywhere below it still has to answer to the floor. `MIN_CHECKS` is
 # the measured check count of a green run; with an exact floor, emptying any
-# scenario body drops the count below it and reds (TODO.md:10472).
+# scenario body drops the count below it and reds (TODO.md:10473).
 #
 # Three limits are stated rather than hidden:
 #   * a floor of 0 (or an unset floor, or a zero-padded all-zero floor such as
