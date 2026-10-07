@@ -16,11 +16,11 @@
 //! gateway feature. Monitor upstream for fix.
 
 #[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 mod args;
 use args::{parse_ssh_args, ssh_gateway_usage, ParsedProxyArgs};
 #[cfg(test)]
 use args::{shell_split, VALID_PROXY_TYPES};
-use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 use dashmap::DashMap;

@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=580 weak=100 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=a5b04408e5558536 ambiguous_set=3343d4d37da5672a excluded_set=d7343d3b54acbcaf
+#   pins: checked=580 weak=100 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=d7a81b92acd4d9b1 ambiguous_set=3343d4d37da5672a excluded_set=d7343d3b54acbcaf
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -462,7 +462,7 @@ frp-server/src/service.rs	961	-	53c310b95373c046	-	shorthand	frp-server/tests/se
 frp-server/src/service.rs	994	-	cb97f3bf1f5c9b33	-	absolute	frp-server/tests/server_protocol.rs	frp-server/src/service.rs:994	678
 frp-server/src/service/listeners.rs	1132	-	7bcb2bb332bc5f74	-	absolute	frp-server/tests/vhost_https_sni.rs	frp-server/src/service/listeners.rs:1132	18
 frp-server/src/service/listeners.rs	328	828	d40f8949da981d8a	d10b36aa74a59bcf	absolute	CLAUDE.md	frp-server/src/service/listeners.rs:328-828	189
-frp-server/src/ssh_gateway/args.rs	156	-	6259e6f69cdc367a	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:156	250
+frp-server/src/ssh_gateway/args.rs	163	-	6259e6f69cdc367a	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:163	250
 frp-server/src/ssh_gateway/args.rs	296	-	3fe2fc211efa85e3	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:296	244
 frp-server/src/ssh_gateway/args.rs	335	469	47052f2fbf3be8c7	358ba3f2223784d8	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:335-469	245
 frp-server/src/ssh_gateway/args.rs	373	-	5a0b431903afdf69	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:373	248

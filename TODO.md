@@ -8438,7 +8438,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   The SSH remote-command argument parser moved out of `frp-server/src/ssh_gateway.rs` into the child
   module `frp-server/src/ssh_gateway/args.rs` (739 lines, window at `args.rs:7-739`) as one
   byte-identical window: base `ssh_gateway.rs:33-765` (733 lines / sha256 `3e067dad…`) —
-  `ParsedProxyArgs` + its 25 fields, `parse_ssh_args`, `parse_long_flag`, `parse_short_flags`,
+  `ParsedProxyArgs` + its 23 fields, `parse_ssh_args`, `parse_long_flag`, `parse_short_flags`,
   `FlagScope`, `FlagSpelling`, `FLAG_SPELLINGS`, `flag_spelling`, `short_flag_target`, `is_bool_flag`,
   `apply_flag_value`, `parse_bool_value`, `parse_kv_pairs`, `parse_port_value`, `split_csv`,
   `default_proxy_name`, `ssh_gateway_usage`, `VALID_PROXY_TYPES`, `shell_split`. The only byte changes

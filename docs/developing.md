@@ -247,7 +247,7 @@ also carries a scope, matched by `FlagScope::allows`
 `FlagScope::Types`. `remote_port` is scoped to `&["tcp"]`
 (`frp-server/src/ssh_gateway/args.rs:373`), so a Rust-only TCP-like type added to list 4
 is *accepted* over SSH but cannot set `remote_port` — the out-of-scope flag is
-rejected as `unknown flag: --remote_port` (`frp-server/src/ssh_gateway/args.rs:156`),
+rejected as `unknown flag: --remote_port` (`frp-server/src/ssh_gateway/args.rs:163`),
 exactly as if Go had never registered it. Add your type to the scope as well as the
 allow-list.
 
