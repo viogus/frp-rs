@@ -1602,7 +1602,7 @@ clean seam.
 | 1 | `ssh_gateway/args.rs` — **landed PR #526** | the whole 33–765 arg-parsing cluster (15 fns, `ParsedProxyArgs` + 23 fields, `FLAG_SPELLINGS`) (was `ssh_gateway.rs:33–765`, 733 lines, now `args.rs:7–739`); parent 2749 → 2019 | **cleanest seam in the file**: zero references to the rest of the module; deps are only `rand` and `frp_core::hex_encode` |
 | 2 | `ssh_gateway/virtual_control.rs` — **landed PR #527** | `VirtualControl` + `WorkConnRequest` + `channel` (was `ssh_gateway.rs:37–181`, 145 lines, now `virtual_control.rs:11–155`) | zero session/listener deps; parent 2019 → 1875 |
 | 3 | `ssh_gateway/stream.rs` — **landed PR #528** | `CloseableSshStream`, `CloseState`, `SshStreamCloser`, `terminate_ssh_session` (was `ssh_gateway.rs:1193–1314`, 122 lines, now `stream.rs:14–135`) | struct + its 4 `impl` blocks (3 trait) must stay in one file; parent 1875 → 1750 |
-| 4 | `ssh_gateway/keys.rs` | `parse_authorized_keys`, `parse_authorized_key_line`, `load_or_generate_host_key` | `#[cfg(unix)] PermissionsExt` and `Path` imports must travel |
+| 4 | `ssh_gateway/keys.rs` — **landed PR #529** | `parse_authorized_keys`, `parse_authorized_key_line`, `load_or_generate_host_key` (was `ssh_gateway.rs:1206–1312` + `:1686–1736`, 158 lines, now `keys.rs:12–118` + `:120–170`) | `#[cfg(unix)] PermissionsExt` and `Path` imports must travel; parent 1750 → 1589 |
 | 5 | `ssh_gateway/frame.rs` | `build_v1_frame_from_args` + 5 helpers | single consumer |
 | 6 | `ssh_gateway/bridge.rs` | `handle_work_conn_requests`, `bridge_ssh_side` | add the duplicated map type aliases here first |
 | 7 | `ssh_gateway/session.rs` | `SshSession` + `impl Handler` (12 methods) + `write_text_and_close` | **last**; needs six `pub(super)` widenings for surviving tests |
@@ -1624,6 +1624,11 @@ no visibility changes (both types stay `pub`, the parent `pub use`s them). Mutat
 `pub(super)` on the stream types and `terminate_ssh_session` (the sibling `tests` module reads
 `SshStreamCloser`'s tuple field and methods). Mutation: a `panic!` at `terminate_ssh_session` reds
 3 lib tests. Seams 4–7 remain.
+
+**Seam 4 landed (2026-10-07, PR #529) — `ssh_gateway/keys.rs`.** Two byte-identical windows (base
+`ssh_gateway.rs:1206–1312`, 107 lines, sha256 `ab8a1230…`; and `:1686–1736`, 51 lines, sha256
+`e0e57f41…`) → `keys.rs:12–118` / `:120–170`. Mutation: `panic!` at `parse_authorized_keys` reds 2
+lib tests, at `load_or_generate_host_key` reds 3. Seams 5–7 remain.
 
 **Do not** split `impl Handler for SshSession` (289–883): one trait impl cannot
 span files, and extracting the auth methods is a ~120-line body refactor with
