@@ -1604,7 +1604,7 @@ clean seam.
 | 3 | `ssh_gateway/stream.rs` — **landed PR #528** | `CloseableSshStream`, `CloseState`, `SshStreamCloser`, `terminate_ssh_session` (was `ssh_gateway.rs:1193–1314`, 122 lines, now `stream.rs:14–135`) | struct + its 4 `impl` blocks (3 trait) must stay in one file; parent 1875 → 1750 |
 | 4 | `ssh_gateway/keys.rs` — **landed PR #529** | `parse_authorized_keys`, `parse_authorized_key_line`, `load_or_generate_host_key` (was `ssh_gateway.rs:1206–1312` + `:1686–1736`, 158 lines, now `keys.rs:12–118` + `:120–170`) | `#[cfg(unix)] PermissionsExt` and `Path` imports must travel; parent 1750 → 1589 |
 | 5 | `ssh_gateway/frame.rs` — **landed PR #530** | `build_v1_frame_from_args` + 5 helpers (was `ssh_gateway.rs:148–287`, 140 lines, now `frame.rs:12–151`) | single consumer; parent 1589 → 1454 |
-| 6 | `ssh_gateway/bridge.rs` | `handle_work_conn_requests`, `bridge_ssh_side` | add the duplicated map type aliases here first |
+| 6 | `ssh_gateway/bridge.rs` — **landed PR #531** | `handle_work_conn_requests`, `bridge_ssh_side` (was `ssh_gateway.rs:784–975`, 192 lines, now `bridge.rs:17–208`) | parent 1454 → 1263 |
 | 7 | `ssh_gateway/session.rs` | `SshSession` + `impl Handler` (12 methods) + `write_text_and_close` | **last**; needs six `pub(super)` widenings for surviving tests |
 | — | `preauth.rs` | 53 lines | **skip** unless `run` is edited anyway |
 
@@ -1634,6 +1634,12 @@ lib tests, at `load_or_generate_host_key` reds 3. Seams 5–7 remain.
 `ssh_gateway.rs:148–287`, 140 lines, sha256 `d55d34ef…`) → `frame.rs:12–151`; the parent narrows its
 `frp_core::msg` import to `NewProxyResp` and adds a `#[cfg(test)] FrpMessage`. Mutation: a `panic!` at
 `build_v1_frame_from_args` reds 3 lib tests. Seams 6–7 remain.
+
+**Seam 6 landed (2026-10-07, PR #531) — `ssh_gateway/bridge.rs`.** One byte-identical window (base
+`ssh_gateway.rs:784–975`, 192 lines, sha256 `1d84a33e…`) → `bridge.rs:17–208`; `pub(super)` only on
+`handle_work_conn_requests`. Mutation: a `panic!` there reds the e2e
+`test_ssh_gateway_reverse_forwarding_roundtrip` (the lib tests do not drive the ReqWorkConn lane).
+Seam 7 remains.
 
 **Do not** split `impl Handler for SshSession` (289–883): one trait impl cannot
 span files, and extracting the auth methods is a ~120-line body refactor with
