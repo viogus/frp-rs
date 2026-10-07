@@ -4022,7 +4022,7 @@ Three build-tier facts the tier names alone would hide. The dashboard is
 is default-on (`frp-server/Cargo.toml:46`). The `http-proxy` feature is
 **default-on** (`frp-server/Cargo.toml:45`), so the server-side
 `[[httpPlugins]]` manager is Keep; that same feature gates the frozen h2c module
-(`frp-server/src/vhost.rs:25`), so h2c's freeze is a code-review rule rather
+(`frp-server/src/vhost.rs:32`), so h2c's freeze is a code-review rule rather
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener

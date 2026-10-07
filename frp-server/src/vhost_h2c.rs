@@ -125,11 +125,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
 ///
 /// The handshake and the first accept are bounded by a single absolute
 /// `vhost_http_timeout` deadline — the exact parallel of the HTTP/1.1 head
-/// read at vhost.rs:193-203 (same `<= 0 → 60s` Go floor, same
+/// read at vhost.rs:200-210 (same `<= 0 → 60s` Go floor, same
 /// `Instant::now() + from_secs` idiom). An unauthenticated client that sends
 /// the 24-byte preface and then goes silent must not park a task, an fd, and
 /// — when `max_connections` is configured — a `conn_semaphore` permit (held
-/// by `let _permit = permit;` in the spawned task at vhost.rs:1100) forever.
+/// by `let _permit = permit;` in the spawned task at vhost.rs:893) forever.
 /// Only the pre-first-stream phase is bounded: once the first stream is
 /// established, later accepts are deliberately NOT deadlined, since a
 /// legitimately idle keep-alive h2c connection between requests is normal
@@ -142,7 +142,7 @@ pub(crate) async fn serve_h2c_request<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Same absolute-deadline idiom as the HTTP/1.1 head read (vhost.rs:193-
+    // Same absolute-deadline idiom as the HTTP/1.1 head read (vhost.rs:200-
     // 740): the whole handshake must complete within vhost_http_timeout, not
     // a per-read timeout a drip-feeding client could stretch indefinitely.
     // `<= 0` floors at 60s (Go parity, shared clamp in vhost.rs).
@@ -161,7 +161,7 @@ pub(crate) async fn serve_h2c_request<S>(
                 // cap per-connection memory.
                 .max_concurrent_streams(100)
                 // Cap the header block at the same 4096-byte bound the HTTP/1.1
-                // head path enforces (vhost.rs:342, 357). h2's 16 MiB default
+                // head path enforces (vhost.rs:349, 364). h2's 16 MiB default
                 // × 100 concurrent streams would otherwise leave an
                 // unauthenticated client a ~1.6 GiB per-connection memory ceiling
                 // to park on.
@@ -384,7 +384,7 @@ async fn handle_stream(
     let (client, control) = tokio::io::duplex(128 * 1024);
     // send().await: backpressure is correct — a full control channel must
     // not silently drop a user connection (the HTTP/1.1 path uses the same
-    // pattern). Bounded (vhost.rs:625-641 parity): a control handler that
+    // pattern). Bounded (vhost.rs:632-648 parity): a control handler that
     // stops draining must not pin this task + fd + permit forever; after
     // CTL_SEND_TIMEOUT the send is abandoned and the h2 stream answers the
     // backend-unreachable 404 (FIX 2, see the timeout arm below).
