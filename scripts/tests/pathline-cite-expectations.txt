@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=580 weak=101 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=25dceb806c2128fd ambiguous_set=3343d4d37da5672a excluded_set=5e1154a0fbb8a9bc
+#   pins: checked=580 weak=101 ambiguous=3 excluded=101 foreign_reported=1098 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=25dceb806c2128fd ambiguous_set=3343d4d37da5672a excluded_set=18fa733d7629306f
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1472
@@ -150,7 +150,7 @@ frp-core/src/auth.rs	894	-	66544d81d39e6068	-	absolute	frp-core/src/auth.rs	auth
 frp-core/src/auth.rs	895	-	b72456a2147b487b	-	absolute	frp-core/src/auth.rs	auth.rs:895	2221
 frp-core/src/auth.rs	898	910	76e22cd4e59458a1	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:898-910	2304
 frp-core/src/auth.rs	990	994	0db3ab4e2a5efe6e	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:990-994	1980
-frp-core/src/bridge.rs	506	532	003fa8d0789d97e9	3313813633c3beac	absolute	frp-server/src/control/bridge.rs	frp-core/src/bridge.rs:506-532	1460
+frp-core/src/bridge.rs	506	532	003fa8d0789d97e9	3313813633c3beac	absolute	frp-server/src/control/bridge/injector.rs	frp-core/src/bridge.rs:506-532	1363
 frp-core/src/bridge.rs	506	532	003fa8d0789d97e9	3313813633c3beac	absolute	frp-server/src/control/bridge/tests.rs	frp-core/src/bridge.rs:506-532	1478
 frp-core/src/bridge.rs	68	-	0d7fed4728ed765b	-	absolute	frp-core/benches/crypto_bridge.rs	frp-core/src/bridge.rs:68	55
 frp-core/src/bridge.rs	77	81	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-core/benches/crypto_bridge.rs	:77-81	55
@@ -161,7 +161,7 @@ frp-core/src/cli.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes
 frp-core/src/cli.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli.rs:3157	266
 frp-core/src/cli.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli.rs:5090-5097	705
 frp-core/src/cli.rs	5095	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:5095	1884
-frp-core/src/cli.rs	590	-	e789d055ecb696dc	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
+frp-core/src/cli.rs	590	-	befa9bcca7b4bc69	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli.rs:590	301
 frp-core/src/cli.rs	6244	6246	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli.rs:6244-6246	399
 frp-core/src/cli.rs	930	-	a298ba38f2e79bca	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:930	2459
 frp-core/src/config/client.rs	256	-	044d5563c14d5e76	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/client.rs:256	483
@@ -345,8 +345,8 @@ frp-server/Cargo.toml	46	-	5f892a3adab944b5	-	absolute	docs/developing.md	frp-se
 frp-server/Cargo.toml	47	-	517eb8fa69c9ff42	-	absolute	docs/developing.md	frp-server/Cargo.toml:47	4020
 frp-server/Cargo.toml	69	-	7beb050a2fe3096c	-	absolute	.github/workflows/ci.yml	frp-server/Cargo.toml:69	4135
 frp-server/Cargo.toml	69	-	7beb050a2fe3096c	-	absolute	docs/developing.md	frp-server/Cargo.toml:69	1080
-frp-server/src/control/bridge.rs	2430	-	574cd08384c40fbb	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:2430	470
-frp-server/src/control/bridge.rs	3117	-	71bfc8393d65b736	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:3117	469
+frp-server/src/control/bridge.rs	1676	-	71bfc8393d65b736	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:1676	469
+frp-server/src/control/bridge.rs	989	-	574cd08384c40fbb	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:989	470
 frp-server/src/control/login.rs	302	-	ad991b5380f15db1	-	absolute	frp-server/tests/http_plugin.rs	frp-server/src/control/login.rs:302	297
 frp-server/src/control/login.rs	386	-	b6948e8a2ed7a833	-	shorthand	frp-server/tests/http_plugin.rs	:386	300
 frp-server/src/control/login.rs	440	-	c2d161844e415cc6	-	shorthand	frp-server/tests/http_plugin.rs	:440	299

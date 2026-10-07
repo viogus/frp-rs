@@ -1405,9 +1405,9 @@ Seams, ranked by value ÷ risk. All pure moves, no statement edits:
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
-| **1** | `control/bridge/injector.rs` | `ResponseHeaderInjector` (120–1544) + `Discard` / `DeclaredFraming` / `ChunkedSkip` / `ChunkedState` / `DISCARD_WARN_THROTTLE`, plus its own tests | **low** |
-| 2 | `control/bridge/udp.rs` | `UdpFrameReader` / `UdpFrameFut` / `udp_frame_fut` / `run_udp_work_conn` / `UDP_WORK_CONN_READ_TIMEOUT` / `request_udp_work_conn_replacement` / `assign_udp_work_conn` / `udp_dest_socket_addr` (~1550–2346) + tests | low |
-| 3 | `control/bridge/assign.rs` | `build_start_work_conn`, `http_leg_head_deadline`, `assign_work_to_proxy` (3108–3321) + tests | low |
+| **1** | `control/bridge/injector.rs` — **landed PR #518** | `ResponseHeaderInjector` (was `bridge.rs:102–1544`, now `injector.rs:5–1447`, struct at `:23`, `pub(super) fn new` at `:205`) + `Discard` / `DeclaredFraming` / `ChunkedSkip` / `ChunkedState` / `DISCARD_WARN_THROTTLE`; parent 3324 → 1884 lines | **low** |
+| 2 | `control/bridge/udp.rs` | `UdpFrameReader` / `UdpFrameFut` / `udp_frame_fut` / `run_udp_work_conn` / `UDP_WORK_CONN_READ_TIMEOUT` / `request_udp_work_conn_replacement` / `assign_udp_work_conn` / `udp_dest_socket_addr` (now `bridge.rs:109–905`) + tests | low |
+| 3 | `control/bridge/assign.rs` | `build_start_work_conn`, `http_leg_head_deadline`, `assign_work_to_proxy` (now `bridge.rs:1667–1880`) + tests | low |
 | 4 | `control/bridge/sudp.rs` | `run_sudp_message_bridge` only | low — **but see the gap below** |
 | — | *deferred* | `run_work_bridge` + `relay_plain_fast` + `UserSide` (the root) | — |
 
@@ -1418,6 +1418,13 @@ and extracting it removes roughly 2900 lines including its tests — the single
 largest reduction available in the file. Needs `try_split_work_halves` and
 `log_bridge_panic` exposed as `pub(super)`; `assign_udp_work_conn` and
 `assign_work_to_proxy` keep their existing `pub(crate)` signatures.
+
+**Seam 1 landed (2026-10-07, PR #518) — `bridge/injector.rs`.** The window was
+`bridge.rs:102–1544` (1443 lines / sha1 `cec7c29c…`), moved to `injector.rs:5–1447` with only
+`pub(super)` on 5 declarations (the struct, `new`, `malformed_raw`, `is_http_version`,
+`head_status_code` — what the sibling `bridge/tests.rs` and `run_work_bridge` reach). The plan's
+"needs `try_split_work_halves` / `log_bridge_panic` exposed" claim was **falsified**: the window
+uses neither. Mutation witness: a `panic!` at `ResponseHeaderInjector::new` reds 33 injector tests.
 
 **Do not split `poll_read`** (905–1543). It is 236 code lines inside one `AsyncRead`
 state machine whose four sections (complete gate 916–951, emission gate 977–1010,
