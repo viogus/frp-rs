@@ -1625,7 +1625,7 @@ no visibility changes (both types stay `pub`, the parent `pub use`s them). Mutat
 `SshStreamCloser`'s tuple field and methods). Mutation: a `panic!` at `terminate_ssh_session` reds
 3 lib tests. Seams 4–7 remain.
 
-**Do not** split `impl Handler for SshSession` (289–1110): one trait impl cannot
+**Do not** split `impl Handler for SshSession` (289–883): one trait impl cannot
 span files, and extracting the auth methods is a ~120-line body refactor with
 medium risk around exact `Auth::Reject` shapes. **Do not** extract
 `SshListener::run`'s accept loop either — 310 lines, but it is one per-connection
