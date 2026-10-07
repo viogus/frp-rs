@@ -6952,8 +6952,8 @@ nothing about whether the described behaviour still holds.
   `setup_proxy_listeners` `proxy_ops/listener.rs:42`; `listen_and_proxy`
   `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
-  `state.rs:344`; `assign_work_to_proxy` `bridge.rs:1676`;
-  `run_work_bridge` `bridge.rs:989`). **Two live errors were found and fixed en
+  `state.rs:344`; `assign_work_to_proxy` `bridge/assign.rs:88`;
+  `run_work_bridge` `bridge.rs:934`). **Two live errors were found and fixed en
   route**: `listen_and_proxy()` does not start listeners for
   http/https/stcp/tcpmux — only `tcp` binds a per-proxy listener — and
   `listen_and_proxy_udp()` does not exist anywhere in the tree (UDP/SUDP bind an
@@ -8327,6 +8327,20 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `ResponseHeaderInjector::new` reds **33** injector tests. Gates: fmt; `clippy -D warnings` (0,
   all-targets/all-features); tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`.
   Cites into `bridge.rs` re-pointed (`assign_work_to_proxy` → `:1676`, `run_work_bridge` → `:989`);
+  `pathline-cite-guard` re-baked to 580/0.
+
+  **P6 seam 3 landed (2026-10-07, PR #519 `dsh/m48-p6-udp` @ `0cdad87c`, base `d0cf52c9`) — `bridge/assign.rs`.**
+  The work-conn assignment cluster of `frp-server/src/control/bridge.rs` moved into a new **child** module
+  `frp-server/src/control/bridge/assign.rs` (292 lines) as two byte-identical windows: W1
+  `build_start_work_conn` base `bridge.rs:31-89` (59 lines / sha1 `70179acf…`) → `assign.rs:5-63`, and W2
+  `http_leg_head_deadline` + `assign_work_to_proxy` base `:1653-1880` (228 lines / sha1 `77ff1682…`) →
+  `assign.rs:65-292`. The only byte change is `pub(super)` on `http_leg_head_deadline`;
+  `assign_work_to_proxy` keeps `pub(crate)` and the parent re-exports it as `bridge::assign_work_to_proxy`
+  for `pool.rs` (`:205`, `:468`, `:1157`), with `#[cfg(test)] use assign::http_leg_head_deadline;` for the
+  sibling test module. The parent went 1883 → **1599** lines. Mutation: `+ 1` in `http_leg_head_deadline`
+  reds `bridge::tests::http_leg_head_deadline_floors_zero_and_caps`. Gates: fmt; `clippy -D warnings` (0);
+  tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed
+  (`assign_work_to_proxy` → `bridge/assign.rs:88`, `run_work_bridge` → `bridge.rs:934`);
   `pathline-cite-guard` re-baked to 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the

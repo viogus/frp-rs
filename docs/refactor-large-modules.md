@@ -1406,8 +1406,8 @@ Seams, ranked by value ÷ risk. All pure moves, no statement edits:
 | Order | New module | Moves | Risk |
 |---|---|---|---|
 | **1** | `control/bridge/injector.rs` — **landed PR #518** | `ResponseHeaderInjector` (was `bridge.rs:102–1544`, now `injector.rs:5–1447`, struct at `:23`, `pub(super) fn new` at `:205`) + `Discard` / `DeclaredFraming` / `ChunkedSkip` / `ChunkedState` / `DISCARD_WARN_THROTTLE`; parent 3324 → 1883 lines | **low** |
-| 2 | `control/bridge/udp.rs` | `UdpFrameReader` / `UdpFrameFut` / `udp_frame_fut` / `run_udp_work_conn` / `UDP_WORK_CONN_READ_TIMEOUT` / `request_udp_work_conn_replacement` / `assign_udp_work_conn` / `udp_dest_socket_addr` (now `bridge.rs:109–905`) + tests | low |
-| 3 | `control/bridge/assign.rs` | `build_start_work_conn`, `http_leg_head_deadline`, `assign_work_to_proxy` (now `bridge.rs:1667–1880`) + tests | low |
+| 2 | `control/bridge/udp.rs` | `UdpFrameReader` / `UdpFrameFut` / `udp_frame_fut` / `run_udp_work_conn` / `UDP_WORK_CONN_READ_TIMEOUT` / `request_udp_work_conn_replacement` / `assign_udp_work_conn` / `udp_dest_socket_addr` (now `bridge.rs:54–850`) + tests | low |
+| 3 | `control/bridge/assign.rs` — **landed PR #519** | `build_start_work_conn` (was `bridge.rs:31–89`, now `assign.rs:5–63`), `http_leg_head_deadline` (was `bridge.rs:1653–1665`, now `assign.rs:75`), `assign_work_to_proxy` (was `bridge.rs:1667–1880`, now `assign.rs:65–292`, keeps `pub(crate)` + parent re-export); parent 1883 → 1599 | low |
 | 4 | `control/bridge/sudp.rs` | `run_sudp_message_bridge` only | low — **but see the gap below** |
 | — | *deferred* | `run_work_bridge` + `relay_plain_fast` + `UserSide` (the root) | — |
 
@@ -1427,6 +1427,14 @@ largest reduction available in the file. Needs `try_split_work_halves` and
 uses neither. Mutation witness: a `panic!` at `ResponseHeaderInjector::new` reds 33 injector tests.
 The bare line numbers in the "Do not split `poll_read`" block and the "Hazards" list below are pre-move
 `bridge.rs` numbers; `poll_read` is now `injector.rs:808-1446`.
+
+**Seam 3 landed (2026-10-07, PR #519) — `bridge/assign.rs`.** Two byte-identical windows:
+`build_start_work_conn` (base `bridge.rs:31–89`, 59 lines, sha1 `70179acf…` → `assign.rs:5–63`) and
+`http_leg_head_deadline` + `assign_work_to_proxy` (base `bridge.rs:1653–1880`, 228 lines, sha1
+`77ff1682…` → `assign.rs:65–292`, `http_leg_head_deadline` at `:75`, `assign_work_to_proxy` at `:88`), with only `pub(super)` on `http_leg_head_deadline`; the parent
+re-exports the already-`pub(crate)` `assign_work_to_proxy` for `pool.rs` and imports
+`http_leg_head_deadline` under `#[cfg(test)]` for the sibling test module. Mutation witness: `+ 1` in
+`http_leg_head_deadline` reds `http_leg_head_deadline_floors_zero_and_caps`.
 
 **Do not split `poll_read`** (905–1543). It is 236 code lines inside one `AsyncRead`
 state machine whose four sections (complete gate 916–951, emission gate 977–1010,
