@@ -4695,7 +4695,7 @@ run_xtcp_test() {
     # stood here; they matched *any* `frpc -c …` command line on the host,
     # including a developer's unrelated run or a sibling worktree's compat run.
     # The repository's stray rules forbid a kill by name alone, and
-    # name-plus-argument is the same hazard in a weaker form (TODO.md:10451).
+    # name-plus-argument is the same hazard in a weaker form (TODO.md:10465).
     #
     # Every server a scenario leaves behind is tracked: `run_go`'s `exec` makes
     # `$!` the binary itself, not a wrapper subshell, and `start_echo_server`
@@ -4706,7 +4706,7 @@ run_xtcp_test() {
     # Belt and braces for a server that somehow escaped `track_pid`: the guard's
     # own mid-run sweep, which reaps exactly the pids its census printed and
     # honours the baseline — so it cannot reach a server that predates the run
-    # (a sibling's), and it never matches an argument pattern (TODO.md:10451).
+    # (a sibling's), and it never matches an argument pattern (TODO.md:10465).
     # The fixture suite drives this helper against real synthetic servers
     # (`scripts/tests/compat-stray-guard.sh`, "the pre-test sweep"), so it is
     # executed by CI rather than merely read. Untracked strays from this run are

@@ -2852,7 +2852,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
-  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1535`) consumes its one `Ready` and the `None`
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1426`) consumes its one `Ready` and the `None`
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
@@ -8474,6 +8474,20 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `tokio::io::{AsyncRead, AsyncWrite, ReadBuf}` (the parent's four now-unused imports are removed).
   Parent 1875 → **1750** lines. Mutation: a `panic!` at `terminate_ssh_session` reds **3**
   ssh_gateway lib tests. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
+  `cargo test -p frp-server --all-features` (green, `ssh_gateway` e2e 17/0); `repo-health.sh`.
+  `pathline-cite-guard` 580/0.
+
+  **P8 seam 4 landed (2026-10-07, PR #529 `dsh/m58-p8-keys` @ `8272afc8`, base `1402842e`) — `ssh_gateway/keys.rs`.**
+  The host-key/authorized_keys helpers moved out of `frp-server/src/ssh_gateway.rs` into the child
+  module `frp-server/src/ssh_gateway/keys.rs` (170 lines, windows at `keys.rs:12-118` and `:120-170`)
+  as two byte-identical windows: W1 base `ssh_gateway.rs:1206-1312` (107 lines / sha256 `ab8a1230…`)
+  — `parse_authorized_keys` + `parse_authorized_key_line`; W2 base `:1686-1736` (51 lines / sha256
+  `e0e57f41…`) — `load_or_generate_host_key`. The only byte changes are `pub(super)` on the two
+  parent-called functions (`parse_authorized_keys`, `load_or_generate_host_key`); `keys.rs` takes
+  `std::path::Path` and the `#[cfg(unix)] PermissionsExt` import (both removed from the parent, which
+  keeps only fully-qualified `std::path::Path::new` uses). Parent 1750 → **1589** lines. Mutation: a
+  `panic!` at `parse_authorized_keys` reds **2** ssh_gateway lib tests and at
+  `load_or_generate_host_key` reds **3**. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
   `cargo test -p frp-server --all-features` (green, `ssh_gateway` e2e 17/0); `repo-health.sh`.
   `pathline-cite-guard` 580/0.
 
