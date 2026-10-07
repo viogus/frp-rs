@@ -1,7 +1,11 @@
 # Refactoring the large modules
 
-**Status: proposal — no code has been changed.** Opened 2026-09-17 at `9c84ada`,
-from the backlog item *"Very large source files"* in [`../TODO.md`](../TODO.md).
+**Status: discharged — P1–P8 landed 2026-10-04..2026-10-08 (PRs #481–#532; the
+earlier #436/#450–#454 seams are in the same train).** The plan was opened on
+2026-09-17 at `9c84ada` as a proposal from the backlog item *"Very large source
+files"* in [`../TODO.md`](../TODO.md); the completion row is
+[`history/development-log.md`](history/development-log.md) and the per-seam
+landed notes are the `TODO.md` item's progress paragraphs.
 
 The backlog item quoted raw line counts. Measuring them properly **changed the
 conclusion**, so the first two sections are the measurements and the corrections

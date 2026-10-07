@@ -7080,7 +7080,7 @@ nothing about whether the described behaviour still holds.
 
 ## P2 — structural
 
-- [ ] **Very large *functions* (not files).** — **[plan written](docs/refactor-large-modules.md)**
+- [x] **Very large *functions* (not files).** — **[plan written](docs/refactor-large-modules.md)**
   Evidence: the original item ranked files by raw `wc -l`, which was wrong twice
   over. Measured properly (`scripts/large-functions.sh`, production code only):
   30–55% of the "large" files are inline tests and 36–77% of the "giant" functions
