@@ -8351,8 +8351,8 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `assign_udp_work_conn` base `:532-686` (155 lines / sha1 `f3d00c56…`) → `udp.rs:467-622`; W2
   `udp_dest_socket_addr` base `:839-850` (12 lines / sha1 `0db02089…`) → `udp.rs:624-635`. The only byte
   changes are `pub(super)` on `run_udp_work_conn` and `UDP_WORK_CONN_READ_TIMEOUT` plus one rustfmt reflow
-  of the long const signature. The shared `log_bridge_panic` **stays in `bridge.rs`** (also used by
-  `assign.rs`/`run_work_bridge`), which is why this seam has three windows rather than two;
+  of the long const signature. The shared `log_bridge_panic` **stays in `bridge.rs`** (used by the
+  `assign.rs` spawn wrapper and `udp.rs`), which is why this seam has three windows rather than two;
   `assign_udp_work_conn` keeps `pub(crate)` + parent re-export, and `run_udp_work_conn` is re-imported
   only under `#[cfg(test)]`. Parent 1599 → **975** lines. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
   `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed (`run_work_bridge` →

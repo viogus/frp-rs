@@ -1440,8 +1440,9 @@ re-exports the already-`pub(crate)` `assign_work_to_proxy` for `pool.rs` and imp
 `bridge.rs:50–510` / `:532–686` / `:839–850`, shas `0375ecaf…` / `f3d00c56…` / `0db02089…`) →
 `udp.rs:5–465` / `:467–622` / `:624–635`, with only `pub(super)` on `run_udp_work_conn` and
 `UDP_WORK_CONN_READ_TIMEOUT` (plus one rustfmt reflow of the long const signature). The shared
-`log_bridge_panic` stays in `bridge.rs` (it is also used by `assign.rs` and `run_work_bridge`), so
-this seam is three windows, not two. `assign_udp_work_conn` keeps `pub(crate)` + parent re-export.
+`log_bridge_panic` stays in `bridge.rs` (it is used by the `assign.rs` spawn wrapper and `udp.rs`),
+so this seam is three windows, not two. The moved `debug!`/`warn!` sites now render
+`target: frp_server::control::bridge::udp`; `RUST_LOG` parent directives still match. `assign_udp_work_conn` keeps `pub(crate)` + parent re-export.
 
 **Do not split `poll_read`** (905–1543). It is 236 code lines inside one `AsyncRead`
 state machine whose four sections (complete gate 916–951, emission gate 977–1010,
