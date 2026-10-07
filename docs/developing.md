@@ -336,7 +336,7 @@ optional:
 Do not pattern-match this table blindly; decide by asking what your type *is*.
 The neighbouring types show the branches that exist: `register_sk_index`
 (`frp-server/src/control/proxy_ops/registry.rs:127`) is for the secret-key routing of
-`stcp`/`xtcp`/`sudp`; `VhostManager` (`frp-server/src/vhost.rs:279`) for
+`stcp`/`xtcp`/`sudp`; `VhostManager` (`frp-server/src/vhost/router.rs:262`) for
 `http`/`https` domain routing; `TcpMuxManager` (`frp-server/src/tcpmux.rs:34`)
 for `tcpmux`. A type that routes by domain or by secret key belongs in the
 corresponding predicate; a type with a real remote port belongs in the port
@@ -429,7 +429,7 @@ peer branches. It has three *type* branches, a group branch, and a fall-through:
 - the `} else {` fall-through (`frp-server/src/control/proxy_ops/listener.rs:413`) —
   everything else, including `http` and `https`. There is no per-proxy listener:
   the shared VHost listener routes by host/domain
-  (`frp-server/src/vhost.rs:279`).
+  (`frp-server/src/vhost/router.rs:262`).
 
 Note the asymmetry: `http`/`https` are *not* a branch of their own, they fall
 through. A type that forgets to add itself lands here rather than hitting an `else`
@@ -4022,7 +4022,7 @@ Three build-tier facts the tier names alone would hide. The dashboard is
 is default-on (`frp-server/Cargo.toml:46`). The `http-proxy` feature is
 **default-on** (`frp-server/Cargo.toml:45`), so the server-side
 `[[httpPlugins]]` manager is Keep; that same feature gates the frozen h2c module
-(`frp-server/src/vhost.rs:23`), so h2c's freeze is a code-review rule rather
+(`frp-server/src/vhost.rs:25`), so h2c's freeze is a code-review rule rather
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
