@@ -2070,7 +2070,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   not by excusing).
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     → 101: `error: method 'remove_run_id_vnet_routes' is never used` at
-    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1115`,
+    `frp-server/src/state.rs:1884` — its only caller, `frp-server/src/ssh_gateway.rs:1115`,
     is `ssh`-gated, and the whole `ssh_gateway` module is too (`frp-server/src/lib.rs:18`), so
     `vnet` without `ssh` leaves it dead.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
@@ -8467,10 +8467,10 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `frp-server/src/ssh_gateway/stream.rs` (135 lines, window at `stream.rs:14-135`) as one
   byte-identical window: base `ssh_gateway.rs:1193-1314` (122 lines / sha256 `b81544ac…`) —
   `CloseableSshStream`, `CloseState`, `SshStreamCloser` and their `Drop`/`AsyncRead`/`AsyncWrite`
-  impls, plus `terminate_ssh_session` (the struct and its four trait impls stay in one file). The only
+  impls, plus `terminate_ssh_session` (the stream types and their four `impl` blocks stay in one file). The only
   byte changes are `pub(super)` on `CloseableSshStream`/`CloseState` (+ its `dropped` field),
   `SshStreamCloser` (+ its tuple field and `close`/`wait_dropped` methods) and `terminate_ssh_session`;
-  the child takes `std::future::Future`, `std::pin::Pin`, `std::task::{Context, Poll}` and
+  the child declares its own `use`s for `std::future::Future`, `std::pin::Pin`, `std::task::{Context, Poll}` and
   `tokio::io::{AsyncRead, AsyncWrite, ReadBuf}` from the parent (four now-unused imports removed
   there). Parent 1875 → **1750** lines. Mutation: a `panic!` at `terminate_ssh_session` reds **3**
   ssh_gateway lib tests. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
