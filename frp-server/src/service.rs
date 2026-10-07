@@ -62,7 +62,7 @@ pub use crate::state::{AppState, ControlTx, InternalMsg, ReloadableState};
 // events carry the same `frp_server::service::listeners` target. This block is
 // un-gated as well: `crate::vhost::run_vhost_https_listener` has a
 // `#[cfg(not(feature = "tls"))]` stub returning an error
-// (`frp-server/src/vhost.rs:1093`), so no gate is needed and no import changed.
+// (`frp-server/src/vhost/https.rs:264`), so no gate is needed and no import changed.
 // The NAT-hole session cleanup task moved to `service/tasks.rs` the same way;
 // its two `tracing` events carry the same `frp_server::service::tasks` target.
 // Like the TCPMux/vhost seams this block is un-gated (`self.state.xtcp` and

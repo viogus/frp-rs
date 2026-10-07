@@ -587,7 +587,7 @@ pub struct FrpsArgs {
     /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
     /// `9223372036854775808` rc 1 `value out of range`).
     ///
-    /// **R6(b) (`TODO.md:11102`): "accept-and-ignore matches Go" is bounded.**
+    /// **R6(b) (`TODO.md:11117`): "accept-and-ignore matches Go" is bounded.**
     /// The flag surface is Go's (the full `int64` accepted above), but the value
     /// that reaches the vhost handler is clamped: `<= 0` floors at 60 s and
     /// anything above 24 h is capped, where Go has no comparable cap. So the
@@ -595,7 +595,7 @@ pub struct FrpsArgs {
     /// above 24 h is accepted here and then silently shortened. Measured by the
     /// unit pin `frp-server/src/vhost/tests.rs:252` (`test_clamp_vhost_timeout`):
     /// `0 → 60`, `-1 → 60`, `86400 → 86400`, `86401 → 86400`, `i64::MAX →
-    /// 86400`; the cap is `frp-server/src/vhost.rs:124`
+    /// 86400`; the cap is `frp-server/src/vhost.rs:120`
     /// (`VHOST_TIMEOUT_CAP_SECS`).
     pub vhost_http_timeout: Option<i64>,
     pub strict_config: bool,
@@ -750,7 +750,7 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// deliberately **not** part of the `verify` subcommand's surface — see
 /// [`FrpsRootSlots`].
 ///
-/// **R6(a) (`TODO.md:11102`): this lane does not read the loaded config's `[log]`
+/// **R6(a) (`TODO.md:11117`): this lane does not read the loaded config's `[log]`
 /// section.** `init_logging(&cli, None)` (`frps/src/main.rs:526`) runs before
 /// `collect_config_files` (`frps/src/main.rs:542`), so the effective log level
 /// comes from the flags alone. Measured over a config dir whose `frps.toml`
@@ -5069,7 +5069,7 @@ impl FrpsArgs {
     /// Config file path to load. Falls back to "frps.toml" when `-c` was
     /// not given on the command line.
     ///
-    /// **R2 (`TODO.md:11058`): this implicit-`./frps.toml` lane is an frp-rs
+    /// **R2 (`TODO.md:11073`): this implicit-`./frps.toml` lane is an frp-rs
     /// extension, not Go parity.** Go binds a server config file only through
     /// `-c`; with no `-c` its run path keeps the flags-only struct
     /// (`cmd/frps/root.go:82`) and logs `frps uses command line arguments for
