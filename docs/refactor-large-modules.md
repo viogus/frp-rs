@@ -1406,7 +1406,7 @@ Seams, ranked by value ÷ risk. All pure moves, no statement edits:
 | Order | New module | Moves | Risk |
 |---|---|---|---|
 | **1** | `control/bridge/injector.rs` — **landed PR #518** | `ResponseHeaderInjector` (was `bridge.rs:102–1544`, now `injector.rs:5–1447`, struct at `:23`, `pub(super) fn new` at `:205`) + `Discard` / `DeclaredFraming` / `ChunkedSkip` / `ChunkedState` / `DISCARD_WARN_THROTTLE`; parent 3324 → 1883 lines | **low** |
-| 2 | `control/bridge/udp.rs` | `UdpFrameReader` / `UdpFrameFut` / `udp_frame_fut` / `run_udp_work_conn` / `UDP_WORK_CONN_READ_TIMEOUT` / `request_udp_work_conn_replacement` / `assign_udp_work_conn` / `udp_dest_socket_addr` (now `bridge.rs:54–850`) + tests | low |
+| 2 | `control/bridge/udp.rs` — **landed PR #520** | three windows: W1a `UdpFrameReader`/`UdpFrameFut`/`udp_frame_fut`/`run_udp_work_conn` (was `bridge.rs:50–510`, now `udp.rs:5–465`), W1b `UDP_WORK_CONN_READ_TIMEOUT`/`request_udp_work_conn_replacement`/`assign_udp_work_conn` (was `bridge.rs:532–686`, now `udp.rs:467–622`), W2 `udp_dest_socket_addr` (was `bridge.rs:839–850`, now `udp.rs:624–635`); `log_bridge_panic` stays in the parent; parent 1599 → 975 | low |
 | 3 | `control/bridge/assign.rs` — **landed PR #519** | `build_start_work_conn` (was `bridge.rs:31–89`, now `assign.rs:5–63`), `http_leg_head_deadline` (was `bridge.rs:1653–1665`, now `assign.rs:75`), `assign_work_to_proxy` (was `bridge.rs:1667–1880`, now `assign.rs:79–292`, fn at `:88`, keeps `pub(crate)` + parent re-export); parent 1883 → 1599 | low |
 | 4 | `control/bridge/sudp.rs` | `run_sudp_message_bridge` only | low — **but see the gap below** |
 | — | *deferred* | `run_work_bridge` + `relay_plain_fast` + `UserSide` (the root) | — |
@@ -1435,6 +1435,13 @@ The bare line numbers in the "Do not split `poll_read`" block and the "Hazards" 
 re-exports the already-`pub(crate)` `assign_work_to_proxy` for `pool.rs` and imports
 `http_leg_head_deadline` under `#[cfg(test)]` for the sibling test module. Mutation witness: `+ 1` in
 `http_leg_head_deadline` reds `http_leg_head_deadline_floors_zero_and_caps`.
+
+**Seam 2 landed (2026-10-07, PR #520) — `bridge/udp.rs`.** Three byte-identical windows (base
+`bridge.rs:50–510` / `:532–686` / `:839–850`, shas `0375ecaf…` / `f3d00c56…` / `0db02089…`) →
+`udp.rs:5–465` / `:467–622` / `:624–635`, with only `pub(super)` on `run_udp_work_conn` and
+`UDP_WORK_CONN_READ_TIMEOUT` (plus one rustfmt reflow of the long const signature). The shared
+`log_bridge_panic` stays in `bridge.rs` (it is also used by `assign.rs` and `run_work_bridge`), so
+this seam is three windows, not two. `assign_udp_work_conn` keeps `pub(crate)` + parent re-export.
 
 **Do not split `poll_read`** (905–1543). It is 236 code lines inside one `AsyncRead`
 state machine whose four sections (complete gate 916–951, emission gate 977–1010,

@@ -6953,7 +6953,7 @@ nothing about whether the described behaviour still holds.
   `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge/assign.rs:88`;
-  `run_work_bridge` `bridge.rs:934`). **Two live errors were found and fixed en
+  `run_work_bridge` `bridge.rs:310`). **Two live errors were found and fixed en
   route**: `listen_and_proxy()` does not start listeners for
   http/https/stcp/tcpmux — only `tcp` binds a per-proxy listener — and
   `listen_and_proxy_udp()` does not exist anywhere in the tree (UDP/SUDP bind an
@@ -8340,8 +8340,23 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   sibling test module. The parent went 1883 → **1599** lines. Mutation: `+ 1` in `http_leg_head_deadline`
   reds `bridge::tests::http_leg_head_deadline_floors_zero_and_caps`. Gates: fmt; `clippy -D warnings` (0);
   tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed
-  (`assign_work_to_proxy` → `bridge/assign.rs:88`, `run_work_bridge` → `bridge.rs:934`);
+  (`assign_work_to_proxy` → `bridge/assign.rs:88`, `run_work_bridge` → `bridge.rs:310`);
   `pathline-cite-guard` re-baked to 580/0.
+
+  **P6 seam 2 landed (2026-10-07, PR #520 `dsh/m49-p6-udp` @ `8fba084d`, base `938a0c7a`) — `bridge/udp.rs`.**
+  The server-side UDP/SUDP work-conn plumbing of `frp-server/src/control/bridge.rs` moved into a new
+  **child** module `frp-server/src/control/bridge/udp.rs` (635 lines) as **three** byte-identical windows:
+  W1a `UdpFrameReader`/`UdpFrameFut`/`udp_frame_fut`/`run_udp_work_conn` base `bridge.rs:50-510` (461 lines
+  / sha1 `0375ecaf…`) → `udp.rs:5-465`; W1b `UDP_WORK_CONN_READ_TIMEOUT`/`request_udp_work_conn_replacement`/
+  `assign_udp_work_conn` base `:532-686` (155 lines / sha1 `f3d00c56…`) → `udp.rs:467-622`; W2
+  `udp_dest_socket_addr` base `:839-850` (12 lines / sha1 `0db02089…`) → `udp.rs:624-635`. The only byte
+  changes are `pub(super)` on `run_udp_work_conn` and `UDP_WORK_CONN_READ_TIMEOUT` plus one rustfmt reflow
+  of the long const signature. The shared `log_bridge_panic` **stays in `bridge.rs`** (also used by
+  `assign.rs`/`run_work_bridge`), which is why this seam has three windows rather than two;
+  `assign_udp_work_conn` keeps `pub(crate)` + parent re-export, and `run_udp_work_conn` is re-imported
+  only under `#[cfg(test)]`. Parent 1599 → **975** lines. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
+  `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed (`run_work_bridge` →
+  `bridge.rs:310`); `pathline-cite-guard` re-baked to 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
