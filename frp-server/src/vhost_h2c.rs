@@ -563,7 +563,7 @@ async fn handle_stream(
 /// Canonicalize an h2 `:authority` (Host equivalent) for routing — Go
 /// `CanonicalHost` semantics (pkg/util/http/http.go:54-66), the same
 /// `host[:port]` → host split the HTTP/1.1 Host-header path performs in
-/// vhost.rs (`canonicalize_authority`). Implemented here directly (not
+/// head.rs (`canonicalize_authority`). Implemented here directly (not
 /// delegated) so the h2c side is self-contained on the SplitHostPort
 /// parity details; both implementations follow the same Go spec and agree
 /// on every input.
@@ -1936,7 +1936,7 @@ mod tests {
         // Exactly one trailing dot is trimmed (Go CanonicalHost
         // TrimSuffix strips ONE dot — "example.com.." becomes
         // "example.com.", which STAYS unroutable because the trailing
-        // dot survives; matching canonicalize_authority in vhost.rs).
+        // dot survives; matching canonicalize_authority in head.rs).
         assert_eq!(host_from_authority("example.com."), "example.com");
         assert_eq!(host_from_authority("example.com.:8080"), "example.com");
         assert_eq!(host_from_authority("example.com.."), "example.com.");
