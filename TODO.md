@@ -6952,8 +6952,8 @@ nothing about whether the described behaviour still holds.
   `setup_proxy_listeners` `proxy_ops/listener.rs:42`; `listen_and_proxy`
   `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
-  `state.rs:344`; `assign_work_to_proxy` `bridge.rs:3117`;
-  `run_work_bridge` `bridge.rs:2430`). **Two live errors were found and fixed en
+  `state.rs:344`; `assign_work_to_proxy` `bridge.rs:1676`;
+  `run_work_bridge` `bridge.rs:989`). **Two live errors were found and fixed en
   route**: `listen_and_proxy()` does not start listeners for
   http/https/stcp/tcpmux — only `tcp` binds a per-proxy listener — and
   `listen_and_proxy_udp()` does not exist anywhere in the tree (UDP/SUDP bind an
@@ -8313,6 +8313,21 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   Gates: fmt; `clippy -D warnings` (0, all-targets/all-features); tiny/micro; `cargo test -p frp-client
   --lib --all-features` 323/0; `repo-health.sh`; cite guards. Cites into `work_conn.rs` re-pointed
   (+9 above the window, −1024 below); `pathline-cite-guard` re-baked.
+
+  **P6 seam 1 landed (2026-10-07, PR #518 `dsh/m47-p6-injector` @ `42f83c81`, base `0a3eb8f9`) — `bridge/injector.rs`.**
+  The self-contained HTTP response-header injector of `frp-server/src/control/bridge.rs` moved into a new
+  **child** module `frp-server/src/control/bridge/injector.rs` as one byte-identical window: base
+  `bridge.rs:102-1544` (1443 lines / sha1 `cec7c29c…`) → `injector.rs:5-1447` (`ResponseHeaderInjector` at
+  `:23`, `pub(super) fn new` at `:205`), carrying `Discard`/`DeclaredFraming`/`ChunkedSkip`/`ChunkedState`
+  and `DISCARD_WARN_THROTTLE`. The only byte change is `pub(super)` on **5** declarations (the struct,
+  `new`, `malformed_raw`, `is_http_version`, `head_status_code` — what the sibling `bridge/tests.rs` and
+  `run_work_bridge` reach); the parent went 3324 → **1883** lines and gained `mod injector;` +
+  `use injector::ResponseHeaderInjector;`. The plan's "needs `try_split_work_halves` / `log_bridge_panic`
+  exposed" claim is **falsified** — the window uses neither. Mutation: a `panic!` at
+  `ResponseHeaderInjector::new` reds **33** injector tests. Gates: fmt; `clippy -D warnings` (0,
+  all-targets/all-features); tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`.
+  Cites into `bridge.rs` re-pointed (`assign_work_to_proxy` → `:1676`, `run_work_bridge` → `:989`);
+  `pathline-cite-guard` re-baked to 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
