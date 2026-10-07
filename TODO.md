@@ -8304,11 +8304,11 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   **P5 client landed (2026-10-07, PR #517 `dsh/m46-p5-workconn` @ `f993ff61`, base `e06b87cc`) — `work_conn/udp.rs`.**
   The UDP/SUDP work-connection family of `frp-client/src/work_conn.rs` moved into a new **child** module
   `frp-client/src/work_conn/udp.rs` (1043 lines) as one byte-identical window: base
-  `work_conn.rs:411-1442` (1032 lines / sha1 `eadd1c10…`) → `udp.rs:9-1040`, the whole UDP session
-  table, `run_udp_session`, `resolve_udp_local_addr`, `udp_addr_of` and `run_udp_work_conn`. The only
-  byte change is `pub(super)` on **17** declarations (the items the parent's inline test module still
-  drives); the parent went 3030 → **2006** lines and gained `mod udp;`, `use udp::run_udp_work_conn;`
-  and a `#[cfg(test)] use udp::{…}` re-import block. Mutation: changing the moved
+  `work_conn.rs:411-1442` (1032 lines / sha1 `eadd1c10…`) → `udp.rs:9-1043`, the whole UDP session
+  table, `run_udp_session`, `resolve_udp_local_addr`, `udp_addr_of` and `run_udp_work_conn`. The bytes differ
+  only by `pub(super)` on **17** declarations the parent's inline test module still drives plus one rustfmt
+  reflow of `resolve_udp_local_addr`'s signature; the parent went 3030 → **2006** lines and gained `mod udp;`,
+  `use udp::run_udp_work_conn;` and a `#[cfg(test)] use udp::{…}` re-import block. Mutation: changing the moved
   `UDP_SESSION_IDLE_TIMEOUT` to 31 s reds `work_conn::tests::udp_session_idle_timeout_is_go_parity_30s`.
   Gates: fmt; `clippy -D warnings` (0, all-targets/all-features); tiny/micro; `cargo test -p frp-client
   --lib --all-features` 323/0; `repo-health.sh`; cite guards. Cites into `work_conn.rs` re-pointed
@@ -10260,7 +10260,7 @@ section; ledger now **24 open / 104 closed**.**
   loopback listener with `client_auth_scopes = ["NewWorkConns"]` and an OIDC client built on an exec
   `tokenSource`, reads the plaintext V1 `NewWorkConn`, and asserts `privilege_key == Some("nwc-oidc-token")`
   (the raw source output, not a hash), `timestamp.is_none()`, and exactly one exec invocation; skipping the
-  auth block (`frp-client/src/work_conn.rs:735`) reds it at `:2599:17` with `left: None`, so the pin is the
+  auth block (`frp-client/src/work_conn.rs:735`) reds it at `:1575:17` with `left: None`, so the pin is the
   key on the wire, not the frame's arrival. No user-visible behaviour changed — oracle and new test only, the
   re-arm semantics shipped in #437 -- so no `CHANGELOG.md` bullet. Residue stated, not hidden: the window
   `[P/2, 3P/2]` = `[1 s, 3 s]` admits ANY call-site literal in that class -- the review's measured survivors
