@@ -8457,7 +8457,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   visibility changes: both types stay `pub` and the parent re-exports them, preserving
   `frp_server::ssh_gateway::VirtualControl` (the sibling `virtual_ctrl_tests` and the `SshSession`
   handler both reach them). The window needs only `use frp_core::msg::NewProxyResp;` and
-  `use tokio::sync::mpsc;`. Parent 2019 → **1877** lines. Mutation: a `panic!` at
+  `use tokio::sync::mpsc;`. Parent 2019 → **1875** lines. Mutation: a `panic!` at
   `VirtualControl::channel` reds **9** ssh_gateway lib tests (2 binaries). Gates: fmt;
   `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
   `repo-health.sh`. `pathline-cite-guard` 580/0.
