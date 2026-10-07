@@ -1600,7 +1600,7 @@ clean seam.
 |---|---|---|---|
 | 0 | `ssh_gateway/tests.rs` | the inline test module (1992–3785, 1794 lines, 67 fns) | zero source-token change |
 | 1 | `ssh_gateway/args.rs` — **landed PR #526** | the whole 33–765 arg-parsing cluster (15 fns, `ParsedProxyArgs` + 23 fields, `FLAG_SPELLINGS`) (was `ssh_gateway.rs:33–765`, 733 lines, now `args.rs:7–739`); parent 2749 → 2019 | **cleanest seam in the file**: zero references to the rest of the module; deps are only `rand` and `frp_core::hex_encode` |
-| 2 | `ssh_gateway/virtual_control.rs` | `VirtualControl` + `WorkConnRequest` + `channel` (783–911) | zero session/listener deps |
+| 2 | `ssh_gateway/virtual_control.rs` — **landed PR #527** | `VirtualControl` + `WorkConnRequest` + `channel` (was `ssh_gateway.rs:37–181`, 145 lines, now `virtual_control.rs:11–155`) | zero session/listener deps; parent 2019 → 1875 |
 | 3 | `ssh_gateway/stream.rs` | `CloseableSshStream`, `CloseState`, `SshStreamCloser`, `terminate_ssh_session` | struct + its 4 trait impls must stay in one file |
 | 4 | `ssh_gateway/keys.rs` | `parse_authorized_keys`, `parse_authorized_key_line`, `load_or_generate_host_key` | `#[cfg(unix)] PermissionsExt` and `Path` imports must travel |
 | 5 | `ssh_gateway/frame.rs` | `build_v1_frame_from_args` + 5 helpers | single consumer |
@@ -1613,6 +1613,11 @@ clean seam.
 `ParsedProxyArgs` + its 23 fields, `parse_ssh_args`, `ssh_gateway_usage`, `shell_split` and
 `VALID_PROXY_TYPES` (the parent's production + `#[cfg(test)]` imports). Mutation: a `panic!` at
 `parse_ssh_args` reds 37 lib tests across 2 binaries. Seams 2–7 remain.
+
+**Seam 2 landed (2026-10-07, PR #527) — `ssh_gateway/virtual_control.rs`.** One byte-identical
+window (base `ssh_gateway.rs:37–181`, 145 lines, sha256 `902964c6…`) → `virtual_control.rs:11–155`;
+no visibility changes (both types stay `pub`, the parent `pub use`s them). Mutation: a `panic!` at
+`VirtualControl::channel` reds 9 lib tests. Seams 3–7 remain.
 
 **Do not** split `impl Handler for SshSession` (1161–1755): one trait impl cannot
 span files, and extracting the auth methods is a ~120-line body refactor with
