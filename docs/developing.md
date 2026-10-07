@@ -336,7 +336,7 @@ optional:
 Do not pattern-match this table blindly; decide by asking what your type *is*.
 The neighbouring types show the branches that exist: `register_sk_index`
 (`frp-server/src/control/proxy_ops/registry.rs:127`) is for the secret-key routing of
-`stcp`/`xtcp`/`sudp`; `VhostManager` (`frp-server/src/vhost.rs:271`) for
+`stcp`/`xtcp`/`sudp`; `VhostManager` (`frp-server/src/vhost.rs:279`) for
 `http`/`https` domain routing; `TcpMuxManager` (`frp-server/src/tcpmux.rs:34`)
 for `tcpmux`. A type that routes by domain or by secret key belongs in the
 corresponding predicate; a type with a real remote port belongs in the port
@@ -429,7 +429,7 @@ peer branches. It has three *type* branches, a group branch, and a fall-through:
 - the `} else {` fall-through (`frp-server/src/control/proxy_ops/listener.rs:413`) —
   everything else, including `http` and `https`. There is no per-proxy listener:
   the shared VHost listener routes by host/domain
-  (`frp-server/src/vhost.rs:271`).
+  (`frp-server/src/vhost.rs:279`).
 
 Note the asymmetry: `http`/`https` are *not* a branch of their own, they fall
 through. A type that forgets to add itself lands here rather than hitting an `else`
