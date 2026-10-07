@@ -8406,9 +8406,9 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `vhost.rs:772-984` (213 lines / sha256 `ed0ad891…`) — `VhostForward`, `VhostResolveError`,
   `resolve_vhost_request`; W2 base `:1309-1821` (513 lines / sha256 `449e90cf…`) —
   `sanitize_rewrite_host`, `rewrite_host_header`, `strip_vhost_hop_by_hop_headers`,
-  `inject_vhost_request_headers`. The only byte changes are `pub(super)` on the four W2 helpers (the
-  parent re-imports them so `router.rs`'s `use super::sanitize_rewrite_host;` and the sibling
-  `vhost/tests.rs` still resolve), plus `use crate::service::AppState;` / `use tracing::{debug, warn};`.
+  `inject_vhost_request_headers`. The only byte changes are `pub(super)` on three W2 helpers (`sanitize_rewrite_host`,
+  `rewrite_host_header`, `inject_vhost_request_headers` — the parent re-imports each one), plus
+  `use crate::service::AppState;` / `use tracing::{debug, warn};`.
   The parent re-imports `resolve_vhost_request`/`VhostResolveError` (parent request path +
   `vhost_h2c.rs`) and, under `#[cfg(test)]`, `VhostForward`, `inject_vhost_request_headers`,
   `rewrite_host_header`. Parent 1932 → **1211** lines. Mutation: a `panic!` at `resolve_vhost_request`

@@ -1551,7 +1551,7 @@ parent-scope call. Parent re-exports `VhostManager`/`VhostRoute`/`VhostRouteMatc
 
 **Seam 4 landed (2026-10-07, PR #524) — `vhost/forward.rs`.** Two byte-identical windows (base
 `vhost.rs:772–984`, 213 lines, sha256 `ed0ad891…`; and `:1309–1821`, 513 lines, sha256 `449e90cf…`) →
-`forward.rs:10–222` / `:224–736`, with `pub(super)` on the four W2 helpers so the parent's
+`forward.rs:10–222` / `:224–736`, with `pub(super)` on three W2 helpers so the parent's
 re-imports keep `router.rs`'s `use super::sanitize_rewrite_host;` and the sibling tests resolving.
 The parent re-imports `resolve_vhost_request`/`VhostResolveError` (request path + `vhost_h2c.rs`) and,
 under `#[cfg(test)]`, `VhostForward`/`inject_vhost_request_headers`/`rewrite_host_header`. Mutation: a

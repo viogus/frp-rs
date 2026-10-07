@@ -346,7 +346,7 @@ pub(super) fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
 /// enforces Go's `!ascii.IsPrint(reqUpType)` rejection (checked BEFORE
 /// stripping in ServeHTTP, answered via the proxy ErrorHandler → Go frp's
 /// 404 route-miss response).
-pub(super) fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
+fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
     let header_end = frp_core::textproto::head_end(&data).unwrap_or(data.len());
     let head = &data[..header_end];
     let tail = &data[header_end..];
