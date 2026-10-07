@@ -235,19 +235,19 @@ differently:
 | 1 | `const VALID_PROXY_TYPES` — `frp-core/src/config/loader.rs:1340` (+ the message at `frp-core/src/config/loader.rs:1347`), checked by `validate_proxy_configs` at `frp-core/src/config/loader.rs:1339` | frpc config-file load | Fatal at startup: `invalid proxy_type '<type>'` (above). **The first wall, always** |
 | 2 | `const VALID_PROXY_TYPES` — `frp-client/src/store.rs:16`, used by `validate_proxy` at `frp-client/src/store.rs:258` | The runtime config store behind the admin API (`/api/store/*`) | Store writes are rejected with `invalid proxy type: <type>`, and an existing store file that contains your type **fails to load** |
 | 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` (feature `admin`) | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
-| 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway.rs:737` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
+| 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway/args.rs:711` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
 | 5 | `let valid_types = [...]` — `frp-server/src/dashboard.rs:659`, guard at `:662` (feature `dashboard`) | The dashboard v1 API's per-type endpoint | `404` for your type (a deliberate divergence from Go, which returns an empty list) |
 | 6 | `const VALID_TYPES` — `frp-server/src/dashboard.rs:1577`, enforced by `fn validate_type` at `frp-server/src/dashboard.rs:2145` (called at `:2690`; feature `dashboard`) | The dashboard v2 API's `proxy_type` filter | `400 BAD_REQUEST`: `type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp` (`frp-server/src/dashboard.rs:2151`) |
 
 **The SSH gateway has two gates, not one.** List 4 is only the first: every flag
 also carries a scope, matched by `FlagScope::allows`
-(`frp-server/src/ssh_gateway.rs:322`) against the `FLAG_SPELLINGS` table
-(`frp-server/src/ssh_gateway.rs:361-495`): most base/common flags are
+(`frp-server/src/ssh_gateway/args.rs:296`) against the `FLAG_SPELLINGS` table
+(`frp-server/src/ssh_gateway/args.rs:335-469`): most base/common flags are
 `FlagScope::Any` (every proxy type) and the restricted ones use
 `FlagScope::Types`. `remote_port` is scoped to `&["tcp"]`
-(`frp-server/src/ssh_gateway.rs:399`), so a Rust-only TCP-like type added to list 4
+(`frp-server/src/ssh_gateway/args.rs:373`), so a Rust-only TCP-like type added to list 4
 is *accepted* over SSH but cannot set `remote_port` — the out-of-scope flag is
-rejected as `unknown flag: --remote_port` (`frp-server/src/ssh_gateway.rs:189`),
+rejected as `unknown flag: --remote_port` (`frp-server/src/ssh_gateway/args.rs:156`),
 exactly as if Go had never registered it. Add your type to the scope as well as the
 allow-list.
 
