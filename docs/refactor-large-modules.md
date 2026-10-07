@@ -1405,7 +1405,7 @@ Seams, ranked by value ÷ risk. All pure moves, no statement edits:
 
 | Order | New module | Moves | Risk |
 |---|---|---|---|
-| **1** | `control/bridge/injector.rs` — **landed PR #518** | `ResponseHeaderInjector` (was `bridge.rs:102–1544`, now `injector.rs:5–1447`, struct at `:23`, `pub(super) fn new` at `:205`) + `Discard` / `DeclaredFraming` / `ChunkedSkip` / `ChunkedState` / `DISCARD_WARN_THROTTLE`; parent 3324 → 1884 lines | **low** |
+| **1** | `control/bridge/injector.rs` — **landed PR #518** | `ResponseHeaderInjector` (was `bridge.rs:102–1544`, now `injector.rs:5–1447`, struct at `:23`, `pub(super) fn new` at `:205`) + `Discard` / `DeclaredFraming` / `ChunkedSkip` / `ChunkedState` / `DISCARD_WARN_THROTTLE`; parent 3324 → 1883 lines | **low** |
 | 2 | `control/bridge/udp.rs` | `UdpFrameReader` / `UdpFrameFut` / `udp_frame_fut` / `run_udp_work_conn` / `UDP_WORK_CONN_READ_TIMEOUT` / `request_udp_work_conn_replacement` / `assign_udp_work_conn` / `udp_dest_socket_addr` (now `bridge.rs:109–905`) + tests | low |
 | 3 | `control/bridge/assign.rs` | `build_start_work_conn`, `http_leg_head_deadline`, `assign_work_to_proxy` (now `bridge.rs:1667–1880`) + tests | low |
 | 4 | `control/bridge/sudp.rs` | `run_sudp_message_bridge` only | low — **but see the gap below** |
@@ -1425,6 +1425,8 @@ largest reduction available in the file. Needs `try_split_work_halves` and
 `head_status_code` — what the sibling `bridge/tests.rs` and `run_work_bridge` reach). The plan's
 "needs `try_split_work_halves` / `log_bridge_panic` exposed" claim was **falsified**: the window
 uses neither. Mutation witness: a `panic!` at `ResponseHeaderInjector::new` reds 33 injector tests.
+The bare line numbers in the "Do not split `poll_read`" block and the "Hazards" list below are pre-move
+`bridge.rs` numbers; `poll_read` is now `injector.rs:808-1446`.
 
 **Do not split `poll_read`** (905–1543). It is 236 code lines inside one `AsyncRead`
 state machine whose four sections (complete gate 916–951, emission gate 977–1010,
@@ -1511,7 +1513,7 @@ External re-export paths that must be preserved (each verified against a caller)
 `extract_sni_from_client_hello` (`tests/vhost_https_sni.rs:160` — the only call; the old cite's line is now a config field),
 `run_vhost_http_listener` / `run_vhost_https_listener` (`frp-server/src/service/listeners.rs:1109,1132` — the callers moved there with the M-15/M-16 seams),
 `count_host_headers` (`tcpmux.rs:465`), `write_not_found_response`
-(`tcpmux.rs:517,714`), `clamp_vhost_timeout` (`bridge.rs:3105`), `VhostManager`
+(`tcpmux.rs:517,714`), `clamp_vhost_timeout` (`bridge.rs:1664`), `VhostManager`
 (`state.rs:28`, `dashboard.rs`, `control/proxy.rs`, `proxy_ops/`).
 
 **Do not split the orchestration core** (`serve_vhost_request`,

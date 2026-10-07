@@ -8321,7 +8321,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `:23`, `pub(super) fn new` at `:205`), carrying `Discard`/`DeclaredFraming`/`ChunkedSkip`/`ChunkedState`
   and `DISCARD_WARN_THROTTLE`. The only byte change is `pub(super)` on **5** declarations (the struct,
   `new`, `malformed_raw`, `is_http_version`, `head_status_code` — what the sibling `bridge/tests.rs` and
-  `run_work_bridge` reach); the parent went 3324 → **1884** lines and gained `mod injector;` +
+  `run_work_bridge` reach); the parent went 3324 → **1883** lines and gained `mod injector;` +
   `use injector::ResponseHeaderInjector;`. The plan's "needs `try_split_work_halves` / `log_bridge_panic`
   exposed" claim is **falsified** — the window uses neither. Mutation: a `panic!` at
   `ResponseHeaderInjector::new` reds **33** injector tests. Gates: fmt; `clippy -D warnings` (0,
