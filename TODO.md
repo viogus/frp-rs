@@ -6951,7 +6951,7 @@ nothing about whether the described behaviour still holds.
   `allocate_port_multi` `proxy.rs:821`; `register_sk_index` `proxy_ops/registry.rs:127`;
   `setup_proxy_listeners` `proxy_ops/listener.rs:42`; `listen_and_proxy`
   `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
-  `frp-server/src/vhost/router.rs:248`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
+  `frp-server/src/vhost/router.rs:262`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge/assign.rs:88`;
   `run_work_bridge` `bridge.rs:313`). **Two live errors were found and fixed en
   route**: `listen_and_proxy()` does not start listeners for
@@ -8386,11 +8386,11 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
 
   **P7 seam 3 landed (2026-10-07, PR #523 `dsh/m52-p7-router` @ `ed4a0e71`, base `92ff5fc0`) — `vhost/router.rs`.**
   The routing table of `frp-server/src/vhost.rs` moved into the child module
-  `frp-server/src/vhost/router.rs` (564 lines, window at `router.rs:14-560`) as one byte-identical
-  window: base `vhost.rs:35-581` (547 lines / sha1 `78dbe162…`) — `VhostRoute`, `VhostRouteMatch`,
+  `frp-server/src/vhost/router.rs` (564 lines, window at `router.rs:14-564`) as one byte-identical
+  window: base `vhost.rs:35-581` (547 lines / sha256 `78dbe162…`) — `VhostRoute`, `VhostRouteMatch`,
   `RouterConfigConflict`, `find_matching_route`, `get_locked`, `sort_by_longest_location`,
   `VhostTables`, `VhostManager`. The only changes are `pub(super)` on `find_matching_route`,
-  `get_locked`, `sort_by_longest_location`, `VhostTables` and its `wildcard_count`/`inner` fields
+  `sort_by_longest_location`, `VhostTables`, its `wildcard_count` field and `VhostManager::inner`
   (the sibling `vhost/tests.rs` reads them to assert wildcard counters), a rustfmt reflow of
   `find_matching_route`'s signature, and `use super::sanitize_rewrite_host;` for the one parent-scope
   call the window makes. The parent re-exports `VhostManager`/`VhostRoute`/`VhostRouteMatch`/

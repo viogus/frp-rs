@@ -177,7 +177,7 @@ pub(super) fn find_matching_route(
 /// Corresponds to Go frp's `getLocked` + calls through `getExactOrAllUsersLocked`:
 /// tries httpUser-specific routes first, then falls back to empty-string httpUser.
 /// `scheme` is the route-scheme key ("http"/"https") — see find_matching_route.
-pub(super) fn get_locked(
+fn get_locked(
     routes: &HashMap<String, HashMap<String, Vec<VhostRoute>>>,
     host: &str,
     path: &str,

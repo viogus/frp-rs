@@ -1529,7 +1529,7 @@ Remaining seams, in order:
 | Order | New module | Contents | Risk |
 |---|---|---|---|
 | 2 | `src/vhost/head.rs` — **landed PR #522** | head parsing / request line / byte sets / basic-auth extraction / authority + host extraction (was `vhost.rs:1846–2329` + `:2845–3068`, 708 lines, now `head.rs:8–491` + `:493–716`); parent 3179 → 2477 | low |
-| 3 | `src/vhost/router.rs` — **landed PR #523** | routing table: `VhostRoute`, `VhostRouteMatch`, `RouterConfigConflict`, `find_matching_route`, `get_locked`, `sort_by_longest_location`, `VhostTables`, `VhostManager` (was `vhost.rs:35–581`, 547 lines, now `router.rs:14–560`); parent 2477 → 1932 | low-medium |
+| 3 | `src/vhost/router.rs` — **landed PR #523** | routing table: `VhostRoute`, `VhostRouteMatch`, `RouterConfigConflict`, `find_matching_route`, `get_locked`, `sort_by_longest_location`, `VhostTables`, `VhostManager` (was `vhost.rs:35–581`, 547 lines, now `router.rs:14–564`); parent 2477 → 1932 | low-medium |
 | 4 | `src/vhost/forward.rs` | `resolve_vhost_request`, `VhostForward`, `VhostResolveError`, rewrite/inject (~560 lines) | low-medium |
 | 5 | `src/vhost/https.rs` | HTTPS/SNI listener + not-TLS stub (**must move as a pair**), `read_client_hello_prefix`, `extract_sni_from_client_hello` | medium |
 
@@ -1542,9 +1542,9 @@ reds 7 vhost tests. `extract_sni_from_client_hello` is left for seam 5; the rewr
 seam 4.
 
 **Seam 3 landed (2026-10-07, PR #523) — `vhost/router.rs`.** One byte-identical window (base
-`vhost.rs:35–581`, 547 lines, sha1 `78dbe162…`) → `router.rs:14–560`, with `pub(super)` on
-`find_matching_route`/`get_locked`/`sort_by_longest_location`, `VhostTables` and its
-`wildcard_count`/`inner` fields (the sibling tests read them), a rustfmt reflow of
+`vhost.rs:35–581`, 547 lines, sha256 `78dbe162…`) → `router.rs:14–564`, with `pub(super)` on
+`find_matching_route`/`sort_by_longest_location`, `VhostTables`, its `wildcard_count` field and
+`VhostManager::inner` (the sibling tests read them), a rustfmt reflow of
 `find_matching_route`'s signature, and `use super::sanitize_rewrite_host;` for the window's one
 parent-scope call. Parent re-exports `VhostManager`/`VhostRoute`/`VhostRouteMatch`/
 `RouterConfigConflict`. Mutation: a `panic!` at `find_matching_route` reds 21 vhost tests.
