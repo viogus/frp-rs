@@ -241,7 +241,7 @@ async fn raw_login_with_key(
     }
 }
 
-/// PR #454 invariant 3 (`TODO.md:11356`): run_id validation runs BEFORE the
+/// PR #454 invariant 3 (`TODO.md:11374`): run_id validation runs BEFORE the
 /// auth phase (`auth_fut` / `verify_login_auth`), not merely before it in the
 /// response text. An oversized run_id paired with a WRONG token must be
 /// rejected as a run_id error, never as an authentication failure.

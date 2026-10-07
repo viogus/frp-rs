@@ -1478,7 +1478,7 @@ mod tests {
         .expect("all spawned work conn tasks should start immediately");
     }
 
-    /// TODO.md:10342 — the work-conn token path was uncovered: no test drove a
+    /// TODO.md:10360 — the work-conn token path was uncovered: no test drove a
     /// work connection (`spawn_work_conn`, the `ReqWorkConn` handler's dial)
     /// that carries a token source, so `oidc.set_new_work_conn` /
     /// `auth_cfg.try_generate_login_key` on the NewWorkConn frame could be
