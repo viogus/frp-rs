@@ -8372,13 +8372,13 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   **P7 seam 2 landed (2026-10-07, PR #522 `dsh/m51-p7-head` @ `3301bcd4`, base `04fe9083`) — `vhost/head.rs`.**
   The pure HTTP head-parsing helpers of `frp-server/src/vhost.rs` moved into a new **child** module
   `frp-server/src/vhost/head.rs` (716 lines) as two byte-identical windows: W1 base `vhost.rs:1846-2329`
-  (484 lines / sha1 `340883c4…`) → `head.rs:7-490` (byte sets, `HeadLineVerdict`,
+  (484 lines / sha1 `340883c4…`) → `head.rs:8-491` (byte sets, `HeadLineVerdict`,
   `validate_vhost_head_lines`, `RequestLine`, `parse_vhost_request_line`, `request_line_minor_gte_1`,
-  `split_path_and_query`), and W2 `:2845-3068` (224 lines / sha1 `efe43f17…`) → `head.rs:492-715`
+  `split_path_and_query`), and W2 `:2845-3068` (224 lines / sha1 `efe43f17…`) → `head.rs:493-716`
   (`extract_basic_auth`, `extract_basic_auth_named`, `has_nonempty_header`, `count_host_headers`,
   `canonicalize_authority`, `extract_raw_request_host`, `extract_host_header`). The only byte change is
-  `pub(super)` on the 12 items the parent request path, the sibling `vhost/tests.rs` and `tcpmux.rs`
-  reach; `count_host_headers` keeps `pub(crate)` + a parent re-export and the `canonicalize_host` import
+  `pub(super)` on 11 items the parent request path, the sibling `vhost/tests.rs` and `tcpmux.rs`
+  reach; `count_host_headers` was already `pub(crate)` and keeps a parent re-export and the `canonicalize_host` import
   travels with the code. Parent 3179 → **2477** lines. `extract_sni_from_client_hello` is left for seam 5
   and the rewrite/inject helpers for seam 4. Mutation: a `panic!` at `is_vhost_tchar` reds **7** vhost
   tests. Gates: fmt; `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features`

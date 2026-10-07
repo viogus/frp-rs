@@ -12,9 +12,9 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
 use crate::service::{AppState, InternalMsg};
-// Strict request-line authority canonicalization (Go url.ParseRequestURI
-// semantics — digit gate on non-empty ports, mis-brackets → 400). Shared
-// with tcpmux.rs, which owns it (round-3 M4).
+// Pure HTTP head parsing helpers (see `head.rs`): strict authority
+// canonicalization (Go url.ParseRequestURI semantics) shared with tcpmux.rs,
+// which owns `canonicalize_host` (round-3 M4).
 
 mod head;
 /// HTTP/2 cleartext (h2c) vhost handling — see `vhost_h2c.rs`.
