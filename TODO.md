@@ -2070,7 +2070,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   not by excusing).
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     → 101: `error: method 'remove_run_id_vnet_routes' is never used` at
-    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1257`,
+    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1113`,
     is `ssh`-gated, and the whole `ssh_gateway` module is too (`frp-server/src/lib.rs:18`), so
     `vnet` without `ssh` leaves it dead.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
@@ -2852,7 +2852,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
-  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1804`) consumes its one `Ready` and the `None`
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1660`) consumes its one `Ready` and the `None`
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
@@ -8448,6 +8448,19 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   at `parse_ssh_args` reds **37** ssh_gateway lib tests (2 test binaries). Gates: fmt;
   `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
   `repo-health.sh`. Cites into the window re-pointed to `args.rs`; `pathline-cite-guard` 580/0.
+
+  **P8 seam 2 landed (2026-10-07, PR #527 `dsh/m56-p8-vc` @ `9d21bfa7`, base `d9e02bfc`) — `ssh_gateway/virtual_control.rs`.**
+  The virtual control channel moved out of `frp-server/src/ssh_gateway.rs` into the child module
+  `frp-server/src/ssh_gateway/virtual_control.rs` (155 lines, window at `virtual_control.rs:11-155`)
+  as one byte-identical window: base `ssh_gateway.rs:37-181` (145 lines / sha256 `902964c6…`) —
+  `VirtualControl`, `WorkConnRequest` and `impl VirtualControl` (the `channel` constructor). No
+  visibility changes: both types stay `pub` and the parent re-exports them, preserving
+  `frp_server::ssh_gateway::VirtualControl` (the sibling `virtual_ctrl_tests` and the `SshSession`
+  handler both reach them). The window needs only `use frp_core::msg::NewProxyResp;` and
+  `use tokio::sync::mpsc;`. Parent 2019 → **1877** lines. Mutation: a `panic!` at
+  `VirtualControl::channel` reds **9** ssh_gateway lib tests (2 binaries). Gates: fmt;
+  `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
+  `repo-health.sh`. `pathline-cite-guard` 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
