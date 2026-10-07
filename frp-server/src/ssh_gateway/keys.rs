@@ -2,7 +2,7 @@
 //!
 //! Split out of `ssh_gateway.rs` as a pure text move; the parent re-imports
 //! `load_or_generate_host_key`/`parse_authorized_keys` for `SshListener::new`,
-//! and the sibling test modules exercise the line parsers directly.
+//! and the sibling test modules exercise `parse_authorized_keys` directly.
 
 use std::path::Path;
 

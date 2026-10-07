@@ -8482,7 +8482,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   module `frp-server/src/ssh_gateway/keys.rs` (170 lines, windows at `keys.rs:12-118` and `:120-170`)
   as two byte-identical windows: W1 base `ssh_gateway.rs:1206-1312` (107 lines / sha256 `ab8a1230…`)
   — `parse_authorized_keys` + `parse_authorized_key_line`; W2 base `:1686-1736` (51 lines / sha256
-  `e0e57f41…`) — `load_or_generate_host_key`. The only byte changes are `pub(super)` on the two
+  `e0e57f41…`) — `load_or_generate_host_key`. The only changes to the moved text are `pub(super)` on the two
   parent-called functions (`parse_authorized_keys`, `load_or_generate_host_key`); `keys.rs` takes
   `std::path::Path` and the `#[cfg(unix)] PermissionsExt` import (both removed from the parent, which
   keeps only fully-qualified `std::path::Path::new` uses). Parent 1750 → **1589** lines. Mutation: a
