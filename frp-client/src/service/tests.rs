@@ -60,7 +60,7 @@ fn heartbeat_ping_backoff_progression() {
     // the value of `PING_FIRST_BACKOFF`, which is what the production call
     // site and the e2e re-arm oracle both read: without this comparison a
     // drift in the constant would be silently agreed to by all three
-    // (TODO.md:10227).
+    // (TODO.md:10240).
     assert_eq!(
         PING_FIRST_BACKOFF,
         Duration::from_secs(2),

@@ -8301,6 +8301,19 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites into
   `mod.rs` re-pointed (+3 above the arm, −268 below); `pathline-cite-guard` re-baked to 580/0.
 
+  **P5 client landed (2026-10-07, PR #517 `dsh/m46-p5-workconn` @ `f993ff61`, base `e06b87cc`) — `work_conn/udp.rs`.**
+  The UDP/SUDP work-connection family of `frp-client/src/work_conn.rs` moved into a new **child** module
+  `frp-client/src/work_conn/udp.rs` (1043 lines) as one byte-identical window: base
+  `work_conn.rs:411-1442` (1032 lines / sha1 `eadd1c10…`) → `udp.rs:9-1040`, the whole UDP session
+  table, `run_udp_session`, `resolve_udp_local_addr`, `udp_addr_of` and `run_udp_work_conn`. The only
+  byte change is `pub(super)` on **17** declarations (the items the parent's inline test module still
+  drives); the parent went 3030 → **2006** lines and gained `mod udp;`, `use udp::run_udp_work_conn;`
+  and a `#[cfg(test)] use udp::{…}` re-import block. Mutation: changing the moved
+  `UDP_SESSION_IDLE_TIMEOUT` to 31 s reds `work_conn::tests::udp_session_idle_timeout_is_go_parity_30s`.
+  Gates: fmt; `clippy -D warnings` (0, all-targets/all-features); tiny/micro; `cargo test -p frp-client
+  --lib --all-features` 323/0; `repo-health.sh`; cite guards. Cites into `work_conn.rs` re-pointed
+  (+9 above the window, −1024 below); `pathline-cite-guard` re-baked.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -10180,7 +10193,7 @@ section; ledger now **24 open / 104 closed**.**
   resolved once at `frp-client/src/service.rs:957` but the same `ValueSource` was *also* stored in
   `AuthConfig.token_source` at `:952` (pre-fix `084f7865` numbering; the post-fix `None` is now `:983`), so every Login (`frp-client/src/control.rs:369` →
   `frp-core/src/auth.rs:427-428`), Ping (`frp-client/src/service.rs:3515`) and NewWorkConn
-  (`frp-client/src/work_conn.rs:1770`) re-ran the command; Go resolves once in `NewService`
+  (`frp-client/src/work_conn.rs:746`) re-ran the command; Go resolves once in `NewService`
   (`client/service.go:168`, reused `:201`/`:316`) and only hashes the cached string. The stored
   source is now dropped (`frp-client/src/service.rs:983` `token_source: None`), with doc-only notes
   in `frp-core/src/auth.rs:96-106` and `:336-347`. Measured with real binaries on one login: pre-fix
@@ -10243,11 +10256,11 @@ section; ledger now **24 open / 104 closed**.**
   returns the constant itself (`let delay = PING_FIRST_BACKOFF;`) instead of consulting `next_ping_backoff`
   stays green, residue filed as its own item below. The NewWorkConn token path is now
   **covered, not explained**: `oidc_token_source_fills_new_work_conn_privilege_key`
-  (`frp-client/src/work_conn.rs:2524`, `#[cfg(feature = "oidc")]`) drives the real `spawn_work_conn` against a
+  (`frp-client/src/work_conn.rs:1500`, `#[cfg(feature = "oidc")]`) drives the real `spawn_work_conn` against a
   loopback listener with `client_auth_scopes = ["NewWorkConns"]` and an OIDC client built on an exec
   `tokenSource`, reads the plaintext V1 `NewWorkConn`, and asserts `privilege_key == Some("nwc-oidc-token")`
   (the raw source output, not a hash), `timestamp.is_none()`, and exactly one exec invocation; skipping the
-  auth block (`frp-client/src/work_conn.rs:1759`) reds it at `:2599:17` with `left: None`, so the pin is the
+  auth block (`frp-client/src/work_conn.rs:735`) reds it at `:2599:17` with `left: None`, so the pin is the
   key on the wire, not the frame's arrival. No user-visible behaviour changed — oracle and new test only, the
   re-arm semantics shipped in #437 -- so no `CHANGELOG.md` bullet. Residue stated, not hidden: the window
   `[P/2, 3P/2]` = `[1 s, 3 s]` admits ANY call-site literal in that class -- the review's measured survivors
@@ -10267,7 +10280,7 @@ section; ledger now **24 open / 104 closed**.**
   call site (`frp-client/src/service.rs:3539`) stays green -- the exact 2 s is pinned only by the unit
   test at `frp-client/src/service.rs:5171-5175` (the literal pin; the pre-#449 block is now `:5177-5181`).
   And no test drives a `ReqWorkConn` carrying a token
-  source (`frp-client/src/work_conn.rs:1758-1780`), although no realistic partial fix isolates it
+  source (`frp-client/src/work_conn.rs:734-756`), although no realistic partial fix isolates it
   (Login/Ping/NewWorkConn share one `Arc<AuthConfig>`, `frp-client/src/service.rs:1214-1220`).
   **Done-when:** the e2e window is tight enough that a wrong call-site backoff reds it (or the
   assertion compares against the pinned constant rather than a range), and the NewWorkConn path is
@@ -10337,7 +10350,7 @@ section; ledger now **24 open / 104 closed**.**
   test at the same `:110:5`; each mutant reverted and the lane re-run 2 passed / 0 failed.
 
   Filed from the R2 adversarial review of PR #449 (the item above).
-  `oidc_token_source_fills_new_work_conn_privilege_key` (`frp-client/src/work_conn.rs:2524`) constructs
+  `oidc_token_source_fills_new_work_conn_privilege_key` (`frp-client/src/work_conn.rs:1500`) constructs
   `WorkConnConfig` itself, so the service's own wiring -- `handle_req_work_conn`
   (`frp-client/src/service.rs:4191`), which threads `oidc_client: self.oidc_client.clone()` (`:4221`),
   `client_auth_scopes` (`:4224`) and `server_auth_scopes: ctx.server_scopes.clone()` (`:4225`) -- is never

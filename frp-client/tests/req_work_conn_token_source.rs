@@ -3,8 +3,8 @@
 //! dial a work connection whose `NewWorkConn` carries the RAW token from that
 //! source — not a cached md5 key, and not nothing at all.
 //!
-//! `TODO.md:10275` residue: the OIDC NewWorkConn path was pinned only at the
-//! `spawn_work_conn` seam (`frp-client/src/work_conn.rs:2524`,
+//! `TODO.md:10288` residue: the OIDC NewWorkConn path was pinned only at the
+//! `spawn_work_conn` seam (`frp-client/src/work_conn.rs:1500`,
 //! `oidc_token_source_fills_new_work_conn_privilege_key` builds its own
 //! `WorkConnConfig`), so `handle_req_work_conn`
 //! (`frp-client/src/service.rs:931`) — the only production call site that
@@ -17,7 +17,7 @@
 //! Login, sends `ReqWorkConn` over the encrypted control stream, accepts the
 //! work connection the client dials, and reads its `NewWorkConn`. The two
 //! tests exercise the two halves of `scope_requires_auth`'s OR
-//! (`frp-client/src/work_conn.rs:252`) — the scope can arrive from the client
+//! (`frp-client/src/work_conn.rs:261`) — the scope can arrive from the client
 //! config (`additional_auth_scopes`) or from the server's LoginResp
 //! (`server_additional_auth_scopes`, read at `frp-client/src/service/session.rs:624`
 //! and threaded through `SessionCtx.server_scopes`) — so emptying EITHER
