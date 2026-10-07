@@ -2070,7 +2070,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   not by excusing).
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     → 101: `error: method 'remove_run_id_vnet_routes' is never used` at
-    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1113`,
+    `frp-server/src/state.rs:1876` — its only caller, `frp-server/src/ssh_gateway.rs:1115`,
     is `ssh`-gated, and the whole `ssh_gateway` module is too (`frp-server/src/lib.rs:18`), so
     `vnet` without `ssh` leaves it dead.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
@@ -2852,7 +2852,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
-  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1660`) consumes its one `Ready` and the `None`
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1535`) consumes its one `Ready` and the `None`
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
@@ -8461,6 +8461,21 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `VirtualControl::channel` reds **9** ssh_gateway lib tests (2 binaries). Gates: fmt;
   `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
   `repo-health.sh`. `pathline-cite-guard` 580/0.
+
+  **P8 seam 3 landed (2026-10-07, PR #528 `dsh/m57-p8-stream` @ `9bc3ebe2`, base `c74b820c`) — `ssh_gateway/stream.rs`.**
+  The closeable-stream helpers moved out of `frp-server/src/ssh_gateway.rs` into the child module
+  `frp-server/src/ssh_gateway/stream.rs` (135 lines, window at `stream.rs:14-135`) as one
+  byte-identical window: base `ssh_gateway.rs:1193-1314` (122 lines / sha256 `b81544ac…`) —
+  `CloseableSshStream`, `CloseState`, `SshStreamCloser` and their `Drop`/`AsyncRead`/`AsyncWrite`
+  impls, plus `terminate_ssh_session` (the struct and its four trait impls stay in one file). The only
+  byte changes are `pub(super)` on `CloseableSshStream`/`CloseState` (+ its `dropped` field),
+  `SshStreamCloser` (+ its tuple field and `close`/`wait_dropped` methods) and `terminate_ssh_session`;
+  the child takes `std::future::Future`, `std::pin::Pin`, `std::task::{Context, Poll}` and
+  `tokio::io::{AsyncRead, AsyncWrite, ReadBuf}` from the parent (four now-unused imports removed
+  there). Parent 1875 → **1750** lines. Mutation: a `panic!` at `terminate_ssh_session` reds **3**
+  ssh_gateway lib tests. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
+  `cargo test -p frp-server --all-features` (green, `ssh_gateway` e2e 17/0); `repo-health.sh`.
+  `pathline-cite-guard` 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
