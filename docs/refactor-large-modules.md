@@ -1530,7 +1530,7 @@ Remaining seams, in order:
 |---|---|---|---|
 | 2 | `src/vhost/head.rs` — **landed PR #522** | head parsing / request line / byte sets / basic-auth extraction / authority + host extraction (was `vhost.rs:1846–2329` + `:2845–3068`, 708 lines, now `head.rs:8–491` + `:493–716`); parent 3179 → 2477 | low |
 | 3 | `src/vhost/router.rs` — **landed PR #523** | routing table: `VhostRoute`, `VhostRouteMatch`, `RouterConfigConflict`, `find_matching_route`, `get_locked`, `sort_by_longest_location`, `VhostTables`, `VhostManager` (was `vhost.rs:35–581`, 547 lines, now `router.rs:14–564`); parent 2477 → 1932 | low-medium |
-| 4 | `src/vhost/forward.rs` | `resolve_vhost_request`, `VhostForward`, `VhostResolveError`, rewrite/inject (~560 lines) | low-medium |
+| 4 | `src/vhost/forward.rs` — **landed PR #524** | `resolve_vhost_request`, `VhostForward`, `VhostResolveError`, rewrite/inject (was `vhost.rs:772–984` + `:1309–1821`, 726 lines, now `forward.rs:10–222` + `:224–736`); parent 1932 → 1211 | low-medium |
 | 5 | `src/vhost/https.rs` | HTTPS/SNI listener + not-TLS stub (**must move as a pair**), `read_client_hello_prefix`, `extract_sni_from_client_hello` | medium |
 
 **Seam 2 landed (2026-10-07, PR #522) — `vhost/head.rs`.** Two byte-identical windows (base
@@ -1548,6 +1548,14 @@ seam 4.
 `find_matching_route`'s signature, and `use super::sanitize_rewrite_host;` for the window's one
 parent-scope call. Parent re-exports `VhostManager`/`VhostRoute`/`VhostRouteMatch`/
 `RouterConfigConflict`. Mutation: a `panic!` at `find_matching_route` reds 21 vhost tests.
+
+**Seam 4 landed (2026-10-07, PR #524) — `vhost/forward.rs`.** Two byte-identical windows (base
+`vhost.rs:772–984`, 213 lines, sha256 `ed0ad891…`; and `:1309–1821`, 513 lines, sha256 `449e90cf…`) →
+`forward.rs:10–222` / `:224–736`, with `pub(super)` on the four W2 helpers so the parent's
+re-imports keep `router.rs`'s `use super::sanitize_rewrite_host;` and the sibling tests resolving.
+The parent re-imports `resolve_vhost_request`/`VhostResolveError` (request path + `vhost_h2c.rs`) and,
+under `#[cfg(test)]`, `VhostForward`/`inject_vhost_request_headers`/`rewrite_host_header`. Mutation: a
+`panic!` at `resolve_vhost_request` reds 8 vhost tests. Seam 5 (`https.rs`) remains.
 
 External re-export paths that must be preserved (each verified against a caller):
 `extract_sni_from_client_hello` (`tests/vhost_https_sni.rs:160` — the only call; the old cite's line is now a config field),

@@ -1395,7 +1395,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   than mapped to an empty head; on expiry the mock answers an explicit `500` naming the cause instead
   of falling through to `/` → 404. Production is untouched:
   the mock is `#[cfg(test)]`-only and `verify_login_auth` never calls it; production accept paths use
-  `tokio::net::TcpListener` (`frp-server/src/vhost.rs:986`, `frp-server/src/tcpmux.rs:320`,
+  `tokio::net::TcpListener` (`frp-server/src/vhost.rs:779`, `frp-server/src/tcpmux.rs:320`,
   `frp-server/src/service.rs:643`), and the only production `set_nonblocking` is the deliberate
   raw-splice pair in `frp-core/src/splice.rs:396-399`. Pins with literal rcs:
   `mock_idp_serves_a_request_that_arrives_after_accept` — a client connects, sleeps 0/5/20/50 ms,
@@ -7306,7 +7306,7 @@ nothing about whether the described behaviour still holds.
   Go-parity note about `vhostHTTPSPort` and the shared TLS acceptor) stays at the call site, and
   `frp-server/src/service.rs` goes 2027 → 2014 (`listeners.rs` 1118 → 1141). No `#[cfg]` and no gate or import
   change was needed: the ungated call site is legal in **every** shape because `run_vhost_https_listener` has a
-  same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1300`. The adversarial reviewer proved by
+  same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1093`. The adversarial reviewer proved by
   mutation that the payload's `https_addr2` clone is **required** (substituting the moved `https_addr` for the
   post-spawn `info!` fails with `error[E0382]: borrow of moved value`, restored byte-for-byte), and that the
   `vhost_bind` borrow of `self.cfg` is consumed by `format_socket_addr` into an owned `String` before the spawn.
@@ -7319,7 +7319,7 @@ nothing about whether the described behaviour still holds.
   verification reviewer: `86 passed, 0 failed`; the reviewer's first run flaked once in
   `go-to-rust-route-by-http-user`, the **HTTP**-vhost scenario this diff cannot reach, and passed 3/3 isolated on
   re-run — the readiness class, not this seam). This seam also **adds** one live cite (the `service.rs` module
-  comment → `vhost.rs:1300`), so the pathline table grew 576 → **577** and `guard_cites`/`guard_cites_floor` rose
+  comment → `vhost.rs:1093`), so the pathline table grew 576 → **577** and `guard_cites`/`guard_cites_floor` rose
   together to 577 with the guard still exact. **15 records were re-pointed by content** — eleven single-line, plus
   three range records over two distinct ranges, plus one **target-file** change (`service.rs:785 →
   listeners.rs:1132`, the call itself) — with every fingerprint and range end unchanged (0 re-bakes) and the table
@@ -8400,6 +8400,22 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed
   (`VhostManager` → `router.rs:262`); `pathline-cite-guard` 580/0.
 
+  **P7 seam 4 landed (2026-10-07, PR #524 `dsh/m53-p7-forward` @ `644118c0`, base `b0a48cd2`) — `vhost/forward.rs`.**
+  Two byte-identical windows of `frp-server/src/vhost.rs` moved into the child module
+  `frp-server/src/vhost/forward.rs` (736 lines, windows at `forward.rs:10-222` and `:224-736`): W1 base
+  `vhost.rs:772-984` (213 lines / sha256 `ed0ad891…`) — `VhostForward`, `VhostResolveError`,
+  `resolve_vhost_request`; W2 base `:1309-1821` (513 lines / sha256 `449e90cf…`) —
+  `sanitize_rewrite_host`, `rewrite_host_header`, `strip_vhost_hop_by_hop_headers`,
+  `inject_vhost_request_headers`. The only byte changes are `pub(super)` on the four W2 helpers (the
+  parent re-imports them so `router.rs`'s `use super::sanitize_rewrite_host;` and the sibling
+  `vhost/tests.rs` still resolve), plus `use crate::service::AppState;` / `use tracing::{debug, warn};`.
+  The parent re-imports `resolve_vhost_request`/`VhostResolveError` (parent request path +
+  `vhost_h2c.rs`) and, under `#[cfg(test)]`, `VhostForward`, `inject_vhost_request_headers`,
+  `rewrite_host_header`. Parent 1932 → **1211** lines. Mutation: a `panic!` at `resolve_vhost_request`
+  reds **8** vhost tests. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
+  `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed;
+  `pathline-cite-guard` 580/0.
+
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
   in `3fcc8ea5` / this records commit).** Two blind spots closed in `scripts/large-functions.sh`.
@@ -8549,7 +8565,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   attribute-after-gate, path-then-one-line-gate and `#[path]`-then-`#[cfg(any(test))]` orderings (the target reads `0 4 4`);
   two shapes still leave it at `4 4 0` — a `#[path]` written before the gate on the gate's line (path-first packing) and any predicate written across lines. The only `#[cfg(test)]`-paired `#[path]` site,
   `frp-server/src/control/proxy_ops/mod.rs:626-628`, is in the supported order. The item's "the tree's only
-  `#[path]` site" is loose: `frp-server/src/vhost.rs:26` carries a second one, paired with a
+  `#[path]` site" is loose: `frp-server/src/vhost.rs:33` carries a second one, paired with a
   `#[cfg(feature = "http-proxy")]` gate rather than a test gate. The two smaller conventions the item records are
   untouched and still hold: `frp-server/src/ssh_gateway.rs` 2742 / 2750 / 8 and `frp-core/src/config/mod.rs`
   25 / 27 / 2.
@@ -8687,7 +8703,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `frps/Cargo.toml:24`), so it is recorded under Keep, and the contrary
   "server-side opt-in" clause in `CLAUDE.md` was fixed. h2c is real and distinct
   (`frp-server/src/vhost_h2c.rs`, 3414 lines) but rides that default-on
-  `http-proxy` feature (`frp-server/src/vhost.rs:25`), so its freeze is a
+  `http-proxy` feature (`frp-server/src/vhost.rs:32`), so its freeze is a
   code-review rule rather than a build gate; the Windows TUN stub errors on every
   operation (`frp-vnet/src/tun_windows.rs:1,24,34`); and the **default XTCP data
   plane is QUIC**, not KCP (`frp-core/src/config/client.rs:823`,
