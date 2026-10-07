@@ -407,7 +407,7 @@ async fn test_static_file_plugin_if_none_match_nonmatching_token() {
 /// for non-ENOENT/non-EACCES errors only). chmod 0o000 the base dir so
 /// `File::open` fails with PermissionDenied. Running as euid 0 (root) or
 /// with CAP_DAC_OVERRIDE bypasses mode bits entirely and the open would
-/// SUCCEED — skip like the ssh_gateway.rs:764 precedent
+/// SUCCEED — skip like the frp-server/tests/ssh_gateway.rs:968 precedent
 /// (`unsafe { libc::geteuid() } == 0`), with permissions restored before
 /// the assertions so cleanup always works.
 #[cfg(unix)]
