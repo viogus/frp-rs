@@ -1395,7 +1395,7 @@ where the reviewer's claim was mechanical I re-ran it myself and say so.
   than mapped to an empty head; on expiry the mock answers an explicit `500` naming the cause instead
   of falling through to `/` → 404. Production is untouched:
   the mock is `#[cfg(test)]`-only and `verify_login_auth` never calls it; production accept paths use
-  `tokio::net::TcpListener` (`frp-server/src/vhost.rs:1523`, `frp-server/src/tcpmux.rs:320`,
+  `tokio::net::TcpListener` (`frp-server/src/vhost.rs:1531`, `frp-server/src/tcpmux.rs:320`,
   `frp-server/src/service.rs:643`), and the only production `set_nonblocking` is the deliberate
   raw-splice pair in `frp-core/src/splice.rs:396-399`. Pins with literal rcs:
   `mock_idp_serves_a_request_that_arrives_after_accept` — a client connects, sleeps 0/5/20/50 ms,
@@ -7306,7 +7306,7 @@ nothing about whether the described behaviour still holds.
   Go-parity note about `vhostHTTPSPort` and the shared TLS acceptor) stays at the call site, and
   `frp-server/src/service.rs` goes 2027 → 2014 (`listeners.rs` 1118 → 1141). No `#[cfg]` and no gate or import
   change was needed: the ungated call site is legal in **every** shape because `run_vhost_https_listener` has a
-  same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1837`. The adversarial reviewer proved by
+  same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1845`. The adversarial reviewer proved by
   mutation that the payload's `https_addr2` clone is **required** (substituting the moved `https_addr` for the
   post-spawn `info!` fails with `error[E0382]: borrow of moved value`, restored byte-for-byte), and that the
   `vhost_bind` borrow of `self.cfg` is consumed by `format_socket_addr` into an owned `String` before the spawn.
@@ -7319,7 +7319,7 @@ nothing about whether the described behaviour still holds.
   verification reviewer: `86 passed, 0 failed`; the reviewer's first run flaked once in
   `go-to-rust-route-by-http-user`, the **HTTP**-vhost scenario this diff cannot reach, and passed 3/3 isolated on
   re-run — the readiness class, not this seam). This seam also **adds** one live cite (the `service.rs` module
-  comment → `vhost.rs:1837`), so the pathline table grew 576 → **577** and `guard_cites`/`guard_cites_floor` rose
+  comment → `vhost.rs:1845`), so the pathline table grew 576 → **577** and `guard_cites`/`guard_cites_floor` rose
   together to 577 with the guard still exact. **15 records were re-pointed by content** — eleven single-line, plus
   three range records over two distinct ranges, plus one **target-file** change (`service.rs:785 →
   listeners.rs:1132`, the call itself) — with every fingerprint and range end unchanged (0 re-bakes) and the table
@@ -8368,6 +8368,21 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   compat-covered (`go-to-rust-sudp-mixed` / `go-to-rust-sudp-v2-v1`); the moved log sites now render
   `target: frp_server::control::bridge::sudp`. Cites
   re-pointed (`run_work_bridge` → `bridge.rs:313`); `pathline-cite-guard` re-baked to 580/0.
+
+  **P7 seam 2 landed (2026-10-07, PR #522 `dsh/m51-p7-head` @ `3301bcd4`, base `04fe9083`) — `vhost/head.rs`.**
+  The pure HTTP head-parsing helpers of `frp-server/src/vhost.rs` moved into a new **child** module
+  `frp-server/src/vhost/head.rs` (716 lines) as two byte-identical windows: W1 base `vhost.rs:1846-2329`
+  (484 lines / sha1 `340883c4…`) → `head.rs:7-490` (byte sets, `HeadLineVerdict`,
+  `validate_vhost_head_lines`, `RequestLine`, `parse_vhost_request_line`, `request_line_minor_gte_1`,
+  `split_path_and_query`), and W2 `:2845-3068` (224 lines / sha1 `efe43f17…`) → `head.rs:492-715`
+  (`extract_basic_auth`, `extract_basic_auth_named`, `has_nonempty_header`, `count_host_headers`,
+  `canonicalize_authority`, `extract_raw_request_host`, `extract_host_header`). The only byte change is
+  `pub(super)` on the 12 items the parent request path, the sibling `vhost/tests.rs` and `tcpmux.rs`
+  reach; `count_host_headers` keeps `pub(crate)` + a parent re-export and the `canonicalize_host` import
+  travels with the code. Parent 3179 → **2477** lines. `extract_sni_from_client_hello` is left for seam 5
+  and the rewrite/inject helpers for seam 4. Mutation: a `panic!` at `is_vhost_tchar` reds **7** vhost
+  tests. Gates: fmt; `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features`
+  778/0; `repo-health.sh`. Cites into `vhost.rs` re-pointed; `pathline-cite-guard` re-baked to 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied

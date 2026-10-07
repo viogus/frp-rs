@@ -426,13 +426,13 @@ alongside the extracted seams' call sites and the startup preamble. Each landed 
   `d3b0f418`): payload `service.rs:773-792` is **20 lines / 916 bytes `cmp`-identical** (sha256
   `89000dc0d04b1d512b0698e0bb49ce8c74f0630681bfcb68bab5f6d0274c01ec`), and `frp-server/src/service.rs`
   2027 → 2014. No `#[cfg]` and no gate/import change: the ungated call site is legal in every shape because
-  `run_vhost_https_listener` has a same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1837`.
+  `run_vhost_https_listener` has a same-signature `#[cfg(not(feature = "tls"))]` stub at `vhost.rs:1845`.
   Coverage: no new test — four in-process tests set the port through `Service::run` (witness
   `frp-server/tests/vhost_https_sni.rs:166`, plus `vhost_audit_fixes.rs:1656` with a real rustls handshake)
   and `scripts/compat-test.sh:5518` (`test_g2r_https`, Rust frps) is the only compat lane that reaches it
   (the other three readiness assertions — two of them the WSS scenarios — run the Go frps, and the matrix never sets
   `vhost_https_port`). This seam also **adds** one live cite (the `service.rs` module comment →
-  `vhost.rs:1837`), so `checked` and `guard_cites`/`guard_cites_floor` moved 576 → 577 together. See the
+  `vhost.rs:1845`), so `checked` and `guard_cites`/`guard_cites_floor` moved 576 → 577 together. See the
   `TODO.md` progress paragraph.
 - NAT-hole session cleanup task → **new module** `frp-server/src/service/tasks.rs`,
   `pub(super) fn spawn_nat_hole_cleanup_task(&self)` — PR #487 at code head `a687feed` (based on `e8d63b7c`):
@@ -1413,7 +1413,7 @@ Seams, ranked by value ÷ risk. All pure moves, no statement edits:
 
 **Ship the injector first, alone.** It is a self-contained `AsyncRead` adapter: the
 type is referenced outside this file **only in comments**
-(`vhost_h2c.rs:530,1769`, `vhost.rs:664`), so there is no reverse coupling at all,
+(`vhost_h2c.rs:530,1769`, `vhost.rs:672`), so there is no reverse coupling at all,
 and extracting it removes roughly 2900 lines including its tests — the single
 largest reduction available in the file. Needs `try_split_work_halves` and
 `log_bridge_panic` exposed as `pub(super)`; `assign_udp_work_conn` and
@@ -1528,10 +1528,18 @@ Remaining seams, in order:
 
 | Order | New module | Contents | Risk |
 |---|---|---|---|
-| 2 | `src/vhost/head.rs` | head parsing / request line / byte sets / basic-auth extraction / authority + host extraction (~640 lines, all pure `&str` → verdict/`&str`, no state, no IO) | low |
+| 2 | `src/vhost/head.rs` — **landed PR #522** | head parsing / request line / byte sets / basic-auth extraction / authority + host extraction (was `vhost.rs:1846–2329` + `:2845–3068`, 708 lines, now `head.rs:7–490` + `:492–715`); parent 3179 → 2477 | low |
 | 3 | `src/vhost/router.rs` | routing table: `VhostRoute`, `VhostRouteMatch`, `RouterConfigConflict`, `find_matching_route`, `get_locked`, `sort_by_longest_location`, `VhostTables`, `VhostManager` | low-medium |
 | 4 | `src/vhost/forward.rs` | `resolve_vhost_request`, `VhostForward`, `VhostResolveError`, rewrite/inject (~560 lines) | low-medium |
 | 5 | `src/vhost/https.rs` | HTTPS/SNI listener + not-TLS stub (**must move as a pair**), `read_client_hello_prefix`, `extract_sni_from_client_hello` | medium |
+
+**Seam 2 landed (2026-10-07, PR #522) — `vhost/head.rs`.** Two byte-identical windows (base
+`vhost.rs:1846–2329`, 484 lines, sha1 `340883c4…`; and `:2845–3068`, 224 lines, sha1 `efe43f17…`) →
+`head.rs:7–490` / `:492–715`, with only `pub(super)` on the 12 items the parent request path,
+`vhost/tests.rs` and `tcpmux.rs` reach (`count_host_headers` keeps `pub(crate)` + a parent re-export);
+the `canonicalize_host` import moved with the code. Mutation witness: a `panic!` at `is_vhost_tchar`
+reds 7 vhost tests. `extract_sni_from_client_hello` is left for seam 5; the rewrite/inject helpers for
+seam 4.
 
 External re-export paths that must be preserved (each verified against a caller):
 `extract_sni_from_client_hello` (`tests/vhost_https_sni.rs:160` — the only call; the old cite's line is now a config field),
@@ -1550,7 +1558,7 @@ duplicate-Host 400 at 1011–1015 → 505 at 1016–1036 → missing-Host 1050�
 Detailed 1089–1097) is pinned byte-exactly by tests; header order is XFF 2788 →
 XFH 2799 → XFP 2808 → configured 2815; error literals at 886/956/985/1013/1026/1051/1094.
 
-One stale comment to ignore rather than honour: `vhost.rs:2932` claims
+One stale comment to ignore rather than honour: `head.rs:579` claims
 `canonicalize_authority` is shared with `vhost_h2c.rs`, but that file defines its
 own `host_from_authority` (580–617) and never imports it. Do not promote it to a
 shared API on that basis.
