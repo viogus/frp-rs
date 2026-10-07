@@ -1605,7 +1605,7 @@ clean seam.
 | 4 | `ssh_gateway/keys.rs` — **landed PR #529** | `parse_authorized_keys`, `parse_authorized_key_line`, `load_or_generate_host_key` (was `ssh_gateway.rs:1206–1312` + `:1686–1736`, 158 lines, now `keys.rs:12–118` + `:120–170`) | `#[cfg(unix)] PermissionsExt` and `Path` imports must travel; parent 1750 → 1589 |
 | 5 | `ssh_gateway/frame.rs` — **landed PR #530** | `build_v1_frame_from_args` + 5 helpers (was `ssh_gateway.rs:148–287`, 140 lines, now `frame.rs:12–151`) | single consumer; parent 1589 → 1454 |
 | 6 | `ssh_gateway/bridge.rs` — **landed PR #531** | `handle_work_conn_requests`, `bridge_ssh_side` (was `ssh_gateway.rs:784–975`, 192 lines, now `bridge.rs:17–208`) | parent 1454 → 1263 |
-| 7 | `ssh_gateway/session.rs` | `SshSession` + `impl Handler` (12 methods) + `write_text_and_close` | **last**; needs six `pub(super)` widenings for surviving tests |
+| 7 | `ssh_gateway/session.rs` — **landed PR #532** | `SshSession` + `impl Handler` (12 methods) + `write_text_and_close` (was `ssh_gateway.rs:49–784`, 736 lines, now `session.rs:25–760`) | **last**; six `pub(super)` widenings for surviving tests; parent 1263 → 521. **P8 complete** |
 | — | `preauth.rs` | 53 lines | **skip** unless `run` is edited anyway |
 
 **Seam 1 landed (2026-10-07, PR #526) — `ssh_gateway/args.rs`.** One byte-identical window (base
@@ -1647,6 +1647,12 @@ medium risk around exact `Auth::Reject` shapes. **Do not** extract
 `SshListener::run`'s accept loop either — 310 lines, but it is one per-connection
 lifecycle (handshake timeout → auth wait → permit release → control-exit/idle
 select → cleanup) where the teardown ordering is the point.
+
+**Seam 7 landed (2026-10-07, PR #532) — `ssh_gateway/session.rs`.** One byte-identical window (base
+`ssh_gateway.rs:49–784`, 736 lines, sha256 `97e293dd…`) → `session.rs:25–760`, with six `pub(super)`
+tokens (five fields + `begin_authentication`). Mutation: a `panic!` at `begin_authentication` reds 8
+lib tests. **This completes P8**: `ssh_gateway.rs` is now a 521-line parent over
+`ssh_gateway/{args,virtual_control,stream,keys,frame,bridge,session,tests,key_tests,preauth_tests,virtual_ctrl_tests}.rs`.
 
 **The validation trap, and it matters more than the seams:** `scripts/compat-test.sh`
 **covers only the SSH gateway's banner and auth-rejection surface, not the gateway's full behaviour.**
