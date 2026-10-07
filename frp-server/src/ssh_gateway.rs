@@ -18,11 +18,13 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 mod args;
+mod stream;
 mod virtual_control;
 use args::{parse_ssh_args, ssh_gateway_usage, ParsedProxyArgs};
 #[cfg(test)]
 use args::{shell_split, VALID_PROXY_TYPES};
 use std::sync::Arc;
+use stream::{terminate_ssh_session, CloseableSshStream};
 pub use virtual_control::{VirtualControl, WorkConnRequest};
 
 use dashmap::DashMap;
@@ -1122,10 +1124,6 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use russh::server::Config;
-use std::future::Future;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpListener;
 
 const SSH_MAX_CONNECTIONS: usize = 128;
@@ -1189,129 +1187,6 @@ impl Drop for PreauthPermit {
 /// How long exec_request waits for the NewProxyResp of a registration —
 /// Go frp's waitProxyStatusReady poll budget (time.Second).
 const PROXY_REGISTER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-
-struct CloseableSshStream {
-    stream: tokio::net::TcpStream,
-    read_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
-    write_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
-    flush_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
-    shutdown_cancelled: Pin<Box<dyn Future<Output = ()> + Send>>,
-    close_state: Arc<CloseState>,
-}
-
-struct CloseState {
-    token: tokio_util::sync::CancellationToken,
-    dropped: tokio_util::sync::CancellationToken,
-}
-
-#[derive(Clone)]
-struct SshStreamCloser(Arc<CloseState>);
-
-impl CloseableSshStream {
-    fn new(stream: tokio::net::TcpStream) -> (Self, SshStreamCloser) {
-        let token = tokio_util::sync::CancellationToken::new();
-        let state = Arc::new(CloseState {
-            token: token.clone(),
-            dropped: tokio_util::sync::CancellationToken::new(),
-        });
-        (
-            Self {
-                stream,
-                read_cancelled: Box::pin(token.clone().cancelled_owned()),
-                write_cancelled: Box::pin(token.clone().cancelled_owned()),
-                flush_cancelled: Box::pin(token.clone().cancelled_owned()),
-                shutdown_cancelled: Box::pin(token.cancelled_owned()),
-                close_state: state.clone(),
-            },
-            SshStreamCloser(state),
-        )
-    }
-}
-
-impl Drop for CloseableSshStream {
-    fn drop(&mut self) {
-        self.close_state.dropped.cancel();
-    }
-}
-
-impl AsyncRead for CloseableSshStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        if self.close_state.token.is_cancelled() || self.read_cancelled.as_mut().poll(cx).is_ready()
-        {
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.stream).poll_read(cx, buf)
-    }
-}
-
-impl AsyncWrite for CloseableSshStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        if self.close_state.token.is_cancelled()
-            || self.write_cancelled.as_mut().poll(cx).is_ready()
-        {
-            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
-        }
-        Pin::new(&mut self.stream).poll_write(cx, buf)
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.close_state.token.is_cancelled()
-            || self.flush_cancelled.as_mut().poll(cx).is_ready()
-        {
-            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
-        }
-        Pin::new(&mut self.stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        if self.close_state.token.is_cancelled()
-            || self.shutdown_cancelled.as_mut().poll(cx).is_ready()
-        {
-            return Poll::Ready(Ok(()));
-        }
-        Pin::new(&mut self.stream).poll_shutdown(cx)
-    }
-}
-
-impl SshStreamCloser {
-    fn close(&self) {
-        self.0.token.cancel();
-    }
-
-    async fn wait_dropped(&self) {
-        self.0.dropped.cancelled().await;
-    }
-}
-
-async fn terminate_ssh_session<D>(
-    disconnect: D,
-    session_task: &mut tokio::task::JoinHandle<Result<(), anyhow::Error>>,
-    stream_closer: &SshStreamCloser,
-    stage_timeout: std::time::Duration,
-) where
-    D: Future<Output = ()>,
-{
-    let _ = tokio::time::timeout(stage_timeout, disconnect).await;
-    stream_closer.close();
-
-    if tokio::time::timeout(stage_timeout, &mut *session_task)
-        .await
-        .is_err()
-    {
-        session_task.abort();
-        let _ = tokio::time::timeout(stage_timeout, &mut *session_task).await;
-    }
-
-    let _ = tokio::time::timeout(stage_timeout, stream_closer.wait_dropped()).await;
-}
 
 /// SSH tunnel gateway listener. Binds a TCP port and accepts SSH connections.
 pub struct SshListener {
