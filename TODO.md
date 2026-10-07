@@ -6953,7 +6953,7 @@ nothing about whether the described behaviour still holds.
   `proxy_ops/listener.rs:587`; `ProxyManager` `proxy.rs:116`; `VhostManager`
   `vhost.rs:265`; `TcpMuxManager` `tcpmux.rs:34`; `InternalMsg::ProxyUserConn`
   `state.rs:344`; `assign_work_to_proxy` `bridge/assign.rs:88`;
-  `run_work_bridge` `bridge.rs:310`). **Two live errors were found and fixed en
+  `run_work_bridge` `bridge.rs:313`). **Two live errors were found and fixed en
   route**: `listen_and_proxy()` does not start listeners for
   http/https/stcp/tcpmux — only `tcp` binds a per-proxy listener — and
   `listen_and_proxy_udp()` does not exist anywhere in the tree (UDP/SUDP bind an
@@ -8340,7 +8340,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   sibling test module. The parent went 1883 → **1599** lines. Mutation: `+ 1` in `http_leg_head_deadline`
   reds `bridge::tests::http_leg_head_deadline_floors_zero_and_caps`. Gates: fmt; `clippy -D warnings` (0);
   tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed
-  (`assign_work_to_proxy` → `bridge/assign.rs:88`, `run_work_bridge` → `bridge.rs:310`);
+  (`assign_work_to_proxy` → `bridge/assign.rs:88`, `run_work_bridge` → `bridge.rs:313`);
   `pathline-cite-guard` re-baked to 580/0.
 
   **P6 seam 2 landed (2026-10-07, PR #520 `dsh/m49-p6-udp` @ `8fba084d`, base `938a0c7a`) — `bridge/udp.rs`.**
@@ -8356,7 +8356,17 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   `assign_udp_work_conn` keeps `pub(crate)` + parent re-export, and `run_udp_work_conn` is re-imported
   only under `#[cfg(test)]`. Parent 1599 → **975** lines. Gates: fmt; `clippy -D warnings` (0); tiny/micro;
   `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`. Cites re-pointed (`run_work_bridge` →
-  `bridge.rs:310`); `pathline-cite-guard` re-baked to 580/0.
+  `bridge.rs:313`); `pathline-cite-guard` re-baked to 580/0.
+
+  **P6 seam 4 landed (2026-10-07, PR #521 `dsh/m50-p6-sudp` @ `88e2c12d`, base `c135e4f7`) — `bridge/sudp.rs`.**
+  The last `bridge.rs` seam: `run_sudp_message_bridge` moved into a new **child** module
+  `frp-server/src/control/bridge/sudp.rs` (260 lines) as one byte-identical window — base
+  `bridge.rs:717-972` (256 lines / sha1 `8ebfb378…`) → `sudp.rs:5-260` — with only `pub(super)` added
+  (its sole caller is the parent's `run_work_bridge`, now `bridge.rs:313`). Parent 975 → **721** lines.
+  Gates: fmt; `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
+  `repo-health.sh`. **Coverage caveat kept open**: no unit test reaches the mixed-encoding routing this
+  function exists for, so the evidence is byte identity + the suite, not a mutation witness. Cites
+  re-pointed (`run_work_bridge` → `bridge.rs:313`); `pathline-cite-guard` re-baked to 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied

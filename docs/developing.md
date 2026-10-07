@@ -467,7 +467,7 @@ green registration and a dead port.** The only guard is the end-to-end test in
 reaches the control handler as `InternalMsg::ProxyUserConn`, the existing path
 pops a work connection, sends `StartWorkConn`, and pumps bytes.
 `assign_work_to_proxy` (`frp-server/src/control/bridge/assign.rs:88`) prepares the
-assignment and `run_work_bridge` (`frp-server/src/control/bridge.rs:310`) selects
+assignment and `run_work_bridge` (`frp-server/src/control/bridge.rs:313`) selects
 plain vs encrypted/compressed. Add code there only if your type rewrites the
 stream (host headers, protocol framing). On the client side, registration builds
 the wire message in `create_new_proxy_msg` (`frp-client/src/proxy.rs:94`) and the
