@@ -8333,7 +8333,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   The work-conn assignment cluster of `frp-server/src/control/bridge.rs` moved into a new **child** module
   `frp-server/src/control/bridge/assign.rs` (292 lines) as two byte-identical windows: W1
   `build_start_work_conn` base `bridge.rs:31-89` (59 lines / sha1 `70179acf…`) → `assign.rs:5-63`, and W2
-  `http_leg_head_deadline` + `assign_work_to_proxy` base `:1653-1880` (228 lines / sha1 `77ff1682…`) →
+  `http_leg_head_deadline` + `assign_work_to_proxy` base `:1653-1880` (228 lines / sha1 `ebb3dd6b…`; `77ff1682…` is the destination) →
   `assign.rs:65-292`. The only byte change is `pub(super)` on `http_leg_head_deadline`;
   `assign_work_to_proxy` keeps `pub(crate)` and the parent re-exports it as `bridge::assign_work_to_proxy`
   for `pool.rs` (`:205`, `:468`, `:1157`), with `#[cfg(test)] use assign::http_leg_head_deadline;` for the

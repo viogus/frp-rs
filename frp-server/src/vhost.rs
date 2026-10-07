@@ -858,7 +858,7 @@ async fn handle_http1_request<S>(
     // client-head window is the hardcoded 60s ReadHeaderTimeout on its
     // vhost http.Server, and the config's Go role — the backend
     // response-head wait, `ResponseHeaderTimeoutS` — runs on the bridge
-    // leg instead (http_leg_head_deadline in bridge.rs, on every http
+    // leg instead (http_leg_head_deadline in bridge/assign.rs, on every http
     // non-CONNECT leg), not here on the client-head window; CONNECT and
     // https legs raw-forward with neither, as does this window's Go
     // literal. The config-on-client-head divergence is documented on
