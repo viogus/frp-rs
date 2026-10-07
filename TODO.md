@@ -2070,7 +2070,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   not by excusing).
   - `RUSTFLAGS="-D warnings" cargo check -p frp-server --no-default-features --features vnet --all-targets`
     → 101: `error: method 'remove_run_id_vnet_routes' is never used` at
-    `frp-server/src/state.rs:1884` — its only caller, `frp-server/src/ssh_gateway.rs:980`,
+    `frp-server/src/state.rs:1884` — its only caller, `frp-server/src/ssh_gateway.rs:789`,
     is `ssh`-gated, and the whole `ssh_gateway` module is too (`frp-server/src/lib.rs:18`), so
     `vnet` without `ssh` leaves it dead.
   - `RUSTFLAGS="-D warnings" cargo check -p frp-client --no-default-features --features quic`
@@ -2852,7 +2852,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
   `join_all` teardown — work-conn, `frp-client/src/service.rs:4108` — drops its handles after a
   timeout instead of re-awaiting them; the `timeout(&mut handle)` sites only ever poll again after a
   *Pending* poll (ssh_gateway's `terminate_ssh_session`, the control writer); the `select!` arm on
-  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1291`) consumes its one `Ready` and the `None`
+  `&mut session_task` (`frp-server/src/ssh_gateway.rs:1100`) consumes its one `Ready` and the `None`
   branch is the only path that polls further; and every `JoinSet` drain uses
   `join_next`/`try_join_next`, which remove the completed task from the set, so no task is polled
   twice. Details and per-site reasons: the PR body.
@@ -8503,6 +8503,19 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   lines. Mutation: a `panic!` at `build_v1_frame_from_args` reds **3** ssh_gateway lib tests. Gates:
   fmt; `clippy -D warnings` (0); tiny/micro; `cargo test -p frp-server --all-features` 778/0;
   `repo-health.sh`. `pathline-cite-guard` 580/0.
+
+  **P8 seam 6 landed (2026-10-07, PR #531 `dsh/m60-p8-bridge` @ `d69a916a`, base `9d59f8b9`) — `ssh_gateway/bridge.rs`.**
+  The reverse-tunnel work-connection plumbing moved out of `frp-server/src/ssh_gateway.rs` into the
+  child module `frp-server/src/ssh_gateway/bridge.rs` (208 lines, window at `bridge.rs:17-208`) as one
+  byte-identical window: base `ssh_gateway.rs:784-975` (192 lines / sha256 `1d84a33e…`) —
+  `handle_work_conn_requests` (the ReqWorkConn background task) and `bridge_ssh_side` (the SSH↔pipe
+  pump). The only byte changes are `pub(super)` on `handle_work_conn_requests`; `bridge.rs` takes
+  `std::sync::Arc`, `tokio::sync::mpsc`, `crate::service::AppState`, `dashmap::DashMap` and the
+  parent's `WorkConnRequest`. Parent 1454 → **1263** lines. Mutation: a `panic!` at
+  `handle_work_conn_requests` reds the e2e `test_ssh_gateway_reverse_forwarding_roundtrip` (16/1; the
+  lib tests alone do not drive the ReqWorkConn lane). Gates: fmt; `clippy -D warnings` (0);
+  tiny/micro; `cargo test -p frp-server --all-features` 778/0; `repo-health.sh`.
+  `pathline-cite-guard` 580/0.
 
   **Done (2026-10-02, code head `3fcc8ea5` on `fix/large-functions-test-modules`, PR #459; both the
   verification and the adversarial review returned MERGE-with-findings and every finding is applied
