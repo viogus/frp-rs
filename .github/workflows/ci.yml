@@ -1776,8 +1776,8 @@ jobs:
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
           # uses: a *falling* count has to move both literals.
-          guard_cites=580
-          guard_cites_floor=580
+          guard_cites=581
+          guard_cites_floor=581
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
