@@ -161,7 +161,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-repo-health-fixtures.log
+          log=/tmp/frp-repo-health-fixtures.$$.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
           guard_pin=a0e0d18d50a670680c682c34b469add850cc6438269b118c13e14ca22dab8f39
@@ -413,7 +413,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-compat-stray-guard-fixtures.log
+          log=/tmp/frp-compat-stray-guard-fixtures.$$.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
           guard_pin=cda2c283d4e2b30fa839acfaaa7778d5f9f284159d8358e75abb15a00762589b
@@ -849,7 +849,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-rss-soak-run-dir.log
+          log=/tmp/frp-rss-soak-run-dir.$$.log
           status=0
           guard_file=scripts/tests/rss-soak-run-dir.sh
           guard_pin=b3f59320f8242e1430f12e9dc464db90c09efe265da5e0b5edffa010c1c86210
@@ -959,7 +959,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-large-functions-classifier.log
+          log=/tmp/frp-large-functions-classifier.$$.log
           status=0
           guard_file=scripts/tests/large-functions-classifier.sh
           guard_pin=d1c2b49d5afa18a0330a2dd5bfaf0567754a7e37c6bf8cd2950c4c73ecef8e6f
@@ -1090,7 +1090,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-docs-go-column.log
+          log=/tmp/frp-docs-go-column.$$.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
           guard_pin=f3158f1d3a49db0dd89e12b5bedc448358e46a78146c01845f735a56d7cfcf22
@@ -1194,7 +1194,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-remote-frps-reap.log
+          log=/tmp/frp-remote-frps-reap.$$.log
           status=0
           guard_file=scripts/tests/remote-frps-reap.sh
           guard_pin=53964caf08a0de9b9055121fc50b44c4a163b410f3d09844c32eaf7cc0138da2
@@ -1313,7 +1313,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-todo-cite-guard.log
+          log=/tmp/frp-todo-cite-guard.$$.log
           status=0
           guard_file=scripts/tests/todo-cite-guard.sh
           guard_pin=541bb4e6085f1bf94c5487761e3191413e2645b88951b27109d04d914f46e048
@@ -1406,7 +1406,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-todo-cite-fixtures.log
+          log=/tmp/frp-todo-cite-fixtures.$$.log
           status=0
           guard_file=scripts/tests/todo-cite-guard-fixtures.sh
           guard_pin=0575080e20463c176c584dc0f26ebd7685901e86246d96add0b6450420843be4
@@ -1760,9 +1760,9 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          log=/tmp/frp-pathline-cite-fixtures.log
-          real_log=/tmp/frp-pathline-cite.log
-          sabotage_table=/tmp/frp-pathline-cite-sabotage.txt
+          log=/tmp/frp-pathline-cite-fixtures.$$.log
+          real_log=/tmp/frp-pathline-cite.$$.log
+          sabotage_table=/tmp/frp-pathline-cite-sabotage.$$.txt
           status=0
           guard_file=scripts/tests/pathline-cite-fixtures.sh
           guard_pin=e5a08315caa259e8bcc01030a631e966dde108528eedb12e2b0a675193f968ee
