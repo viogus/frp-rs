@@ -33,26 +33,81 @@
 #
 # Measured on an 8-core host with concurrent `cargo test` sweeps, shipped bodies:
 #
-#   * two concurrent full 13-step sweeps x 4 rounds: step 06 red in round 2, both
-#     lanes; step 08 red in rounds 2 and 4. That is 4 red step-runs out of 8
-#     lane-rounds (104 step-runs), with rounds 1 and 3 all green — a flake, not a
+#   * base tree, three concurrent cargo lanes plus two back-to-back full 13-step
+#     sweeps plus a hot lane on steps 02/06/09/11: 12 red step-runs out of 237
+#     (steps 02, 06 and 08), whole rounds otherwise green — a flake, not a
 #     deterministic failure;
 #   * step 6's body with the shipped path, two concurrent lanes: `status=1` with
-#     `ok=108 result=1 fail=0 exact=269` (round 4) and `ok=232/237` (round 2) —
-#     2 of 5 rounds; every other lane scored `ok=269 result=1 status=0`;
+#     `ok=108 result=1 fail=0 exact=269` (round 4) and `ok=232/237` (round 2);
 #   * the same body with only `.$$` inserted before the extension, same host,
-#     same rounds, same contention: 0 reds in 10 lane-runs, every one of them
-#     `ok=269 result=1 status=0`.
+#     same rounds, same contention: 0 reds in 28 lane-runs, every one of them
+#     `ok=269 result=1 status=0`. An independent reviewer rebuilt the two-arm
+#     control from scratch and measured 6 red / 12 staggered lane-runs for the
+#     shipped path against 0 red / 12 for `.$$`.
 #
 # The fix is therefore one token per path: make the path per-run. `$$` in a
 # /tmp path is this repo's established idiom for exactly this (see
 # scripts/tests/rss-soak-run-dir.sh, scripts/tests/inner-feature-port-probe.sh,
 # scripts/remote-frps.sh).
 #
-# Why this is not a CI step: adding one would renumber every numeric
-# `.github/workflows/ci.yml` citation that live files carry, which is the reason
-# `scripts/tests/inner-feature-port-probe.sh` records for staying unwired. Run it
-# by hand after touching the health job:
+# What this file checks, in order:
+#
+#   1. the workflow exists; the `health:` job exists; and the workflow declares
+#      exactly one top-level `health:` key, so a second copy cannot be guarded
+#      only by luck of ordering;
+#   2. the extracted region still hashes to `guard_region_pin` (the job's text);
+#   3. the region declares 13 run blocks, names 11 distinct /tmp/frp tokens, and
+#      each of those tokens occurs exactly once. That trio pins the current
+#      *spelling* — deliberately, so the paths in this job cannot be renamed
+#      silently — but it is not the property:
+#
+#          log="${TMPDIR:-/tmp}/frp-rss-soak-run-dir.log"
+#          log_dir=/tmp/frp2-hidden; log=$log_dir/rss-soak.log
+#
+#      both pass it, and the three `${TMPDIR:-/tmp}` steps in this job are
+#      outside the token list by design. The word "assigned" in check 3 means
+#      "the token text occurs once", not "one assignment site": that is what the
+#      variable-level checks below establish;
+#   4. the region is the only job referencing each of the 13 suites the job
+#      drives — in code, comment lines stripped. A renamed copy of the block
+#      invoking the same suites reds here, and the failure names the copy's job
+#      key;
+#   5. every variable a run block uses as a log is discovered from that block's
+#      own text (a `>`/`>>`/`>|` target, a `$(<file)` source, a `cat` argument),
+#      evaluated in the block's own assignment context in two separate shells,
+#      and required to differ — that is the per-run invariant, and it sees paths
+#      spelled any way. The values are then required to be pairwise distinct
+#      across all steps;
+#   6. every evaluated log path sits in an existing parent directory. This is
+#      what refuses
+#
+#          log=/tmp/frp-rss-soak-run-dir.$$.log/tmp/frp-rss-shared.log
+#
+#      whose real path's parent is the per-run `...$$.log` component, a file.
+#      Measured with the shipped step-6 body and only that assignment changed:
+#      the redirect fails with "/tmp/frp-rss-soak-run-dir.<pid>.log/tmp/
+#      frp-rss-shared.log: No such file or directory", the suite never runs, and
+#      under the body's own `set -e` the read-back stops the step with rc 1
+#      before its `::error::` line. A path whose parent does not exist cannot be
+#      a log this job writes, and no step in this job `mkdir`s its log's parent,
+#      so "the parent exists" is a true invariant here;
+#   7. enforcer canaries: known-answer inputs for the per-run predicate, the
+#      distinctness comparison and the parent-directory rule, each with one
+#      input it must accept and one it must refuse.
+#
+# Unwired and self-unhashed, on purpose. Adding this file as a CI step would
+# renumber every numeric `.github/workflows/ci.yml` citation that live files
+# carry — the reason `scripts/tests/inner-feature-port-probe.sh` records for
+# staying unwired. And nothing pins *this* file: the region pin pins the job, so
+# a commit that reverts a `log=` value and edits this guard to match is caught
+# by nothing automatic. What catches that is review of any PR touching the
+# health job, plus running this guard by hand and comparing the
+# `guard self-hash` line it prints (on the success path) with the sha256
+# recorded in the PR record and the round's development-log entry. The
+# self-hash is checked to be computable from a readable regular file, so a
+# failed self-hash is a red run, not a skipped line.
+#
+# Run it by hand after touching the health job:
 #
 #     bash scripts/tests/health-step-log-privacy.sh
 #
@@ -95,7 +150,7 @@ extract_region() {
 # count of a green run, so deleting any check below drops the count under it.
 # A floor of 0 (or an unset floor, or an all-zero spelling) would disable the
 # guard from inside, so each of those is itself a failure.
-MIN_CHECKS=24
+MIN_CHECKS=60
 checks=0
 fails=0
 
@@ -168,6 +223,36 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/health-log-privacy.XXXXXX")
 cleanup() { rm -rf -- "$work"; }
 trap 'floor_check; cleanup; exit "$fails"' EXIT
 
+# --- self-identity ------------------------------------------------------------
+# The region pin pins the health job, not this file. Nothing pins this guard, so
+# its own digest is printed on the success path for the PR record and the round's
+# development-log entry, and a self-hash that cannot be computed (unreadable $0,
+# no hasher) is a failure rather than a skipped line.
+self_path="$self_dir/$(basename -- "${BASH_SOURCE[0]}")"
+self_file_ok=0
+if [ -f "$self_path" ] && [ -r "$self_path" ]; then
+    self_file_ok=1
+    ok "this guard's own file is a readable regular file ($self_path)"
+else
+    bad "this guard's own file is not a readable regular file ($self_path): the self-hash cannot be trusted"
+fi
+guard_self_sha=''
+if [ -n "$guard_hasher" ] && [ "$self_file_ok" = "1" ]; then
+    self_out=$($guard_hasher < "$self_path" 2>/dev/null)
+    guard_self_sha=${self_out%% *}
+fi
+self_hash_ok=1
+[ -n "$guard_self_sha" ] || self_hash_ok=0
+[ "${#guard_self_sha}" = "64" ] || self_hash_ok=0
+case "$guard_self_sha" in
+    *[!0-9a-f]*) self_hash_ok=0 ;;
+esac
+if [ "$self_hash_ok" = "1" ]; then
+    ok "this guard's own sha256 was computed with the same absolute hasher ($guard_self_sha)"
+else
+    bad "this guard's own sha256 could not be computed (got '${guard_self_sha:-<empty>}')"
+fi
+
 # --- the predicate under test -------------------------------------------------
 # A token is run-unique when it carries a per-run component: the same token text
 # evaluated in two different processes must yield two different paths. `$$` is
@@ -213,6 +298,18 @@ case "$region" in
     *'name: Health'*) ok 'the health job was located and carries its name line' ;;
     *) bad 'the health job could not be located (no `name: Health` in the region)' ;;
 esac
+
+# `extract_region` stops at the first `^  health:$` it finds, so a second
+# top-level `health:` key would leave whatever follows it unguarded while this
+# file stayed green. Assert the count. (A *renamed* copy is caught by the
+# whole-file ownership checks further down, not here.)
+health_keys=$(grep -cE '^  health:$' "$workflow" 2>/dev/null || true)
+health_keys=${health_keys:-0}
+if [ "$health_keys" = "1" ]; then
+    ok 'the workflow declares exactly one top-level health job key'
+else
+    bad "the workflow declares $health_keys top-level health job keys: only one is read, so a second copy could carry a reverted path unnoticed"
+fi
 
 guard_region_pin=4eb650cf8a3afd5bacf4d2794a43d02c1313004bf255a9c3847ff63b20297ca6
 region_pin=$(sha_of "$region")
@@ -266,7 +363,7 @@ for token in ${tokens[@]+"${tokens[@]}"}; do
     fi
 done
 if [ "$once" = "1" ]; then
-    ok 'every /tmp/frp path is assigned exactly once (no copy-pasted path between two steps)'
+    ok 'each of the 11 /tmp/frp path tokens occurs exactly once in the job (a per-token occurrence check; the variable-level checks below are the assignment-level invariant)'
 fi
 
 values=()
@@ -288,7 +385,194 @@ done
 if list_is_distinct ${values[@]+"${values[@]}"}; then
     ok "all ${#values[@]} evaluated paths are distinct within one run"
 else
-    bad 'two of the health job paths evaluate to the same file in one run'
+    bad "the ${#values[@]} evaluated path token(s) are not pairwise distinct in one run (a token evaluates to the same file as another)"
+fi
+
+# --- whole-file ownership: the region is the only job running these suites ----
+# `extract_region` reads only the health block, so a second job — a renamed copy
+# of the block, say — could invoke the same suites (and carry one reverted path)
+# while every check above stayed green. Every non-comment reference to each suite
+# the job drives must therefore sit inside the region, and the region must
+# reference all 13. `scripts/repo-health.sh` is named in comments outside the
+# job; only comment-stripped references count.
+region_start=$(grep -nE '^  health:$' "$workflow" 2>/dev/null | head -n 1 | cut -d: -f1)
+region_start=${region_start:-0}
+region_end=0
+if [ "$region_start" -gt 0 ] && [ -f "$workflow" ]; then
+    region_end=$(awk -v s="$region_start" 'NR > s && /^  [A-Za-z0-9_-]+:$/ { print NR - 1; exit }' "$workflow")
+    if [ -z "$region_end" ]; then
+        region_end=$(wc -l < "$workflow" | tr -d ' ')
+    fi
+fi
+
+guard_suites=(
+    scripts/repo-health.sh
+    scripts/tests/repo-health-fixtures.sh
+    scripts/tests/compat-stray-guard.sh
+    scripts/tests/compat-port-ownership.sh
+    scripts/tests/compat-scenario-retry.sh
+    scripts/tests/rss-soak-run-dir.sh
+    scripts/tests/large-functions-classifier.sh
+    scripts/tests/docs-go-column.sh
+    scripts/tests/remote-frps-reap.sh
+    scripts/tests/todo-cite-guard.sh
+    scripts/tests/todo-cite-guard-fixtures.sh
+    scripts/tests/ab-measurable-delta.sh
+    scripts/tests/pathline-cite-fixtures.sh
+)
+guard_suite_count=13
+if [ "${#guard_suites[@]}" = "$guard_suite_count" ]; then
+    ok "the guard names all $guard_suite_count suites the health job drives"
+else
+    bad "the guard names ${#guard_suites[@]} suites, not the pinned $guard_suite_count"
+fi
+for suite in ${guard_suites[@]+"${guard_suites[@]}"}; do
+    in_region=$(awk -v s="$region_start" -v e="$region_end" -v p="$suite" '
+        NR >= s && NR <= e && $0 !~ /^[[:space:]]*#/ && index($0, p) > 0 { c++ }
+        END { print c + 0 }
+    ' "$workflow" 2>/dev/null)
+    outside=$(awk -v s="$region_start" -v e="$region_end" -v p="$suite" '
+        /^  [A-Za-z0-9_-]+:$/ { job = $0; sub(/^[[:space:]]+/, "", job); sub(/:[[:space:]]*$/, "", job) }
+        (NR < s || NR > e) && $0 !~ /^[[:space:]]*#/ && index($0, p) > 0 { print NR ":" job }
+    ' "$workflow" 2>/dev/null)
+    if [ -n "$outside" ]; then
+        bad "$suite is referenced outside the health job at $outside: this guard reads only the health block, so a copy there could carry a reverted path"
+    elif [ "${in_region:-0}" = "0" ]; then
+        bad "$suite is never referenced inside the health job (the region or the suite list is stale)"
+    else
+        ok "the health job is the only job referencing $suite ($in_region comment-stripped reference(s) inside the region)"
+    fi
+done
+
+# --- the log variables, discovered from each block's own text ------------------
+# The token list above is a spelling pin; this is the invariant. Each run block's
+# body is parsed out of the region, and every variable that block uses as a log
+# is discovered from usage — a `>`/`>>`/`>|` target, a `$(<file)` source, a `cat`
+# argument — then evaluated in that block's own assignment context (the leading
+# assignments of its body, not a bare `eval`) in two separate shells.
+mkdir -p -- "$work/blocks"
+printf '%s\n' "$region" > "$work/region.txt"
+awk -v dir="$work/blocks" '
+    function close_block() { if (open_) { close(f); open_ = 0 } }
+    /^[[:space:]]+run:/ {
+        close_block()
+        match($0, /^[ ]+/); ind = RLENGTH
+        n++
+        f = dir "/block-" n ".body"
+        open_ = 1
+        run_ind = ind
+        rest = substr($0, ind + 1)
+        sub(/^run:[[:space:]]*/, "", rest)
+        if (rest != "" && rest != "|" && rest != "|-" && rest != "|+" && rest != ">" && rest != ">-") {
+            print "# inline run: " rest > f
+        }
+        next
+    }
+    open_ {
+        if ($0 ~ /^[[:space:]]*$/) { print "" > f; next }
+        match($0, /^[ ]*/); ind2 = RLENGTH
+        if (ind2 > run_ind) { print substr($0, run_ind + 3) > f; next }
+        close_block()
+    }
+    END { close_block(); printf "%d\n", n + 0 > (dir "/count") }
+' "$work/region.txt"
+guard_blocks=0
+if [ -f "$work/blocks/count" ]; then
+    guard_blocks=$(cat "$work/blocks/count")
+fi
+
+# The discovery patterns. `[{]`/`[}]` are literal braces: ERE interval syntax is
+# not involved, so they mean the same thing to every grep this repo runs.
+block_var_names() {
+    local body="$1"
+    {
+        grep -oE '>>?[[:space:]]*"\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?"' "$body"
+        grep -oE '>\|[[:space:]]*"\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?"' "$body"
+        grep -oE '\$\(<"\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?"\)' "$body"
+        grep -oE 'cat[[:space:]]+"\$[{]?[A-Za-z_][A-Za-z0-9_]*[}]?"' "$body"
+    } 2>/dev/null | sed -E 's/.*\$[{]?([A-Za-z_][A-Za-z0-9_]*)[}]?"\)?$/\1/' | sort -u
+}
+# The body's own context: its leading assignments, stopping at the first line
+# that is neither an assignment nor a harmless prelude line. This is what makes
+# the evaluation "in the step's own context" rather than a bare `eval` of the
+# token — a variable set from another variable is resolved as the step sets it.
+block_context() {
+    awk '
+        /^[[:space:]]*$/ { next }
+        /^[[:space:]]*#/ { next }
+        /^set / { next }
+        /^[A-Za-z_][A-Za-z0-9_]*=/ { print; next }
+        { exit }
+    ' "$1"
+}
+eval_in_context() {
+    {
+        cat "$1"
+        printf 'printf "%%s" "$%s"\n' "$2"
+    } > "$work/eval-body.sh"
+    bash "$work/eval-body.sh" 2>/dev/null
+}
+
+guard_log_vars=14
+log_vars=()
+log_values=()
+block=0
+while [ "$block" -lt "$guard_blocks" ]; do
+    block=$((block + 1))
+    body="$work/blocks/block-$block.body"
+    if [ ! -f "$body" ]; then
+        bad "run block $block has no parsed body (the block parser and the step counter disagree)"
+        continue
+    fi
+    block_context "$body" > "$work/blocks/block-$block.ctx"
+    while IFS= read -r var; do
+        [ -n "$var" ] || continue
+        log_vars+=("$block:$var")
+        first=$(eval_in_context "$work/blocks/block-$block.ctx" "$var")
+        second=$(eval_in_context "$work/blocks/block-$block.ctx" "$var")
+        log_values+=("$first")
+        if [ -z "$first" ]; then
+            bad "the log variable $var in run block $block evaluates to nothing: its context or its spelling cannot produce a path"
+        elif [ "$first" != "$second" ]; then
+            ok "the log variable $var in run block $block is per-run (evaluated in its own context twice: $first)"
+        else
+            bad "the log variable $var in run block $block evaluates to the same path in two shells ($first): concurrent runs of this step share it"
+        fi
+    done < <(block_var_names "$body")
+done
+
+if [ "${#log_vars[@]}" = "$guard_log_vars" ]; then
+    ok "the job's $guard_blocks run blocks name $guard_log_vars log variables, discovered from usage rather than from spelling"
+else
+    bad "the job's run blocks name ${#log_vars[@]} log variables, not the pinned $guard_log_vars (parsed $guard_blocks block(s)): a log path was added, removed, or spelled past the discovery patterns"
+fi
+
+if list_is_distinct ${log_values[@]+"${log_values[@]}"}; then
+    ok "all ${#log_values[@]} discovered log variables evaluate to distinct paths in one run"
+else
+    bad "the ${#log_values[@]} discovered log value(s) are not pairwise distinct in one run: two steps share a log, or the discovery found fewer than two"
+fi
+
+# --- every log path's parent must be a real directory --------------------------
+# `log=/tmp/<per-run>.log/tmp/other.log` keeps a per-run component and 11 distinct
+# tokens, but the real path's parent is a file: the redirect cannot succeed, the
+# suite never runs, and the step's own `|| status=1` reds it. A path whose parent
+# does not exist cannot be a log this job writes successfully, and no step here
+# `mkdir`s its log's parent, so this is a true invariant.
+parent_dir_exists() { [ -d "$(dirname -- "$1")" ]; }
+parent_missing=''
+parents_ok=1
+for path in ${log_values[@]+"${log_values[@]}"}; do
+    [ -n "$path" ] || continue
+    if ! parent_dir_exists "$path"; then
+        parents_ok=0
+        parent_missing="$parent_missing $path (parent: $(dirname -- "$path"))"
+    fi
+done
+if [ "$parents_ok" = "1" ]; then
+    ok 'every evaluated log path sits in an existing parent directory'
+else
+    bad "these evaluated log paths have no existing parent directory:$parent_missing"
 fi
 
 # --- enforcer canaries --------------------------------------------------------
@@ -320,6 +604,17 @@ if list_is_distinct '/tmp/frp-canary.$$.log' '/tmp/frp-canary.$$.log'; then
 else
     ok 'canary: the distinctness check refuses two identical templates'
 fi
+if parent_dir_exists '/tmp/frp-canary.$$.log'; then
+    ok 'canary: the parent-directory rule accepts a /tmp-rooted path (its parent exists)'
+else
+    bad 'canary: the parent-directory rule refused a /tmp-rooted path whose parent exists'
+fi
+if parent_dir_exists "$work/no-such-log-dir/canary.log"; then
+    bad 'canary: the parent-directory rule accepted a path under a directory that does not exist'
+else
+    ok 'canary: the parent-directory rule refuses a path under a nonexistent directory'
+fi
 
+printf 'guard self-hash (sha256): %s\n' "$guard_self_sha"
 printf '\nRESULT: %d fixture check(s) hold\n' "$((checks - fails))"
 exit "$fails"
