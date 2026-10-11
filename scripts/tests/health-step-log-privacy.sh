@@ -9,8 +9,9 @@
 # traceability comment. The item itself is still covered by
 # `scripts/tests/todo-cite-guard.sh` everywhere it is cited by number.
 #
-# The shape it pins. Nine of the health job's thirteen fixture steps write their
-# suite's output to one fixed path under /tmp and then judge that path:
+# The shape it pins. Before the fix, nine of the health job's thirteen fixture
+# steps wrote their suite's output to one fixed path under /tmp and then judged
+# that path:
 #
 #     log=/tmp/frp-<step>.log
 #     bash scripts/tests/<suite>.sh > "$log" 2>&1 || status=1
@@ -75,13 +76,26 @@
 #      drives — in code, comment lines stripped. A renamed copy of the block
 #      invoking the same suites reds here, and the failure names the copy's job
 #      key;
-#   5. every variable a run block uses as a log is discovered from that block's
-#      own text (a `>`/`>>`/`>|` target, a `$(<file)` source, a `cat` argument),
-#      evaluated in the block's own assignment context in two separate shells,
-#      and required to differ — that is the per-run invariant, and it sees paths
-#      spelled any way. The values are then required to be pairwise distinct
-#      across all steps;
-#   6. every evaluated log path sits in an existing parent directory. This is
+#   5. every log variable spelled as a quoted `"$var"` target is discovered from
+#      the block's own text (a `>`/`>>`/`>|` target, a `$(<file)` source, a
+#      `cat` argument), evaluated in the block's own assignment context in two
+#      separate shells, and required to differ. This is a pin on the *spelling*
+#      the current steps use, not on the property: it sees only quoted-variable
+#      targets, so a redirect written as a fixed literal is invisible to it;
+#   6. every redirect/pipe *target word* in every run block — the invariant, and
+#      the reason this file exists. The scanner below reads each block with its
+#      comments stripped and reports its `>`/`>>`/`>|`/`&>` targets, its
+#      `| tee <target>` arguments, its `dd of=<target>` and its read sides
+#      (`$(<file)`, `cat <file>`); a quoted case label such as `'-> child red'`
+#      is a word, not a redirect. Each non-exempt word is then evaluated as a
+#      shell word in the block's own leading-assignment context, in two separate
+#      shells, and required to differ — so a fixed literal target
+#      (`| tee "$log" >> /tmp/shared.log`, `dd of=/tmp/shared`,
+#      `bash ... > /tmp/anything.log`) reds on its own, naming the block, the
+#      target and both evaluated values, with `guard_region_pin` left at the
+#      unmodified job's hash. These values are also required to be pairwise
+#      distinct across all steps;
+#   7. every evaluated log path sits in an existing parent directory. This is
 #      what refuses
 #
 #          log=/tmp/frp-rss-soak-run-dir.$$.log/tmp/frp-rss-shared.log
@@ -94,9 +108,24 @@
 #      before its `::error::` line. A path whose parent does not exist cannot be
 #      a log this job writes, and no step in this job `mkdir`s its log's parent,
 #      so "the parent exists" is a true invariant here;
-#   7. enforcer canaries: known-answer inputs for the per-run predicate, the
-#      distinctness comparison and the parent-directory rule, each with one
-#      input it must accept and one it must refuse.
+#   8. enforcer canaries: known-answer inputs for the per-run predicate, the
+#      distinctness comparison, the parent-directory rule and the target scanner
+#      itself, each with one input it must accept and one it must refuse.
+#
+# Exemptions are explicit and complete: an fd-duplication operator (`>&N`,
+# `2>&1`, `&N`) has no path and is not a target; and a target whose evaluated
+# value is `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/*` or `-` is a
+# sink, not a shared log. Nothing else is exempt. An earlier revision discovered
+# targets only by quoted-`"$var"` spelling, which left the review's
+# `| tee "$log" >> /tmp/shared.log` recipe green with a genuinely shared fixed
+# path; the word-level scan is what closes that, and it is deliberately not
+# implemented as a wider grep pattern.
+#
+# Residual limits, stated rather than implied: this scanner is line-oriented, so
+# a path assembled inside a function body or by `eval` at a level it does not
+# reach, process substitution (`>(...)`), a target handed to a wrapper that
+# redirects on its caller's behalf, and `set -x` trace output are not seen. Each
+# would need a new shape here, not a wider exemption list.
 #
 # Unwired and self-unhashed, on purpose. Adding this file as a CI step would
 # renumber every numeric `.github/workflows/ci.yml` citation that live files
@@ -153,7 +182,7 @@ extract_region() {
 # count of a green run, so deleting any check below drops the count under it.
 # A floor of 0 (or an unset floor, or an all-zero spelling) would disable the
 # guard from inside, so each of those is itself a failure.
-MIN_CHECKS=60
+MIN_CHECKS=82
 checks=0
 fails=0
 
@@ -220,6 +249,14 @@ if [ "$print_region_hash" = "1" ]; then
     fi
     printf '%s\n' "$(sha_of "$(extract_region)")"
     exit 0
+fi
+
+# The target scanner below is python3 (the repo's other script suites use the
+# same interpreter). A missing interpreter is a red run, never a skipped check:
+# the check it performs is the invariant this file exists for.
+if ! command -v python3 >/dev/null 2>&1; then
+    printf 'FAIL  python3 is required by the redirect-target scanner and was not found\n' >&2
+    exit 1
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/health-log-privacy.XXXXXX")
@@ -515,6 +552,227 @@ eval_in_context() {
     } > "$work/eval-body.sh"
     bash "$work/eval-body.sh" 2>/dev/null
 }
+# Evaluate one *word* (quotes and expansions included, as the block spells it) in
+# the block's own context. This is what makes the word-level check see a literal
+# target, a `"$dir"/x.log` mix and a `"$(mktemp)"` alike: the word is spliced
+# into a printf in the block's assignment context, so the shell — not a pattern —
+# decides what it means.
+eval_word_in_context() {
+    {
+        cat "$1"
+        printf 'printf "%%s" %s\n' "$2"
+    } > "$work/eval-word.sh"
+    bash "$work/eval-word.sh" 2>/dev/null
+}
+
+# The redirect/pipe target scanner. Discovery by *shape*, not by spelling: this
+# is the check an earlier quoted-`"$var"`-only grep could not make. Output is one
+# `op<TAB>kind<TAB>word` line per item, in file order, with comments stripped and
+# quoted words skipped. kind is `target` (a redirect or pipe target), `read` (a
+# `$(<file)` / `cat <file>` source) or `fddup` (an fd-duplication operator, which
+# names no path). Exemptions are decided by the caller (operator for `fddup`,
+# evaluated value for the `/dev` sinks and `-`), never by this scanner.
+block_target_items() {
+    python3 -B - "$1" <<'PY'
+import sys
+
+
+def strip_comment(line):
+    """Drop an unquoted shell comment. `#` opens one at the start of a word."""
+    out = []
+    i, n = 0, len(line)
+    quote = None
+    while i < n:
+        c = line[i]
+        if quote:
+            if c == "\\" and quote == '"':
+                out.append(c)
+                i += 1
+                if i < n:
+                    out.append(line[i])
+                    i += 1
+                continue
+            out.append(c)
+            i += 1
+            if c == quote:
+                quote = None
+            continue
+        if c in ('"', "'"):
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if c == "\\":
+            out.append(c)
+            i += 1
+            if i < n:
+                out.append(line[i])
+                i += 1
+            continue
+        if c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
+            break
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def read_word(line, i):
+    """Read one shell word, quotes kept verbatim; stop at an unquoted operator."""
+    out = []
+    n = len(line)
+    while i < n:
+        c = line[i]
+        if c in " \t":
+            break
+        if c in ";|&<>()":
+            break
+        if c == "$" and i + 1 < n and line[i + 1] == "(":
+            break
+        if c == "\\":
+            out.append(c)
+            i += 1
+            if i < n:
+                out.append(line[i])
+                i += 1
+            continue
+        if c in ('"', "'"):
+            q = c
+            out.append(c)
+            i += 1
+            while i < n:
+                d = line[i]
+                if q == '"' and d == "\\":
+                    out.append(d)
+                    i += 1
+                    if i < n:
+                        out.append(line[i])
+                        i += 1
+                    continue
+                out.append(d)
+                i += 1
+                if d == q:
+                    break
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out), i
+
+
+def scan_line(line):
+    """Return (op, kind, word) for every redirect/pipe item on one line."""
+    res = []
+    line = strip_comment(line)
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if c in ('"', "'"):
+            _, i = read_word(line, i)
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c == ">" and i + 1 < n and line[i + 1] == "&":
+            j = i + 2
+            w, j = read_word(line, j)
+            res.append((">&", "fddup", w))
+            i = j
+            continue
+        if c == "&" and i + 1 < n and line[i + 1] == ">":
+            op = "&>>" if i + 2 < n and line[i + 2] == ">" else "&>"
+            j = i + len(op)
+            while j < n and line[j] in " \t":
+                j += 1
+            w, j = read_word(line, j)
+            if w:
+                res.append((op, "target", w))
+            i = j
+            continue
+        if c == ">":
+            op = ">"
+            j = i + 1
+            if j < n and line[j] == ">":
+                op = ">>"
+                j += 1
+            elif j < n and line[j] == "|":
+                op = ">|"
+                j += 1
+            while j < n and line[j] in " \t":
+                j += 1
+            w, j = read_word(line, j)
+            if w:
+                res.append((op, "target", w))
+            i = j
+            continue
+        if c == "|" and not (i + 1 < n and line[i + 1] == "|"):
+            j = i + 1
+            while j < n and line[j] in " \t":
+                j += 1
+            w, j = read_word(line, j)
+            if w == "tee":
+                while True:
+                    while j < n and line[j] in " \t":
+                        j += 1
+                    if j >= n or line[j] in ";|<>":
+                        break
+                    a, j2 = read_word(line, j)
+                    j = j2
+                    if a.startswith("-"):
+                        continue
+                    res.append(("tee", "target", a))
+                    break
+            i = j
+            continue
+        if c == "$" and line[i:i + 3] == "$(<":
+            j = i + 3
+            while j < n and line[j] in " \t":
+                j += 1
+            w, j = read_word(line, j)
+            while j < n and line[j] in " \t":
+                j += 1
+            if j < n and line[j] == ")":
+                j += 1
+            if w:
+                res.append(("$(<)", "read", w))
+            i = j
+            continue
+        if c not in ";|&<>()":
+            w, j = read_word(line, i)
+            if w == "dd":
+                k = j
+                while k < n:
+                    while k < n and line[k] in " \t":
+                        k += 1
+                    if k >= n or line[k] in ";|&<>":
+                        break
+                    a, k2 = read_word(line, k)
+                    if a.startswith("of=") and len(a) > 3:
+                        res.append(("dd-of", "target", a[3:]))
+                    k = k2
+                j = k
+            elif w.startswith("of=") and len(w) > 3:
+                res.append(("dd-of", "target", w[3:]))
+            elif w == "cat":
+                k = j
+                while k < n and line[k] in " \t":
+                    k += 1
+                if k < n and line[k] not in ";|&<>":
+                    a, k2 = read_word(line, k)
+                    res.append(("cat", "read", a))
+                    k = k2
+                j = k
+            i = j if j > i else i + 1
+            continue
+        i += 1
+    return res
+
+
+with open(sys.argv[1], errors="replace") as fh:
+    for line in fh:
+        for op, kind, word in scan_line(line):
+            if word:
+                sys.stdout.write("%s\t%s\t%s\n" % (op, kind, word))
+PY
+}
 
 guard_log_vars=14
 log_vars=()
@@ -556,6 +814,79 @@ else
     bad "the ${#log_values[@]} discovered log value(s) are not pairwise distinct in one run: two steps share a log, or the discovery found fewer than two"
 fi
 
+# --- the redirect/pipe targets, discovered by shape rather than by spelling ----
+# The section above pins the *spelled* forms the current steps use; a target
+# written as a fixed literal is invisible to it. This section is the invariant:
+# every target word a run block redirects to or pipes into, whatever its
+# spelling, must be per-run. The review's counterexample —
+# `... 2>&1 | tee "$log" >> /tmp/shared.log` — is refused here on its literal.
+guard_target_words=14
+guard_target_exempt=52
+target_words=()
+target_values=()
+exempt_items=0
+block=0
+while [ "$block" -lt "$guard_blocks" ]; do
+    block=$((block + 1))
+    body="$work/blocks/block-$block.body"
+    if [ ! -f "$body" ]; then
+        bad "run block $block has no parsed body (the block parser and the step counter disagree)"
+        continue
+    fi
+    ctx="$work/blocks/block-$block.ctx"
+    [ -f "$ctx" ] || block_context "$body" > "$ctx"
+    seen="$work/blocks/block-$block.targets"
+    : > "$seen"
+    while IFS=$'\t' read -r op kind word; do
+        [ -n "$word" ] || continue
+        if [ "$kind" = "fddup" ]; then
+            exempt_items=$((exempt_items + 1))
+            continue
+        fi
+        first=$(eval_word_in_context "$ctx" "$word")
+        second=$(eval_word_in_context "$ctx" "$word")
+        if [ -z "$first" ]; then
+            bad "the target $word in run block $block ($op) evaluates to nothing: its context or its spelling cannot produce a path"
+            continue
+        fi
+        case "$first" in
+            /dev/null|/dev/stdout|/dev/stderr|/dev/fd/*|-)
+                exempt_items=$((exempt_items + 1))
+                continue
+                ;;
+        esac
+        if grep -Fxq -- "$word" "$seen" 2>/dev/null; then
+            continue
+        fi
+        printf '%s\n' "$word" >> "$seen"
+        target_words+=("$block:$op:$word")
+        target_values+=("$first")
+        if [ "$first" != "$second" ]; then
+            ok "the target $word in run block $block ($op) is per-run (evaluated in its own context twice: $first)"
+        else
+            bad "the target $word in run block $block ($op) evaluates to the same path in two shells ($first): concurrent runs of this step would share it"
+        fi
+    done < <(block_target_items "$body")
+done
+
+if [ "${#target_words[@]}" = "$guard_target_words" ]; then
+    ok "the job's $guard_blocks run blocks name $guard_target_words non-exempt target word(s), discovered by shape rather than by spelling"
+else
+    bad "the job's run blocks name ${#target_words[@]} non-exempt target word(s), not the pinned $guard_target_words (parsed $guard_blocks block(s)): a redirect target was added, removed, or spelled past the scanner"
+fi
+
+if [ "$exempt_items" = "$guard_target_exempt" ]; then
+    ok "the scanner exempted $guard_target_exempt redirect item(s) as fd duplications and /dev sinks; no other exemption is recognised"
+else
+    bad "the scanner classified $exempt_items redirect item(s) as exempt, not the pinned $guard_target_exempt: the exemption set is only fd duplications and the /dev sinks, so this is a new exempt shape or a changed count"
+fi
+
+if list_is_distinct ${target_values[@]+"${target_values[@]}"}; then
+    ok "all ${#target_values[@]} evaluated target paths are pairwise distinct in one run"
+else
+    bad "the ${#target_values[@]} evaluated target path(s) are not pairwise distinct in one run: two steps share a target, or the scanner found fewer than two"
+fi
+
 # --- every log path's parent must be a real directory --------------------------
 # `log=/tmp/<per-run>.log/tmp/other.log` keeps a per-run component and 11 distinct
 # tokens, but the real path's parent is a file: the redirect cannot succeed, the
@@ -576,6 +907,20 @@ if [ "$parents_ok" = "1" ]; then
     ok 'every evaluated log path sits in an existing parent directory'
 else
     bad "these evaluated log paths have no existing parent directory:$parent_missing"
+fi
+target_parent_missing=''
+target_parents_ok=1
+for path in ${target_values[@]+"${target_values[@]}"}; do
+    [ -n "$path" ] || continue
+    if ! parent_dir_exists "$path"; then
+        target_parents_ok=0
+        target_parent_missing="$target_parent_missing $path (parent: $(dirname -- "$path"))"
+    fi
+done
+if [ "$target_parents_ok" = "1" ]; then
+    ok 'every evaluated target path sits in an existing parent directory'
+else
+    bad "these evaluated target paths have no existing parent directory:$target_parent_missing"
 fi
 
 # --- enforcer canaries --------------------------------------------------------
@@ -616,6 +961,50 @@ if parent_dir_exists "$work/no-such-log-dir/canary.log"; then
     bad 'canary: the parent-directory rule accepted a path under a directory that does not exist'
 else
     ok 'canary: the parent-directory rule refuses a path under a nonexistent directory'
+fi
+# The scanner decides every live target, so it carries known-answer inputs of its
+# own: the review's recipe must be discovered (its literal included), a comment
+# and a quoted case label must not be, and the per-run rule must refuse a literal
+# while accepting a command substitution.
+printf '%s\n' 'bash scripts/tests/rss-soak-run-dir.sh 2>&1 | tee "$log" >> /tmp/hff-canary-shared.log || status=1' > "$work/canary-recipe.sh"
+canary_targets=0
+canary_literal=0
+while IFS=$'\t' read -r op kind word; do
+    [ -n "$word" ] || continue
+    if [ "$kind" = "fddup" ]; then
+        continue
+    fi
+    canary_targets=$((canary_targets + 1))
+    if [ "$word" = "/tmp/hff-canary-shared.log" ]; then
+        canary_literal=1
+    fi
+done < <(block_target_items "$work/canary-recipe.sh")
+if [ "$canary_targets" = "2" ] && [ "$canary_literal" = "1" ]; then
+    ok 'canary: the scanner finds both the piped variable target and the appended literal target in the review recipe (2 non-fd items)'
+else
+    bad "canary: the scanner found $canary_targets non-fd item(s) in the review recipe (literal seen: $canary_literal); it must find 2, including the literal"
+fi
+printf '%s\n' '# > /tmp/hff-canary-comment.log' "case \$line in '  ok '*) : ;; '-> child red') : ;; esac" > "$work/canary-prose.sh"
+canary_prose=$(block_target_items "$work/canary-prose.sh" | wc -l | tr -d ' ')
+if [ "$canary_prose" = "0" ]; then
+    ok 'canary: a commented redirect and a quoted case label carrying -> are not discovered as targets'
+else
+    bad "canary: the scanner discovered $canary_prose item(s) in a comment and a quoted case label; prose and comments are not redirects"
+fi
+: > "$work/canary-empty.ctx"
+canary_lit_a=$(eval_word_in_context "$work/canary-empty.ctx" '/tmp/hff-canary-shared.log')
+canary_lit_b=$(eval_word_in_context "$work/canary-empty.ctx" '/tmp/hff-canary-shared.log')
+if [ -n "$canary_lit_a" ] && [ "$canary_lit_a" = "$canary_lit_b" ]; then
+    ok 'canary: a literal target word evaluates identically in two shells, so the per-run rule refuses it'
+else
+    bad "canary: a literal target word did not evaluate identically twice ('$canary_lit_a' vs '$canary_lit_b'); the per-run rule would accept the review's counterexample"
+fi
+canary_sub_a=$(eval_word_in_context "$work/canary-empty.ctx" '"$(mktemp)"')
+canary_sub_b=$(eval_word_in_context "$work/canary-empty.ctx" '"$(mktemp)"')
+if [ -n "$canary_sub_a" ] && [ "$canary_sub_a" != "$canary_sub_b" ]; then
+    ok 'canary: a command-substitution target word evaluates differently in two shells, so the per-run rule accepts it'
+else
+    bad "canary: a command-substitution target word did not evaluate differently twice ('$canary_sub_a' vs '$canary_sub_b'); the rule is too strict to trust"
 fi
 
 printf 'guard self-hash (sha256): %s\n' "$guard_self_sha"
