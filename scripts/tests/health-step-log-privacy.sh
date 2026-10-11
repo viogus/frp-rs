@@ -40,10 +40,13 @@
 #   * step 6's body with the shipped path, two concurrent lanes: `status=1` with
 #     `ok=108 result=1 fail=0 exact=269` (round 4) and `ok=232/237` (round 2);
 #   * the same body with only `.$$` inserted before the extension, same host,
-#     same rounds, same contention: 0 reds in 28 lane-runs, every one of them
-#     `ok=269 result=1 status=0`. An independent reviewer rebuilt the two-arm
-#     control from scratch and measured 6 red / 12 staggered lane-runs for the
-#     shipped path against 0 red / 12 for `.$$`.
+#     same rounds, same contention: 0 reds in 32 lane-runs (16 paired + 16
+#     staggered), every one of them `ok=269 result=1 status=0`, against 6 red /
+#     32 for the shipped path (4 red / 16 paired, 2 red / 16 staggered; the six
+#     partial reads saw 108, 108, 232, 237, 252 and 259 `  ok` lines). An
+#     independent reviewer rebuilt the two-arm control from scratch and measured
+#     6 red / 12 staggered lane-runs for the shipped path against 0 red / 12 for
+#     `.$$`.
 #
 # The fix is therefore one token per path: make the path per-run. `$$` in a
 # /tmp path is this repo's established idiom for exactly this (see
