@@ -47,7 +47,10 @@
 #     partial reads saw 108, 108, 232, 237, 252 and 259 `  ok` lines). An
 #     independent reviewer rebuilt the two-arm control from scratch and measured
 #     6 red / 12 staggered lane-runs for the shipped path against 0 red / 12 for
-#     `.$$`.
+#     `.$$`. The reproducible basis is the offset (staggered) launch: a truly
+#     simultaneous launch did not red the shipped path in either rebuild (the
+#     reviewer measured S 0/20 and F 0/20; the author's lockstep probe recorded
+#     0/32), so that row is not part of this evidence.
 #
 # The fix is therefore one token per path: make the path per-run. `$$` in a
 # /tmp path is this repo's established idiom for exactly this (see
@@ -89,17 +92,26 @@
 #      `>`/`>>`/`>|`/`&>`/`&>>`/`N>`/`<>` yields an evaluated target word,
 #      `<`/`N<` a source read, `>&`/`N>&` a file-descriptor duplication, and a
 #      here-string/here-document word an explicit no-path exemption. It finds
-#      targets by command position rather than by spelling: any `tee` in command
-#      position (also `sudo tee`, `command tee`, `/usr/bin/tee`) contributes
-#      *all* of its file arguments (after `--` and `-a`/`-i`/`-p`), a `dd`
-#      contributes its `of=`, a `cat` its arguments, and the scanner recurses
-#      into `$(...)`, backticks and process substitutions (`>(...)`) and into
-#      the literal text of `eval` and `sh -c`, so a `tee` inside a helper
-#      function body or a `cat > /tmp/x` inside a command text is found. A
-#      quoted case label such as `'-> child red'` is a word, not a redirect.
-#      Each non-exempt target word is then evaluated as a shell word in the
-#      block's own leading-assignment context, in two separate shells, and
-#      required to differ — so a fixed literal target
+#      targets by command position and by a two-phase reading of the command
+#      word: a word it can read statically is matched against its watch list by
+#      basename and by prefixer (a `tee` — `tee`, `sudo tee`, `command tee`,
+#      `/usr/bin/tee`, `nice -n 5 tee`, `timeout 60 tee`, `setsid tee`,
+#      `sudo -u nobody tee`, `xargs -I{} tee` — contributes *all* of its file
+#      arguments after `--` and `-a`/`-i`/`-p`, a `dd` its `of=`, a `cat` its
+#      arguments), and a word it cannot read (an escaped, half-escaped,
+#      ANSI-quoted or command-substituted spelling: `\tee`, `te\e`, `$'\x74ee'`,
+#      `$(echo tee)`, `"$(command -v tee)"`) is evaluated as a shell word in the
+#      block's own leading-assignment context, in two separate shells, and if
+#      both agree on a command basename the block is re-scanned with that name.
+#      The scanner recurses into `$(...)`, backticks and process substitutions
+#      (`>(...)`) and into the literal text of `eval` and `sh -c`, so a `tee`
+#      inside a helper function body or a `cat > /tmp/x` inside a command text
+#      is found; a shell keyword (`if`/`then`/`do`/`while`/`!`/…) does not end
+#      command position, and a `case` pattern word is data until its `)` opens
+#      the body. A quoted case label such as `'-> child red'` is a word, not a
+#      redirect. Each non-exempt target word is then evaluated as a shell word
+#      in the block's own leading-assignment context, in two separate shells,
+#      and required to differ — so a fixed literal target
 #      (`| tee "$log" >> /tmp/shared.log`, `dd of=/tmp/shared`,
 #      `bash ... > /tmp/anything.log`) reds on its own, naming the block, the
 #      target and both evaluated values, with `guard_region_pin` left at the
@@ -117,6 +129,23 @@
 #      `sh -c 'cat > /tmp/f.log'` by scanning their literal text,
 #      `bash -c 'cat "$0" >> /tmp/f.log' "$log"` likewise, and a redirect written
 #      in a shape the scanner cannot read is refused rather than skipped;
+#   6c. a command-position word the scanner cannot read is resolved, not
+#      skipped. The block's own leading assignments are the context, and each
+#      such word is evaluated in it in two separate shells: if both agree on a
+#      command basename, the block is re-scanned with that name (so `\tee`,
+#      `te\e`, `$'\x74ee'`, `$(echo tee)` and `"$(command -v tee)"` are all
+#      `tee`, and a prelude `t=tee` makes `$t /tmp/f.log` a target); if the two
+#      shells disagree the block reds with both values, because a command that
+#      changes between runs cannot be accounted for; if both are empty and the
+#      word is not a bare variable reference the block reds as a command that
+#      cannot name anything; and a recognised prefixer's operands are walked so
+#      that `nice -n 5 tee`, `timeout 60 tee`, `setsid tee`, `sudo -u nobody tee`
+#      and `stdbuf -o L tee` are all read. Each block prints one `ok` with its
+#      own counts (resolved, refused, unresolved, and the documented
+#      bare-variable residual). The single carve-out is a word that is exactly a
+#      bare variable reference the block's prelude leaves unset or empty — step 2
+#      legitimately runs its candidate as `"$cand"`, a loop variable set later in
+#      the body — which is counted and printed rather than silently accepted;
 #   7. every evaluated log path sits in an existing parent directory. This is
 #      what refuses
 #
@@ -131,11 +160,18 @@
 #      a log this job writes, and no step in this job `mkdir`s its log's parent,
 #      so "the parent exists" is a true invariant here;
 #   8. enforcer canaries: known-answer inputs for the per-run predicate, the
-#      distinctness comparison, the parent-directory rule and the target scanner
-#      itself — a discovered literal, a second `tee` argument, a `tee` inside a
-#      helper function, an operator with no target word refused, a well-formed
-#      redirect not refused, and prose/quoted labels not discovered — each with
-#      one input it must accept and one it must refuse.
+#      distinctness comparison, the parent-directory rule, the target scanner and
+#      the command-word resolution — a discovered literal, a second `tee`
+#      argument, a `tee` inside a helper function, an operator with no target
+#      word refused, a well-formed redirect not refused, prose and quoted labels
+#      not discovered, the five escaped/quoted/substituted spellings of a watch
+#      command, a watch command behind each recognised prefixer's operands, a
+#      watch command at the head of an `if`/`while` body, the same prefixer and
+#      keyword shapes with a per-run variable still yielding the single word
+#      `"$log"`, a command word the prelude assigns (`t=tee`), and the
+#      bare-variable carve-out with one word it must accept (`"$cand"`) and one
+#      it must refuse (`$(false)`) — each with one input it must accept and one
+#      it must refuse.
 #
 # Exemptions are explicit and complete: an fd-duplication operator (`>&N`,
 # `2>&1`, `&N`) has no path and is not a target; a here-string/here-document
@@ -152,17 +188,27 @@
 # Residual limits, stated rather than implied — what this round closed and what
 # it did not. Closed: a `tee` in a helper function, all of a `tee`'s arguments,
 # `sudo`/`command`/path-qualified `tee`, `dd`/`cat` arguments, a `$(<file)` read,
-# process substitution, and any redirect operator the scanner cannot classify
-# (now refused, not ignored). What genuinely remains: an `eval`/`sh -c` text that
-# is not a literal is refused, not executed, so a shared path hidden in a
-# runtime-built command text reds as a refusal rather than being caught as a
-# target; a shell reading its script from stdin, or a command text handed
-# through an unexpanded variable (`xargs`, `find -exec`, `${p} -c "$t"`), is not
-# a command position this scanner recognises unless its text is visible; a
-# quoted word carrying `>` that is not a command text is a word, not a redirect
-# (measured: no live line does this, and the live `"… <none> …"` line must stay
-# green, so the trade is deliberate); and `set -x` trace output is not scanned.
-# Each would need a new shape here, not a wider exemption list.
+# process substitution, any redirect operator the scanner cannot classify (now
+# refused, not ignored), and a command word it cannot read (now resolved, not
+# skipped): `\tee`, `te\e`, `$'\x74ee'`, `$(echo tee)`, `"$(command -v tee)"`, a
+# `tee` reached through a prefixer's operands (`nice -n 5`, `timeout 60`,
+# `setsid`, `sudo -u nobody`, `stdbuf -o L`, `xargs -I{}`), a `tee` at the head
+# of an `if`/`while` body, and a command word the block's prelude assigns. What
+# genuinely remains: an `eval`/`sh -c` text that is not a literal is refused, not
+# executed, so a shared path hidden in a runtime-built command text reds as a
+# refusal rather than being caught as a target; a watch command that is an
+# argument of a plain wrapper this scanner does not treat as a prefixer is not a
+# command position it recognises (measured: `find /tmp -exec tee /tmp/f.log \;`
+# yields no target), as is a command named only through a variable the block's
+# prelude does not set (`t=tee` written inside the body) — that one is the
+# counted bare-variable residual, not a refusal, and a fixed path behind it would
+# be invisible (measured: the live job's only two such words are `"$cand"` and
+# `$guard_hasher`, neither of which writes a log); a shell reading its script
+# from stdin is not scanned; a quoted word carrying `>` that is not a command
+# text is a word, not a redirect (measured: no live line does this, and the live
+# `"… <none> …"` line must stay green, so the trade is deliberate); and `set -x`
+# trace output is not scanned. Each would need a new shape here, not a wider
+# exemption list.
 #
 # Unwired and self-unhashed, on purpose. Adding this file as a CI step would
 # renumber every numeric `.github/workflows/ci.yml` citation that live files
@@ -219,7 +265,7 @@ extract_region() {
 # count of a green run, so deleting any check below drops the count under it.
 # A floor of 0 (or an unset floor, or an all-zero spelling) would disable the
 # guard from inside, so each of those is itself a failure.
-MIN_CHECKS=89
+MIN_CHECKS=109
 checks=0
 fails=0
 
@@ -605,6 +651,20 @@ eval_word_in_context() {
     } > "$work/eval-word.sh"
     bash "$work/eval-word.sh" 2>/dev/null
 }
+# A command word that is exactly a variable reference the block's leading
+# assignments leave unset or empty names a command this guard cannot resolve
+# (step 2 runs its candidate as `"$cand"`, a loop variable set later in the
+# body). That is the documented residual, not a shape to refuse -- and an
+# assignment *in the prelude* is different: `t=tee` in the prelude makes a later
+# `$t /tmp/f.log` resolve to `tee` and be caught like any other target.
+is_bare_var_ref() {
+    local w="$1"
+    case "$w" in '"'*'"') w="${w:1:${#w}-2}" ;; esac
+    [[ "$w" =~ ^\$\{[A-Za-z_][A-Za-z0-9_]*\}$ ]] && return 0
+    [[ "$w" =~ ^\$[A-Za-z_][A-Za-z0-9_]*$ ]] && return 0
+    [[ "$w" =~ ^\$[0-9@*#?$!-]$ ]] && return 0
+    return 1
+}
 
 # The redirect/pipe target scanner. Discovery by *shape*, not by spelling: this
 # is the check an earlier quoted-`"$var"`-only grep could not make, and it has
@@ -627,14 +687,28 @@ eval_word_in_context() {
 # (operator for `fddup`, evaluated value for the `/dev` sinks and `-`), never by
 # this scanner.
 block_target_items() {
-    python3 -B - "$1" <<'PY'
+    python3 -B - "$1" "${2:-}" <<'PY'
 import re
 import sys
 
 PREFIX = {
     "sudo", "command", "env", "nohup", "time", "nice", "stdbuf", "xargs",
-    "exec", "builtin", "doas",
+    "exec", "builtin", "doas", "timeout", "setsid", "ionice", "chrt",
+    "taskset", "flock", "chroot", "unbuffer", "script",
 }
+# Shell keywords that start a command list rather than name a command. Without
+# them `if`/`then`/`do` would end command position and the first real command of
+# the branch (`if true; then tee ...; fi`) would be skipped.
+KEYWORDS = {
+    "if", "then", "else", "elif", "fi", "do", "done", "while", "until",
+    "for", "in", "case", "esac", "!",
+}
+# A word the scanner can read as a command name without the block's context: a
+# plain literal such as `tee`, `sh`, `/usr/bin/tee`. Anything else -- a quoted
+# or escaped spelling, `$(...)`, a backtick, a variable -- is *opaque* and is
+# handed to the caller, which resolves it in the block's own context in two
+# shells and tells the scanner what it found.
+PLAIN_RE = re.compile(r"^[A-Za-z0-9_./+:\-\[\]]+$")
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"}
 WATCH = {"tee", "dd", "eval"}
 READ_CMDS = {"cat"}
@@ -682,6 +756,15 @@ def strip_comment(line):
     return "".join(out)
 
 
+def norm_word(raw):
+    """The one spelling of a word that the scanner and the caller both use.
+
+    The scanner reports one line per item and the shell joins a backslash
+    continuation, so both sides normalise before comparing.
+    """
+    return " ".join(raw.replace("\\\n", "").split())
+
+
 class Tok(object):
     __slots__ = ("kind", "raw", "simple", "line")
 
@@ -693,9 +776,11 @@ class Tok(object):
 
 
 class Scanner(object):
-    def __init__(self):
+    def __init__(self, overrides=None):
         self.items = []
         self.refusals = []
+        self.cmds = []
+        self.overrides = overrides or {}
         self.stats = {"lexed": 0, "class": 0, "refused": 0, "nested": 0}
 
     def refuse(self, line, text, why):
@@ -741,6 +826,38 @@ class Scanner(object):
             j += 1
         return -1
 
+    def find_brace(self, code, i):
+        """code[i] == '{'; return the index just past the matching '}'."""
+        n = len(code)
+        depth = 0
+        quote = None
+        j = i
+        while j < n:
+            c = code[j]
+            if quote:
+                if quote == '"' and c == "\\":
+                    j += 2
+                    continue
+                if c == quote:
+                    quote = None
+                j += 1
+                continue
+            if c == "\\":
+                j += 2
+                continue
+            if c in ("'", '"'):
+                quote = c
+                j += 1
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return -1
+
     def find_backtick(self, code, i):
         n = len(code)
         j = i + 1
@@ -753,11 +870,11 @@ class Scanner(object):
             j += 1
         return -1
 
-    def scan_text(self, text, depth=0):
+    def scan_text(self, text, depth=0, base_line=0):
         """Lex a whole block: comments are stripped per line, everything else is
         one stream, so a construct split by a line continuation still closes."""
         code = "\n".join(strip_comment(l) for l in text.split("\n"))
-        toks = self.lex(code, 1, depth)
+        toks = self.lex(code, base_line + 1, depth)
         self.walk(toks, depth)
 
     def lex(self, code, lineno, depth):
@@ -794,7 +911,7 @@ class Scanner(object):
                     continue
                 toks.append(Tok("procsub", code[i:end], code[i:end], lineno))
                 self.stats["nested"] += 1
-                self.scan_text(code[i + 2:end - 1], depth + 1)
+                self.scan_text(code[i + 2:end - 1], depth + 1, lineno - 1)
                 i = end
                 continue
             m = OP_RE.match(code, i)
@@ -855,7 +972,7 @@ class Scanner(object):
                     raw.append(code[i:end])
                     simple.append(code[i:end])
                     self.stats["nested"] += 1
-                    self.scan_text(code[i + 1:end - 1], depth + 1)
+                    self.scan_text(code[i + 1:end - 1], depth + 1, lineno - 1)
                     lineno += code[i:end].count("\n")
                     i = end
                     continue
@@ -864,6 +981,18 @@ class Scanner(object):
                     if end < 0:
                         self.refuse(lineno, code[i:i + 20],
                                     "an unterminated arithmetic expansion")
+                        i = n
+                        break
+                    raw.append(code[i:end])
+                    simple.append(code[i:end])
+                    lineno += code[i:end].count("\n")
+                    i = end
+                    continue
+                if code.startswith("${", i):
+                    end = self.find_brace(code, i + 1)
+                    if end < 0:
+                        self.refuse(lineno, code[i:i + 20],
+                                    "an unterminated parameter expansion")
                         i = n
                         break
                     raw.append(code[i:end])
@@ -881,7 +1010,7 @@ class Scanner(object):
                     raw.append(code[i:end])
                     simple.append(code[i:end])
                     self.stats["nested"] += 1
-                    self.scan_text(code[i + 2:end - 1], depth + 1)
+                    self.scan_text(code[i + 2:end - 1], depth + 1, lineno - 1)
                     lineno += code[i:end].count("\n")
                     i = end
                     continue
@@ -910,7 +1039,7 @@ class Scanner(object):
                 raw.append(code[i:end])
                 simple.append(code[i:end])
                 self.stats["nested"] += 1
-                self.scan_text(code[i + 1:end - 1], depth + 1)
+                self.scan_text(code[i + 1:end - 1], depth + 1, lineno - 1)
                 lineno += code[i:end].count("\n")
                 i = end
                 continue
@@ -919,6 +1048,18 @@ class Scanner(object):
                 if end < 0:
                     self.refuse(lineno, code[i:i + 20],
                                 "an unterminated arithmetic expansion")
+                    i = n
+                    break
+                raw.append(code[i:end])
+                simple.append(code[i:end])
+                lineno += code[i:end].count("\n")
+                i = end
+                continue
+            if quote == '"' and code.startswith("${", i):
+                end = self.find_brace(code, i + 1)
+                if end < 0:
+                    self.refuse(lineno, code[i:i + 20],
+                                "an unterminated parameter expansion")
                     i = n
                     break
                 raw.append(code[i:end])
@@ -936,7 +1077,7 @@ class Scanner(object):
                 raw.append(code[i:end])
                 simple.append(code[i:end])
                 self.stats["nested"] += 1
-                self.scan_text(code[i + 2:end - 1], depth + 1)
+                self.scan_text(code[i + 2:end - 1], depth + 1, lineno - 1)
                 lineno += code[i:end].count("\n")
                 i = end
                 continue
@@ -965,11 +1106,26 @@ class Scanner(object):
 
     def walk(self, toks, depth):
         cmdpos = True
+        pending = False     # inside a recognised prefixer's operand list
+        case_state = None   # None | "pattern" | "body"
         k = 0
         while k < len(toks):
             t = toks[k]
             if t.kind == "sep":
-                cmdpos = True
+                pending = False
+                if case_state == "pattern":
+                    # `)` opens the branch body; anything else (newline, `|`)
+                    # is still the pattern list, never a command word
+                    if t.raw == ")":
+                        case_state = "body"
+                        cmdpos = True
+                    else:
+                        cmdpos = False
+                elif case_state == "body" and t.raw in (";;", ";&", ";;&"):
+                    case_state = "pattern"
+                    cmdpos = False
+                else:
+                    cmdpos = True
                 k += 1
                 continue
             if t.kind == "op":
@@ -985,23 +1141,56 @@ class Scanner(object):
             if t.kind == "procsub":
                 k += 1
                 continue
+            if case_state is not None and t.simple == "esac":
+                case_state = None
+                cmdpos = False
+                pending = False
+                k += 1
+                continue
+            if case_state == "pattern":
+                k += 1
+                continue
             if not cmdpos:
                 k += 1
                 continue
             s = t.simple
+            if s in KEYWORDS:
+                if s == "case":
+                    case_state = "pattern"
+                    cmdpos = False
+                else:
+                    cmdpos = True
+                pending = False
+                k += 1
+                continue
             if s.startswith("-"):
                 k += 1
                 continue
             if ASSIGN_RE.match(s):
                 k += 1
                 continue
-            base = s.split("/")[-1]
+            key = norm_word(t.raw)
+            mapped = self.overrides.get(key)
+            if mapped is not None:
+                base = mapped
+            else:
+                base = s.split("/")[-1]
+                if not PLAIN_RE.match(key) or t.raw != t.simple:
+                    # opaque: the caller resolves it in the block's own context
+                    self.cmds.append((key, t.line))
             if base in PREFIX:
+                pending = True
+                cmdpos = True
                 k += 1
                 continue
             if base in WATCH or base in SHELLS or base in READ_CMDS:
                 k = self.handle_command(base, toks, k, depth)
                 cmdpos = False
+                pending = False
+                continue
+            if pending:
+                # an operand of a recognised prefixer, not the command word
+                k += 1
                 continue
             cmdpos = False
             k += 1
@@ -1055,7 +1244,7 @@ class Scanner(object):
         before = len(self.items) + len(self.refusals)
         text = tok.simple
         self.stats["nested"] += 1
-        self.scan_text(text, depth + 1)
+        self.scan_text(text, depth + 1, tok.line - 1)
         if len(self.items) + len(self.refusals) > before:
             return
         if "$" in text or "`" in text:
@@ -1094,11 +1283,20 @@ class Scanner(object):
         self.add(o, "target", tgt.raw, op.line)
 
 
+overrides = {}
+if len(sys.argv) > 2 and sys.argv[2]:
+    with open(sys.argv[2], errors="replace") as fh:
+        for ln in fh:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) == 2 and parts[0]:
+                overrides[parts[0]] = parts[1]
 with open(sys.argv[1], errors="replace") as fh:
-    sc = Scanner()
+    sc = Scanner(overrides)
     sc.scan_text(fh.read())
 for op, kind, word, line in sc.items:
     sys.stdout.write("%s\t%s\t%s\t%d\n" % (op, kind, word, line))
+for word, line in sc.cmds:
+    sys.stdout.write("cmd\tcmd\t%s\t%d\n" % (word, line))
 for line, text, why in sc.refusals:
     sys.stdout.write("refuse\trefuse\t%s\t%d\n"
                      % (" ".join(("%s (%s)" % (text, why)).split()), line))
@@ -1194,7 +1392,60 @@ while [ "$block" -lt "$guard_blocks" ]; do
     : > "$seen"
     : > "$seen_reads"
     accounted=0
+    # --- the command words the scanner could not name by itself ---------------
+    # The scanner reports every command-position word it cannot read as a plain
+    # literal -- an escaped or quoted spelling, `$(...)`, a backtick, a variable --
+    # and this is where those words are resolved: in the block's own context, in
+    # two separate shells, exactly like a target word. The result goes back to the
+    # scanner so the same walk can classify what the command is (a `tee`, a `dd`,
+    # an `eval`, a shell `-c`). Refusing outright would red step 2, which
+    # legitimately runs `"$cand"`; *skipping* is what let `\tee` and
+    # `$(echo tee)` write a shared fixed log while the guard stayed green.
+    overrides="$work/blocks/block-$block.overrides"
+    cmd_list="$work/blocks/block-$block.cmds"
+    items="$work/blocks/block-$block.items"
+    : > "$overrides"
+    cmd_words=0
+    cmd_resolved=0
+    cmd_residual=0
+    cmd_unresolved=0
+    block_target_items "$body" > "$items"
+    awk -F'\t' '$1 == "cmd" && $3 != "" && !seen[$3]++ { print $3 "\t" $4 }' "$items" > "$cmd_list"
+    while IFS=$'\t' read -r cword cline; do
+        [ -n "$cword" ] || continue
+        cfirst=$(eval_word_in_context "$ctx" "$cword")
+        csecond=$(eval_word_in_context "$ctx" "$cword")
+        cmd_words=$((cmd_words + 1))
+        if [ "$cfirst" != "$csecond" ]; then
+            cmd_unresolved=$((cmd_unresolved + 1))
+            bad "the command word $cword in run block $block (ci.yml:$(yml_line_of "$block" "$cline")) resolves differently in two shells ('$cfirst' vs '$csecond'): the scanner cannot account for a command that changes between runs"
+            continue
+        fi
+        if [ -z "$cfirst" ]; then
+            if is_bare_var_ref "$cword"; then
+                cmd_residual=$((cmd_residual + 1))
+                continue
+            fi
+            cmd_unresolved=$((cmd_unresolved + 1))
+            bad "the command word $cword in run block $block (ci.yml:$(yml_line_of "$block" "$cline")) resolves to nothing: its context or its spelling cannot name a command, so a write through it would be invisible"
+            continue
+        fi
+        cmd_resolved=$((cmd_resolved + 1))
+        printf '%s\t%s\n' "$cword" "${cfirst##*/}" >> "$overrides"
+    done < "$cmd_list"
+    # Re-scan the same block with the resolved command names. Without this the
+    # resolution above would only be reported, never applied: `\tee /tmp/f.log`
+    # would still contribute no target, and the fixed path would stay invisible.
+    if [ -s "$overrides" ]; then
+        block_target_items "$body" "$overrides" > "$items"
+    fi
+    if [ "$cmd_unresolved" = "0" ]; then
+        ok "run block $block accounted for $cmd_words opaque command word(s) in the block's own context in two shells: $cmd_resolved resolved to a command, $cmd_residual a bare variable reference the prelude leaves unset or empty (the documented residual), 0 unresolved"
+    fi
     while IFS=$'\t' read -r op kind word bline; do
+        if [ "$op" = "cmd" ]; then
+            continue
+        fi
         if [ "$op" = "#accounting" ]; then
             accounted=1
             accounting_blocks=$((accounting_blocks + 1))
@@ -1242,7 +1493,7 @@ while [ "$block" -lt "$guard_blocks" ]; do
         else
             bad "the target $word in run block $block ($op) evaluates to the same path in two shells ($first): concurrent runs of this step would share it"
         fi
-    done < <(block_target_items "$body")
+    done < "$items"
     if [ "$accounted" != "1" ]; then
         bad "run block $block produced no scanner accounting line: the redirect scanner did not run on it or crashed, so no redirect in that block was classified"
     fi
@@ -1421,6 +1672,108 @@ else
     bad "canary: the scanner discovered $canary_prose item(s) in a comment and a quoted case label; prose and comments are not redirects"
 fi
 : > "$work/canary-empty.ctx"
+# The command words the scanner cannot read by itself are resolved by the caller,
+# so these canaries exercise the same two-phase path: resolve the file's opaque
+# command words in the given context, then ask the scanner again with those
+# overrides. Without this a canary for `\tee` would only prove the scanner
+# skipped it -- which is the defect this check exists for.
+scanner_items_resolved() {
+    local items="$work/canary-items.tsv" ov="$work/canary-overrides.tsv"
+    local cword cfirst csecond
+    : > "$ov"
+    block_target_items "$1" > "$items"
+    while IFS=$'\t' read -r cword cline; do
+        [ -n "$cword" ] || continue
+        cfirst=$(eval_word_in_context "$2" "$cword")
+        csecond=$(eval_word_in_context "$2" "$cword")
+        if [ -n "$cfirst" ] && [ "$cfirst" = "$csecond" ]; then
+            printf '%s\t%s\n' "$cword" "${cfirst##*/}" >> "$ov"
+        fi
+    done < <(awk -F'\t' '$1 == "cmd" && $3 != "" && !seen[$3]++ { print $3 "\t" $4 }' "$items")
+    block_target_items "$1" "$ov"
+}
+canary_all_found() {
+    local file="$1" ctx="$2" lit
+    shift 2
+    for lit in "$@"; do
+        if ! scanner_items_resolved "$file" "$ctx" | awk -F'\t' -v want="$lit" '
+            $1 != "#accounting" && $1 != "refuse" && $3 == want { found = 1 }
+            END { exit !found }'; then
+            return 1
+        fi
+    done
+    return 0
+}
+cat > "$work/canary-spellings.sh" <<'CANARY'
+\tee /tmp/hff-canary-esc.log
+te\e /tmp/hff-canary-halfesc.log
+$'\x74ee' /tmp/hff-canary-ansi.log
+$(echo tee) /tmp/hff-canary-subst.log
+"$(command -v tee)" /tmp/hff-canary-path.log
+CANARY
+if canary_all_found "$work/canary-spellings.sh" "$work/canary-empty.ctx" \
+        /tmp/hff-canary-esc.log /tmp/hff-canary-halfesc.log /tmp/hff-canary-ansi.log \
+        /tmp/hff-canary-subst.log /tmp/hff-canary-path.log; then
+    ok 'canary: an escaped, half-escaped, ANSI-quoted, command-substituted and resolved-path spelling of a watch command all resolve to it, so its fixed file argument is found'
+else
+    bad 'canary: the scanner missed a fixed file argument behind an escaped, quoted or substituted spelling of tee; a write through that spelling would be invisible'
+fi
+cat > "$work/canary-prefixers.sh" <<'CANARY'
+nice -n 5 tee /tmp/hff-canary-nice.log
+timeout 60 tee /tmp/hff-canary-timeout60.log
+setsid tee /tmp/hff-canary-setsid.log
+sudo -u nobody tee /tmp/hff-canary-sudo.log
+stdbuf -o L tee /tmp/hff-canary-stdbuf.log
+timeout 5 tee /tmp/hff-canary-timeout5.log
+sudo -u root tee /tmp/hff-canary-sudoroot.log
+CANARY
+if canary_all_found "$work/canary-prefixers.sh" "$work/canary-empty.ctx" \
+        /tmp/hff-canary-nice.log /tmp/hff-canary-timeout60.log /tmp/hff-canary-setsid.log \
+        /tmp/hff-canary-sudo.log /tmp/hff-canary-stdbuf.log /tmp/hff-canary-timeout5.log \
+        /tmp/hff-canary-sudoroot.log; then
+    ok 'canary: a watch command reached through a prefixer and its operands (nice -n 5, timeout 60, setsid, sudo -u X, stdbuf -o L) is found, so its fixed file argument is not ignored'
+else
+    bad 'canary: the scanner missed a watch command behind a prefixer operand, so a fixed path passed that way would be ignored'
+fi
+cat > "$work/canary-keywords.sh" <<'CANARY'
+if true; then tee /tmp/hff-canary-then.log; fi
+while :; do tee /tmp/hff-canary-do.log; break; done
+CANARY
+if canary_all_found "$work/canary-keywords.sh" "$work/canary-empty.ctx" \
+        /tmp/hff-canary-then.log /tmp/hff-canary-do.log; then
+    ok 'canary: a shell keyword does not end command position, so the first command of an if/while body is found'
+else
+    bad 'canary: the scanner skipped a command that follows a shell keyword, so a fixed path written there would be ignored'
+fi
+cat > "$work/canary-perrun.sh" <<'CANARY'
+log=/tmp/hff-canary.$$.log
+nice -n 5 tee "$log"
+if true; then tee "$log"; fi
+CANARY
+canary_perrun_words=$(scanner_items_resolved "$work/canary-perrun.sh" "$work/canary-empty.ctx" \
+    | awk -F'\t' '$1 != "#accounting" && $1 != "refuse" { print $3 }' | sort -u | tr '\n' ' ')
+if [ "$canary_perrun_words" = '"$log" ' ]; then
+    ok 'canary: the same prefixer and keyword shapes with a per-run variable stay the single discovered word "$log" (no fixed-path false positive)'
+else
+    bad "canary: the prefixer and keyword shapes with a per-run variable produced '$canary_perrun_words', not a single \"\$log\" word"
+fi
+if is_bare_var_ref '"$cand"'; then
+    ok 'canary: the command-word rule treats a bare variable reference the prelude leaves empty as the documented residual (step 2'"'"'s "$cand")'
+else
+    bad 'canary: the command-word rule refused a bare variable reference the prelude leaves empty, which would red step 2'
+fi
+if is_bare_var_ref '$(false)'; then
+    bad 'canary: the command-word rule accepted a substitution that names no command as a bare variable reference (the carve-out is too wide)'
+else
+    ok 'canary: the command-word rule does not accept a substitution that resolves to nothing as a bare variable reference'
+fi
+printf 't=tee\n' > "$work/canary-leadvar.ctx"
+printf '%s\n' '$t /tmp/hff-canary-leadvar.log' > "$work/canary-leadvar.sh"
+if canary_all_found "$work/canary-leadvar.sh" "$work/canary-leadvar.ctx" /tmp/hff-canary-leadvar.log; then
+    ok 'canary: a variable the prelude assigns (t=tee; $t ...) is resolved to its command, so its fixed file argument is found'
+else
+    bad 'canary: a command word that is a variable the prelude assigns was not resolved, so a fixed path behind it would be ignored'
+fi
 canary_lit_a=$(eval_word_in_context "$work/canary-empty.ctx" '/tmp/hff-canary-shared.log')
 canary_lit_b=$(eval_word_in_context "$work/canary-empty.ctx" '/tmp/hff-canary-shared.log')
 if [ -n "$canary_lit_a" ] && [ "$canary_lit_a" = "$canary_lit_b" ]; then
