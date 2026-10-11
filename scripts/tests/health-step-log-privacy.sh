@@ -81,20 +81,42 @@
 #      `cat` argument), evaluated in the block's own assignment context in two
 #      separate shells, and required to differ. This is a pin on the *spelling*
 #      the current steps use, not on the property: it sees only quoted-variable
-#      targets, so a redirect written as a fixed literal is invisible to it;
-#   6. every redirect/pipe *target word* in every run block — the invariant, and
-#      the reason this file exists. The scanner below reads each block with its
-#      comments stripped and reports its `>`/`>>`/`>|`/`&>` targets, its
-#      `| tee <target>` arguments, its `dd of=<target>` and its read sides
-#      (`$(<file)`, `cat <file>`); a quoted case label such as `'-> child red'`
-#      is a word, not a redirect. Each non-exempt word is then evaluated as a
-#      shell word in the block's own leading-assignment context, in two separate
-#      shells, and required to differ — so a fixed literal target
+#      targets, so a redirect written as a fixed literal is invisible to it.
+#      Check 6 below is the property, and it does not depend on this spelling;
+#   6. every redirect-like token in every run block — the invariant, and the
+#      reason this file exists. The scanner below lexes each block with its
+#      comments stripped and classifies *every* redirect operator it sees: a
+#      `>`/`>>`/`>|`/`&>`/`&>>`/`N>`/`<>` yields an evaluated target word,
+#      `<`/`N<` a source read, `>&`/`N>&` a file-descriptor duplication, and a
+#      here-string/here-document word an explicit no-path exemption. It finds
+#      targets by command position rather than by spelling: any `tee` in command
+#      position (also `sudo tee`, `command tee`, `/usr/bin/tee`) contributes
+#      *all* of its file arguments (after `--` and `-a`/`-i`/`-p`), a `dd`
+#      contributes its `of=`, a `cat` its arguments, and the scanner recurses
+#      into `$(...)`, backticks and process substitutions (`>(...)`) and into
+#      the literal text of `eval` and `sh -c`, so a `tee` inside a helper
+#      function body or a `cat > /tmp/x` inside a command text is found. A
+#      quoted case label such as `'-> child red'` is a word, not a redirect.
+#      Each non-exempt target word is then evaluated as a shell word in the
+#      block's own leading-assignment context, in two separate shells, and
+#      required to differ — so a fixed literal target
 #      (`| tee "$log" >> /tmp/shared.log`, `dd of=/tmp/shared`,
 #      `bash ... > /tmp/anything.log`) reds on its own, naming the block, the
 #      target and both evaluated values, with `guard_region_pin` left at the
 #      unmodified job's hash. These values are also required to be pairwise
 #      distinct across all steps;
+#   6b. the scanner refuses rather than ignores, which is what keeps 6 an
+#      invariant instead of a list of known spellings. Every operator it lexed
+#      must be accounted for by exactly one classification (the scanner prints
+#      one `#accounting` line per block, and a mismatch is a red on its own),
+#      and anything it cannot classify is a `refuse` item: an operator with no
+#      target word, an unterminated quote or substitution, and an `eval`/`sh -c`
+#      text that is not a literal. A refusal is a red run naming the block, the
+#      ci.yml line and the text, so `helper() { tee /tmp/f.log; }; ... | helper`
+#      is caught by the `tee` in command position, `eval "tee /tmp/f.log"` and
+#      `sh -c 'cat > /tmp/f.log'` by scanning their literal text,
+#      `bash -c 'cat "$0" >> /tmp/f.log' "$log"` likewise, and a redirect written
+#      in a shape the scanner cannot read is refused rather than skipped;
 #   7. every evaluated log path sits in an existing parent directory. This is
 #      what refuses
 #
@@ -110,22 +132,37 @@
 #      so "the parent exists" is a true invariant here;
 #   8. enforcer canaries: known-answer inputs for the per-run predicate, the
 #      distinctness comparison, the parent-directory rule and the target scanner
-#      itself, each with one input it must accept and one it must refuse.
+#      itself — a discovered literal, a second `tee` argument, a `tee` inside a
+#      helper function, an operator with no target word refused, a well-formed
+#      redirect not refused, and prose/quoted labels not discovered — each with
+#      one input it must accept and one it must refuse.
 #
 # Exemptions are explicit and complete: an fd-duplication operator (`>&N`,
-# `2>&1`, `&N`) has no path and is not a target; and a target whose evaluated
-# value is `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/fd/*` or `-` is a
-# sink, not a shared log. Nothing else is exempt. An earlier revision discovered
-# targets only by quoted-`"$var"` spelling, which left the review's
-# `| tee "$log" >> /tmp/shared.log` recipe green with a genuinely shared fixed
-# path; the word-level scan is what closes that, and it is deliberately not
-# implemented as a wider grep pattern.
+# `2>&1`, `&N`) has no path and is not a target; a here-string/here-document
+# word is data, not a path; and a target whose evaluated value is `/dev/null`,
+# `/dev/stdout`, `/dev/stderr`, `/dev/fd/*` or `-` is a sink, not a shared log.
+# Nothing else is exempt, and quoting carries no privilege: it only stops the
+# surrounding operator from being read as a redirect (`'-> child red'` is a
+# word). An earlier revision discovered targets only by quoted-`"$var"`
+# spelling, which left the review's `| tee "$log" >> /tmp/shared.log` recipe
+# green with a genuinely shared fixed path; the operator-level scan is what
+# closes that, and it is deliberately not implemented as a wider grep pattern or
+# a wider exemption list.
 #
-# Residual limits, stated rather than implied: this scanner is line-oriented, so
-# a path assembled inside a function body or by `eval` at a level it does not
-# reach, process substitution (`>(...)`), a target handed to a wrapper that
-# redirects on its caller's behalf, and `set -x` trace output are not seen. Each
-# would need a new shape here, not a wider exemption list.
+# Residual limits, stated rather than implied — what this round closed and what
+# it did not. Closed: a `tee` in a helper function, all of a `tee`'s arguments,
+# `sudo`/`command`/path-qualified `tee`, `dd`/`cat` arguments, a `$(<file)` read,
+# process substitution, and any redirect operator the scanner cannot classify
+# (now refused, not ignored). What genuinely remains: an `eval`/`sh -c` text that
+# is not a literal is refused, not executed, so a shared path hidden in a
+# runtime-built command text reds as a refusal rather than being caught as a
+# target; a shell reading its script from stdin, or a command text handed
+# through an unexpanded variable (`xargs`, `find -exec`, `${p} -c "$t"`), is not
+# a command position this scanner recognises unless its text is visible; a
+# quoted word carrying `>` that is not a command text is a word, not a redirect
+# (measured: no live line does this, and the live `"… <none> …"` line must stay
+# green, so the trade is deliberate); and `set -x` trace output is not scanned.
+# Each would need a new shape here, not a wider exemption list.
 #
 # Unwired and self-unhashed, on purpose. Adding this file as a CI step would
 # renumber every numeric `.github/workflows/ci.yml` citation that live files
@@ -182,7 +219,7 @@ extract_region() {
 # count of a green run, so deleting any check below drops the count under it.
 # A floor of 0 (or an unset floor, or an all-zero spelling) would disable the
 # guard from inside, so each of those is itself a failure.
-MIN_CHECKS=82
+MIN_CHECKS=89
 checks=0
 fails=0
 
@@ -492,26 +529,30 @@ done
 # assignments of its body, not a bare `eval`) in two separate shells.
 mkdir -p -- "$work/blocks"
 printf '%s\n' "$region" > "$work/region.txt"
+# Each body line's region line number is recorded alongside it, so a refusal can
+# name the ci.yml line rather than an offset inside the block.
 awk -v dir="$work/blocks" '
-    function close_block() { if (open_) { close(f); open_ = 0 } }
+    function close_block() { if (open_) { close(f); close(m); open_ = 0 } }
     /^[[:space:]]+run:/ {
         close_block()
         match($0, /^[ ]+/); ind = RLENGTH
         n++
         f = dir "/block-" n ".body"
+        m = dir "/block-" n ".map"
         open_ = 1
         run_ind = ind
         rest = substr($0, ind + 1)
         sub(/^run:[[:space:]]*/, "", rest)
         if (rest != "" && rest != "|" && rest != "|-" && rest != "|+" && rest != ">" && rest != ">-") {
             print "# inline run: " rest > f
+            print NR > m
         }
         next
     }
     open_ {
-        if ($0 ~ /^[[:space:]]*$/) { print "" > f; next }
+        if ($0 ~ /^[[:space:]]*$/) { print "" > f; print NR > m; next }
         match($0, /^[ ]*/); ind2 = RLENGTH
-        if (ind2 > run_ind) { print substr($0, run_ind + 3) > f; next }
+        if (ind2 > run_ind) { print substr($0, run_ind + 3) > f; print NR > m; next }
         close_block()
     }
     END { close_block(); printf "%d\n", n + 0 > (dir "/count") }
@@ -566,15 +607,40 @@ eval_word_in_context() {
 }
 
 # The redirect/pipe target scanner. Discovery by *shape*, not by spelling: this
-# is the check an earlier quoted-`"$var"`-only grep could not make. Output is one
-# `op<TAB>kind<TAB>word` line per item, in file order, with comments stripped and
-# quoted words skipped. kind is `target` (a redirect or pipe target), `read` (a
-# `$(<file)` / `cat <file>` source) or `fddup` (an fd-duplication operator, which
-# names no path). Exemptions are decided by the caller (operator for `fddup`,
-# evaluated value for the `/dev` sinks and `-`), never by this scanner.
+# is the check an earlier quoted-`"$var"`-only grep could not make, and it has
+# two duties. First, read every redirect-like construct out of a block whatever
+# its spelling: `>`/`>>`/`>|`/`&>`/`&>>`/`N>` targets, every `tee` file argument,
+# every `dd of=`, a process substitution (whose body is scanned recursively), a
+# redirect inside `$(...)`/backticks/`eval`/`sh -c`, and the read side
+# (`$(<file)`, `cat <file>`, `<`). Second, refuse rather than ignore: every
+# redirect operator lexed must end up either classified or refused, and a
+# redirect whose target cannot be read (an operator with no word, an
+# unterminated quote/substitution, or an `eval`/`-c` text that is not a literal)
+# is refused with the block line and the text. Output is one
+# `op<TAB>kind<TAB>word<TAB>line` line per item and one
+# `#accounting<TAB>lexed<TAB>class<TAB>refused` line per block; the caller
+# re-checks that lexed == class + refused, so a construct the scanner neither
+# classified nor refused fails the guard instead of disappearing. kind is
+# `target` (a redirect or pipe target), `read` (a source read), `fddup` (an fd
+# duplication naming no path), `exempt` (a here-document/here-string word or a
+# process substitution) or `refuse`. Exemptions are decided by the caller
+# (operator for `fddup`, evaluated value for the `/dev` sinks and `-`), never by
+# this scanner.
 block_target_items() {
     python3 -B - "$1" <<'PY'
+import re
 import sys
+
+PREFIX = {
+    "sudo", "command", "env", "nohup", "time", "nice", "stdbuf", "xargs",
+    "exec", "builtin", "doas",
+}
+SHELLS = {"sh", "bash", "dash", "zsh", "ksh", "ash", "mksh"}
+WATCH = {"tee", "dd", "eval"}
+READ_CMDS = {"cat"}
+ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+OP_RE = re.compile(r"[0-9]*(?:&>>|&>|>>|>\||>&|<\||<>|<<-|<<<|<<|>|<)")
+FD_DUP_RE = re.compile(r"^-$|^[0-9]+$")
 
 
 def strip_comment(line):
@@ -616,161 +682,432 @@ def strip_comment(line):
     return "".join(out)
 
 
-def read_word(line, i):
-    """Read one shell word, quotes kept verbatim; stop at an unquoted operator."""
-    out = []
-    n = len(line)
-    while i < n:
-        c = line[i]
-        if c in " \t":
-            break
-        if c in ";|&<>()":
-            break
-        if c == "$" and i + 1 < n and line[i + 1] == "(":
-            break
-        if c == "\\":
-            out.append(c)
-            i += 1
-            if i < n:
-                out.append(line[i])
+class Tok(object):
+    __slots__ = ("kind", "raw", "simple", "line")
+
+    def __init__(self, kind, raw="", simple="", line=0):
+        self.kind = kind
+        self.raw = raw
+        self.simple = simple
+        self.line = line
+
+
+class Scanner(object):
+    def __init__(self):
+        self.items = []
+        self.refusals = []
+        self.stats = {"lexed": 0, "class": 0, "refused": 0, "nested": 0}
+
+    def refuse(self, line, text, why):
+        self.refusals.append((line, text, why))
+
+    def refuse_op(self, line, text, why):
+        self.stats["refused"] += 1
+        self.refusals.append((line, text, why))
+
+    def add(self, op, kind, word, line):
+        word = " ".join(str(word).split())
+        self.items.append((op, kind, word, line))
+
+    def find_close(self, code, i):
+        """code[i] == '('; return the index just past the matching ')'."""
+        n = len(code)
+        depth = 0
+        quote = None
+        j = i
+        while j < n:
+            c = code[j]
+            if quote:
+                if quote == '"' and c == "\\":
+                    j += 2
+                    continue
+                if c == quote:
+                    quote = None
+                j += 1
+                continue
+            if c == "\\":
+                j += 2
+                continue
+            if c in ("'", '"'):
+                quote = c
+                j += 1
+                continue
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return j + 1
+            j += 1
+        return -1
+
+    def find_backtick(self, code, i):
+        n = len(code)
+        j = i + 1
+        while j < n:
+            if code[j] == "\\":
+                j += 2
+                continue
+            if code[j] == "`":
+                return j + 1
+            j += 1
+        return -1
+
+    def scan_text(self, text, depth=0):
+        """Lex a whole block: comments are stripped per line, everything else is
+        one stream, so a construct split by a line continuation still closes."""
+        code = "\n".join(strip_comment(l) for l in text.split("\n"))
+        toks = self.lex(code, 1, depth)
+        self.walk(toks, depth)
+
+    def lex(self, code, lineno, depth):
+        toks = []
+        i, n = 0, len(code)
+        while i < n:
+            c = code[i]
+            if c == "\n":
+                toks.append(Tok("sep", "\n", "\n", lineno))
+                lineno += 1
                 i += 1
-            continue
-        if c in ('"', "'"):
-            q = c
-            out.append(c)
-            i += 1
-            while i < n:
-                d = line[i]
-                if q == '"' and d == "\\":
-                    out.append(d)
+                continue
+            if c in " \t":
+                i += 1
+                continue
+            if c == "\\" and i + 1 < n and code[i + 1] == "\n":
+                lineno += 1
+                i += 2
+                continue
+            if code.startswith(";;", i):
+                toks.append(Tok("sep", ";;", line=lineno))
+                i += 2
+                continue
+            if code.startswith("&&", i) or code.startswith("||", i):
+                toks.append(Tok("sep", code[i:i + 2], line=lineno))
+                i += 2
+                continue
+            if c in ("<", ">") and i + 1 < n and code[i + 1] == "(":
+                end = self.find_close(code, i + 1)
+                if end < 0:
+                    self.refuse(lineno, code[i:i + 20],
+                                "an unterminated process substitution")
+                    i = n
+                    continue
+                toks.append(Tok("procsub", code[i:end], code[i:end], lineno))
+                self.stats["nested"] += 1
+                self.scan_text(code[i + 2:end - 1], depth + 1)
+                i = end
+                continue
+            m = OP_RE.match(code, i)
+            if m:
+                op = m.group(0)
+                toks.append(Tok("op", op, op, lineno))
+                self.stats["lexed"] += 1
+                i += len(op)
+                continue
+            if c in ";|&(){}":
+                toks.append(Tok("sep", c, c, lineno))
+                i += 1
+                continue
+            tok, i, lineno = self.read_word(code, i, lineno, depth)
+            if tok is not None:
+                toks.append(tok)
+        return toks
+
+    def read_word(self, code, i, lineno, depth):
+        n = len(code)
+        raw = []
+        simple = []
+        quote = None
+        while i < n:
+            c = code[i]
+            if quote is None:
+                if c == "\\" and i + 1 < n and code[i + 1] == "\n":
+                    lineno += 1
+                    i += 2
+                    continue
+                if c in " \t\n":
+                    break
+                if c in ";|&<>()":
+                    break
+                if c == "\\":
+                    raw.append(c)
+                    simple.append(c)
                     i += 1
                     if i < n:
-                        out.append(line[i])
+                        raw.append(code[i])
+                        simple.append(code[i])
+                        if code[i] == "\n":
+                            lineno += 1
                         i += 1
                     continue
-                out.append(d)
+                if c in ("'", '"'):
+                    quote = c
+                    raw.append(c)
+                    i += 1
+                    continue
+                if c == "`":
+                    end = self.find_backtick(code, i)
+                    if end < 0:
+                        self.refuse(lineno, code[i:i + 20],
+                                    "an unterminated backtick command substitution")
+                        i = n
+                        break
+                    raw.append(code[i:end])
+                    simple.append(code[i:end])
+                    self.stats["nested"] += 1
+                    self.scan_text(code[i + 1:end - 1], depth + 1)
+                    lineno += code[i:end].count("\n")
+                    i = end
+                    continue
+                if code.startswith("$((", i):
+                    end = self.find_close(code, i + 1)
+                    if end < 0:
+                        self.refuse(lineno, code[i:i + 20],
+                                    "an unterminated arithmetic expansion")
+                        i = n
+                        break
+                    raw.append(code[i:end])
+                    simple.append(code[i:end])
+                    lineno += code[i:end].count("\n")
+                    i = end
+                    continue
+                if code.startswith("$(", i):
+                    end = self.find_close(code, i + 1)
+                    if end < 0:
+                        self.refuse(lineno, code[i:i + 20],
+                                    "an unterminated command substitution")
+                        i = n
+                        break
+                    raw.append(code[i:end])
+                    simple.append(code[i:end])
+                    self.stats["nested"] += 1
+                    self.scan_text(code[i + 2:end - 1], depth + 1)
+                    lineno += code[i:end].count("\n")
+                    i = end
+                    continue
+                raw.append(c)
+                simple.append(c)
                 i += 1
-                if d == q:
+                continue
+            if c == "\\" and quote == '"':
+                raw.append(c)
+                simple.append(c)
+                i += 1
+                if i < n:
+                    raw.append(code[i])
+                    simple.append(code[i])
+                    if code[i] == "\n":
+                        lineno += 1
+                    i += 1
+                continue
+            if quote == '"' and c == "`":
+                end = self.find_backtick(code, i)
+                if end < 0:
+                    self.refuse(lineno, code[i:i + 20],
+                                "an unterminated backtick command substitution")
+                    i = n
                     break
-            continue
-        out.append(c)
-        i += 1
-    return "".join(out), i
-
-
-def scan_line(line):
-    """Return (op, kind, word) for every redirect/pipe item on one line."""
-    res = []
-    line = strip_comment(line)
-    i, n = 0, len(line)
-    while i < n:
-        c = line[i]
-        if c in ('"', "'"):
-            _, i = read_word(line, i)
-            continue
-        if c == "\\":
-            i += 2
-            continue
-        if c == ">" and i + 1 < n and line[i + 1] == "&":
-            j = i + 2
-            w, j = read_word(line, j)
-            res.append((">&", "fddup", w))
-            i = j
-            continue
-        if c == "&" and i + 1 < n and line[i + 1] == ">":
-            op = "&>>" if i + 2 < n and line[i + 2] == ">" else "&>"
-            j = i + len(op)
-            while j < n and line[j] in " \t":
-                j += 1
-            w, j = read_word(line, j)
-            if w:
-                res.append((op, "target", w))
-            i = j
-            continue
-        if c == ">":
-            op = ">"
-            j = i + 1
-            if j < n and line[j] == ">":
-                op = ">>"
-                j += 1
-            elif j < n and line[j] == "|":
-                op = ">|"
-                j += 1
-            while j < n and line[j] in " \t":
-                j += 1
-            w, j = read_word(line, j)
-            if w:
-                res.append((op, "target", w))
-            i = j
-            continue
-        if c == "|" and not (i + 1 < n and line[i + 1] == "|"):
-            j = i + 1
-            while j < n and line[j] in " \t":
-                j += 1
-            w, j = read_word(line, j)
-            if w == "tee":
-                while True:
-                    while j < n and line[j] in " \t":
-                        j += 1
-                    if j >= n or line[j] in ";|<>":
-                        break
-                    a, j2 = read_word(line, j)
-                    j = j2
-                    if a.startswith("-"):
-                        continue
-                    res.append(("tee", "target", a))
+                raw.append(code[i:end])
+                simple.append(code[i:end])
+                self.stats["nested"] += 1
+                self.scan_text(code[i + 1:end - 1], depth + 1)
+                lineno += code[i:end].count("\n")
+                i = end
+                continue
+            if quote == '"' and code.startswith("$((", i):
+                end = self.find_close(code, i + 1)
+                if end < 0:
+                    self.refuse(lineno, code[i:i + 20],
+                                "an unterminated arithmetic expansion")
+                    i = n
                     break
-            i = j
-            continue
-        if c == "$" and line[i:i + 3] == "$(<":
-            j = i + 3
-            while j < n and line[j] in " \t":
-                j += 1
-            w, j = read_word(line, j)
-            while j < n and line[j] in " \t":
-                j += 1
-            if j < n and line[j] == ")":
-                j += 1
-            if w:
-                res.append(("$(<)", "read", w))
-            i = j
-            continue
-        if c not in ";|&<>()":
-            w, j = read_word(line, i)
-            if w == "dd":
-                k = j
-                while k < n:
-                    while k < n and line[k] in " \t":
-                        k += 1
-                    if k >= n or line[k] in ";|&<>":
-                        break
-                    a, k2 = read_word(line, k)
-                    if a.startswith("of=") and len(a) > 3:
-                        res.append(("dd-of", "target", a[3:]))
-                    k = k2
-                j = k
-            elif w.startswith("of=") and len(w) > 3:
-                res.append(("dd-of", "target", w[3:]))
-            elif w == "cat":
-                k = j
-                while k < n and line[k] in " \t":
+                raw.append(code[i:end])
+                simple.append(code[i:end])
+                lineno += code[i:end].count("\n")
+                i = end
+                continue
+            if quote == '"' and code.startswith("$(", i):
+                end = self.find_close(code, i + 1)
+                if end < 0:
+                    self.refuse(lineno, code[i:i + 20],
+                                "an unterminated command substitution")
+                    i = n
+                    break
+                raw.append(code[i:end])
+                simple.append(code[i:end])
+                self.stats["nested"] += 1
+                self.scan_text(code[i + 2:end - 1], depth + 1)
+                lineno += code[i:end].count("\n")
+                i = end
+                continue
+            if c == quote:
+                quote = None
+                raw.append(c)
+                i += 1
+                continue
+            if c == "\n":
+                lineno += 1
+            raw.append(c)
+            simple.append(c)
+            i += 1
+        if quote is not None:
+            self.refuse(lineno, "".join(raw) + code[i:i + 20],
+                        "an unterminated %s quote: the rest of the block cannot be classified"
+                        % ("single" if quote == "'" else "double"))
+            while i < n:
+                if code[i] == "\n":
+                    lineno += 1
+                raw.append(code[i])
+                i += 1
+        if not raw:
+            return None, i, lineno
+        return Tok("word", "".join(raw), "".join(simple), lineno), i, lineno
+
+    def walk(self, toks, depth):
+        cmdpos = True
+        k = 0
+        while k < len(toks):
+            t = toks[k]
+            if t.kind == "sep":
+                cmdpos = True
+                k += 1
+                continue
+            if t.kind == "op":
+                nxt = toks[k + 1] if k + 1 < len(toks) else None
+                if nxt is None or nxt.kind in ("op", "sep"):
+                    self.refuse_op(t.line, t.raw,
+                                   "the redirect operator %s has no target word" % t.raw)
                     k += 1
-                if k < n and line[k] not in ";|&<>":
-                    a, k2 = read_word(line, k)
-                    res.append(("cat", "read", a))
-                    k = k2
-                j = k
-            i = j if j > i else i + 1
-            continue
-        i += 1
-    return res
+                    continue
+                self.classify_op(t, nxt)
+                k += 2
+                continue
+            if t.kind == "procsub":
+                k += 1
+                continue
+            if not cmdpos:
+                k += 1
+                continue
+            s = t.simple
+            if s.startswith("-"):
+                k += 1
+                continue
+            if ASSIGN_RE.match(s):
+                k += 1
+                continue
+            base = s.split("/")[-1]
+            if base in PREFIX:
+                k += 1
+                continue
+            if base in WATCH or base in SHELLS or base in READ_CMDS:
+                k = self.handle_command(base, toks, k, depth)
+                cmdpos = False
+                continue
+            cmdpos = False
+            k += 1
+
+    def args_from(self, toks, k):
+        j = k + 1
+        args = []
+        while j < len(toks) and toks[j].kind not in ("sep", "op"):
+            if toks[j].kind == "word":
+                args.append(toks[j])
+            j += 1
+        return args, j
+
+    def handle_command(self, base, toks, k, depth):
+        args, j = self.args_from(toks, k)
+        if base == "tee":
+            for a in args:
+                if a.simple.startswith("-"):
+                    continue
+                self.add("tee", "target", a.raw, a.line)
+            return j
+        if base == "dd":
+            for a in args:
+                if a.simple.startswith("of=") and len(a.simple) > 3:
+                    pos = a.raw.find("of=")
+                    self.add("dd-of", "target", a.raw[pos + 3:], a.line)
+            return j
+        if base in READ_CMDS:
+            for a in args:
+                if a.simple.startswith("-"):
+                    continue
+                self.add(base, "read", a.raw, a.line)
+            return j
+        if base == "eval":
+            for a in args:
+                self.defer_or_scan(a, depth)
+            return j
+        ci = None
+        for idx, a in enumerate(args):
+            if a.simple == "-c" or (a.simple.startswith("-") and "c" in a.simple[1:]
+                                    and not a.simple.startswith("--")):
+                ci = idx
+                break
+        if ci is not None and ci + 1 < len(args):
+            self.defer_or_scan(args[ci + 1], depth)
+        return j
+
+    def defer_or_scan(self, tok, depth):
+        """A command-position text (an `eval` argument, a shell `-c` string) must
+        be accounted for, not ignored: scan the literal, refuse when it is not one."""
+        before = len(self.items) + len(self.refusals)
+        text = tok.simple
+        self.stats["nested"] += 1
+        self.scan_text(text, depth + 1)
+        if len(self.items) + len(self.refusals) > before:
+            return
+        if "$" in text or "`" in text:
+            self.refuse(tok.line, tok.raw,
+                        "the command text is not a literal the scanner can read (it carries "
+                        "an expansion), so any redirect it performs is invisible here: %s"
+                        % text[:80])
+        else:
+            self.refuse(tok.line, tok.raw,
+                        "the command text %r names no redirect the scanner can classify"
+                        % text[:60])
+
+    def classify_op(self, op, tgt):
+        o = op.raw
+        self.stats["class"] += 1
+        if tgt.kind == "procsub":
+            self.add(o, "exempt",
+                     "a process substitution, whose body the scanner scanned", op.line)
+            return
+        if o.endswith(">&") or o.endswith("<&"):
+            if FD_DUP_RE.match(tgt.simple):
+                self.add(o, "fddup", tgt.raw, op.line)
+            else:
+                self.add(o, "target", tgt.raw, op.line)
+            return
+        if o.endswith("<<<") or o.endswith("<<") or o.endswith("<<-"):
+            self.add(o, "exempt",
+                     "a here-document/here-string word, not a path: %s" % tgt.raw, op.line)
+            return
+        if o.endswith("<>"):
+            self.add(o, "target", tgt.raw, op.line)
+            return
+        if o.endswith("<"):
+            self.add(o, "read", tgt.raw, op.line)
+            return
+        self.add(o, "target", tgt.raw, op.line)
 
 
 with open(sys.argv[1], errors="replace") as fh:
-    for line in fh:
-        for op, kind, word in scan_line(line):
-            if word:
-                sys.stdout.write("%s\t%s\t%s\n" % (op, kind, word))
+    sc = Scanner()
+    sc.scan_text(fh.read())
+for op, kind, word, line in sc.items:
+    sys.stdout.write("%s\t%s\t%s\t%d\n" % (op, kind, word, line))
+for line, text, why in sc.refusals:
+    sys.stdout.write("refuse\trefuse\t%s\t%d\n"
+                     % (" ".join(("%s (%s)" % (text, why)).split()), line))
+sys.stdout.write("#accounting\t%d\t%d\t%d\n"
+                 % (sc.stats["lexed"], sc.stats["class"], sc.stats["refused"]))
+if sc.stats["lexed"] != sc.stats["class"] + sc.stats["refused"]:
+    sys.stderr.write("scanner accounting failed: lexed=%d class=%d refused=%d\n"
+                     % (sc.stats["lexed"], sc.stats["class"], sc.stats["refused"]))
+    sys.exit(3)
 PY
 }
 
@@ -818,13 +1155,30 @@ fi
 # The section above pins the *spelled* forms the current steps use; a target
 # written as a fixed literal is invisible to it. This section is the invariant:
 # every target word a run block redirects to or pipes into, whatever its
-# spelling, must be per-run. The review's counterexample —
-# `... 2>&1 | tee "$log" >> /tmp/shared.log` — is refused here on its literal.
+# spelling, must be per-run, and every redirect-like construct the scanner
+# cannot read must be refused here rather than skipped. The review's
+# counterexample — `... 2>&1 | tee "$log" >> /tmp/shared.log` — is refused on
+# its literal; a helper function's `tee`, an `eval`/`sh -c` text, a process
+# substitution, an operator with no target word and an unterminated quote are
+# refused by the scanner itself, naming the block, the ci.yml line and the text.
 guard_target_words=14
-guard_target_exempt=52
+guard_target_exempt=65
+guard_target_reads=14
+# A body line is not a ci.yml line: the block parser records the region line each
+# body line came from, and the region starts at `region_start`.
+yml_line_of() {
+    local n
+    n=$(sed -n "${2}p" "$work/blocks/block-$1.map" 2>/dev/null)
+    [ -n "$n" ] || n="$2"
+    printf '%s' "$((region_start + n - 1))"
+}
+scanner_refusals=0
+refusal_text=''
+accounting_blocks=0
 target_words=()
 target_values=()
 exempt_items=0
+read_items=0
 block=0
 while [ "$block" -lt "$guard_blocks" ]; do
     block=$((block + 1))
@@ -836,11 +1190,33 @@ while [ "$block" -lt "$guard_blocks" ]; do
     ctx="$work/blocks/block-$block.ctx"
     [ -f "$ctx" ] || block_context "$body" > "$ctx"
     seen="$work/blocks/block-$block.targets"
+    seen_reads="$work/blocks/block-$block.reads"
     : > "$seen"
-    while IFS=$'\t' read -r op kind word; do
-        [ -n "$word" ] || continue
-        if [ "$kind" = "fddup" ]; then
+    : > "$seen_reads"
+    accounted=0
+    while IFS=$'\t' read -r op kind word bline; do
+        if [ "$op" = "#accounting" ]; then
+            accounted=1
+            accounting_blocks=$((accounting_blocks + 1))
+            if [ "$kind" != "$((word + bline))" ]; then
+                bad "run block $block: the scanner lexed $kind redirect operator(s) but accounted for $((word + bline)) of them (classified $word, refused $bline): an operator was neither classified nor refused"
+            fi
+            continue
+        fi
+        if [ "$op" = "refuse" ]; then
+            scanner_refusals=$((scanner_refusals + 1))
+            refusal_text="$refusal_text block $block at ci.yml:$(yml_line_of "$block" "$bline") ($word);"
+            continue
+        fi
+        if [ "$kind" = "fddup" ] || [ "$kind" = "exempt" ]; then
             exempt_items=$((exempt_items + 1))
+            continue
+        fi
+        if [ "$kind" = "read" ]; then
+            if ! grep -Fxq -- "$word" "$seen_reads" 2>/dev/null; then
+                printf '%s\n' "$word" >> "$seen_reads"
+                read_items=$((read_items + 1))
+            fi
             continue
         fi
         first=$(eval_word_in_context "$ctx" "$word")
@@ -867,7 +1243,22 @@ while [ "$block" -lt "$guard_blocks" ]; do
             bad "the target $word in run block $block ($op) evaluates to the same path in two shells ($first): concurrent runs of this step would share it"
         fi
     done < <(block_target_items "$body")
+    if [ "$accounted" != "1" ]; then
+        bad "run block $block produced no scanner accounting line: the redirect scanner did not run on it or crashed, so no redirect in that block was classified"
+    fi
 done
+
+if [ "$accounting_blocks" = "$guard_blocks" ]; then
+    ok "every one of the $guard_blocks run blocks lexed its redirect operators and accounted for each one (classified or refused)"
+else
+    bad "only $accounting_blocks of $guard_blocks run block(s) produced a scanner accounting line: the redirect scanner did not run on the others"
+fi
+
+if [ "$scanner_refusals" = "0" ]; then
+    ok 'the scanner refused no redirect-like construct in the unmodified job'
+else
+    bad "the scanner refused $scanner_refusals redirect-like construct(s) it could not classify:$refusal_text"
+fi
 
 if [ "${#target_words[@]}" = "$guard_target_words" ]; then
     ok "the job's $guard_blocks run blocks name $guard_target_words non-exempt target word(s), discovered by shape rather than by spelling"
@@ -876,9 +1267,15 @@ else
 fi
 
 if [ "$exempt_items" = "$guard_target_exempt" ]; then
-    ok "the scanner exempted $guard_target_exempt redirect item(s) as fd duplications and /dev sinks; no other exemption is recognised"
+    ok "the scanner exempted $guard_target_exempt redirect item(s) as fd duplications, here-string/here-document words and /dev sinks; no other exemption is recognised"
 else
-    bad "the scanner classified $exempt_items redirect item(s) as exempt, not the pinned $guard_target_exempt: the exemption set is only fd duplications and the /dev sinks, so this is a new exempt shape or a changed count"
+    bad "the scanner classified $exempt_items redirect item(s) as exempt, not the pinned $guard_target_exempt: the exemption set is only fd duplications, here-string/here-document words and the /dev sinks, so this is a new exempt shape or a changed count"
+fi
+
+if [ "$read_items" = "$guard_target_reads" ]; then
+    ok "the scanner found $guard_target_reads distinct source-read word(s) (\$(<file), cat <file>, <); a read target is not required to be per-run"
+else
+    bad "the scanner found $read_items distinct source-read word(s), not the pinned $guard_target_reads: a read was added, removed, or spelled past the scanner"
 fi
 
 if list_is_distinct ${target_values[@]+"${target_values[@]}"}; then
@@ -963,17 +1360,25 @@ else
     ok 'canary: the parent-directory rule refuses a path under a nonexistent directory'
 fi
 # The scanner decides every live target, so it carries known-answer inputs of its
-# own: the review's recipe must be discovered (its literal included), a comment
-# and a quoted case label must not be, and the per-run rule must refuse a literal
-# while accepting a command substitution.
+# own: the review's recipe must be discovered (its literal included), the second
+# file argument of a `tee` pipeline and a `tee` inside a helper function must be
+# discovered, a comment and a quoted case label must not be, an operator with no
+# target word must be refused while a well-formed redirect must not be, and the
+# per-run rule must refuse a literal while accepting a command substitution.
+scanner_finds_literal() {
+    block_target_items "$1" | awk -F'\t' -v want="$2" '
+        $1 != "#accounting" && $1 != "refuse" && $3 == want { found = 1 }
+        END { exit !found }'
+}
+scanner_refuses_op() {
+    block_target_items "$1" | awk -F'\t' '$1 == "refuse" { found = 1 } END { exit !found }'
+}
 printf '%s\n' 'bash scripts/tests/rss-soak-run-dir.sh 2>&1 | tee "$log" >> /tmp/hff-canary-shared.log || status=1' > "$work/canary-recipe.sh"
 canary_targets=0
 canary_literal=0
-while IFS=$'\t' read -r op kind word; do
-    [ -n "$word" ] || continue
-    if [ "$kind" = "fddup" ]; then
-        continue
-    fi
+while IFS=$'\t' read -r op kind word bline; do
+    [ "$op" = "#accounting" ] && continue
+    [ "$kind" = "fddup" ] && continue
     canary_targets=$((canary_targets + 1))
     if [ "$word" = "/tmp/hff-canary-shared.log" ]; then
         canary_literal=1
@@ -984,8 +1389,32 @@ if [ "$canary_targets" = "2" ] && [ "$canary_literal" = "1" ]; then
 else
     bad "canary: the scanner found $canary_targets non-fd item(s) in the review recipe (literal seen: $canary_literal); it must find 2, including the literal"
 fi
+printf '%s\n' 'bash scripts/tests/rss-soak-run-dir.sh 2>&1 | tee "$log" /tmp/hff-canary-tee-fixed.log || status=1' > "$work/canary-tee-multi.sh"
+if scanner_finds_literal "$work/canary-tee-multi.sh" '/tmp/hff-canary-tee-fixed.log'; then
+    ok 'canary: the scanner discovers the second file argument of a tee pipeline (tee "$log" /tmp/fixed.log)'
+else
+    bad "canary: the scanner missed the second file argument of a tee pipeline, so a fixed path passed to a tee argument past the first would be ignored"
+fi
+printf '%s\n' 'helper() { tee /tmp/hff-canary-helper.log; }' 'bash scripts/tests/rss-soak-run-dir.sh | helper' > "$work/canary-helper.sh"
+if scanner_finds_literal "$work/canary-helper.sh" '/tmp/hff-canary-helper.log'; then
+    ok 'canary: the scanner discovers a tee inside a helper function body that the pipeline calls'
+else
+    bad 'canary: the scanner missed a tee inside a helper function body, so a fixed path a helper writes would be ignored'
+fi
+printf '%s\n' 'bash scripts/tests/rss-soak-run-dir.sh >' > "$work/canary-refuse.sh"
+if scanner_refuses_op "$work/canary-refuse.sh"; then
+    ok 'canary: the scanner refuses a redirect operator with no target word instead of ignoring it'
+else
+    bad 'canary: the scanner ignored a redirect operator with no target word; a shape it cannot classify must be refused, not skipped'
+fi
+printf '%s\n' 'log=/tmp/frp-canary.$$.log' 'bash scripts/tests/rss-soak-run-dir.sh > "$log" 2>&1 || status=1' > "$work/canary-clean.sh"
+if scanner_refuses_op "$work/canary-clean.sh"; then
+    bad 'canary: the scanner refused a well-formed per-run redirect (the refusal rule is too strict to trust)'
+else
+    ok 'canary: the scanner does not refuse a well-formed per-run redirect'
+fi
 printf '%s\n' '# > /tmp/hff-canary-comment.log' "case \$line in '  ok '*) : ;; '-> child red') : ;; esac" > "$work/canary-prose.sh"
-canary_prose=$(block_target_items "$work/canary-prose.sh" | wc -l | tr -d ' ')
+canary_prose=$(block_target_items "$work/canary-prose.sh" | grep -cv '^#accounting')
 if [ "$canary_prose" = "0" ]; then
     ok 'canary: a commented redirect and a quoted case label carrying -> are not discovered as targets'
 else
