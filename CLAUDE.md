@@ -174,7 +174,7 @@ not be cited for them.
 | `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 1 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |
 | `scripts/compat-test.sh` vs Go frp v0.71.0 | 86 passed, 0 failed |
 | `scripts/protocol-matrix.sh` | 11/11 transport rows move data |
-| Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0449` + `cargo deny check` before release |
+| Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
 | Vendored crates | `rustls`, `yamux`, `russh` under `[patch.crates-io]` — **each has an exit condition, see [Vendored crates](README.md#vendored-crates)** |
 
 **To update this file's history**: append the round to
@@ -209,10 +209,11 @@ context and has a 64 KB instruction budget; keep it under ~25 KB.
 - **Cross-compat tests**: `scripts/compat-test.sh` — 86 run_test scenarios + 17 XTCP pairwise scenarios against Go frp v0.71.0 (V2 included, plus KCP+TLS and KCP+tcpMux Go↔Rust scenarios since the in-tree KCP landed). Runs on every push via `compat.yml`; XTCP compat runs daily on VPS via `xtcp-compat.yml`. Subset runs: `compat-test.sh --test <display-name>` (matches scenario display name, e.g. `go-to-rust-oidc-proxy`).
 - **Protocol connectivity matrix**: `scripts/protocol-matrix.sh` — end-to-end throughput through frps+frpc for 11 transport rows (tcp/ws/wss/kcp/quic × tls × tcp_mux). Each row asserts data actually moves (mbps > 0), catching "connects but bridges zero bytes" regressions like the WS-over-TLS lost-wakeup stall. Runs in `compat.yml` after the compat tests; also run locally after any transport change: `bash scripts/protocol-matrix.sh`.
 - **Repo invariants**: `scripts/repo-health.sh` is the local mirror of the `health` CI job — it gates version alignment and that every **backtick-delimited** repo path anchored at a known root in current docs or source comments resolves (file-relative, then owning crate root, then repo root; `crate/feature` recognised as Cargo feature syntax). The path scan is **tracked-files-only** (file list from `git ls-files -z`, deduplicated, with `GIT_DIR`/`GIT_INDEX_FILE`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`/`GIT_OBJECT_DIRECTORY` and any `GIT_TRACE*` stripped from git's environment; only a tree with no `.git` entry at all — not even a dangling symlink — falls back to walking the filesystem, and any `.git` entry whose index cannot be read fails the gate instead), so when `.git` is present gitignored local state such as `.worktrees/` and `.superpowers/` is never scanned (the `.git`-less walk fallback prunes only `.git`/`target`). Not covered, by design: un-backticked prose and tree diagrams, locator-less shorthands (`mux.rs`), a directory that still exists but was emptied, untracked local files, submodule contents, and third-party `vendor/*/README.md`. Point-in-time files (`CHANGELOG.md`, `TODO.md`, `performance-audit.md`, `docs/refactor-large-modules.md`) are out of scope. See [docs/developing.md § Repository Invariants](docs/developing.md#repository-invariants-repo-healthsh).
-- **Security audit**: Run `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0449` and `cargo deny check` before each release. The four ignores are pre-existing issues with **no upstream fix** (cargo-audit ≥0.21 dropped `audit.toml` config file support — flags are the only mechanism; keep reasons in sync with the CI job in `ci.yml`):
+- **Security audit**: Run `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` and `cargo deny check` before each release. The three ignores are pre-existing issues with **no upstream fix** (cargo-audit ≥0.21 dropped `audit.toml` config file support — flags are the only mechanism; keep reasons in sync with the CI job in `ci.yml`):
   - `RUSTSEC-2026-0194/0195` (quick-xml 0.26, high): dev-only `profiling` feature chain pprof 0.15 → inferno 0.11.21 → quick-xml 0.26. pprof 0.15.0 is the latest release; nothing newer resolves. Never compiled into release binaries.
   - `RUSTSEC-2023-0071` (rsa 0.10.0-rc.18, Marvin attack, medium): pinned by russh 0.62.7 (latest) via ssh-key 0.7.0-rc.11. Advisory has no fixed upgrade. Affects frps SSH gateway (RSA host keys/auth) only. Re-check on every russh bump.
-  - `RUSTSEC-2024-0449` (unsafe-libyaml 0.2.11, informational *unmaintained*): pulled by `serde_yaml_ng` 0.10 for `.yaml`/`.yml` config files. The repo was archived 2024-03-25 and both `patched` and `unaffected` are empty, so no upgrade clears it. Config input is operator-supplied; the frpc admin API validates a config PUT body as TOML before writing it to the config path, which the reload then re-reads by extension, and that caller is already privileged to rewrite the config — so the exposure is **low rather than nil**. **Temporary** — remove this ignore when `serde_yaml_ng` is replaced by a maintained safe-Rust parser (see the `TODO.md` item).
+
+  `RUSTSEC-2024-0449` (unsafe-libyaml *unmaintained*) was dropped when `serde_yaml_ng` was replaced by `yaml-rust2` 0.13 in the config layer; `unsafe-libyaml` is no longer in the graph (`cargo tree -i unsafe-libyaml` finds nothing).
 
 ## Test Coverage Gaps
 
@@ -237,7 +238,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 |--------|-------|-------|
 | Async runtime | `tokio` | net, io-util, time, sync, macros, rt-multi-thread, signal |
 | Serialization | `serde` + `serde_json` | derive feature |
-| Config | `toml` | 0.8 (TOML); `.yaml`/`.yml`/`.json`/`.ini` via `serde_yaml_ng`/`serde_json` — auto-detected by extension |
+| Config | `toml` | 0.8 (TOML); `.yaml`/`.yml`/`.json`/`.ini` via `yaml-rust2` 0.13 (`default-features = false`, Go-compatible YAML 1.1 scalar resolution) / `serde_json` — auto-detected by extension |
 | Test certs (dev) | `rcgen` | optional under `tls` feature, dev/tests only (LTO-GC'd out of shipped binaries) |
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |

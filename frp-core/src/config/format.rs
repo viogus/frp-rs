@@ -82,31 +82,81 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
 /// v0.71.0 release binary — see [`yaml_plain_scalar`]. That is a deliberate
 /// behaviour change from the previous `serde_yaml_ng` reader for a small set of
 /// plain scalars, which now match Go instead of being silently read the other
-/// way: the YAML 1.1 booleans (`y`/`yes`/`on`/`n`/`no`/`off`), the null
-/// spellings `Null`/`NULL`, `0b101` binary, `1_000` with underscores, and the
-/// leading-zero octals (`017` is 15, not 17).
+/// way:
 ///
-/// The resulting `serde_json::Value` then goes through the same `json_to_toml`
+/// * the YAML 1.1 booleans — unquoted `y`/`yes`/`on` and `n`/`no`/`off`, any
+///   case, are booleans, so quote them to keep the text (the old reader rejected
+///   an unquoted `no` on a boolean field with
+///   `invalid type: string "no", expected a boolean`);
+/// * a plain leading-zero number is an octal (`017` is 15) where the old reader
+///   kept the text, and a tagged `!!float`/`!!int` body is parsed as an integer
+///   first (`!!float 017` is 15, not 17);
+/// * `_`-prefixed tokens (`_100`) stay strings, matching Go's
+///   `resolveTable[in[0]]` gate; a sign selects Go's numeric branch, so `+_100`
+///   is still 100;
+/// * an uppercase binary prefix resolves (`0B101` is 5 where the old reader kept
+///   the text; lowercase `0b101` was already 5).
+///
+/// Not changes against the old reader, and recorded so they are not re-filed as
+/// ones: `0o17` already resolved to 15, and `Null`/`NULL`/`~` already resolved
+/// to null.
+///
+/// Deliberate, *loud* differences from Go frp that remain: duplicate keys in one
+/// mapping are an error (the old reader also errored, with the same
+/// `duplicate entry with key "…"` text; Go silently keeps the last value), and a
+/// second document is an error. Two previously listed "unmeasured" rows now
+/// match Go on outcome: a byte-order mark in the middle of a document becomes
+/// part of the following key exactly as it does in Go (the old reader errored),
+/// and `!!set`/`!!omap`/`!!pairs` accept and reject the same inputs Go does
+/// (their resolved shapes differ from Go's `null` values).
+///
+/// The `serde_json::Value` built here then goes through the same `json_to_toml`
 /// conversion as the JSON path, so both formats share one type-inference
 /// pipeline.
 ///
-/// Deliberate, *loud* differences from the previous reader that remain:
-/// duplicate keys in one mapping are an error, and a second document is an
-/// error.
+/// Remaining divergences from Go that are **pre-existing at `main`** rather than
+/// introduced by this reader, recorded with the measured `main` behaviour so they
+/// are not mis-filed as regressions:
 ///
-/// Known remaining differences from Go frp, none of them silent: a merge key is
-/// applied in *insertion* order, so an explicitly written key always wins, while
-/// Go resolves a merge by position (`{level: info, <<: {level: bogus}}` takes
-/// `bogus` there); `!!binary` keeps its text instead of being decoded; and the
+/// * a map key outside `i64`/`u64` range (`{18446744073709551615: v}`) and a
+///   null key (`{~: v}`) are accepted as text; Go errors (`main`: same);
+/// * an integral float key renders with its `.0` (`{10.0: v}` -> `"10.0"`, and
+///   `{1000.0: v}` -> `"1000.0"`); Go renders `"10"` / `"1000"` (`main`: same);
+/// * a `%YAML 1.2` directive is accepted; Go errors (`main`: same);
+/// * an empty or comment-only document yields the empty string, which the
+///   `ClientConfig` decoder rejects with `invalid type: string "", expected
+///   struct ClientConfig`; Go uses defaults (`main`: same);
+/// * the top-level dot-key deletion Go's `parseYAMLWithDotFieldsHandling` does
+///   is not reproduced, but an unknown key is only ignored, so `.note: hello`
+///   loads with defaults rather than erroring (`main`: same);
+/// * a quoted `"<<"` is a literal key, as in Go — the old reader errored on it,
+///   treating it as a merge key (`main`: differs, toward Go);
+/// * `!Custom 7000` resolves to the string `7000`, as in Go — the old reader
+///   produced the integer 7000 (`main`: differs, toward Go).
+///
+/// Unknown differences from Go frp, none of them silent: a merge key is applied
+/// in *insertion* order, so an explicitly written key always wins, while Go
+/// resolves a merge by position — `{serverPort: 7000, <<: {serverPort: 1234}}`
+/// dials **1234** in Go and **7000** here, because an explicit key does not
+/// shadow `<<` there; `!!binary` keeps its text instead of being decoded;
+/// `!!timestamp`/`!!binary` bodies are not validated, so an invalid one such as
+/// `!!timestamp garbage` is kept as a string where Go rejects it; and the
 /// strictness of unknown fields is not reproduced.
+///
+/// Deliberate *refusals* that Go accepts, all loud: a tab used for indentation
+/// inside a flow collection (the scanner refuses it), and a multi-line flow
+/// collection whose continuation is not indented (`x: [1,` / `2]`), which the
+/// scanner reads as `invalid indentation` — while the tab-continued form is
+/// accepted.
 ///
 /// # Errors
 ///
 /// `YAML parse error: …` for malformed input, a duplicate mapping key, more than
 /// one document, a tab used for indentation, a `...` without a document, an
-/// unresolvable alias, or an explicitly tagged scalar (`!!int`) whose body does
-/// not match its tag; `YAML merge key (``<<``) error: …` for a merge key whose
-/// value is not a mapping or a sequence of mappings.
+/// unresolvable alias, an alias expansion past the size budget, or an explicitly
+/// tagged scalar (`!!int`) whose body does not match its tag; `YAML merge key
+/// (``<<``) error: …` for a merge key whose value is not a mapping or a sequence
+/// of mappings.
 fn yaml_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     // `yaml-rust2`'s scanner does not strip a byte-order mark (its own TODO);
     // the previous reader did, and config files are UTF-8.
@@ -120,7 +170,7 @@ fn yaml_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>
         )
         .into());
     }
-    let mut receiver = YamlReceiver::default();
+    let mut receiver = YamlReceiver::new(content.len());
     yaml_rust2::parser::Parser::new_from_str(content)
         .load(&mut receiver, true)
         .map_err(|e| format!("YAML parse error: {e}"))?;
@@ -314,13 +364,32 @@ fn yaml_scalar_to_json(scalar: &yaml_rust2::yaml::Yaml) -> serde_json::Value {
 /// dropped `BadValue`, duplicate keys are reported with their position, an empty
 /// document is null, and more than one document is refused — the previous
 /// `serde_yaml_ng` `from_str` refused it too.
+/// One container (or a scalar parked at the document root) still being built.
+///
+/// `size` is the number of nodes the whole subtree holds; it is what an alias
+/// that copies this node is charged for.
+struct PendingNode {
+    node: YamlNode,
+    /// The anchor the parser assigned this node (0 for none).
+    anchor: usize,
+    /// The node count of `node`, including its children.
+    size: usize,
+}
+
 #[derive(Default)]
 struct YamlReceiver {
     docs: Vec<YamlNode>,
-    doc_stack: Vec<(YamlNode, usize)>,
+    doc_stack: Vec<PendingNode>,
     key_stack: Vec<Option<YamlNode>>,
-    anchors: std::collections::BTreeMap<usize, YamlNode>,
+    /// One set per open mapping: the rendered key names already written there,
+    /// so a duplicate is found without rescanning every earlier entry.
+    key_sets: Vec<std::collections::HashSet<String>>,
+    anchors: std::collections::BTreeMap<usize, (YamlNode, usize)>,
     error: Option<yaml_rust2::scanner::ScanError>,
+    /// Nodes built so far, charged against `alias_budget`.
+    expanded_nodes: usize,
+    /// The most nodes a document of this input length may expand to.
+    alias_budget: usize,
 }
 
 impl yaml_rust2::parser::MarkedEventReceiver for YamlReceiver {
@@ -335,6 +404,20 @@ impl yaml_rust2::parser::MarkedEventReceiver for YamlReceiver {
 }
 
 impl YamlReceiver {
+    /// A receiver whose alias-expansion budget is derived from the input size.
+    ///
+    /// The bound mirrors `yaml.v2`'s `allowedAliasRatio`: a document may expand
+    /// to at most `max(100_000, input.len() * 100)` nodes. A node costs at least
+    /// one input byte, so 100× cannot reject a document that was written out in
+    /// full, while the exponential alias bomb is refused in milliseconds instead
+    /// of allocating gigabytes.
+    fn new(input_len: usize) -> Self {
+        Self {
+            alias_budget: input_len.saturating_mul(100).max(100_000),
+            ..Self::default()
+        }
+    }
+
     fn finish(mut self, source: &str) -> Result<YamlNode, Box<dyn std::error::Error>> {
         if let Some(e) = self.error.take() {
             return Err(format!("YAML parse error: {e}").into());
@@ -373,96 +456,149 @@ impl YamlReceiver {
                 // what the previous reader returned.
                 let document = match self.doc_stack.len() {
                     0 => YamlNode::Resolved(yaml_rust2::yaml::Yaml::Null),
-                    1 => self.doc_stack.pop().expect("one document").0,
+                    1 => self.doc_stack.pop().expect("one document").node,
                     _ => unreachable!("the document stack holds at most one node"),
                 };
                 self.docs.push(document);
             }
             Event::SequenceStart(aid, tag) => {
                 log_dropped_tag(&tag);
-                self.doc_stack.push((YamlNode::Seq(Vec::new()), aid));
+                self.doc_stack.push(PendingNode {
+                    node: YamlNode::Seq(Vec::new()),
+                    anchor: aid,
+                    size: 1,
+                });
             }
             Event::SequenceEnd => {
                 let node = self.doc_stack.pop().expect("a sequence was started");
-                self.insert(node.0, node.1, mark)?;
+                self.insert(node.node, node.anchor, node.size, 1, mark)?;
             }
             Event::MappingStart(aid, tag) => {
                 log_dropped_tag(&tag);
-                self.doc_stack.push((YamlNode::Map(Vec::new()), aid));
+                self.doc_stack.push(PendingNode {
+                    node: YamlNode::Map(Vec::new()),
+                    anchor: aid,
+                    size: 1,
+                });
                 self.key_stack.push(None);
+                self.key_sets.push(std::collections::HashSet::new());
             }
             Event::MappingEnd => {
                 self.key_stack.pop();
+                self.key_sets.pop();
                 let node = self.doc_stack.pop().expect("a mapping was started");
-                self.insert(node.0, node.1, mark)?;
+                self.insert(node.node, node.anchor, node.size, 1, mark)?;
             }
             Event::Scalar(text, style, aid, tag) => {
                 let node = scalar_node(text, style, tag);
-                self.insert(node, aid, mark)?;
+                self.insert(node, aid, 1, 1, mark)?;
             }
             Event::Alias(id) => {
-                // An alias the parser could not resolve is an error, never a
-                // silently dropped node. The message mirrors the previous
-                // reader's `unknown anchor` wording without leaking
-                // yaml-rust2's internal anchor id.
-                let node = self.anchors.get(&id).cloned().unwrap_or_else(|| {
-                    YamlNode::Bad(
-                        "unknown anchor: this alias has no matching anchor in the document"
-                            .to_string(),
-                    )
-                });
-                self.insert(node, 0, mark)?;
+                if let Some((node, size)) = self.anchors.get(&id) {
+                    // Refuse **before** cloning. The clone is the blow-up, so the
+                    // budget has to gate the copy rather than merely count it
+                    // afterwards; `insert` re-checks for the non-alias paths.
+                    if self.expanded_nodes.saturating_add(*size) > self.alias_budget {
+                        return Err(yaml_rust2::scanner::ScanError::new_string(
+                            mark,
+                            "alias expansion limit exceeded".to_string(),
+                        ));
+                    }
+                    let (node, size) = (node.clone(), *size);
+                    self.insert(node, 0, size, size, mark)?;
+                } else {
+                    // An alias the parser could not resolve is an error, never a
+                    // silently dropped node. The message mirrors the previous
+                    // reader's `unknown anchor` wording without leaking
+                    // yaml-rust2's internal anchor id.
+                    self.insert(
+                        YamlNode::Bad(
+                            "unknown anchor: this alias has no matching anchor in the document"
+                                .to_string(),
+                        ),
+                        0,
+                        1,
+                        1,
+                        mark,
+                    )?;
+                }
             }
         }
         Ok(())
     }
 
+    /// Add a node to the tree being built.
+    ///
+    /// `size` is the node count of `node`; `contribution` is how many *new* nodes
+    /// this insertion adds — 1 for a container whose children were already
+    /// counted, `size` for an alias that copies a whole subtree. An alias is
+    /// charged for every node it duplicates, so an exponentially expanding
+    /// document is refused as soon as the total passes `alias_budget`.
+    #[allow(clippy::too_many_arguments)] // (node, anchor, size, contribution, mark)
     fn insert(
         &mut self,
         node: YamlNode,
         aid: usize,
+        size: usize,
+        contribution: usize,
         mark: yaml_rust2::scanner::Marker,
     ) -> Result<(), yaml_rust2::scanner::ScanError> {
+        self.expanded_nodes += contribution;
+        if self.expanded_nodes > self.alias_budget {
+            return Err(yaml_rust2::scanner::ScanError::new_string(
+                mark,
+                "alias expansion limit exceeded".to_string(),
+            ));
+        }
         // Valid anchor ids start at 1, as in `YamlLoader`.
         if aid > 0 {
-            self.anchors.insert(aid, node.clone());
+            self.anchors.insert(aid, (node.clone(), size));
         }
         if self.doc_stack.is_empty() {
-            self.doc_stack.push((node, aid));
+            self.doc_stack.push(PendingNode {
+                node,
+                anchor: aid,
+                size,
+            });
             return Ok(());
         }
-        let parent = &mut self.doc_stack.last_mut().expect("a container").0;
-        match parent {
-            YamlNode::Seq(items) => {
-                items.push(node);
-                Ok(())
-            }
-            YamlNode::Map(entries) => {
-                let slot = self.key_stack.last_mut().expect("a mapping key slot");
-                match slot.take() {
-                    None => {
-                        *slot = Some(node);
-                        Ok(())
-                    }
-                    Some(key) => {
-                        // Duplicate detection is on the key's rendered string,
-                        // the same form the JSON/TOML conversion uses, so `a:`
-                        // twice and `1:` next to `"1":` are both refused rather
-                        // than one silently winning.
-                        let name = yaml_key_to_string(&key);
-                        if entries.iter().any(|(k, _)| yaml_key_to_string(k) == name) {
-                            return Err(yaml_rust2::scanner::ScanError::new_string(
-                                mark,
-                                format!("duplicate entry with key {name:?}"),
-                            ));
-                        }
-                        entries.push((key, node));
-                        Ok(())
-                    }
+        let top_is_map = matches!(
+            self.doc_stack.last().map(|pending| &pending.node),
+            Some(YamlNode::Map(_))
+        );
+        if top_is_map {
+            let slot = self.key_stack.last_mut().expect("a mapping key slot");
+            if let Some(key) = slot.take() {
+                // Duplicate detection is on the key's rendered string, the same
+                // form the JSON/TOML conversion uses, so `a:` twice and `1:` next
+                // to `"1":` are both refused rather than one silently winning.
+                let name = yaml_key_to_string(&key);
+                let fresh = self
+                    .key_sets
+                    .last_mut()
+                    .expect("an open mapping")
+                    .insert(name.clone());
+                if !fresh {
+                    return Err(yaml_rust2::scanner::ScanError::new_string(
+                        mark,
+                        format!("duplicate entry with key {name:?}"),
+                    ));
                 }
+                match &mut self.doc_stack.last_mut().expect("a container").node {
+                    YamlNode::Map(entries) => entries.push((key, node)),
+                    _ => unreachable!("only a sequence or a mapping can be a container"),
+                }
+            } else {
+                *slot = Some(node);
             }
-            _ => unreachable!("only a sequence or a mapping can be a container"),
+        } else {
+            match &mut self.doc_stack.last_mut().expect("a container").node {
+                YamlNode::Seq(items) => items.push(node),
+                _ => unreachable!("only a sequence or a mapping can be a container"),
+            }
         }
+        self.doc_stack.last_mut().expect("a container").size += size;
+        Ok(())
     }
 }
 
@@ -536,18 +672,31 @@ fn tag_mismatch(text: &str, suffix: &str) -> YamlNode {
 }
 
 /// A `!!float`-tagged body: the spelled non-finites keep the canonical text (Go
-/// cannot marshal them, and the previous reader produced `.inf`), a YAML-style
-/// float is a real, and an integer body is converted the way Go's `!!float` does
-/// (`!!float 0x10` is 16).
+/// cannot marshal them, and the previous reader produced `.inf`), an integer body
+/// is converted the way Go's `!!float` does (`!!float 0x10` is 16), and only then
+/// is a YAML-style real accepted.
+///
+/// The order matters: Go's `resolve` runs `ParseInt(plain, 0, 64)` before its
+/// float shape, so `!!float 017` is the legacy-octal `15` and `!!float 010` is
+/// `8`, not `17`/`10`.
 fn yaml_tagged_float(text: &str) -> Option<YamlNode> {
     if let Some(canonical) = non_finite_spelling(text) {
         return Some(YamlNode::Str(canonical.to_string()));
+    }
+    // `!!float _100` is an error in Go: the `_` first byte never enters the
+    // numeric branch, so the tag cannot be satisfied. Without this gate the
+    // underscore stripping below would accept it as 100.
+    if !yaml_may_be_numeric(text) {
+        return None;
+    }
+    if let Some(value) = yaml_go_int(text) {
+        return Some(YamlNode::Resolved(yaml_rust2::yaml::Yaml::Integer(value)));
     }
     let plain = strip_underscores(text);
     if yaml_style_float(&plain) {
         return Some(YamlNode::Resolved(yaml_rust2::yaml::Yaml::Real(plain)));
     }
-    yaml_go_int(text).map(|value| YamlNode::Resolved(yaml_rust2::yaml::Yaml::Integer(value)))
+    None
 }
 
 fn log_dropped_tag(tag: &Option<yaml_rust2::parser::Tag>) {
@@ -621,6 +770,9 @@ fn yaml_plain_scalar(text: &str) -> YamlNode {
     if yaml_plain_scalar_is_null(text) {
         return YamlNode::Resolved(Yaml::Null);
     }
+    if !yaml_may_be_numeric(text) {
+        return YamlNode::Resolved(Yaml::String(text.to_string()));
+    }
     if let Some(value) = yaml_go_int(text) {
         return YamlNode::Resolved(Yaml::Integer(value));
     }
@@ -638,6 +790,20 @@ fn yaml_plain_scalar(text: &str) -> YamlNode {
     YamlNode::Resolved(Yaml::String(text.to_string()))
 }
 
+/// Whether Go's resolver would even consider `text` numeric.
+///
+/// Go looks up `resolveTable[in[0]]` and only enters the int/float/timestamp
+/// branch for a sign (`S`), a dot (`.`) or a digit (`D`); every other first byte
+/// (`_`, a letter, a space) leaves the scalar a string. This must gate the
+/// **whole** numeric path, not just the integer attempt: `_100` would otherwise
+/// fail [`yaml_go_int`] and still be retyped as the float `100`.
+fn yaml_may_be_numeric(text: &str) -> bool {
+    matches!(
+        text.as_bytes().first(),
+        Some(b'+' | b'-' | b'.' | b'0'..=b'9')
+    )
+}
+
 /// The null spellings Go's resolver accepts: ``, `~`, `null`, `Null`, `NULL`.
 fn yaml_plain_scalar_is_null(text: &str) -> bool {
     matches!(text, "" | "~" | "null" | "Null" | "NULL")
@@ -648,7 +814,14 @@ fn yaml_plain_scalar_is_null(text: &str) -> bool {
 /// `None` when Go would not read the text as an integer — including a
 /// leading-zero body that is not valid octal (`008`), which Go resolves as a
 /// float instead.
+///
+/// The first byte is gated **before** the underscores are stripped, because Go's
+/// `resolve` decides with `resolveTable[in[0]]` and `'_'` maps to 0: `_100` is a
+/// string there, while stripping first would make it the integer 100.
 fn yaml_go_int(text: &str) -> Option<i64> {
+    if !matches!(text.as_bytes().first(), Some(b'+' | b'-' | b'0'..=b'9')) {
+        return None;
+    }
     let plain = strip_underscores(text);
     let (negative, digits) = match plain.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -1695,6 +1868,56 @@ mod yaml_scalar_rule_tests {
         assert_eq!(resolved("hello"), serde_json::json!("hello"));
     }
 
+    /// A tag whose body is shared by two arms.
+    fn core_tag(suffix: &str) -> Option<yaml_rust2::parser::Tag> {
+        Some(yaml_rust2::parser::Tag {
+            handle: "tag:yaml.org,2002:".to_string(),
+            suffix: suffix.to_string(),
+        })
+    }
+
+    /// Go's resolver decides with `resolveTable[in[0]]`, and `'_'` maps to 0, so
+    /// an underscore-prefixed body never reaches the int/float branch: `_100`
+    /// stays the string `_100` there (`serverPort: _100` is "cannot unmarshal
+    /// string into int"), `_1` stays `_1`, and `!!int _100` cannot satisfy its
+    /// tag. The gate has to cover the **float fallthrough** too, or `_100` fails
+    /// the integer attempt and is still retyped as the integral real 100.
+    #[test]
+    fn underscore_prefixed_scalars_stay_strings() {
+        for text in ["_100", "_1", "__1", "_0x10", "_1.5", "_100_", "_", "__"] {
+            assert_eq!(yaml_go_int(text), None, "{text:?} is not an int for Go");
+            assert_eq!(
+                resolved(text),
+                serde_json::json!(text),
+                "{text:?} must stay the string it was written as"
+            );
+        }
+        // A sign *does* select Go's numeric branch, and the `_` is then removed:
+        // `+_100` is the integer 100 there (measured), unlike the bare `_100`.
+        assert_eq!(integer("+_100"), 100);
+        assert_eq!(integer("-_100"), -100);
+
+        // Go only strips `_` once the first byte has already selected a numeric
+        // branch, so a valid separator is still removed: `1_000` is 1000.
+        assert_eq!(integer("1_000"), 1000);
+        assert_eq!(integer("7_9_1_1"), 7911);
+
+        // The numeric tags reject the same bodies instead of accepting them.
+        for (suffix, text) in [("int", "_100"), ("float", "_100"), ("float", "_1.5")] {
+            assert!(
+                matches!(
+                    scalar_node(
+                        text.to_string(),
+                        yaml_rust2::scanner::TScalarStyle::Plain,
+                        core_tag(suffix)
+                    ),
+                    YamlNode::Bad(_)
+                ),
+                "!!{suffix} {text:?} must be an error"
+            );
+        }
+    }
+
     /// The tab cases were measured against both Go frp and `yaml-rust2`, per the
     /// review's `§4.3`: these are the ones `yaml-rust2` silently accepts.
     #[test]
@@ -1716,11 +1939,20 @@ mod yaml_scalar_rule_tests {
         }
     }
 
-    /// ...and accepted where Go accepts it: inside a flow collection, as
-    /// separation within a line, and in a block scalar whose indentation is
-    /// already established.
+    /// These are the shapes the **pre-check** [`yaml_indentation_tab`] allows,
+    /// because Go allows them — inside a flow collection, as separation within a
+    /// line, and in a block scalar whose indentation is already established.
+    ///
+    /// This is *not* a claim that the parser accepts them end-to-end.
+    /// `yaml-rust2`'s scanner applies its own, stricter rule on top, and refuses
+    /// two shapes Go accepts: a tab-indented flow collection
+    /// (`metadatas: {\n\tk: v\n}` → `tabs disallowed within this context`) and an
+    /// unindented flow continuation (`x: [1,\n2]` → `invalid indentation`). Both
+    /// are loud refusals, listed in the migration notes on [`yaml_to_toml`]. The
+    /// test pins only the allow-list of this helper, so a change to either the
+    /// helper or the scanner shows up as a failure here rather than silently.
     #[test]
-    fn tab_indentation_is_allowed_where_go_allows_it() {
+    fn tab_pre_check_allows_shapes_the_scanner_independently_refuses() {
         for source in [
             "a: \t1\n",
             "{\ta: 1}\n",

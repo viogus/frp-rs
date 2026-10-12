@@ -4338,6 +4338,81 @@ fn parse_yaml(yaml: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
     super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)
 }
 
+/// A "billion laughs" alias document must be refused by the expansion budget,
+/// not expanded. The document is generated, so growth is exponential in the
+/// number of levels while the input stays tiny.
+///
+/// Measured before the fix: 22 levels took 15.9 s and 2,565,636,096 B peak RSS,
+/// 26 levels did not finish in 60 s. Go rejects the same shape in 0.08 s
+/// ("document contains excessive aliasing") and the previous reader in 0.07 s
+/// ("repetition limit exceeded"). The budget is `max(100_000, input.len()*100)`
+/// nodes, and the check runs **before** the subtree is cloned, so the test
+/// asserts the error without ever materialising the expanded tree.
+#[test]
+fn test_yaml_alias_expansion_is_bounded() {
+    let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
+    for level in 1..=40 {
+        source.push_str(&format!(
+            "m{level}: &a{level} [*a{}, *a{}]\n",
+            level - 1,
+            level - 1
+        ));
+    }
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("the alias bomb must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("alias expansion limit exceeded"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the bomb must be refused fast, took {:?}",
+        started.elapsed()
+    );
+
+    // The budget only bites on exponential expansion: a small document that
+    // reuses one anchor a few times is still accepted, and so is the same
+    // 40-level shape when each level references the previous one only once
+    // (linear growth stays under `100_000`).
+    let mut linear = String::from("serverAddr: &a0 127.0.0.1\n");
+    for level in 1..=40 {
+        linear.push_str(&format!("m{level}: &a{level} [*a{}]\n", level - 1));
+    }
+    parse_yaml(&linear).expect("linear alias reuse stays within the budget");
+}
+
+/// The duplicate-key check is a set lookup, not a scan of the entries so far:
+/// 20k keys took 8.51 s before the fix (the previous reader: 0.24 s) and the
+/// cost is quadratic. This pins both the speed and the error semantics.
+#[test]
+fn test_yaml_many_keys_are_checked_in_linear_time() {
+    let mut source = String::new();
+    for key in 0..20_000 {
+        source.push_str(&format!("key{key}: {key}\n"));
+    }
+
+    let started = std::time::Instant::now();
+    let value = parse_yaml(&source).expect("20k distinct keys parse");
+    let elapsed = started.elapsed();
+    assert_eq!(value.as_table().map(toml::value::Table::len), Some(20_000));
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "20k keys must not be quadratic, took {elapsed:?}"
+    );
+
+    // The set must not make the duplicate error any less precise, and it must
+    // not collapse two *different* keys that render the same way.
+    let mut duplicate = source.clone();
+    duplicate.push_str("key0: 1\n");
+    let error = parse_yaml(&duplicate).expect_err("a duplicate key is still an error");
+    assert!(
+        format!("{error:#}").contains(r#"duplicate entry with key "key0""#),
+        "unexpected error: {error:#}"
+    );
+}
+
 /// The recorded removal contract for RUSTSEC-2024-0449 requires the parser swap
 /// to implement the documented YAML 1.1 boolean behaviour rather than preserve
 /// the previous string behaviour, because that behaviour is exactly what the
@@ -4492,6 +4567,35 @@ exponent_real: 1e3
     }
 }
 
+/// Go's resolver picks the numeric branch with `resolveTable[in[0]]`, and `'_'`
+/// is not one of its starts, so an underscore-prefixed scalar stays a string
+/// there. Removing the underscores *before* that first-byte check retyped both
+/// directions: `server_port: _100` silently bound port 100 (Go: `cannot
+/// unmarshal string into int`) and `name: _1` became `invalid type: integer 1,
+/// expected a string` (Go: the string `_1`).
+#[test]
+fn test_yaml_underscore_prefixed_numbers_are_strings() {
+    let error = load_client_config_from_yaml("server_addr: 127.0.0.1\nserver_port: _100\n")
+        .expect_err("`_100` is a string for Go, so it cannot bind a port");
+    assert!(
+        format!("{error:#}").contains("_100"),
+        "the error must name the offending text: {error:#}"
+    );
+
+    for body in ["_100", "_1", "__1", "_0x10", "_1.5"] {
+        let value = parse_yaml(&format!("k: {body}\n")).unwrap();
+        assert_eq!(
+            value.get("k").and_then(toml::Value::as_str),
+            Some(body),
+            "{body:?} must stay the string it was written as"
+        );
+    }
+
+    // A sign *does* enter Go's numeric branch, and the `_` is then removed.
+    let value = parse_yaml("k: +_100\n").unwrap();
+    assert_eq!(value.get("k").and_then(toml::Value::as_integer), Some(100));
+}
+
 /// The scalars that are *not* numbers for Go and must stay strings: a timestamp,
 /// a clock time, an overflowing float (Go's `ParseFloat` fails on `1e1000`, so
 /// the text is kept), a bare integer prefix, and a mixed-case boolean word.
@@ -4523,8 +4627,10 @@ mixed_case_bool: nO
         );
     }
 }
-/// CHANGE-2: a duplicated key used to keep the last value silently; it is now a
-/// loud parse error (the previous reader errored here too).
+/// A duplicated key used to keep the last value silently; it is now a loud parse
+/// error. This is **not** a change against the previous `serde_yaml_ng` reader,
+/// which also errored (`YAML parse error: metadatas: duplicate entry with key
+/// "a"`); the divergence that remains is against Go, which keeps the last value.
 #[test]
 fn test_yaml_duplicate_key_is_an_error() {
     let err = parse_yaml("a: 1\na: 2\n").expect_err("duplicate key must be refused");
@@ -4644,10 +4750,13 @@ fn test_yaml_null_spellings_resolve_to_null() {
 }
 
 /// The tag decides first, whatever the written style: `!!str 017` is the string
-/// `017` while `!!int "017"` is 15 (both measured in Go). A body that does not
-/// match its tag is an error rather than a silently converted value, a non-core
-/// tag is dropped while the text is kept, and the remaining core tags
-/// (`!!binary`, `!!timestamp`) keep their text as the previous reader did.
+/// `017` while `!!int "017"` is 15 (both measured in Go). The core scalars whose
+/// body does not match their tag (`!!int notanint`) are errors rather than
+/// silently converted values, a non-core tag is dropped while the text is kept,
+/// and the remaining core tags **keep their text as written even when the body
+/// does not match the tag**: `!!binary` is not decoded and `!!timestamp` is not
+/// validated, so `!!timestamp garbage` is accepted here where Go rejects it
+/// (registered divergence, not a silent value change).
 #[test]
 fn test_yaml_tags_are_resolved_or_rejected() {
     let value = parse_yaml(
@@ -4659,6 +4768,9 @@ as_int_hex: !!int 0x10
 as_int_binary: !!int 0b101
 as_float: !!float 1.5
 as_float_int: !!float 017
+as_float_octal_010: !!float 010
+as_float_octal_0777: !!float 0777
+as_float_octal_015: !!float 015
 as_bool: !!bool yes
 as_bool_true: !!bool True
 as_null: !!null NULL
@@ -4679,8 +4791,13 @@ timestamp: !!timestamp 2001-12-14
         ("as_int_quoted", 15),
         ("as_int_hex", 16),
         ("as_int_binary", 5),
-        // `!!float 017` is a float in Go, but `json.Marshal` renders it as 17.
-        ("as_float_int", 17),
+        // Go's `resolve` runs `ParseInt(plain, 0, 64)` before its float shape,
+        // so `!!float 017` is the legacy octal 15 (not 17); the integral float64
+        // then reaches an integer field as 15.
+        ("as_float_int", 15),
+        ("as_float_octal_010", 8),
+        ("as_float_octal_0777", 511),
+        ("as_float_octal_015", 13),
     ] {
         assert_eq!(
             value.get(key).and_then(toml::Value::as_integer),

@@ -171,6 +171,33 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **YAML config files are read by a maintained pure-Rust parser, and unquoted scalars now resolve
+  the way Go's does.** `.yaml`/`.yml` loading moved from `serde_yaml_ng` to `yaml-rust2` 0.13
+  (`default-features = false`) plus an in-tree scalar resolver and receiver in
+  `frp-core/src/config/format.rs` that reproduce `gopkg.in/yaml.v2`'s `resolve()` rules. The reason
+  is security, not features: `serde_yaml_ng`'s only reader was the archived c2rust `unsafe-libyaml`
+  (RUSTSEC-2024-0449, unmaintained, no upstream fix and empty `patched`/`unaffected`), which is why
+  the release checklist carried a standing `cargo audit --ignore RUSTSEC-2024-0449` and a matching
+  `deny.toml` row. Both are **gone**, and `cargo audit` / `cargo deny --all-features check` now pass
+  **without** any `RUSTSEC-2024-0449` ignore; `cargo tree --all-features -i unsafe-libyaml` no longer
+  resolves. The swap is also slightly smaller: frpc 4,428,432 → 4,411,648 B and frps 5,428,304 →
+  5,411,568 B (macOS arm64, release profile).
+  **Behaviour changes to check your config for.** Because the resolver now matches Go instead of the
+  old crate, some previously-string scalars are typed, and some previously-typed ones are strings:
+  unquoted `yes`/`no`/`on`/`off`/`y`/`n` (any case) now resolve to booleans, so quote them
+  (`"yes"`) if you meant the text — the pre-swap reader rejected an unquoted `no` on a boolean field
+  with `invalid type: string "no", expected a boolean`, while the old `docs/config.md` claim that
+  they were booleans was not actually implemented; unquoted leading-zero numbers now resolve as Go
+  octals (`017` is 15, not 17), so quote them (`"017"`) to keep the digits; `_`-prefixed tokens such
+  as `_100` stay strings (Go gates on the first byte), where the first cut of this port retyped
+  them. Merge-key ordering follows the measured Go binary: `<<` overrides an explicit key
+  (`serverPort: 7000` + `<<: {serverPort: 1234}` dials **1234** in Go — frp-rs still resolves 7000,
+  registered below). Two shapes Go and the old reader accepted are now **loudly refused** by the
+  yaml-rust2 scanner rather than silently misread: a tab-indented line inside a flow collection
+  (`metadatas: {\n\tk: v\n}` → `tabs disallowed within this context (block indentation)`), and a
+  multi-line flow collection whose continuation is unindented (`x: [1,\n2]` → `invalid indentation
+  in flow construct`) — re-indent the continuation or quote/convert the flow collection to block
+  style. Full divergence register: `TODO.md` and the `format.rs` doc comments.
 - **`quinn-proto` moves 0.11.17 → 0.11.18 for RUSTSEC-2026-0338, RUSTSEC-2026-0340 and
   RUSTSEC-2026-0343** (all three carry `patched = >=0.11.18`, and the version they were
   reported against was the only affected dependency in the tree), so QUIC builds pick up the
