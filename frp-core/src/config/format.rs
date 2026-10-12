@@ -62,85 +62,863 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
     }
 }
 
-// ─── YAML parser (Go Viper-compatible, YAML 1.1 via serde_yaml_ng) ──
+// ─── YAML parser (Go frp's own scalar resolution) ───────────────────────
 
-/// Parse YAML content into a toml::Value.
+/// Parse YAML content into a `toml::Value`.
 ///
-/// serde_yaml_ng parses into its own `Value` tree first (so YAML 1.1 scalar
-/// typing — `yes`/`no`/`on`/`off` booleans, unquoted numbers, anchors — is
-/// preserved), then the tree is converted to `serde_json::Value` and fed
-/// through the same `json_to_toml` conversion used by the JSON path. This
-/// keeps exactly one type-inference pipeline for both formats.
+/// The parser's own event stream is the source of truth, for three reasons:
 ///
-/// YAML merge keys (`<<`, <https://yaml.org/type/merge.html>) are *not*
-/// applied automatically when deserializing into a `serde_yaml_ng::Value`;
-/// the crate exposes `Value::apply_merge` for the YAML 1.1 merge semantics,
-/// so we call it explicitly before converting.
+/// * **Scalar style is only visible there.** A plain `yes` and a quoted `"yes"`
+///   are the same `Yaml::String` once loaded, but only the plain one may be read
+///   as a YAML 1.1 boolean; a block scalar (`|`, `>`) must never be transformed
+///   either.
+/// * **The tag is only visible there.** `!!int "017"` is 15 and `!!str 017` is
+///   the string `017`, but a loaded tree keeps only the text.
+/// * **Anchors, aliases and merge keys are resolved in one traversal**, so the
+///   value built here is exactly the value that was written.
+///
+/// Plain scalars are resolved with the rules of the YAML reader Go frp itself
+/// embeds — `gopkg.in/yaml.v2` v2.4.0, measured with `go version -m` on the
+/// v0.71.0 release binary — see [`yaml_plain_scalar`]. That is a deliberate
+/// behaviour change from the previous `serde_yaml_ng` reader for a small set of
+/// plain scalars, which now match Go instead of being silently read the other
+/// way: the YAML 1.1 booleans (`y`/`yes`/`on`/`n`/`no`/`off`), the null
+/// spellings `Null`/`NULL`, `0b101` binary, `1_000` with underscores, and the
+/// leading-zero octals (`017` is 15, not 17).
+///
+/// The resulting `serde_json::Value` then goes through the same `json_to_toml`
+/// conversion as the JSON path, so both formats share one type-inference
+/// pipeline.
+///
+/// Deliberate, *loud* differences from the previous reader that remain:
+/// duplicate keys in one mapping are an error, and a second document is an
+/// error.
+///
+/// Known remaining differences from Go frp, none of them silent: a merge key is
+/// applied in *insertion* order, so an explicitly written key always wins, while
+/// Go resolves a merge by position (`{level: info, <<: {level: bogus}}` takes
+/// `bogus` there); `!!binary` keeps its text instead of being decoded; and the
+/// strictness of unknown fields is not reproduced.
+///
+/// # Errors
+///
+/// `YAML parse error: …` for malformed input, a duplicate mapping key, more than
+/// one document, a tab used for indentation, a `...` without a document, an
+/// unresolvable alias, or an explicitly tagged scalar (`!!int`) whose body does
+/// not match its tag; `YAML merge key (``<<``) error: …` for a merge key whose
+/// value is not a mapping or a sequence of mappings.
 fn yaml_to_toml(content: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
-    let mut yaml_value: serde_yaml_ng::Value =
-        serde_yaml_ng::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
-    yaml_value
-        .apply_merge()
-        .map_err(|e| format!("YAML merge key (`<<`) error: {e}"))?;
-    Ok(json_to_toml(yaml_value_to_json(yaml_value)))
+    // `yaml-rust2`'s scanner does not strip a byte-order mark (its own TODO);
+    // the previous reader did, and config files are UTF-8.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+    // Tabs are checked before parsing because `yaml-rust2` accepts several
+    // forms that Go frp (and the previous reader) reject; see the function.
+    if let Some((line, column)) = yaml_indentation_tab(content) {
+        return Err(format!(
+            "YAML parse error: a tab character cannot be used for indentation \
+             (line {line} column {column}); indent with spaces"
+        )
+        .into());
+    }
+    let mut receiver = YamlReceiver::default();
+    yaml_rust2::parser::Parser::new_from_str(content)
+        .load(&mut receiver, true)
+        .map_err(|e| format!("YAML parse error: {e}"))?;
+    let document = receiver.finish(content)?;
+    Ok(json_to_toml(yaml_value_to_json(&document)?))
 }
 
-/// Convert a serde_yaml_ng::Value into a serde_json::Value.
+/// The parser-event description of one value, before it becomes a
+/// `serde_json::Value`.
 ///
-/// Mapping keys are converted to their string representation when they are
-/// not already strings (YAML allows scalar keys other than strings; JSON and
-/// TOML do not).
-fn yaml_value_to_json(v: serde_yaml_ng::Value) -> serde_json::Value {
-    match v {
-        serde_yaml_ng::Value::Null => serde_json::Value::Null,
-        serde_yaml_ng::Value::Bool(b) => serde_json::Value::Bool(b),
-        serde_yaml_ng::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::Value::Number(i.into())
-            } else if let Some(u) = n.as_u64() {
-                serde_json::Value::Number(u.into())
-            } else if let Some(f) = n.as_f64() {
-                serde_json::Number::from_f64(f).map_or_else(
-                    || serde_json::Value::String(n.to_string()),
-                    serde_json::Value::Number,
-                )
-            } else {
-                serde_json::Value::String(n.to_string())
+/// It carries the two things the parser's event stream knows and a plain
+/// `Yaml` tree does not: the *written style* of a scalar (plain vs quoted vs
+/// block) and its *tag*.
+#[derive(Clone, Debug)]
+enum YamlNode {
+    /// A quoted or block scalar: always a string, never re-typed.
+    Str(String),
+    /// A plain, untagged scalar, resolved by yaml-rust2's own resolver.
+    Resolved(yaml_rust2::yaml::Yaml),
+    /// A plain scalar carrying a tag yaml-rust2 does not special-case
+    /// (`!!timestamp …`, `!Newtype 1`): the tag carries no configuration
+    /// meaning, so it is dropped and the text kept as written.
+    Tagged(Box<yaml_rust2::parser::Tag>, String),
+    /// An explicitly tagged core scalar whose body does not match its tag
+    /// (`!!int notanint`), or an alias naming no anchor. Both must be errors.
+    Bad(String),
+    /// A sequence, in written order.
+    Seq(Vec<YamlNode>),
+    /// A mapping, in written order.
+    Map(YamlMap),
+}
+
+/// One mapping's entries, in written order.
+type YamlMap = Vec<(YamlNode, YamlNode)>;
+
+/// Convert the document into the JSON tree the TOML pipeline consumes.
+///
+/// Mapping keys are converted to their string representation when they are not
+/// already strings (JSON and TOML keys are strings; YAML keys may be numbers,
+/// booleans, null or collections).
+///
+/// # Errors
+///
+/// A merge key whose value is not a mapping (or a sequence of mappings) is
+/// reported with the `YAML merge key (``<<``) error:` prefix, matching the
+/// previous reader's `Value::apply_merge` failure. An unresolvable alias or a
+/// tagged scalar that does not match its tag is reported as a parse error.
+fn yaml_value_to_json(v: &YamlNode) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(match v {
+        YamlNode::Str(s) => serde_json::Value::String(s.clone()),
+        YamlNode::Resolved(scalar) => yaml_scalar_to_json(scalar),
+        YamlNode::Tagged(tag, text) => {
+            debug!("YAML tagged value in config (tag dropped): {tag:?}");
+            serde_json::Value::String(text.clone())
+        }
+        YamlNode::Bad(reason) => return Err(format!("YAML parse error: {reason}").into()),
+        YamlNode::Seq(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(yaml_value_to_json)
+                .collect::<Result<_, _>>()?,
+        ),
+        YamlNode::Map(entries) => {
+            let mut object = serde_json::Map::new();
+            // The keys the mapping itself declares, in written order.
+            for (key, value) in entries {
+                if is_merge_key(key) {
+                    continue;
+                }
+                let name = yaml_map_key(key)?;
+                object.insert(name, yaml_value_to_json(value)?);
             }
-        }
-        serde_yaml_ng::Value::String(s) => serde_json::Value::String(s),
-        serde_yaml_ng::Value::Sequence(seq) => {
-            serde_json::Value::Array(seq.into_iter().map(yaml_value_to_json).collect())
-        }
-        serde_yaml_ng::Value::Mapping(map) => {
-            let object: serde_json::Map<String, serde_json::Value> = map
-                .into_iter()
-                .map(|(k, v)| (yaml_key_to_string(&k), yaml_value_to_json(v)))
-                .collect();
+            // `<<: *a` / `<<: [*a, *b]` — YAML 1.1 merge (yaml.org/type/merge),
+            // which yaml-rust2 does not implement. An explicit key above wins
+            // over every merge source, and for a sequence an earlier source wins
+            // over a later one; inserting in written order and skipping a name
+            // that is already present implements exactly that.
+            for (key, value) in entries {
+                if !is_merge_key(key) {
+                    continue;
+                }
+                for source in yaml_merge_sources(value)? {
+                    for (name, source_value) in source {
+                        if object.contains_key(&name) {
+                            continue;
+                        }
+                        object.insert(name, source_value);
+                    }
+                }
+            }
             serde_json::Value::Object(object)
         }
-        // `!Tag` values (e.g. `!Newtype 1`) carry no configuration meaning;
-        // unwrap to the tagged value itself (lossy: the tag name is dropped).
-        serde_yaml_ng::Value::Tagged(tagged) => {
-            debug!(
-                "YAML tagged value in config (tag dropped): {:?}",
-                tagged.tag
-            );
-            yaml_value_to_json(tagged.value)
+    })
+}
+
+/// Whether a mapping key is the YAML 1.1 merge key `<<`.
+///
+/// Only the **plain** (or explicitly `!!merge`-tagged) form is the merge key:
+/// a quoted `"<<"` is an ordinary key named `<<`, because YAML 1.1 gives the
+/// merge type to the plain scalar only. That is why this matches
+/// [`YamlNode::Resolved`] and not [`YamlNode::Str`].
+fn is_merge_key(key: &YamlNode) -> bool {
+    matches!(key, YamlNode::Resolved(yaml_rust2::yaml::Yaml::String(s)) if s == "<<")
+}
+
+/// The mappings one `<<` value contributes, in the order they were written.
+///
+/// Each source is resolved (its own merge keys applied) before it is returned,
+/// so a merged mapping never leaks a `<<` key of its own.
+///
+/// # Errors
+///
+/// A non-mapping value (a scalar, or a sequence element that is not a mapping)
+/// is a merge-key error rather than a silently ignored key.
+fn yaml_merge_sources(
+    value: &YamlNode,
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, Box<dyn std::error::Error>> {
+    let items: Vec<&YamlNode> = match value {
+        YamlNode::Seq(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    let mut resolved = Vec::with_capacity(items.len());
+    for item in items {
+        match yaml_value_to_json(item)? {
+            serde_json::Value::Object(object) => resolved.push(object),
+            _ => {
+                return Err(merge_error(format!(
+                    "value must be a mapping or a sequence of mappings, found {}",
+                    yaml_node_kind(item)
+                )));
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+fn merge_error(reason: String) -> Box<dyn std::error::Error> {
+    format!("YAML merge key (`<<`) error: {reason}").into()
+}
+
+/// A short description of a node, for error messages.
+fn yaml_node_kind(node: &YamlNode) -> &'static str {
+    match node {
+        YamlNode::Str(_) | YamlNode::Resolved(_) | YamlNode::Tagged(_, _) => "a scalar",
+        YamlNode::Bad(_) => "an unresolvable value",
+        YamlNode::Seq(_) => "a sequence",
+        YamlNode::Map(_) => "a mapping",
+    }
+}
+
+/// Convert a resolved YAML scalar to JSON.
+///
+/// A **finite** real uses the JSON number Go's `json.Marshal` produces: an
+/// integral value is emitted as an integer number, because Go renders an
+/// integral `float64` without a fraction and so reads `7777.0` into an integer
+/// field. A **non-finite** real (`inf`/`-inf`/`nan`, however spelled) has no
+/// JSON representation, so it falls back to the canonical scalar text (`.inf`,
+/// not `inf`); a typed numeric field then fails loudly instead of silently
+/// reading null.
+fn yaml_scalar_to_json(scalar: &yaml_rust2::yaml::Yaml) -> serde_json::Value {
+    use yaml_rust2::yaml::Yaml;
+    match scalar {
+        Yaml::Null => serde_json::Value::Null,
+        Yaml::Boolean(b) => serde_json::Value::Bool(*b),
+        Yaml::Integer(i) => serde_json::Value::Number((*i).into()),
+        Yaml::Real(text) => match parse_real(text) {
+            Some(value) if value.is_finite() => match integral_json_number(value) {
+                Some(number) => serde_json::Value::Number(number),
+                None => serde_json::Number::from_f64(value).map_or_else(
+                    || serde_json::Value::String(text.clone()),
+                    serde_json::Value::Number,
+                ),
+            },
+            _ => serde_json::Value::String(
+                non_finite_spelling(text).map_or_else(|| text.clone(), str::to_string),
+            ),
+        },
+        Yaml::String(s) => serde_json::Value::String(s.clone()),
+        // `Alias`/`Array`/`Hash`/`BadValue` are handled (or refused) while
+        // building the node tree, so reaching them here would be a bug; render
+        // them rather than panic.
+        other => serde_json::Value::String(format!("{other:?}")),
+    }
+}
+
+/// Builds the document straight from the parser event stream.
+///
+/// Shaped after `yaml_rust2::yaml::YamlLoader`, but the written scalar style and
+/// tag are kept (so plain `yes` can become a boolean while `"yes"` cannot), a
+/// tagged scalar whose body does not match its tag is an error rather than a
+/// dropped `BadValue`, duplicate keys are reported with their position, an empty
+/// document is null, and more than one document is refused — the previous
+/// `serde_yaml_ng` `from_str` refused it too.
+#[derive(Default)]
+struct YamlReceiver {
+    docs: Vec<YamlNode>,
+    doc_stack: Vec<(YamlNode, usize)>,
+    key_stack: Vec<Option<YamlNode>>,
+    anchors: std::collections::BTreeMap<usize, YamlNode>,
+    error: Option<yaml_rust2::scanner::ScanError>,
+}
+
+impl yaml_rust2::parser::MarkedEventReceiver for YamlReceiver {
+    fn on_event(&mut self, ev: yaml_rust2::parser::Event, mark: yaml_rust2::scanner::Marker) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Err(e) = self.handle(ev, mark) {
+            self.error = Some(e);
         }
     }
 }
 
-/// Render a YAML mapping key as a string for the JSON/TOML path.
-fn yaml_key_to_string(k: &serde_yaml_ng::Value) -> String {
-    match k {
-        serde_yaml_ng::Value::String(s) => s.clone(),
-        serde_yaml_ng::Value::Number(n) => n.to_string(),
-        serde_yaml_ng::Value::Bool(b) => b.to_string(),
-        serde_yaml_ng::Value::Null => String::new(),
-        // Complex keys (sequences/mappings/tags) have no JSON/TOML
-        // equivalent; fall back to the YAML representation.
-        other => serde_yaml_ng::to_string(other).unwrap_or_else(|_| format!("{other:?}")),
+impl YamlReceiver {
+    fn finish(mut self, source: &str) -> Result<YamlNode, Box<dyn std::error::Error>> {
+        if let Some(e) = self.error.take() {
+            return Err(format!("YAML parse error: {e}").into());
+        }
+        match self.docs.len() {
+            // `yaml-rust2` reports `...` on its own as a stream with no
+            // document, exactly like genuinely empty input (`""`, comments).
+            // Go frp and the previous reader reject `...`, so the two are
+            // told apart here.
+            0 if yaml_has_document_end_marker(source) => Err(
+                "YAML parse error: did not find expected node content (a `...` marker \
+                 ends a document that was never started)"
+                    .into(),
+            ),
+            0 => Ok(YamlNode::Resolved(yaml_rust2::yaml::Yaml::Null)),
+            1 => Ok(self.docs.pop().expect("exactly one document")),
+            n => Err(format!(
+                "YAML parse error: deserializing from YAML containing more than one \
+                 document is not supported (found {n})"
+            )
+            .into()),
+        }
+    }
+
+    fn handle(
+        &mut self,
+        ev: yaml_rust2::parser::Event,
+        mark: yaml_rust2::scanner::Marker,
+    ) -> Result<(), yaml_rust2::scanner::ScanError> {
+        use yaml_rust2::parser::Event;
+        match ev {
+            Event::StreamStart | Event::StreamEnd | Event::Nothing => {}
+            Event::DocumentStart => self.anchors.clear(),
+            Event::DocumentEnd => {
+                // An empty document (`""`, `# comment only`) is null, which is
+                // what the previous reader returned.
+                let document = match self.doc_stack.len() {
+                    0 => YamlNode::Resolved(yaml_rust2::yaml::Yaml::Null),
+                    1 => self.doc_stack.pop().expect("one document").0,
+                    _ => unreachable!("the document stack holds at most one node"),
+                };
+                self.docs.push(document);
+            }
+            Event::SequenceStart(aid, tag) => {
+                log_dropped_tag(&tag);
+                self.doc_stack.push((YamlNode::Seq(Vec::new()), aid));
+            }
+            Event::SequenceEnd => {
+                let node = self.doc_stack.pop().expect("a sequence was started");
+                self.insert(node.0, node.1, mark)?;
+            }
+            Event::MappingStart(aid, tag) => {
+                log_dropped_tag(&tag);
+                self.doc_stack.push((YamlNode::Map(Vec::new()), aid));
+                self.key_stack.push(None);
+            }
+            Event::MappingEnd => {
+                self.key_stack.pop();
+                let node = self.doc_stack.pop().expect("a mapping was started");
+                self.insert(node.0, node.1, mark)?;
+            }
+            Event::Scalar(text, style, aid, tag) => {
+                let node = scalar_node(text, style, tag);
+                self.insert(node, aid, mark)?;
+            }
+            Event::Alias(id) => {
+                // An alias the parser could not resolve is an error, never a
+                // silently dropped node. The message mirrors the previous
+                // reader's `unknown anchor` wording without leaking
+                // yaml-rust2's internal anchor id.
+                let node = self.anchors.get(&id).cloned().unwrap_or_else(|| {
+                    YamlNode::Bad(
+                        "unknown anchor: this alias has no matching anchor in the document"
+                            .to_string(),
+                    )
+                });
+                self.insert(node, 0, mark)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert(
+        &mut self,
+        node: YamlNode,
+        aid: usize,
+        mark: yaml_rust2::scanner::Marker,
+    ) -> Result<(), yaml_rust2::scanner::ScanError> {
+        // Valid anchor ids start at 1, as in `YamlLoader`.
+        if aid > 0 {
+            self.anchors.insert(aid, node.clone());
+        }
+        if self.doc_stack.is_empty() {
+            self.doc_stack.push((node, aid));
+            return Ok(());
+        }
+        let parent = &mut self.doc_stack.last_mut().expect("a container").0;
+        match parent {
+            YamlNode::Seq(items) => {
+                items.push(node);
+                Ok(())
+            }
+            YamlNode::Map(entries) => {
+                let slot = self.key_stack.last_mut().expect("a mapping key slot");
+                match slot.take() {
+                    None => {
+                        *slot = Some(node);
+                        Ok(())
+                    }
+                    Some(key) => {
+                        // Duplicate detection is on the key's rendered string,
+                        // the same form the JSON/TOML conversion uses, so `a:`
+                        // twice and `1:` next to `"1":` are both refused rather
+                        // than one silently winning.
+                        let name = yaml_key_to_string(&key);
+                        if entries.iter().any(|(k, _)| yaml_key_to_string(k) == name) {
+                            return Err(yaml_rust2::scanner::ScanError::new_string(
+                                mark,
+                                format!("duplicate entry with key {name:?}"),
+                            ));
+                        }
+                        entries.push((key, node));
+                        Ok(())
+                    }
+                }
+            }
+            _ => unreachable!("only a sequence or a mapping can be a container"),
+        }
+    }
+}
+
+/// Resolve one scalar event into a node.
+///
+/// The **tag** decides first, whatever the written style: `!!str 017` is the
+/// string `017` while `!!int "017"` is 15, which is what Go does too. The core
+/// tags are resolved here rather than by the loader, because the loader turns a
+/// body it cannot resolve into a `BadValue`, silently losing the field, while
+/// this makes it an error.
+///
+/// * A **plain, untagged** scalar is resolved by [`yaml_plain_scalar`] — Go
+///   frp's own rules, including the YAML 1.1 booleans.
+/// * A **quoted or block**, untagged scalar is always the string that was
+///   written; it is never re-typed and never boolean-coerced.
+/// * A **tagged** scalar is resolved by its tag. A body that does not match the
+///   tag becomes [`YamlNode::Bad`] — a hard error — rather than being dropped.
+fn scalar_node(
+    text: String,
+    style: yaml_rust2::scanner::TScalarStyle,
+    tag: Option<yaml_rust2::parser::Tag>,
+) -> YamlNode {
+    use yaml_rust2::scanner::TScalarStyle;
+    use yaml_rust2::yaml::Yaml;
+    let Some(tag) = tag else {
+        return if style == TScalarStyle::Plain {
+            yaml_plain_scalar(&text)
+        } else {
+            YamlNode::Str(text)
+        };
+    };
+    if tag.handle != "tag:yaml.org,2002:" {
+        return YamlNode::Tagged(Box::new(tag), text);
+    }
+    match tag.suffix.as_str() {
+        "str" => YamlNode::Str(text),
+        "null" => {
+            if yaml_plain_scalar_is_null(&text) {
+                YamlNode::Resolved(Yaml::Null)
+            } else {
+                tag_mismatch(&text, &tag.suffix)
+            }
+        }
+        "bool" => yaml_plain_scalar_bool(&text).map_or_else(
+            || tag_mismatch(&text, &tag.suffix),
+            |value| YamlNode::Resolved(Yaml::Boolean(value)),
+        ),
+        "int" => yaml_go_int(&text).map_or_else(
+            || tag_mismatch(&text, &tag.suffix),
+            |value| YamlNode::Resolved(Yaml::Integer(value)),
+        ),
+        "float" => yaml_tagged_float(&text).unwrap_or_else(|| tag_mismatch(&text, &tag.suffix)),
+        // `!!merge <<` is the merge key written explicitly; it becomes the same
+        // node as a plain `<<` so that [`is_merge_key`] recognises it.
+        "merge" if text == "<<" => YamlNode::Resolved(Yaml::String("<<".to_string())),
+        // The remaining core tags — `!!binary`, `!!timestamp`, `!!omap`, … —
+        // keep the scalar text as written, as the previous reader did. (Go
+        // decodes `!!binary`; that difference is registered.)
+        _ => YamlNode::Str(text),
+    }
+}
+
+/// The error for a tagged scalar whose body does not resolve as its tag.
+///
+/// The body is shown with `{:?}` so a control character stays readable, and the
+/// tag is named without Rust's `Tag` debug form.
+fn tag_mismatch(text: &str, suffix: &str) -> YamlNode {
+    YamlNode::Bad(format!(
+        "scalar {text:?} does not match its `!!{suffix}` tag"
+    ))
+}
+
+/// A `!!float`-tagged body: the spelled non-finites keep the canonical text (Go
+/// cannot marshal them, and the previous reader produced `.inf`), a YAML-style
+/// float is a real, and an integer body is converted the way Go's `!!float` does
+/// (`!!float 0x10` is 16).
+fn yaml_tagged_float(text: &str) -> Option<YamlNode> {
+    if let Some(canonical) = non_finite_spelling(text) {
+        return Some(YamlNode::Str(canonical.to_string()));
+    }
+    let plain = strip_underscores(text);
+    if yaml_style_float(&plain) {
+        return Some(YamlNode::Resolved(yaml_rust2::yaml::Yaml::Real(plain)));
+    }
+    yaml_go_int(text).map(|value| YamlNode::Resolved(yaml_rust2::yaml::Yaml::Integer(value)))
+}
+
+fn log_dropped_tag(tag: &Option<yaml_rust2::parser::Tag>) {
+    if let Some(tag) = tag {
+        debug!("YAML tagged value in config (tag dropped): {tag:?}");
+    }
+}
+
+/// Parse a YAML real scalar the way yaml-rust2 does (the `.inf`/`.nan`
+/// spellings, then anything containing a digit that `f64` accepts).
+fn parse_real(text: &str) -> Option<f64> {
+    match text {
+        ".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" => Some(f64::INFINITY),
+        "-.inf" | "-.Inf" | "-.INF" => Some(f64::NEG_INFINITY),
+        ".nan" | ".NaN" | ".NAN" => Some(f64::NAN),
+        _ if text.bytes().any(|b| b.is_ascii_digit()) => text.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+/// The YAML 1.1 boolean spellings Go frp's YAML library resolves.
+///
+/// Table-driven on purpose: this is the single place the set may change, and it
+/// has a unit test per spelling, because the Go-parity investigation may still
+/// refine it. Only **untagged plain** scalars consult it — quoted, block and
+/// tagged scalars return before it ([`scalar_node`]).
+fn yaml_plain_scalar_bool(text: &str) -> Option<bool> {
+    const TRUE: &[&str] = &[
+        "y", "Y", "yes", "Yes", "YES", "true", "True", "TRUE", "on", "On", "ON",
+    ];
+    const FALSE: &[&str] = &[
+        "n", "N", "no", "No", "NO", "false", "False", "FALSE", "off", "Off", "OFF",
+    ];
+    if TRUE.contains(&text) {
+        Some(true)
+    } else if FALSE.contains(&text) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Resolve one plain, untagged scalar exactly as Go frp's YAML reader does.
+///
+/// Go frp embeds `gopkg.in/yaml.v2` v2.4.0 (measured with `go version -m` on
+/// the v0.71.0 release binary), whose `resolve` decides what a plain scalar
+/// means. In order:
+///
+/// 1. the exact, case-sensitive YAML 1.1 boolean table
+///    ([`yaml_plain_scalar_bool`]) — `yes` is `true`, `nO` is a string;
+/// 2. the null table: ``, `~`, `null`, `Null`, `NULL`;
+/// 3. a base-0 integer with the `_` separators removed
+///    (`strconv.ParseInt(plain, 0, 64)`): decimal, `0x`/`0X`, `0o`/`0O`,
+///    `0b`/`0B`, and the legacy leading-zero **octal** form, so `017` is 15;
+/// 4. the spelled non-finites (`.inf`, `-.Inf`, `.NaN`, …), kept as their
+///    canonical *text* because Go cannot marshal them to JSON at all and the
+///    previous reader produced `.inf`/`-.inf`/`.nan` too;
+/// 5. Go's float shape (`^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$`)
+///    — where an overflow such as `1e1000` stays the string Go keeps, because
+///    Go's `ParseFloat` *fails* on it while Rust's returns infinity;
+/// 6. otherwise the string itself.
+///
+/// This is the one place the scalar rules live, for values and for mapping keys
+/// alike (Go resolves keys the same way). Unit tests: `mod
+/// yaml_scalar_rule_tests`.
+fn yaml_plain_scalar(text: &str) -> YamlNode {
+    use yaml_rust2::yaml::Yaml;
+    if let Some(value) = yaml_plain_scalar_bool(text) {
+        return YamlNode::Resolved(Yaml::Boolean(value));
+    }
+    if yaml_plain_scalar_is_null(text) {
+        return YamlNode::Resolved(Yaml::Null);
+    }
+    if let Some(value) = yaml_go_int(text) {
+        return YamlNode::Resolved(Yaml::Integer(value));
+    }
+    if let Some(canonical) = non_finite_spelling(text) {
+        return YamlNode::Str(canonical.to_string());
+    }
+    let plain = strip_underscores(text);
+    if yaml_style_float(&plain) {
+        if let Ok(value) = plain.parse::<f64>() {
+            if value.is_finite() {
+                return YamlNode::Resolved(Yaml::Real(plain));
+            }
+        }
+    }
+    YamlNode::Resolved(Yaml::String(text.to_string()))
+}
+
+/// The null spellings Go's resolver accepts: ``, `~`, `null`, `Null`, `NULL`.
+fn yaml_plain_scalar_is_null(text: &str) -> bool {
+    matches!(text, "" | "~" | "null" | "Null" | "NULL")
+}
+
+/// Go's integer rule: `strconv.ParseInt` with base 0, after removing every `_`.
+///
+/// `None` when Go would not read the text as an integer — including a
+/// leading-zero body that is not valid octal (`008`), which Go resolves as a
+/// float instead.
+fn yaml_go_int(text: &str) -> Option<i64> {
+    let plain = strip_underscores(text);
+    let (negative, digits) = match plain.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, plain.strip_prefix('+').unwrap_or(&plain)),
+    };
+    let (radix, body) = if let Some(rest) = strip_any(digits, &["0x", "0X"]) {
+        (16, rest)
+    } else if let Some(rest) = strip_any(digits, &["0o", "0O"]) {
+        (8, rest)
+    } else if let Some(rest) = strip_any(digits, &["0b", "0B"]) {
+        (2, rest)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits)
+    };
+    let magnitude = u64::from_str_radix(body, radix).ok()?;
+    if negative {
+        // `-9223372036854775808` is representable even though its magnitude is
+        // one past `i64::MAX`.
+        (magnitude <= i64::MIN.unsigned_abs()).then(|| (magnitude as i64).wrapping_neg())
+    } else {
+        (magnitude <= i64::MAX as u64).then_some(magnitude as i64)
+    }
+}
+
+/// `text` without its `_` separators (Go removes them before parsing a number).
+fn strip_underscores(text: &str) -> String {
+    text.chars().filter(|c| *c != '_').collect()
+}
+
+/// The first prefix in `prefixes` that `text` starts with.
+fn strip_any<'a>(text: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    prefixes.iter().find_map(|prefix| text.strip_prefix(prefix))
+}
+
+/// Whether `text` has the shape Go's resolver accepts as a float:
+/// `^[-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?$`.
+fn yaml_style_float(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    if matches!(bytes.first(), Some(b'+' | b'-')) {
+        index += 1;
+    }
+    let integer_digits = count_digits(bytes, &mut index);
+    let mut fraction_digits = 0;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        fraction_digits = count_digits(bytes, &mut index);
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return false;
+    }
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        index += 1;
+        if matches!(bytes.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        if count_digits(bytes, &mut index) == 0 {
+            return false;
+        }
+    }
+    index == bytes.len()
+}
+
+/// Consume the ASCII digits at `*index`, returning how many there were.
+fn count_digits(bytes: &[u8], index: &mut usize) -> usize {
+    let start = *index;
+    while bytes.get(*index).is_some_and(u8::is_ascii_digit) {
+        *index += 1;
+    }
+    *index - start
+}
+
+/// The canonical text of a spelled non-finite real (`.inf`, `-.inf`, `.nan`).
+///
+/// It is kept as text rather than an `f64` because JSON has no non-finite
+/// number: Go fails to marshal it, and the previous reader produced exactly
+/// these strings (`.inf`, not `inf`), which makes a typed numeric field fail
+/// loudly instead of silently reading null. `-.nan`/`+.nan` are not among the
+/// spellings either reader resolves, so they stay as written.
+fn non_finite_spelling(text: &str) -> Option<&'static str> {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if unsigned.eq_ignore_ascii_case(".inf") {
+        return Some(if negative { "-.inf" } else { ".inf" });
+    }
+    if !negative && !text.starts_with('+') && unsigned.eq_ignore_ascii_case(".nan") {
+        return Some(".nan");
+    }
+    None
+}
+
+/// A finite real that is an integer becomes an integer JSON number.
+///
+/// Go resolves `7777.0` to a `float64` and `json.Marshal` renders an integral
+/// float without a fraction, so an integer field accepts it (`serverPort:
+/// 7777.0` is 7777 there) while the previous reader rejected it. A value outside
+/// `i64` stays a float and still fails an integer field, as it does in Go.
+fn integral_json_number(value: f64) -> Option<serde_json::Number> {
+    /// 2^63, the exclusive upper bound of `i64` as an `f64`.
+    const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    if value.fract() != 0.0 || !(-I64_LIMIT..I64_LIMIT).contains(&value) {
+        return None;
+    }
+    Some(serde_json::Number::from(value as i64))
+}
+
+/// The position of the first tab used for indentation, if any.
+///
+/// Go frp (and the previous reader) reject a tab where indentation is required:
+/// a line whose leading whitespace contains a tab (`\ta: 1`), a block sequence
+/// entry indented with a tab (`- \ta: 1`), and the first content line of a block
+/// scalar (`k: |` then `  \tfoo`). `yaml-rust2` accepts several of these, which
+/// would silently read `\ta: 1` as the mapping `{a: 1}`, so they are rejected
+/// here instead.
+///
+/// A tab is *not* an indentation error as separation inside a line (`a: \t1`),
+/// inside a flow collection (`[\t1]`, or a continued flow line, where there is
+/// no indentation), or after a block scalar's indentation has been established
+/// (`|`, then `  a`, then `  \tb`) — Go accepts all of those. The check is
+/// deliberately conservative: it may miss a case, but it must not reject one Go
+/// accepts.
+fn yaml_indentation_tab(content: &str) -> Option<(usize, usize)> {
+    // The previous line left a flow collection open (it ended with `[`, `{` or
+    // a continuation comma), so the next line continues it and carries no
+    // indentation of its own.
+    let mut in_flow = false;
+    // Inside a block scalar: the indentation of its `|`/`>` header, and whether
+    // a content line has established that indentation yet.
+    let mut block_scalar: Option<(usize, bool)> = None;
+    for (index, line) in content.lines().enumerate() {
+        let number = index + 1;
+        let indentation = line.len() - line.trim_start_matches([' ', '\t']).len();
+        let whitespace = &line[..indentation];
+        let body = &line[indentation..];
+        if let Some((header_indent, established)) = block_scalar {
+            if body.is_empty() {
+                continue; // A blank line stays inside the block scalar.
+            }
+            if indentation > header_indent {
+                if !established {
+                    if let Some(column) = tab_position(whitespace) {
+                        return Some((number, column));
+                    }
+                    block_scalar = Some((header_indent, true));
+                }
+                continue; // Content is verbatim; a later tab is not indentation.
+            }
+            block_scalar = None; // The scalar ended; check this line normally.
+        }
+        if !in_flow {
+            if let Some(column) = tab_position(whitespace) {
+                return Some((number, column));
+            }
+            if let Some(rest) = body.strip_prefix('-') {
+                let rest = rest.trim_start_matches([' ', '\t']);
+                let separation = &body[1..body.len() - rest.len()];
+                if let Some(offset) = separation.find('\t') {
+                    return Some((number, 2 + offset));
+                }
+            }
+        }
+        let content = strip_comment(body).trim_end();
+        in_flow = content.ends_with([',', '[', '{']);
+        if block_scalar_header(content) {
+            block_scalar = Some((indentation, false));
+        }
+    }
+    None
+}
+
+/// The 1-based column of the first tab in an indentation run.
+fn tab_position(whitespace: &str) -> Option<usize> {
+    whitespace.find('\t').map(|offset| offset + 1)
+}
+
+/// `body` without a trailing `#` comment (a comment needs leading whitespace).
+fn strip_comment(body: &str) -> &str {
+    let bytes = body.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'#' && (index == 0 || bytes[index - 1].is_ascii_whitespace()) {
+            return &body[..index];
+        }
+    }
+    body
+}
+
+/// Whether a line's content opens a block scalar (`|` or `>`, with the optional
+/// indentation and chomping modifiers).
+///
+/// The indicator has to sit in a node position — at the start of the content, or
+/// after the `:` of a mapping value or the `-` of a sequence entry — so that a
+/// plain scalar which merely ends in `>` (`x: a>`) is not mistaken for a header.
+fn block_scalar_header(content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut end = bytes.len();
+    let mut modifiers = 0;
+    while end > 0 && matches!(bytes[end - 1], b'-' | b'+' | b'0'..=b'9') {
+        end -= 1;
+        modifiers += 1;
+        if modifiers > 2 {
+            return false;
+        }
+    }
+    if end == 0 || !matches!(bytes[end - 1], b'|' | b'>') {
+        return false;
+    }
+    let prefix = content[..end - 1].trim_end();
+    prefix.is_empty() || prefix.ends_with([':', '-'])
+}
+
+/// Whether the source contains a `...` document-end marker.
+///
+/// `yaml-rust2` cannot tell `...` from empty input in its event stream, but Go
+/// frp and the previous reader reject `...` when no document was started, so the
+/// text is consulted for that one case.
+fn yaml_has_document_end_marker(content: &str) -> bool {
+    content.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("...")
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+    })
+}
+
+/// The string a mapping key contributes to the JSON/TOML object.
+///
+/// JSON and TOML keys are strings while YAML keys may be any scalar (or a
+/// collection): `1`, `1.5`, `true` and `null` therefore become `"1"`, `"1.5"`,
+/// `"true"` and `""`, and a complex key falls back to a debug representation
+/// rather than panicking.
+fn yaml_key_to_string(key: &YamlNode) -> String {
+    match key {
+        YamlNode::Str(s) => s.clone(),
+        YamlNode::Resolved(scalar) => yaml_scalar_key_text(scalar),
+        YamlNode::Tagged(_, text) => text.clone(),
+        YamlNode::Bad(reason) => reason.clone(),
+        YamlNode::Seq(_) | YamlNode::Map(_) => format!("{key:?}"),
+    }
+}
+
+/// [`yaml_key_to_string`] for the conversion path, where an unresolvable key is
+/// an error rather than a rendered name.
+fn yaml_map_key(key: &YamlNode) -> Result<String, Box<dyn std::error::Error>> {
+    match key {
+        YamlNode::Bad(reason) => Err(format!("YAML parse error: {reason}").into()),
+        other => Ok(yaml_key_to_string(other)),
+    }
+}
+
+/// The text a resolved scalar contributes as a mapping key: strings verbatim,
+/// numbers the way `serde_json::Number` renders them (`1e1` → `10.0`, `1.50` →
+/// `1.5`, `1E3` → `1000.0`, matching the previous reader), booleans as
+/// `true`/`false`, null as the empty string.
+fn yaml_scalar_key_text(scalar: &yaml_rust2::yaml::Yaml) -> String {
+    use yaml_rust2::yaml::Yaml;
+    match scalar {
+        Yaml::String(s) => s.clone(),
+        Yaml::Integer(i) => i.to_string(),
+        Yaml::Real(text) => match parse_real(text).and_then(serde_json::Number::from_f64) {
+            Some(number) => number.to_string(),
+            // A spelled non-finite (`-.inf`) keeps its canonical text;
+            // `serde_json` cannot render a number for it.
+            None => non_finite_spelling(text).map_or_else(|| text.clone(), str::to_string),
+        },
+        Yaml::Boolean(b) => b.to_string(),
+        Yaml::Null => String::new(),
+        other => format!("{other:?}"),
     }
 }
 
@@ -673,4 +1451,317 @@ fn infer_ini_value_depth(s: &str, depth: usize) -> toml::Value {
 
     // Default: string
     toml::Value::String(s.to_string())
+}
+
+#[cfg(test)]
+mod yaml_scalar_rule_tests {
+    use super::*;
+    use yaml_rust2::yaml::Yaml;
+
+    /// One test per boolean spelling, so a changed table names the spelling
+    /// that moved. The set is Go's (`gopkg.in/yaml.v2`), which is case
+    /// sensitive and has no `nO`-style mixed forms.
+    macro_rules! boolean_spelling_tests {
+        ($($name:ident: $spelling:literal => $expected:literal,)*) => {
+            $(
+                #[test]
+                #[allow(non_snake_case)] // the spelling is the test name
+                fn $name() {
+                    assert_eq!(
+                        yaml_plain_scalar_bool($spelling),
+                        Some($expected),
+                        "Go resolves {:?} as a YAML 1.1 boolean",
+                        $spelling
+                    );
+                }
+            )*
+        };
+    }
+
+    boolean_spelling_tests! {
+        yaml_boolean_y: "y" => true,
+        yaml_boolean_Y: "Y" => true,
+        yaml_boolean_yes: "yes" => true,
+        yaml_boolean_Yes: "Yes" => true,
+        yaml_boolean_YES: "YES" => true,
+        yaml_boolean_true: "true" => true,
+        yaml_boolean_True: "True" => true,
+        yaml_boolean_TRUE: "TRUE" => true,
+        yaml_boolean_on: "on" => true,
+        yaml_boolean_On: "On" => true,
+        yaml_boolean_ON: "ON" => true,
+        yaml_boolean_n: "n" => false,
+        yaml_boolean_N: "N" => false,
+        yaml_boolean_no: "no" => false,
+        yaml_boolean_No: "No" => false,
+        yaml_boolean_NO: "NO" => false,
+        yaml_boolean_false: "false" => false,
+        yaml_boolean_False: "False" => false,
+        yaml_boolean_FALSE: "FALSE" => false,
+        yaml_boolean_off: "off" => false,
+        yaml_boolean_Off: "Off" => false,
+        yaml_boolean_OFF: "OFF" => false,
+    }
+
+    #[test]
+    fn mixed_case_and_numeral_words_are_not_booleans() {
+        for text in ["nO", "yES", "TRue", "oN", "1", "0", "truey", "yes!", ""] {
+            assert_eq!(
+                yaml_plain_scalar_bool(text),
+                None,
+                "{text:?} is not a boolean spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn the_null_table_is_go_s() {
+        for text in ["", "~", "null", "Null", "NULL"] {
+            assert!(yaml_plain_scalar_is_null(text), "{text:?} is null in Go");
+        }
+        for text in ["nUll", "NULLL", "none", "Nil", "~ "] {
+            assert!(
+                !yaml_plain_scalar_is_null(text),
+                "{text:?} is not null in Go"
+            );
+        }
+    }
+
+    /// Every value here was measured against the Go frp v0.71.0 binary with
+    /// `serverPort`, per `/tmp/yaml-go-parity-contract.md`.
+    #[test]
+    fn go_integer_values_are_reproduced() {
+        let table: &[(&str, Option<i64>)] = &[
+            ("7000", Some(7000)),
+            ("07000", Some(3584)), // legacy leading-zero octal
+            ("07777", Some(4095)),
+            ("017", Some(15)),
+            ("007", Some(7)),
+            ("00", Some(0)),
+            ("000", Some(0)),
+            ("080000", None),
+            ("0o17", Some(15)),
+            ("0O17", Some(15)),
+            ("0x115c", Some(4444)),
+            ("0X115C", Some(4444)),
+            ("0b1010", Some(10)),
+            ("0b101", Some(5)),
+            ("0B101", Some(5)),
+            ("+7911", Some(7911)),
+            ("-017", Some(-15)),
+            ("1_000", Some(1000)),
+            ("7_9_1_1", Some(7911)),
+            ("0", Some(0)),
+            ("-0", Some(0)),
+            // Not integers for Go: an invalid octal falls through to the float
+            // rule, a bare prefix is a string, and an out-of-range body is not
+            // an int at all.
+            ("008", None),
+            ("09999", None),
+            ("0x", None),
+            ("0b", None),
+            ("9999999999999999999", None),
+            ("-9223372036854775809", None),
+            ("1e2", None),
+            ("", None),
+            ("abc", None),
+        ];
+        for (text, expected) in table {
+            assert_eq!(yaml_go_int(text), *expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn i64_bounds_are_representable() {
+        assert_eq!(yaml_go_int("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(yaml_go_int("-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(yaml_go_int("9223372036854775808"), None);
+    }
+
+    /// Go's `yamlStyleFloat` shape, from the harness's measured behaviour:
+    /// `1e1000` is *not* a real there (Go's `ParseFloat` fails on overflow).
+    #[test]
+    fn float_shapes_match_go() {
+        for text in [
+            "7777.0", "7777.5", "09999", "008", "5.", ".5", "1e2", "1E3", "+1.5", "-1.5e-2",
+        ] {
+            assert!(yaml_style_float(text), "{text:?} is a Go float shape");
+        }
+        for text in [
+            "1:30",
+            "2001-12-14",
+            "0x10",
+            ".",
+            "",
+            "e3",
+            "1e",
+            "1_0",
+            ".inf",
+            "abc",
+            "1.5.5",
+        ] {
+            assert!(!yaml_style_float(text), "{text:?} is not a Go float shape");
+        }
+    }
+
+    #[test]
+    fn non_finite_spellings_are_canonical() {
+        let table: &[(&str, Option<&str>)] = &[
+            (".inf", Some(".inf")),
+            (".Inf", Some(".inf")),
+            (".INF", Some(".inf")),
+            ("+.inf", Some(".inf")),
+            ("+.INF", Some(".inf")),
+            ("-.inf", Some("-.inf")),
+            ("-.Inf", Some("-.inf")),
+            (".nan", Some(".nan")),
+            (".NaN", Some(".nan")),
+            (".NAN", Some(".nan")),
+            // Neither reader resolves a signed NaN spelling; keep it as written.
+            ("-.nan", None),
+            ("+.nan", None),
+            ("inf", None),
+            ("nan", None),
+        ];
+        for (text, expected) in table {
+            assert_eq!(non_finite_spelling(text), *expected, "{text:?}");
+        }
+    }
+
+    /// Go renders an integral `float64` without a fraction, so those values have
+    /// to reach the TOML pipeline as integers (`serverPort: 7777.0` is 7777).
+    #[test]
+    fn integral_reals_become_integer_json_numbers() {
+        let table: &[(f64, Option<&str>)] = &[
+            (7777.0, Some("7777")),
+            (1000.0, Some("1000")),
+            (-15.0, Some("-15")),
+            (1.5, None),
+            (1e19, None),
+            (-9.223372036854776e18, Some("-9223372036854775808")),
+        ];
+        for (value, expected) in table {
+            let rendered = integral_json_number(*value).map(|number| number.to_string());
+            assert_eq!(rendered.as_deref(), *expected, "{value}");
+        }
+        assert!(integral_json_number(f64::INFINITY).is_none());
+        assert!(integral_json_number(f64::NAN).is_none());
+    }
+
+    fn resolved(text: &str) -> serde_json::Value {
+        yaml_value_to_json(&yaml_plain_scalar(text)).expect("a plain scalar resolves")
+    }
+
+    fn integer(text: &str) -> i64 {
+        match yaml_plain_scalar(text) {
+            YamlNode::Resolved(Yaml::Integer(value)) => value,
+            other => panic!("{text:?} should resolve to an integer, got {other:?}"),
+        }
+    }
+
+    /// The end-to-end projection of a plain scalar, with the Go measurement it
+    /// reproduces (all per `/tmp/yaml-go-parity-contract.md`).
+    #[test]
+    fn plain_scalars_resolve_like_go() {
+        assert_eq!(integer("017"), 15);
+        assert_eq!(integer("007"), 7);
+        assert_eq!(integer("07000"), 3584);
+        assert_eq!(integer("0b101"), 5);
+        assert_eq!(integer("1_000"), 1000);
+        assert_eq!(integer("0x115c"), 4444);
+        assert_eq!(integer("+7911"), 7911);
+        // An invalid octal is a float for Go; the JSON projection of an integral
+        // float is an integer, so an integer field still accepts it.
+        assert_eq!(resolved("008"), serde_json::json!(8));
+        assert_eq!(resolved("080000"), serde_json::json!(80000));
+        assert_eq!(resolved("09999"), serde_json::json!(9999));
+        assert_eq!(resolved("7777.0"), serde_json::json!(7777));
+        assert_eq!(resolved("7777.5"), serde_json::json!(7777.5));
+        assert_eq!(resolved("yes"), serde_json::json!(true));
+        assert_eq!(resolved("off"), serde_json::json!(false));
+        assert_eq!(resolved("NULL"), serde_json::Value::Null);
+        assert_eq!(resolved("~"), serde_json::Value::Null);
+        assert_eq!(resolved(""), serde_json::Value::Null);
+        // Not numbers or booleans: preserve the text.
+        assert_eq!(resolved("nO"), serde_json::json!("nO"));
+        assert_eq!(resolved("1e1000"), serde_json::json!("1e1000"));
+        assert_eq!(resolved("2001-12-14"), serde_json::json!("2001-12-14"));
+        assert_eq!(resolved("1:30"), serde_json::json!("1:30"));
+        // Non-finites keep their canonical text (Go cannot marshal them).
+        assert_eq!(resolved(".inf"), serde_json::json!(".inf"));
+        assert_eq!(resolved("-.Inf"), serde_json::json!("-.inf"));
+        assert_eq!(resolved(".NaN"), serde_json::json!(".nan"));
+        assert_eq!(resolved("-.nan"), serde_json::json!("-.nan"));
+        assert_eq!(resolved("hello"), serde_json::json!("hello"));
+    }
+
+    /// The tab cases were measured against both Go frp and `yaml-rust2`, per the
+    /// review's `§4.3`: these are the ones `yaml-rust2` silently accepts.
+    #[test]
+    fn tab_indentation_is_rejected_where_go_rejects_it() {
+        let table: &[(&str, Option<(usize, usize)>)] = &[
+            ("\ta: 1\n", Some((1, 1))),
+            (" \ta: 1\n", Some((1, 2))),
+            ("- \ta: 1\n", Some((1, 3))),
+            ("x: |\n  \tfoo\n", Some((2, 3))),
+            ("x: >\n  \tfoo\n", Some((2, 3))),
+            ("x: |\n\tfoo\n", Some((2, 1))),
+            ("# c\n\tx: 1\n", Some((2, 1))),
+            ("x: foo\n\tbar\n", Some((2, 1))),
+            ("x: 1\n\n\tb: 2\n", Some((3, 1))),
+            ("a: 1\n \tb: 2\n", Some((2, 2))),
+        ];
+        for (source, expected) in table {
+            assert_eq!(yaml_indentation_tab(source), *expected, "{source:?}");
+        }
+    }
+
+    /// ...and accepted where Go accepts it: inside a flow collection, as
+    /// separation within a line, and in a block scalar whose indentation is
+    /// already established.
+    #[test]
+    fn tab_indentation_is_allowed_where_go_allows_it() {
+        for source in [
+            "a: \t1\n",
+            "{\ta: 1}\n",
+            "x: [\t1, 2]\n",
+            "x: [1,\n\t2]\n",
+            "x: {\na: 1,\n\tb: 2}\n",
+            "x: |\n  a\n  \tb\n",
+            "x: |\n  a\n\t\n",
+            "x: 1\n",
+        ] {
+            assert_eq!(yaml_indentation_tab(source), None, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn block_scalar_headers_are_recognised() {
+        for content in [
+            "x: |", "x: >", "x: |-", "x: >+", "x: |2", "x: |2-", "x: >-2",
+        ] {
+            assert!(block_scalar_header(content), "{content:?}");
+        }
+        for content in ["x: a", "x: a>", "x: '|'", "x: |x", ""] {
+            assert!(!block_scalar_header(content), "{content:?}");
+        }
+    }
+
+    #[test]
+    fn comments_are_stripped_only_after_whitespace() {
+        assert_eq!(strip_comment("x: 1 # c"), "x: 1 ");
+        assert_eq!(strip_comment("# c"), "");
+        assert_eq!(strip_comment("x: a#b"), "x: a#b");
+        assert_eq!(strip_comment("x: 1"), "x: 1");
+    }
+
+    #[test]
+    fn a_document_end_marker_is_detected() {
+        for source in ["...", "...\n", "a: 1\n...\n", "a: 1\n... # end\n"] {
+            assert!(yaml_has_document_end_marker(source), "{source:?}");
+        }
+        for source in ["", "a: 1\n", "...foo\n", "a: \n"] {
+            assert!(!yaml_has_document_end_marker(source), "{source:?}");
+        }
+    }
 }
