@@ -1360,7 +1360,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         // head terminator is an unterminated response
                         // head; http.Transport ReadResponse errors on it
                         // and the vhost ErrorHandler answers 404
-                        // (frp-core/src/bridge.rs:506-532 renders that
+                        // (frp-core/src/bridge.rs:505-531 renders that
                         // page from this Err arm).
                         return Poll::Ready(Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,

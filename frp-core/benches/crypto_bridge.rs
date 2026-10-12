@@ -52,8 +52,8 @@ fn bench_compression(c: &mut Criterion) {
     // this function by name and it must exist. No other group here needs the
     // feature: without it
     // `make_compressor`/`make_decompressor` return `None`
-    // (frp-core/src/bridge.rs:68,87; feature-off branches at :77-81 and
-    // :96-100), so `encrypted_compressed_bridge` runs the uncompressed path
+    // (frp-core/src/bridge.rs:67,86; feature-off branches at :76-80 and
+    // :95-99), so `encrypted_compressed_bridge` runs the uncompressed path
     // rather than panicking.
     #[cfg(feature = "compression")]
     {

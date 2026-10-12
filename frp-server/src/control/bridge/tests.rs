@@ -1475,7 +1475,7 @@ async fn injector_204_chunked_malformed_junk_ends_stream_permanently() {
 /// driven directly here: a flag-set stream whose backend closes with
 /// no head must surface `Err(UnexpectedEof)`, which frp-core answers
 /// with Go's vhost ErrorHandler 404 page
-/// (frp-core/src/bridge.rs:506-532) — never a clean end-of-stream.
+/// (frp-core/src/bridge.rs:505-531) — never a clean end-of-stream.
 /// The pre-fix guard returned `Ok(())` (fail-open), so this is RED on
 /// that code.
 #[tokio::test]

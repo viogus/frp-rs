@@ -106,6 +106,17 @@ fn shutdown_write(dst_fd: libc::c_int) -> io::Result<()> {
     }
 }
 
+/// Bounded-linger state shared by the two directions of a splice relay.
+///
+/// `rx` flips to `true` once the sibling direction has finished, after which
+/// this direction's read wait is bounded by `timeout`: an **idle** bound (reset
+/// on every byte) rather than a deadline, so a peer that keeps sending is never
+/// truncated while a live-but-silent peer cannot park the relay forever.
+struct HalfCloseLinger {
+    rx: tokio::sync::watch::Receiver<bool>,
+    timeout: Duration,
+}
+
 /// Run one splice direction, propagating the FIN to `dst` when the
 /// direction fails.
 ///
@@ -124,8 +135,7 @@ async fn splice_direction(
     dst: &AsyncFd<OwnedFd>,
     counter: &AtomicU64,
     pipe_capacity: usize,
-    half_closed_rx: tokio::sync::watch::Receiver<bool>,
-    linger: Duration,
+    half_close: HalfCloseLinger,
 ) -> io::Result<()> {
     let result = splice_direction_loop(
         src,
@@ -134,8 +144,7 @@ async fn splice_direction(
         dst,
         counter,
         pipe_capacity,
-        half_closed_rx,
-        linger,
+        half_close,
     )
     .await;
     if result.is_err() {
@@ -180,9 +189,9 @@ async fn splice_direction_loop(
     dst: &AsyncFd<OwnedFd>,
     counter: &AtomicU64,
     pipe_capacity: usize,
-    mut half_closed_rx: tokio::sync::watch::Receiver<bool>,
-    linger: Duration,
+    half_close: HalfCloseLinger,
 ) -> io::Result<()> {
+    let (mut half_closed_rx, linger) = (half_close.rx, half_close.timeout);
     let flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as libc::c_uint;
 
     let src_fd = src.get_ref().as_raw_fd();
@@ -499,8 +508,10 @@ async fn bridge_splice_with_linger(
         &work_async,
         &u2w_count,
         u2w_cap,
-        half_closed_rx.clone(),
-        linger,
+        HalfCloseLinger {
+            rx: half_closed_rx.clone(),
+            timeout: linger,
+        },
     );
     let w2u_fut = splice_direction(
         &work_async,
@@ -509,8 +520,10 @@ async fn bridge_splice_with_linger(
         &user_async,
         &w2u_count,
         w2u_cap,
-        half_closed_rx,
-        linger,
+        HalfCloseLinger {
+            rx: half_closed_rx,
+            timeout: linger,
+        },
     );
     // The pinned futures borrow the counters below; the block scopes them so
     // the pins (and their borrows) are dropped before the counts are read.
