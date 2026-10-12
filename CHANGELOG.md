@@ -457,7 +457,8 @@ User-facing release notes for frp-rs.
   accepted.** `serve_plugin` (`frp-client/src/plugin/mod.rs`), the shared accept loop behind
   every client plugin, spawned each accepted connection's handler into a
   `tokio::task::JoinSet` and only drained that set at shutdown, so a finished-but-unjoined
-  task's handle stayed in the set and with it the task's boxed cell: a listener's bookkeeping
+  task's handle stayed in the set and with it the task's cell (the allocation whose future
+  storage is inline only below tokio's boxing threshold): a listener's bookkeeping
   grew with *cumulative accepted connections* rather than concurrency — measured on the
   reporter's OpenWrt router as ~2.4 KB retained per accepted connection on the `socks5`
   plugin (a ~2032 B handler future kept inline in the cell) and ~0.37 KB on the `http_proxy`
