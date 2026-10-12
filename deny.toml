@@ -25,6 +25,17 @@ ignore = [
     # upstream still pins inferno 0.11; track for a fixed release.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # unsafe-libyaml 0.2.11 (pulled by serde_yaml_ng 0.10 for `.yaml`/`.yml`
+    # config files). RUSTSEC-2024-0449 is an *unmaintained* informational
+    # advisory, not a vulnerability: dtolnay/unsafe-libyaml (a c2rust
+    # translation of libyaml) was archived on 2024-03-25 and both `patched` and
+    # `unaffected` are empty, so no upgrade can ever clear it. The only YAML
+    # input is an operator-supplied local config file (the frpc admin API
+    # accepts TOML only), so there is no remote/untrusted parse path.
+    # TEMPORARY — remove this row when serde_yaml_ng is replaced by a
+    # maintained safe-Rust parser; tracked by the `TODO.md` item
+    # "Replace `serde_yaml_ng` with a maintained safe-Rust YAML parser".
+    "RUSTSEC-2024-0449",
 ]
 
 [licenses]
