@@ -1,7 +1,6 @@
 use std::io;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-#[cfg(test)]
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -931,6 +930,47 @@ async fn bridge_plain_core(
     let _ = tokio::join!(user_to_work, work_to_user);
 }
 
+/// How long one relay direction may sit with NO progress (no bytes read)
+/// after the OPPOSITE direction has already hit EOF, before the relay
+/// abandons it and drops both transports.
+///
+/// Half-close (FIN propagation) exists so that a peer which shut down its
+/// write half can still receive the rest of a response. It has to be
+/// bounded, because a peer that never sends its own FIN leaves the opposite
+/// read parked on a future that can never complete — pinning two sockets and
+/// two pooled 32 KiB buffers for the lifetime of the process. Measured on a
+/// live frpc (OpenWrt router, socks5 plugin proxy, ordinary browser
+/// traffic): 2137 permanently half-closed sockets (1490 `FIN_WAIT2` + 647
+/// `CLOSE_WAIT`) and ~224 MB RSS+swap after 23 h, growing at ~2 fds and
+/// ~120 kB per minute, all of it unreclaimable without restarting the
+/// process.
+///
+/// Go frp's `golib/io.Join` closes BOTH connections as soon as either
+/// `io.Copy` returns, so it cannot park this way; any bound is strictly more
+/// permissive than the compatibility target.
+///
+/// This is an IDLE bound, not a deadline measured from the moment of
+/// half-close: the window restarts on every byte read, so a peer that keeps
+/// making progress (e.g. a client that half-closes its request and then
+/// receives a long response) is never cut mid-transfer. What IS cut, after one
+/// full idle window, is a direction whose next byte never arrives — a peer
+/// that has gone away, or a server that needs longer than the window to start
+/// responding. That direction ends cleanly (`Ok` with the bytes copied so
+/// far), so the give-up itself is not reported as an error; the counts simply
+/// stop short.
+///
+/// Scope: used by [`relay_plain_pooled`] and, on Linux, `bridge_splice`
+/// (`frp-core/src/splice.rs`). The compressed / encrypted / rate-limited
+/// variants (`bridge_plain_core`, `bridge_plain_rate_limited_core`,
+/// `bridge_encrypted_core`) and the SUDP message bridge still join their two
+/// directions unbounded and carry the same leak.
+///
+/// No config key exposes this deliberately: Go frp has no equivalent knob (it
+/// closes both connections on the first `io.Copy` return), so adding one would
+/// extend the config surface past the compatibility target for a bound that is
+/// already strictly more permissive than it.
+pub const HALF_CLOSE_LINGER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Bidirectional plain relay between two full-duplex transports using
 /// POOLED buffers (one `PoolGuard` per direction, returned to the pool on
 /// exit). Replaces `tokio::io::copy_bidirectional_with_sizes`, which
@@ -938,11 +978,16 @@ async fn bridge_plain_core(
 /// churn that is two allocs + two frees per connection on every non-splice
 /// path.
 ///
-/// Semantics match tokio's copy_bidirectional (which is also Go frp's
-/// libio.Join model): each direction copies independently, and when one
-/// side's read hits EOF the peer's write half is shut down (TCP FIN /
-/// yamux half-close / QUIC stream finish) so the opposite copy observes EOF
-/// too; the call ends when BOTH directions have completed.
+/// Each direction copies independently, and when one side's read hits EOF the
+/// peer's write half is shut down (TCP FIN / yamux half-close / QUIC stream
+/// finish) so the opposite copy observes EOF too. The call ends when BOTH
+/// directions have completed, or — if the opposite direction stops making
+/// progress after a half-close — one [`HALF_CLOSE_LINGER_TIMEOUT`] window
+/// after its last byte. It does NOT return an error in that case: the bytes
+/// copied in each direction are reported as usual. (Go frp closes both
+/// connections the moment either direction finishes; the linger keeps the
+/// half-close behaviour for the normal case — the peer's FIN follows within
+/// an RTT — while making the pathological case bounded.)
 ///
 /// The generic `tokio::io::split` (BiLock) is used rather than
 /// `Transport::into_split`: shutdown forwards to the inner transport's
@@ -954,17 +999,48 @@ where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    relay_plain_pooled_with_linger(a, b, HALF_CLOSE_LINGER_TIMEOUT).await
+}
+
+/// [`relay_plain_pooled`] with an injectable half-close linger, so tests can
+/// pin both the abandon-a-stalled-peer and the do-not-truncate-a-slow-peer
+/// behaviours without depending on the wall clock.
+async fn relay_plain_pooled_with_linger<A, B>(
+    a: A,
+    b: B,
+    linger: Duration,
+) -> io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut a_r, mut a_w) = tokio::io::split(a);
     let (mut b_r, mut b_w) = tokio::io::split(b);
-    let a_to_b = async {
-        let n = copy_pooled(&mut a_r, &mut b_w).await?;
-        b_w.shutdown().await?;
-        Ok::<u64, io::Error>(n)
+    // Flipped by whichever direction reaches EOF first. The opposite
+    // direction then keeps running for as long as it reads bytes, and is
+    // abandoned after `linger` with no progress.
+    let (half_closed_tx, half_closed_rx) = tokio::sync::watch::channel(false);
+    let a_to_b = {
+        let rx = half_closed_rx.clone();
+        let tx = half_closed_tx.clone();
+        async move {
+            let n = copy_pooled(&mut a_r, &mut b_w, rx, linger).await?;
+            // Signal before awaiting the shutdown: the peer's write half is
+            // already closed (EOF was read), so the sibling may start its
+            // linger window immediately.
+            let _ = tx.send(true);
+            b_w.shutdown().await?;
+            Ok::<u64, io::Error>(n)
+        }
     };
-    let b_to_a = async {
-        let n = copy_pooled(&mut b_r, &mut a_w).await?;
-        a_w.shutdown().await?;
-        Ok::<u64, io::Error>(n)
+    let b_to_a = {
+        let tx = half_closed_tx;
+        async move {
+            let n = copy_pooled(&mut b_r, &mut a_w, half_closed_rx, linger).await?;
+            let _ = tx.send(true);
+            a_w.shutdown().await?;
+            Ok::<u64, io::Error>(n)
+        }
     };
     let (x, y) = tokio::try_join!(a_to_b, b_to_a)?;
     Ok((x, y))
@@ -972,7 +1048,19 @@ where
 
 /// One-direction copy through a pooled `PoolGuard` buffer (length ==
 /// BUFFER_SIZE, so `read` always has a full slice to fill).
-async fn copy_pooled<R, W>(src: &mut R, dst: &mut W) -> io::Result<u64>
+///
+/// Once `half_closed_rx` reports that the sibling direction has finished, a
+/// read that makes no progress for `linger` ends this copy early and returns
+/// the bytes copied so far. That releases the socket and the pooled buffer
+/// instead of parking them forever on a half-close the peer never completes.
+/// Reads before the half-close, and reads that keep producing bytes after it,
+/// stay unbounded.
+async fn copy_pooled<R, W>(
+    src: &mut R,
+    dst: &mut W,
+    mut half_closed_rx: tokio::sync::watch::Receiver<bool>,
+    linger: Duration,
+) -> io::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
@@ -980,7 +1068,42 @@ where
     let mut buf = PoolGuard::acquire();
     let mut total = 0u64;
     loop {
-        let n = src.read(buf.as_mut_slice()).await?;
+        // Scoped so the read future's borrow of `buf` ends before the write
+        // below needs it.
+        let n = {
+            // Cancel-safe: `AsyncReadExt::read` only ever reports bytes that
+            // are already in `buf`, so dropping the future loses nothing.
+            let read = src.read(buf.as_mut_slice());
+            tokio::pin!(read);
+            if *half_closed_rx.borrow() {
+                match tokio::time::timeout(linger, &mut read).await {
+                    Ok(n) => n?,
+                    Err(_) => {
+                        tracing::debug!(
+                            "half-close linger expired: releasing an idle bridge direction \
+                             ({} bytes copied; the peer never sent its FIN)",
+                            total
+                        );
+                        return Ok(total);
+                    }
+                }
+            } else {
+                tokio::select! {
+                    n = &mut read => n?,
+                    // The sibling hit EOF while this read was pending: stop
+                    // waiting without a bound and re-issue the read under the
+                    // linger.
+                    //
+                    // The `Ok(())` pattern is load-bearing: if the sender were
+                    // ever dropped before sending, this arm is merely disabled
+                    // and the read stays unbounded. The sender lives in the
+                    // sibling direction (see `relay_plain_pooled_with_linger`),
+                    // which cannot finish without sending, so the arm is
+                    // always live here.
+                    Ok(()) = half_closed_rx.changed() => continue,
+                }
+            }
+        };
         if n == 0 {
             return Ok(total);
         }
@@ -2763,6 +2886,130 @@ mod tests {
         // Keep test_a_w alive until the error check is done; the failed
         // direction owns the a_w half via BiLock split.
         drop(test_a_w);
+    }
+
+    /// `relay_plain_pooled` half-close LINGER pin: a peer that half-closes
+    /// while its counterpart never sends its own FIN must not park the relay
+    /// forever. Without the linger this leaked two sockets and two pooled
+    /// 32 KiB buffers per connection (1490 FIN_WAIT2 + 647 CLOSE_WAIT and
+    /// ~224 MB RSS+swap observed on a live frpc).
+    #[tokio::test]
+    async fn relay_plain_pooled_abandons_idle_half_closed_peer() {
+        let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = la.local_addr().unwrap();
+        let addr_b = lb.local_addr().unwrap();
+        let (mut conn_a, srv_a) = {
+            let conn_a = tokio::net::TcpStream::connect(addr_a).await.unwrap();
+            let srv_a = la.accept().await.unwrap().0;
+            (conn_a, srv_a)
+        };
+        // B's peer stays open for the whole test: it never writes and never
+        // closes — the shape that leaked in production.
+        let (mut conn_b, srv_b) = {
+            let conn_b = tokio::net::TcpStream::connect(addr_b).await.unwrap();
+            let srv_b = lb.accept().await.unwrap().0;
+            (conn_b, srv_b)
+        };
+
+        let linger = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let relay =
+            tokio::spawn(async move { relay_plain_pooled_with_linger(srv_a, srv_b, linger).await });
+
+        // Direction A -> B completes normally: 4 KiB then A's FIN.
+        let payload = pseudo_random_bytes(4096, 0xa1a1_0001);
+        conn_a.write_all(&payload).await.unwrap();
+        conn_a.shutdown().await.unwrap();
+
+        // The FIN must still propagate to B: half-close is preserved.
+        let mut got = vec![0u8; 4096];
+        conn_b.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, payload, "A -> B stays byte-exact under the linger");
+
+        // B -> A never makes progress. The relay must give up one linger
+        // window after A's EOF rather than parking for the process lifetime.
+        let counts = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay must not park forever on a peer that never FINs")
+            .unwrap()
+            .expect("abandoning a stalled direction is a clean end, not an error");
+        assert_eq!(counts, (4096, 0), "(A->B, B->A) byte counts");
+        assert!(
+            start.elapsed() >= linger,
+            "must actually hold the half-close window open, gave up after {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// `relay_plain_pooled` linger is an IDLE bound, not a deadline measured
+    /// from the moment of half-close: a peer that keeps sending — slowly —
+    /// across a total window longer than the linger must be copied to
+    /// completion (a long response to a half-closed request is the normal
+    /// HTTP/1.0-ish case this protects).
+    #[tokio::test]
+    async fn relay_plain_pooled_linger_does_not_truncate_progressing_peer() {
+        let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = la.local_addr().unwrap();
+        let addr_b = lb.local_addr().unwrap();
+        let (mut conn_a, srv_a) = {
+            let conn_a = tokio::net::TcpStream::connect(addr_a).await.unwrap();
+            let srv_a = la.accept().await.unwrap().0;
+            (conn_a, srv_a)
+        };
+        let (mut conn_b, srv_b) = {
+            let conn_b = tokio::net::TcpStream::connect(addr_b).await.unwrap();
+            let srv_b = lb.accept().await.unwrap().0;
+            (conn_b, srv_b)
+        };
+
+        let linger = Duration::from_secs(1);
+        let chunk_size = 2048usize;
+        // 5 chunks spaced linger/4 apart: each gap leaves a 4x timing margin
+        // (a loaded CI runner must stall for >750 ms to flake it), while the
+        // 1.25 s of gaps adds up to more than one full window, so the test
+        // still proves the window re-arms per read rather than being a single
+        // deadline measured from the half-close.
+        let chunks = 5u32;
+        let gap = linger / 4;
+        let start = std::time::Instant::now();
+        let relay =
+            tokio::spawn(async move { relay_plain_pooled_with_linger(srv_a, srv_b, linger).await });
+
+        // A sends its request and half-closes: everything after this is on the
+        // B -> A direction, which now runs under the linger.
+        conn_a.write_all(b"req").await.unwrap();
+        conn_a.shutdown().await.unwrap();
+
+        let mut expected = Vec::new();
+        for i in 0..chunks {
+            let chunk = pseudo_random_bytes(chunk_size, 0x5eed_0000 + i);
+            conn_b.write_all(&chunk).await.unwrap();
+            let mut got = vec![0u8; chunk_size];
+            conn_a.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, chunk, "chunk {i} must be forwarded intact");
+            expected.extend_from_slice(&chunk);
+            // Gap well inside the linger: progress, not a stall.
+            tokio::time::sleep(gap).await;
+        }
+        conn_b.shutdown().await.unwrap();
+
+        let counts = tokio::time::timeout(Duration::from_secs(5), relay)
+            .await
+            .expect("relay must finish once the slow peer finally FINs")
+            .unwrap()
+            .expect("relay must succeed");
+        assert_eq!(
+            counts,
+            (3, (chunk_size * chunks as usize) as u64),
+            "(A->B, B->A) byte counts"
+        );
+        assert!(
+            start.elapsed() > linger,
+            "the transfer must outlast a single linger window, took {:?}",
+            start.elapsed()
+        );
     }
 
     /// Work reader whose first read fails with InvalidData — the error

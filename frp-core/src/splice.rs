@@ -10,6 +10,7 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
 
@@ -123,8 +124,20 @@ async fn splice_direction(
     dst: &AsyncFd<OwnedFd>,
     counter: &AtomicU64,
     pipe_capacity: usize,
+    half_closed_rx: tokio::sync::watch::Receiver<bool>,
+    linger: Duration,
 ) -> io::Result<()> {
-    let result = splice_direction_loop(src, pipe_rd, pipe_wr, dst, counter, pipe_capacity).await;
+    let result = splice_direction_loop(
+        src,
+        pipe_rd,
+        pipe_wr,
+        dst,
+        counter,
+        pipe_capacity,
+        half_closed_rx,
+        linger,
+    )
+    .await;
     if result.is_err() {
         // Tell dst that no more bytes will follow so a peer waiting for our
         // EOF terminates instead of hanging on a live-but-silent conn.
@@ -167,6 +180,8 @@ async fn splice_direction_loop(
     dst: &AsyncFd<OwnedFd>,
     counter: &AtomicU64,
     pipe_capacity: usize,
+    mut half_closed_rx: tokio::sync::watch::Receiver<bool>,
+    linger: Duration,
 ) -> io::Result<()> {
     let flags = (libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK) as libc::c_uint;
 
@@ -178,7 +193,48 @@ async fn splice_direction_loop(
     loop {
         // ---- Phase A: src → pipe ----
         let n_read = 'read_block: loop {
-            let mut guard = src.readable().await?;
+            // Phase A wait. Before the sibling direction has finished this is
+            // an unbounded await (a proxy must be able to sit idle on a live
+            // connection). Once the sibling has hit EOF, this direction is
+            // only still waiting for the peer's own FIN/response — which a
+            // live-but-silent peer never sends — so a source that stays dry
+            // for `linger` ends the direction cleanly instead of parking the
+            // bridge (and both sockets and both pipe pairs) forever. This is
+            // the splice path's half-close leak; the bound is idle-based and
+            // read-side only — a peer that keeps sending is never truncated,
+            // while a destination that stops accepting (the `dst.writable()`
+            // waits in Phase B) stays unbounded.
+            let armed = *half_closed_rx.borrow();
+            let mut guard = if armed {
+                match tokio::time::timeout(linger, src.readable()).await {
+                    Ok(g) => g?,
+                    Err(_) => {
+                        // Mirror the true-EOF path below: hand the peer a FIN
+                        // before releasing the pipe pair (best effort — the
+                        // peer may already be gone).
+                        tracing::debug!(
+                            "half-close linger expired: releasing an idle splice direction \
+                             (the peer never sent its FIN)"
+                        );
+                        let _ = shutdown_write(dst_fd);
+                        return Ok(());
+                    }
+                }
+            } else {
+                tokio::select! {
+                    g = src.readable() => g?,
+                    // The sibling finished while this direction was parked:
+                    // re-enter the loop so the wait above is bounded.
+                    //
+                    // The `Ok(())` pattern is load-bearing: if the sender were
+                    // dropped without sending, this arm would merely be
+                    // disabled and the wait would stay unbounded. The sender
+                    // lives in the sibling direction (`bridge_splice_with_linger`),
+                    // which cannot finish without sending, so the arm is alive
+                    // whenever this direction is still waiting.
+                    Ok(()) = half_closed_rx.changed() => continue,
+                }
+            };
             // SAFETY: src_fd and pipe_wr_fd are valid. null offset pointers.
             // splice is a standard Linux syscall.
             let ret = unsafe {
@@ -375,7 +431,12 @@ async fn splice_direction_loop(
 /// - a **clean EOF** (half-close) in one direction keeps the opposite
 ///   direction running so it can carry the response — matching
 ///   `tokio::io::copy_bidirectional` and the half-close semantics of
-///   `splice_direction`;
+///   `splice_direction` — but arms its idle bound
+///   ([`crate::bridge::HALF_CLOSE_LINGER_TIMEOUT`]), so a live-but-silent
+///   peer that never sends its own FIN cannot park the bridge, its two
+///   sockets and its two pipe pairs forever (the bound covers the read side —
+///   Phase A waiting for the source; a destination that stops accepting still
+///   waits unbounded in Phase B);
 /// - an **error** in one direction immediately cancels the sibling (its
 ///   future is dropped) and propagates — previously the sibling was left
 ///   running on a live-but-silent connection, hanging the bridge forever
@@ -388,6 +449,17 @@ enum Side {
 pub async fn bridge_splice(
     user: tokio::net::TcpStream,
     work: tokio::net::TcpStream,
+) -> io::Result<(u64, u64)> {
+    bridge_splice_with_linger(user, work, crate::bridge::HALF_CLOSE_LINGER_TIMEOUT).await
+}
+
+/// [`bridge_splice`] with an injectable half-close linger, so tests can pin
+/// the abandon-a-stalled-peer behaviour without waiting out the production
+/// window.
+async fn bridge_splice_with_linger(
+    user: tokio::net::TcpStream,
+    work: tokio::net::TcpStream,
+    linger: Duration,
 ) -> io::Result<(u64, u64)> {
     // Step 1: Deregister from tokio's reactor and transfer fd ownership.
     // `into_std()` may reset the fd to blocking mode; AsyncFd requires
@@ -415,6 +487,11 @@ pub async fn bridge_splice(
 
     // Step 5: Run both directions concurrently on the same task. First
     // completion wins; the loser is dropped when the select completes.
+    // The watch below arms the loser's idle bound: whichever direction
+    // finishes first flips it, and the other then gives up `linger` after its
+    // last byte instead of waiting forever for a peer that never FINs (see
+    // `HALF_CLOSE_LINGER_TIMEOUT`).
+    let (half_closed_tx, half_closed_rx) = tokio::sync::watch::channel(false);
     let u2w_fut = splice_direction(
         &user_async,
         &u2w_r,
@@ -422,6 +499,8 @@ pub async fn bridge_splice(
         &work_async,
         &u2w_count,
         u2w_cap,
+        half_closed_rx.clone(),
+        linger,
     );
     let w2u_fut = splice_direction(
         &work_async,
@@ -430,6 +509,8 @@ pub async fn bridge_splice(
         &user_async,
         &w2u_count,
         w2u_cap,
+        half_closed_rx,
+        linger,
     );
     // The pinned futures borrow the counters below; the block scopes them so
     // the pins (and their borrows) are dropped before the counts are read.
@@ -447,11 +528,15 @@ pub async fn bridge_splice(
             Err(e) => return Err(e),
             // Clean half-close: splice_direction already propagated the FIN
             // to the peer. Keep the response direction alive until it
-            // finishes.
+            // finishes — but arm its idle bound first, so a peer that never
+            // sends its own FIN cannot park this bridge (and its two sockets
+            // and two pipe pairs) for the lifetime of the process.
             Ok(Side::UserToWork) => {
+                let _ = half_closed_tx.send(true);
                 w2u.await?;
             }
             Ok(Side::WorkToUser) => {
+                let _ = half_closed_tx.send(true);
                 u2w.await?;
             }
         }
@@ -749,5 +834,51 @@ mod tests {
                 panic!("bridge_splice timed out after 5s — likely hung");
             }
         }
+    }
+
+    /// A peer that half-closes while the other end goes silent (never sends
+    /// its own FIN) must not park the splice bridge forever: one idle window
+    /// after the first direction ends, the open direction is abandoned and
+    /// the bridge returns — pre-fix it parked for the process lifetime,
+    /// holding two sockets and two pipe pairs.
+    #[tokio::test]
+    async fn test_bridge_splice_abandons_idle_half_closed_peer() {
+        let ((bridge_user, mut test_user), (bridge_work, mut test_work)) =
+            socket_pairs().await.expect("socket pairs");
+
+        let linger = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        let handle = tokio::spawn(async move {
+            bridge_splice_with_linger(bridge_user, bridge_work, linger).await
+        });
+
+        // Client sends its request, then half-closes. The backend reads it
+        // and stays silent: no response, no close.
+        let request = b"request body";
+        test_user.write_all(request).await.expect("write request");
+        test_user.shutdown().await.expect("shutdown client write");
+
+        let mut received = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), test_work.read_to_end(&mut received))
+            .await
+            .expect("backend must see EOF after the client half-close")
+            .expect("read request");
+        assert_eq!(received, request, "half-close must still propagate");
+
+        let counts = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("bridge_splice must not park on a peer that never FINs")
+            .unwrap()
+            .expect("abandoning a stalled direction is a clean end, not an error");
+        assert_eq!(
+            counts,
+            (request.len() as u64, 0),
+            "(user->work, work->user) byte counts"
+        );
+        assert!(
+            start.elapsed() >= linger,
+            "must hold the half-close window open, gave up after {:?}",
+            start.elapsed()
+        );
     }
 }
