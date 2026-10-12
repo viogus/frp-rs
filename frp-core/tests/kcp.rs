@@ -215,3 +215,175 @@ async fn test_kcp_512kib_volume_byte_exact() {
     assert_eq!(got, payload, "512 KiB payload must be byte-exact");
     dial_handle.await.expect("dial task");
 }
+
+/// Bind a KCP listener on the address family `localhost` resolves to *first*.
+///
+/// Both `dial_kcp` and `dial_server` use the first address the resolver returns
+/// and never retry the other family (Go's `net.ResolveUDPAddr`, which kcp-go's
+/// `Dial` uses, is likewise a single-address call). A test that hardcoded
+/// `127.0.0.1` for the listener would therefore pass or fail on the host's
+/// resolver order — macOS returns `::1` before `127.0.0.1` for `localhost`.
+/// Binding the family the dialer will actually pick keeps the assertion about
+/// frp-rs's hostname handling rather than about the host's address stack.
+async fn bind_where_localhost_resolves_first(config: KcpConfig) -> KcpListener {
+    let first = tokio::net::lookup_host("localhost:0")
+        .await
+        .expect("resolve localhost")
+        .next()
+        .expect("localhost must resolve to at least one address");
+    let bind = if first.is_ipv4() {
+        "127.0.0.1:0"
+    } else {
+        "[::1]:0"
+    };
+    KcpListener::bind(bind, config).await.expect("bind")
+}
+
+/// Regression: a KCP dial target may be a **hostname**, not a literal socket
+/// address. `dial_kcp_with_driver` used to `addr.parse::<SocketAddr>()`
+/// unconditionally, so `serverAddr = "kr.cdf.mba"` + `transport.protocol =
+/// "kcp"` died one layer up as `transport error: KCP dial: invalid socket
+/// address syntax` with no UDP socket ever bound and zero packets sent, while
+/// the same domain worked on TCP/TLS/WS/QUIC. Go's kcp-go `Dial(raddr string)`
+/// goes through `net.ResolveUDPAddr`, so a hostname is a valid target.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kcp_dial_hostname_round_trip() {
+    let config = no_fec_config();
+    let mut listener = bind_where_localhost_resolves_first(config.clone()).await;
+    let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
+
+    // Allow driver event loops to start.
+    sleep(Duration::from_millis(50)).await;
+
+    let dial_handle = tokio::spawn(async move {
+        let mut stream = timeout(Duration::from_secs(10), dial_kcp(&addr, config))
+            .await
+            .expect("dial timeout")
+            .expect("dial_kcp must accept a hostname");
+        stream
+            .write_all(b"hello via hostname")
+            .await
+            .expect("write");
+        stream.shutdown().await.expect("shutdown");
+    });
+
+    let mut stream = timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("accept timeout")
+        .expect("accept");
+    let mut buf = vec![0u8; 64];
+    let n = timeout(Duration::from_secs(10), stream.read(&mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read");
+    assert_eq!(&buf[..n], b"hello via hostname");
+    dial_handle.await.expect("dial task");
+}
+
+/// Regression at the layer a user's config actually reaches:
+/// `dial_server` with `serverAddr = "localhost"`, `transport.protocol = "kcp"`
+/// and no `dns_server`. The KCP arm rebuilt the address from the *unresolved*
+/// `serverAddr` (`format!("{target_ip}:{port}")`) and handed that to
+/// `dial_kcp`, so the hostname failed before a socket existed — the reported
+/// `frpc 不支持域名` symptom. The arm now dials the address `dial_server`
+/// resolved once for every transport.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kcp_dial_server_accepts_a_hostname() {
+    use frp_core::kcp::default_kcp_client_config;
+    use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+
+    // dial_server's KCP arm builds its client config with
+    // default_kcp_client_config (FEC 10,3); the listener must match or the
+    // FEC-wrapped packets are unparseable.
+    let config = default_kcp_client_config();
+    let mut listener = bind_where_localhost_resolves_first(config).await;
+    let port = listener.local_addr().unwrap().port();
+
+    // Allow driver event loops to start.
+    sleep(Duration::from_millis(50)).await;
+
+    let server = tokio::spawn(async move {
+        let mut stream = timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("accept timeout")
+            .expect("accept");
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("read");
+        assert_eq!(&buf[..n], b"hello via dial_server hostname");
+    });
+
+    let opts = DialOptions {
+        server_addr: "localhost".to_string(),
+        server_port: port,
+        protocol: TransportProtocol::Kcp,
+        ..Default::default()
+    };
+    let mut io = timeout(Duration::from_secs(10), dial_server(&opts))
+        .await
+        .expect("dial timeout")
+        .expect("dial_server must accept a hostname on KCP");
+    io.write_all(b"hello via dial_server hostname")
+        .await
+        .expect("write");
+    io.flush().await.expect("flush");
+    server.await.expect("server task");
+}
+
+/// Regression: a bare IPv6 literal is a valid `serverAddr` on KCP.
+///
+/// Before the fix this configuration could not work at any layer: the KCP arm
+/// string-formatted the address into `"::1:<port>"`, which is not a parseable
+/// socket address, and the dial socket was bound to `0.0.0.0:0` no matter what
+/// the remote's family was, so an `AF_INET6` remote was unreachable even once
+/// resolved (a cross-family datagram is dropped without an error — see the
+/// socket-family note in `frp-core/src/kcp/listener.rs`). This test pins the
+/// IPv6 branch of the family-aware bind, which the two `localhost` tests above
+/// only reach on a host whose resolver returns IPv6 first: here the remote is
+/// unambiguously IPv6 on every platform. The CI lane that runs this target
+/// (`cargo test -p frp-core`, ubuntu-latest) provides an IPv6 loopback.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_kcp_dial_server_accepts_a_bare_ipv6_literal() {
+    use frp_core::kcp::default_kcp_client_config;
+    use frp_core::transport::{dial_server, DialOptions, TransportProtocol};
+
+    let config = default_kcp_client_config();
+    let mut listener = KcpListener::bind("[::1]:0", config)
+        .await
+        .expect("bind [::1]:0 — an IPv6 loopback is required by this test");
+    let port = listener.local_addr().unwrap().port();
+
+    // Allow driver event loops to start.
+    sleep(Duration::from_millis(50)).await;
+
+    let server = tokio::spawn(async move {
+        let mut stream = timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("accept timeout")
+            .expect("accept");
+        let mut buf = vec![0u8; 64];
+        let n = timeout(Duration::from_secs(10), stream.read(&mut buf))
+            .await
+            .expect("read timeout")
+            .expect("read");
+        assert_eq!(&buf[..n], b"hello over a bare IPv6 literal");
+    });
+
+    let opts = DialOptions {
+        server_addr: "::1".to_string(),
+        server_port: port,
+        protocol: TransportProtocol::Kcp,
+        ..Default::default()
+    };
+    let mut io = timeout(Duration::from_secs(10), dial_server(&opts))
+        .await
+        .expect("dial timeout")
+        .expect("dial_server must accept a bare IPv6 literal on KCP");
+    io.write_all(b"hello over a bare IPv6 literal")
+        .await
+        .expect("write");
+    io.flush().await.expect("flush");
+    server.await.expect("server task");
+}

@@ -1525,7 +1525,20 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
     match opts.protocol {
         #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
-            let addr = format!("{target_ip}:{}", opts.server_port);
+            // Dial the address resolved above, not `format!("{target_ip}:{port}")`:
+            // with `serverAddr = "kr.cdf.mba"` and no `dns_server`, `target_ip` is
+            // still a hostname, which `dial_kcp` used to reject outright with
+            // `invalid socket address syntax` — a domain never dialled on KCP at
+            // all, while every other transport resolved it. `dial_kcp` resolves
+            // hostnames itself (Go kcp-go parity), but the address is already in
+            // hand here, so KCP resolves exactly once and picks the same address
+            // the TCP/TLS/WS arms below do. (Given the fallback, this arm is not
+            // behaviourally distinguishable from re-resolving in `dial_kcp`: it
+            // is kept so the address dialled is exactly the address `peer`
+            // carries — the one the KCP+TLS stream reports as its `peer_addr` —
+            // and so a second resolver round trip, which a rotating resolver
+            // could answer differently, never happens.)
+            let addr = peer.to_string();
             let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_client_config())
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
@@ -3278,7 +3291,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2254).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2267).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {
