@@ -171,6 +171,14 @@ User-facing release notes for frp-rs.
   negative value is accepted and means the deadline has already passed).
 
 ### Changed
+- **`quinn-proto` moves 0.11.17 → 0.11.18 for RUSTSEC-2026-0338, RUSTSEC-2026-0340 and
+  RUSTSEC-2026-0343** (all three carry `patched = >=0.11.18`, and the version they were
+  reported against was the only affected dependency in the tree), so QUIC builds pick up the
+  fixed crate; `cargo audit` and `cargo deny` are clean after the bump. The same
+  re-resolution moved a set of Windows-only crates from `windows-sys` 0.61.2 to 0.59.0,
+  because `frp-vnet` 0.1.0 requires `^0.59` while `socket2` 0.6.5 requires `>=0.60,<0.62` —
+  a requirement-sanctioned selection change on the Windows dependency graph, not a behaviour
+  change on other platforms.
 - **The compat lanes no longer install a Go toolchain nothing uses.** `compat.yml`
   and `xtcp-compat.yml` ran `actions/setup-go` with a floating `>=1.22.0` range,
   so which Go was present was a runner-image property, and nothing invoked it:
@@ -445,6 +453,24 @@ User-facing release notes for frp-rs.
   `--strict-config=false` to keep the old lenient behaviour.
 
 ### Fixed
+- **A long-lived client plugin listener no longer grows with the connections it has ever
+  accepted.** `serve_plugin` (`frp-client/src/plugin/mod.rs`), the shared accept loop behind
+  every client plugin, spawned each accepted connection's handler into a
+  `tokio::task::JoinSet` and only drained that set at shutdown, so a finished-but-unjoined
+  task's handle stayed in the set and with it the task's boxed cell: a listener's bookkeeping
+  grew with *cumulative accepted connections* rather than concurrency — measured on the
+  reporter's OpenWrt router as ~2.4 KB retained per accepted connection on the `socks5`
+  plugin (a ~2032 B handler future kept inline in the cell) and ~0.37 KB on the `http_proxy`
+  plugin (a ~21.7 KB future that tokio `Box::pin`s, so only the small cell is retained).
+  Finished handlers are now reaped once per accept (`reap_finished_handlers` at
+  `frp-client/src/plugin/mod.rs:227`, helper at `:287`), matching
+  `frp-client/src/plugin/unix_socket.rs:90` and `frp-client/src/plugin/h2.rs:119`; measured
+  A/B on aarch64 musl (the router's platform), the pre-fix build retained 2354 B per accept
+  and grew a single anonymous mapping from 4.7 MB to 23.5 MB over 10,000 accepted
+  connections, where the fix retains 0 B per accept over 10,000 accepts with the mappings
+  unchanged. A new end-to-end regression test (`frp-client/tests/plugin_accept_reap.rs`)
+  drives the real accept loop and fails (3.68 MB retained over 20,000 connections) when the
+  reap call is removed.
 - **A hand-named inner feature no longer advertises a listener port it cannot read: the gated-port readers now come from `frp-server`, so `--features tiny,frp-core/kcp` warns for `--kcp-bind-port` and for the `kcp_bind_port` file key instead of accepting them silently.**
   The port flags and the `kcp_bind_port`/`quic_bind_port`/`websocket_port` presence flags were gated on **frp-core**'s features while the listener belongs to **frp-server**, so `cargo build -p frps --no-default-features --features tiny,frp-core/kcp` advertised `--kcp-bind-port`, accepted it, bound no UDP socket and printed zero records (the same for `frp-core/quic`; `websocket_port` is the file-key half only, since no `--websocket-port` exists). A new `frp_core::config::GatedListenerPortReaders` is now built by `frp_server::service::gated_listener_port_readers()` from frp-server's own gates and threaded into the presence record and the CLI overlay, so "does this build read the port" is answered by the crate that owns the listener: with frp-core's feature off the record still fires regardless of the reader, and with it on the record fires when frp-server has no listener (`kcp_bind_port has no effect in this build: frp-core compiled the field, but frp-server was built without its \`kcp\` feature …`). The honoured shapes are unchanged (zero records and the UDP socket bound), `tiny` still rejects the flag with `--kcp-bind-port is not expected in this context`, and the `-p frp-server --no-default-features --all-targets` lane now asserts the hand-named shape explicitly rather than only its record invariant. Closes `TODO.md:11018`.
 - **A `--dashboard-port`-style CLI override of a reader-gated listener port is now reported in the same shapes the file key is.** `FrpsArgs::override_server_config` runs *after* the load that fills `ConfigPresence` from the normalized file, so a port it wrote could not re-enter the presence record: in a build without `frp-server/dashboard`, `frps --dashboard-port 7500` (no `-c`, no `--config-dir`) parsed the flag, applied it to `cfg.web_server.port`, opened no listener and printed **zero** records, where the same value in the file printed one. `override_server_config` now returns an `AppliedReaderGatedPorts` naming the reader-gated ports it actually wrote (`frp-core/src/config/loader.rs`), and its only production caller merges that into the presence record before the warn block (`frps/src/main.rs`), so the flag emits the existing record (`web_server.port has no effect: this build has no dashboard support, …`) exactly where the file key does — one record per load, and none when the build honours the port. The two paths that apply no overlay stay silent and are recorded as precedence rather than gates: `--config-dir` (a named config source is authoritative) and `frps verify`, which accepts `--dashboard-port` and ignores it while a file that requests the port prints its record before `syntax is ok`. A hand-named inner feature (`--features tiny,frp-core/kcp`) is the one shape still advertised without a reader, and is filed as its own item. Closes `TODO.md:10577`. (Superseded by the entry above: the hand-named shape now warns and `TODO.md:11018` is closed.)
