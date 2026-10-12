@@ -276,12 +276,14 @@ where
 
 /// Reap completed plugin handlers so a long-lived listener's `JoinSet` does
 /// not retain one task cell for every accepted connection it ever served.
-/// The unjoined `JoinHandle` sits in the set's idle list holding that cell:
-/// the boxed allocation carrying the task header, the future's storage (the
-/// future itself is already dropped at completion) and the output slot
-/// (`Stage::Finished(())`). Retention must therefore track in-flight
-/// concurrency, not cumulative accepts. Handler errors are already logged
-/// inside the handler, so the `()` output is dropped.
+/// The unjoined `JoinHandle` sits in the set's idle list holding that cell
+/// (the boxed task cell carrying the task header and output slot
+/// `Stage::Finished(())` — its future's storage is inline when `sizeof(F)` is
+/// below tokio's boxing threshold; above it the future is `Box::pin`'d and
+/// freed at completion, leaving only the small cell). Retention must
+/// therefore track in-flight concurrency, not cumulative accepts. Handler
+/// errors are already logged inside the handler, so the `()` output is
+/// dropped.
 fn reap_finished_handlers(handlers: &mut tokio::task::JoinSet<()>) {
     while handlers.try_join_next().is_some() {}
 }
