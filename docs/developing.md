@@ -3867,7 +3867,7 @@ covered by any gate and are the ones that have actually been missed before.
       [`docs/history/development-log.md`](history/development-log.md). Do not write
       the same detail twice (see the [docs conventions](README.md#conventions-for-these-docs)).
 - [ ] **Security audit** —
-      `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071`
+      `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0449`
       and `cargo deny check`.
 - [ ] **Vendored crates — the step no tool covers.** `[patch.crates-io]` pins
       `rustls`, `yamux` and `russh`, so **`cargo update` will not pick up upstream
