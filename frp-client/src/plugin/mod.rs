@@ -221,6 +221,10 @@ where
                             frp_core::transport::set_nodelay(&stream);
                             let s = state.clone();
                             handlers.spawn(handler(stream, peer, s));
+                            // Reap per accept — load-bearing: without this the
+                            // listener retains one task cell per cumulative
+                            // accepted connection.
+                            reap_finished_handlers(&mut handlers);
                         }
                         Err(e) => {
                             // Warn at most once per second while the accept
@@ -268,6 +272,18 @@ where
         _task: task,
         shutdown: Some(shutdown_tx),
     })
+}
+
+/// Reap completed plugin handlers so a long-lived listener's `JoinSet` does
+/// not retain one task cell for every accepted connection it ever served.
+/// The unjoined `JoinHandle` sits in the set's idle list holding that cell:
+/// the boxed allocation carrying the task header, the future's storage (the
+/// future itself is already dropped at completion) and the output slot
+/// (`Stage::Finished(())`). Retention must therefore track in-flight
+/// concurrency, not cumulative accepts. Handler errors are already logged
+/// inside the handler, so the `()` output is dropped.
+fn reap_finished_handlers(handlers: &mut tokio::task::JoinSet<()>) {
+    while handlers.try_join_next().is_some() {}
 }
 
 /// Dispatch to the correct plugin start function based on plugin_type.
@@ -3780,5 +3796,68 @@ mod tests {
             lines[0], "X-Forwarded-For: 1.2.3.4 5.6.7.8, 9.9.9.9, 203.0.113.9",
             "fold merges into its row's value with a single space; rows join with ', '"
         );
+    }
+
+    /// Pin for `serve_plugin`'s reaping: a `JoinSet` retains a finished
+    /// task's cell until its handle is joined, so `len` stays at the
+    /// cumulative spawn count — the leak the accept loop must not inherit.
+    /// `reap_finished_handlers` drops exactly those finished entries.
+    #[tokio::test]
+    async fn reap_finished_handlers_releases_finished_tasks() {
+        const N: usize = 8;
+        let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        // Capacity N, so each send cannot block and is the task's last action:
+        // receiving all N messages proves every task body has run to
+        // completion.
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::channel::<()>(N);
+        for _ in 0..N {
+            let done_tx = done_tx.clone();
+            handlers.spawn(async move {
+                let _ = done_tx.send(()).await;
+            });
+        }
+        drop(done_tx);
+        for _ in 0..N {
+            done_rx.recv().await.expect("handler task completed");
+        }
+        // Let the runtime finish JoinSet bookkeeping for the completed tasks.
+        tokio::task::yield_now().await;
+
+        assert_eq!(
+            handlers.len(),
+            N,
+            "finished-but-unjoined tasks are retained by the JoinSet (the leak)"
+        );
+        reap_finished_handlers(&mut handlers);
+        assert_eq!(
+            handlers.len(),
+            0,
+            "reaping must release every finished task"
+        );
+    }
+
+    /// Pin the accept-loop idiom the fix relies on: reaping once per
+    /// accepted connection keeps the listener's `JoinSet` bounded by
+    /// in-flight handlers, not by cumulative accepts. Each iteration is
+    /// `serve_plugin`'s accept arm (spawn, then reap) minus the socket.
+    #[tokio::test]
+    async fn per_accept_reap_keeps_joinset_bounded() {
+        const ACCEPTS: usize = 64;
+        let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+        let mut max_len = 0;
+        for _ in 0..ACCEPTS {
+            handlers.spawn(async {});
+            reap_finished_handlers(&mut handlers);
+            max_len = max_len.max(handlers.len());
+            // Let the handler body run; in the real loop the spawned task
+            // runs concurrently and is reaped by a later accept.
+            tokio::task::yield_now().await;
+        }
+        reap_finished_handlers(&mut handlers);
+        assert!(
+            max_len <= 2,
+            "JoinSet grew to {max_len}; it must track concurrency, not {ACCEPTS} cumulative accepts"
+        );
+        assert_eq!(handlers.len(), 0, "all finished handlers released");
     }
 }
