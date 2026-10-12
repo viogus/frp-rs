@@ -266,10 +266,11 @@ fn try_split_work_halves(
 
 /// Holds split user-side halves as one `AsyncRead`+`AsyncWrite` object so the
 /// XTCP STCP fallback can keep its `copy_bidirectional` semantics via the
-/// pooled relay `relay_plain_pooled` (both directions run to completion; the
-/// work side is only shut down after the full bidirectional copy — avoids
-/// the premature-FIN race that a join-of-two-halves bridge would
-/// reintroduce).
+/// pooled relay `relay_plain_pooled` (both directions run to completion — or
+/// the still-open direction gives up after one idle `HALF_CLOSE_LINGER_TIMEOUT`
+/// window, `frp-core/src/bridge.rs`; the work side is only shut down after the
+/// full bidirectional copy — avoids the premature-FIN race that a
+/// join-of-two-halves bridge would reintroduce).
 struct UserSide<R, W> {
     r: R,
     w: W,
@@ -582,13 +583,17 @@ async fn run_work_bridge(
             else {
                 return;
             };
-            // Pooled-buffer relay (audit round-8 P1): relay_plain_pooled has
-            // EXACTLY the copy_bidirectional semantics this arm's comment
-            // above requires — both directions run to completion and the
-            // work side is only shut down after the full bidirectional copy
+            // Pooled-buffer relay (audit round-8 P1): relay_plain_pooled
+            // keeps the copy_bidirectional semantics this arm's comment above
+            // requires — both directions run to completion and the work side
+            // is only shut down after the full bidirectional copy
             // (FIN-propagation, no premature-FIN race), without the
             // per-conn buffer pair. Buffer size stays FRP_BRIDGE_BUF_KB
             // (the pool's BUFFER_SIZE governs the XTCP STCP fallback path).
+            //
+            // Difference from copy_bidirectional: once one direction has hit
+            // EOF, the other is bounded by HALF_CLOSE_LINGER_TIMEOUT (30 s of
+            // idleness) so a silent peer cannot pin both sockets forever.
             let user_side = UserSide { r: u_r, w: u_w };
             match frp_core::bridge::relay_plain_pooled(user_side, work_conn).await {
                 Ok((a, b)) => {
