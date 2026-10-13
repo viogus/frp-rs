@@ -146,8 +146,8 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
 /// Deliberate *refusals* that Go accepts, all loud: a tab used for indentation
 /// inside a flow collection (the scanner refuses it), and a multi-line flow
 /// collection whose continuation is not indented (`x: [1,` / `2]`), which the
-/// scanner reads as `invalid indentation` — while the tab-continued form is
-/// accepted.
+/// scanner reads as `invalid indentation in flow construct` — while the
+/// tab-continued form is accepted.
 ///
 /// # Errors
 ///
@@ -1947,7 +1947,8 @@ mod yaml_scalar_rule_tests {
     /// `yaml-rust2`'s scanner applies its own, stricter rule on top, and refuses
     /// two shapes Go accepts: a tab-indented flow collection
     /// (`metadatas: {\n\tk: v\n}` → `tabs disallowed within this context`) and an
-    /// unindented flow continuation (`x: [1,\n2]` → `invalid indentation`). Both
+    /// unindented flow continuation (`x: [1,\n2]` → `invalid indentation in
+    /// flow construct`). Both
     /// are loud refusals, listed in the migration notes on [`yaml_to_toml`]. The
     /// test pins only the allow-list of this helper, so a change to either the
     /// helper or the scanner shows up as a failure here rather than silently.

@@ -4735,8 +4735,9 @@ fn test_yaml_bool_shaped_keys_are_renamed_unless_quoted() {
     assert_eq!(value.get("n").and_then(toml::Value::as_integer), Some(4));
 }
 /// Every null spelling Go resolves becomes null — an empty value, `~`, `null`,
-/// `Null` and `NULL` (the previous reader left the last two as the *strings*
-/// `"Null"`/`"NULL"`). The TOML projection of null is an empty string.
+/// `Null` and `NULL` (the previous reader already resolved the last two to null
+/// as well, so this row is not a change against it). The TOML projection of
+/// null is an empty string.
 #[test]
 fn test_yaml_null_spellings_resolve_to_null() {
     let value = parse_yaml("a:\nb: ~\nc: null\nd: Null\ne: NULL\n").unwrap();

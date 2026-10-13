@@ -784,7 +784,7 @@ All `.toml`, `.ini`, `.json`, `.yaml`, and `.yml` files in the directory (recurs
 
 `frps` and `frpc` detect the config format by file extension. TOML is the default; `.ini`, `.json`, `.yaml`, and `.yml` are also accepted. Every format runs through the same pipeline — Go frp key aliases, `includes`, env expansion, template functions, and strict key checking all apply identically.
 
-YAML is parsed with `yaml-rust2` (`default-features = false`) plus an in-tree scalar resolver that reproduces Go frp's `gopkg.in/yaml.v2` resolution rules on top of it, so unquoted scalars resolve the same way Go's `resolve()` does: `yes`/`no`/`on`/`off`/`y`/`n` and leading-zero numbers (e.g. `017` is octal 15) stay **strings** here because they do in Go — quote them as `"yes"`/`"017"` only if you also want them to stay strings for the old reader. `_`-prefixed tokens such as `_100` are strings (Go gates on the first byte), and `null`/`~`/`Null`/`NULL` resolve to null. YAML merge keys (`<<`) are supported:
+YAML is parsed with `yaml-rust2` (`default-features = false`) plus an in-tree scalar resolver that reproduces Go frp's `gopkg.in/yaml.v2` resolution rules on top of it, so unquoted scalars resolve the same way Go's `resolve()` does: `yes`/`no`/`on`/`off`/`y`/`n` resolve as booleans and a leading-zero number as an octal integer (e.g. `017` is 15), exactly as in Go — quote them (`"yes"`, `"017"`) when a string value is intended. `_`-prefixed tokens such as `_100` are strings (Go gates on the first byte), and `null`/`~`/`Null`/`NULL` resolve to null. YAML merge keys (`<<`) are supported:
 
 ```yaml
 # frps.yaml
