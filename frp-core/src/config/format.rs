@@ -2102,13 +2102,13 @@ mod yaml_scalar_rule_tests {
     }
 
     /// A scalar alias is charged **one** node per copy, so "the charge is bigger
-    /// than one" does not identify an alias: a document that re-expands a
-    /// one-character scalar hundreds of thousands of times is a pure alias bomb,
-    /// yet it used to be reported as a large but honest document. The receiver is
-    /// driven by hand to keep the test small — a real fixture reaching the
-    /// `100_000`-node floor costs ~200 KB–2 MB, more than this test is worth.
+    /// than one" does not identify an alias: re-expanding a small scalar many
+    /// times is a pure alias bomb. The label follows the charge that crossed the
+    /// budget, not the document, so a mapping-shaped bomb crossing on a plain key
+    /// reports the node message; this test pins the shape where an alias crosses
+    /// (driven by hand — a real fixture reaching the floor costs ~200 KB–2 MB).
     #[test]
-    fn a_scalar_alias_past_the_budget_reports_the_alias_limit() {
+    fn a_consecutive_scalar_alias_bomb_reports_the_alias_limit() {
         let mut sink = FirstMarker(None);
         yaml_rust2::parser::Parser::new_from_str("x\n")
             .load(&mut sink, false)
