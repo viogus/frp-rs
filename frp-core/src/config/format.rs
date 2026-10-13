@@ -153,8 +153,12 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
 /// expands past `400_000` nodes is refused (`document exceeds the node limit`),
 /// and so is an alias expansion past the same per-document budget. That is far
 /// beyond any real config — roughly 200 000 mapping entries — and it is what
-/// bounds worst-case memory when an alias bomb is padded with inert bytes; Go
-/// bounds the same shape with `allowedAliasRatio`.
+/// stops a node bomb padded with inert bytes (a 1 MiB file whose bomb would
+/// expand to ~100 million nodes is refused in tens of milliseconds). It bounds
+/// *nodes*, not bytes: a large scalar anchor re-expanded many times stays under
+/// the ceiling and can still cost gigabytes. That residual is pre-existing, not
+/// a Go divergence, and is registered in `TODO.md` — see `YamlReceiver::new`.
+/// Go bounds the node-bomb shape itself with `allowedAliasRatio`.
 ///
 /// # Errors
 ///
@@ -413,12 +417,14 @@ impl yaml_rust2::parser::MarkedEventReceiver for YamlReceiver {
 
 /// The error message for an insertion that pushed the node count past `budget`.
 ///
-/// An alias clone is charged for the whole subtree it copies (`contribution > 1`),
-/// so tripping the budget that way is an alias bomb. A plain node is charged one,
-/// so the document itself is past the absolute ceiling — a large but honest
-/// config, which must not be reported as an alias bomb.
-fn over_budget_message(contribution: usize, budget: usize) -> String {
-    if contribution > 1 {
+/// `is_alias` is passed by the caller, never inferred from the size of the
+/// charge: an alias of a *scalar* is charged one node, exactly like a plain
+/// scalar, so the charge cannot tell a scalar-alias bomb from a large but honest
+/// document. The `Event::Alias` pre-clone check passes `true`; `insert` passes
+/// `false` for every node it counts itself, because the alias path's own charge
+/// can no longer trip the check there (its pre-check uses the same arithmetic).
+fn over_budget_message(is_alias: bool, budget: usize) -> String {
+    if is_alias {
         "alias expansion limit exceeded".to_string()
     } else {
         format!("document exceeds the node limit ({budget} nodes)")
@@ -429,18 +435,31 @@ impl YamlReceiver {
     /// A receiver whose expansion budget is derived from the input size and then
     /// clamped to an absolute ceiling.
     ///
-    /// The proportional part mirrors `yaml.v2`'s `allowedAliasRatio`
-    /// (`max(100_000, input.len() * 100)`), but a ratio on its own is **not** a
-    /// memory bound: comments, blank lines, `%` directives and a legitimately
-    /// large config are inert bytes that inflate the allowance without adding a
-    /// single node, so padding a tiny alias bomb out to 1 MiB would buy it a
-    /// 100-million-node allowance (measured: 5.42 s / 12.1 GB peak RSS).
+    /// **What the budget bounds is node count, not bytes.** It is what stops a
+    /// node bomb — an alias re-expanded until the tree would hold hundreds of
+    /// millions of nodes — including the padded form, where a tiny bomb is
+    /// diluted with inert bytes to buy a huge proportional allowance. Measured
+    /// through the real entry point: a 1 MiB file whose bomb would expand to
+    /// ~100 million nodes is refused in 47 ms at 50.8 MB peak RSS instead of
+    /// 5.42 s at 12.1 GB.
     ///
-    /// The absolute ceiling is what actually bounds the worst case: whatever the
-    /// padding claims, the expanded tree may not pass
-    /// `input.len() * 100` clamped into `100_000 ..= 400_000` nodes — tens of MB
-    /// at the ~120 B/node measured, not gigabytes. `400_000` is the order of
-    /// magnitude of Go's `alias_ratio_range_low`.
+    /// It is **not** a memory bound. A node may carry a string as long as the
+    /// input and an alias deep-copies the whole string, while the charge is one
+    /// node per alias whatever the string's length — so a single large scalar
+    /// anchor re-expanded a few thousand times stays far below `400_000` nodes
+    /// and still costs gigabytes (measured 2.2–7.9 GB peak RSS on 125 KiB–1 MiB
+    /// crafted inputs; the previous reader costs 1.3–4.0 GB and Go's own config
+    /// path 8.4 GB on the same file). That residual is pre-existing, is not a
+    /// Go-parity divergence, and is registered as debt in `TODO.md` rather than
+    /// fixed here.
+    ///
+    /// The proportional part mirrors `yaml.v2`'s `allowedAliasRatio`
+    /// (`max(100_000, input.len() * 100)`), but a ratio on its own buys an
+    /// allowance for free: comments, blank lines, `%` directives and a
+    /// legitimately large config are inert bytes that inflate it without adding
+    /// a single node. The absolute ceiling is what keeps the node count bounded
+    /// whatever the padding claims; `400_000` is the order of magnitude of Go's
+    /// `alias_ratio_range_low`.
     fn new(input_len: usize) -> Self {
         Self {
             alias_budget: input_len.saturating_mul(100).clamp(100_000, 400_000),
@@ -528,10 +547,12 @@ impl YamlReceiver {
                     // Refuse **before** cloning. The clone is the blow-up, so the
                     // budget has to gate the copy rather than merely count it
                     // afterwards; `insert` re-checks for the non-alias paths.
+                    // This is the only caller that reports an alias, whatever
+                    // the charged size — a scalar alias charges 1.
                     if self.expanded_nodes.saturating_add(*size) > self.alias_budget {
                         return Err(yaml_rust2::scanner::ScanError::new_string(
                             mark,
-                            over_budget_message(*size, self.alias_budget),
+                            over_budget_message(true, self.alias_budget),
                         ));
                     }
                     let (node, size) = (node.clone(), *size);
@@ -564,6 +585,10 @@ impl YamlReceiver {
     /// counted, `size` for an alias that copies a whole subtree. An alias is
     /// charged for every node it duplicates, so an exponentially expanding
     /// document is refused as soon as the total passes `alias_budget`.
+    ///
+    /// Every failure here is a plain node past the ceiling, so the message says
+    /// so: the alias path pre-checks the same arithmetic before it clones, and
+    /// therefore never reaches this check.
     #[allow(clippy::too_many_arguments)] // (node, anchor, size, contribution, mark)
     fn insert(
         &mut self,
@@ -577,7 +602,7 @@ impl YamlReceiver {
         if self.expanded_nodes > self.alias_budget {
             return Err(yaml_rust2::scanner::ScanError::new_string(
                 mark,
-                over_budget_message(contribution, self.alias_budget),
+                over_budget_message(false, self.alias_budget),
             ));
         }
         // Valid anchor ids start at 1, as in `YamlLoader`.
@@ -2028,10 +2053,10 @@ mod yaml_scalar_rule_tests {
         }
     }
 
-    /// The proportional rule alone is not a memory bound: inert bytes inflate it,
-    /// so a padded alias bomb would be allowed millions of nodes. The absolute
-    /// ceiling is what bounds the expanded tree, and it must not let a large
-    /// input raise the allowance above it.
+    /// The proportional rule alone is not a bound on the tree: inert bytes
+    /// inflate it, so a padded alias bomb would be allowed millions of nodes.
+    /// The absolute ceiling is what bounds the expanded node count, and it must
+    /// not let a large input raise the allowance above it.
     #[test]
     fn the_expansion_budget_is_clamped_to_an_absolute_ceiling() {
         assert_eq!(YamlReceiver::new(1_048_576).alias_budget, 400_000);
@@ -2043,17 +2068,79 @@ mod yaml_scalar_rule_tests {
         assert_eq!(YamlReceiver::new(2_000).alias_budget, 200_000);
     }
 
-    /// An alias clone is a bomb; a plain node at the ceiling is just a big
-    /// document. The two must not share an error message.
+    /// An alias bomb and a large honest document must not share an error
+    /// message. The cause is what the caller knows, not the size of the charge:
+    /// an alias of a scalar is charged exactly one node, like a plain scalar.
     #[test]
     fn over_budget_messages_name_the_right_cause() {
         assert_eq!(
-            over_budget_message(2, 400_000),
+            over_budget_message(true, 400_000),
             "alias expansion limit exceeded"
         );
         assert_eq!(
-            over_budget_message(1, 400_000),
+            over_budget_message(false, 400_000),
             "document exceeds the node limit (400000 nodes)"
         );
+    }
+
+    /// A real parse, kept only for the marker it hands back.
+    struct FirstMarker(Option<yaml_rust2::scanner::Marker>);
+
+    impl yaml_rust2::parser::MarkedEventReceiver for FirstMarker {
+        fn on_event(
+            &mut self,
+            _event: yaml_rust2::parser::Event,
+            mark: yaml_rust2::scanner::Marker,
+        ) {
+            self.0.get_or_insert(mark);
+        }
+    }
+
+    /// A scalar alias is charged **one** node per copy, so "the charge is bigger
+    /// than one" does not identify an alias: a document that re-expands a
+    /// one-character scalar hundreds of thousands of times is a pure alias bomb,
+    /// yet it used to be reported as a large but honest document. The receiver is
+    /// driven by hand because the real budget floors at `100_000` nodes, which a
+    /// one-node alias cannot reach from an input small enough for the suite.
+    #[test]
+    fn a_scalar_alias_past_the_budget_reports_the_alias_limit() {
+        let mut sink = FirstMarker(None);
+        yaml_rust2::parser::Parser::new_from_str("x\n")
+            .load(&mut sink, false)
+            .expect("the probe document parses");
+        let mark = sink.0.expect("the probe document emits an event");
+
+        let mut receiver = YamlReceiver {
+            alias_budget: 3,
+            ..YamlReceiver::default()
+        };
+        let anchored = |text: &str, aid: usize| {
+            yaml_rust2::parser::Event::Scalar(
+                text.to_string(),
+                yaml_rust2::scanner::TScalarStyle::Plain,
+                aid,
+                None,
+            )
+        };
+        receiver
+            .handle(yaml_rust2::parser::Event::SequenceStart(0, None), mark)
+            .expect("a sequence starts");
+        receiver
+            .handle(anchored("s", 1), mark)
+            .expect("the anchored scalar fits");
+        for _ in 0..2 {
+            receiver
+                .handle(yaml_rust2::parser::Event::Alias(1), mark)
+                .expect("an alias inside the three-node budget");
+        }
+        let error = receiver
+            .handle(yaml_rust2::parser::Event::Alias(1), mark)
+            .expect_err("the third alias passes the three-node budget");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("alias expansion limit exceeded"),
+            "{message}"
+        );
+        assert!(!message.contains("node limit"), "{message}");
     }
 }
