@@ -72,8 +72,8 @@ frp-client/src/control.rs	39	42	3662ccabe5670d2a	2494981b307ace60	absolute	frp-c
 frp-client/src/control.rs	401	403	3662ccabe5670d2a	3662ccabe5670d2a	shorthand	frp-client/tests/end_to_end.rs	:401-403	119
 frp-client/src/control.rs	429	431	3662ccabe5670d2a	3662ccabe5670d2a	shorthand	frp-client/tests/end_to_end.rs	:429-431	119
 frp-client/src/control.rs	478	486	912c6b6c23231b18	c04909fdc279fec6	absolute	frp-core/tests/v2_handshake_round14.rs	control.rs:478-486	74
-frp-client/src/plugin/mod.rs	276	-	2c9ec9c2f0b207a8	-	absolute	docs/developing.md	frp-client/src/plugin/mod.rs:276	909
-frp-client/src/plugin/mod.rs	333	-	70559f5f0108134d	-	absolute	docs/developing.md	frp-client/src/plugin/mod.rs:333	4029
+frp-client/src/plugin/mod.rs	294	-	2c9ec9c2f0b207a8	-	absolute	docs/developing.md	frp-client/src/plugin/mod.rs:294	909
+frp-client/src/plugin/mod.rs	351	-	70559f5f0108134d	-	absolute	docs/developing.md	frp-client/src/plugin/mod.rs:351	4029
 frp-client/src/proxy.rs	154	161	4785904c85d0c9d1	d10b36aa74a59bcf	absolute	frp-client/tests/round14_proxy_msg.rs	proxy.rs:154-161	68
 frp-client/src/proxy.rs	94	-	7f127ce02dd0360a	-	absolute	docs/developing.md	frp-client/src/proxy.rs:94	473
 frp-client/src/reload.rs	30	-	7208f09fa5696ef8	-	absolute	frp-client/tests/token_source_single_exec.rs	frp-client/src/reload.rs:30	43
