@@ -147,7 +147,7 @@ a review must refuse to accept — is in
 
 ## Current Health
 
-**Last verified: 2026-09-17 at `89951ae`.** Round-by-round history is in
+**Last verified: 2026-10-13 at `39087f85`.** Round-by-round history is in
 [`docs/history/development-log.md`](docs/history/development-log.md).
 
 Countable figures are **generated, not hand-maintained** — run
