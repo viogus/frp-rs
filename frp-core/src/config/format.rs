@@ -447,11 +447,11 @@ impl YamlReceiver {
     /// input and an alias deep-copies the whole string, while the charge is one
     /// node per alias whatever the string's length — so a single large scalar
     /// anchor re-expanded a few thousand times stays far below `400_000` nodes
-    /// and still costs gigabytes (measured 2.2–7.9 GB peak RSS on 125 KiB–1 MiB
-    /// crafted inputs; the previous reader costs 1.3–4.0 GB and Go's own config
-    /// path 8.4 GB on the same file). That residual is pre-existing, is not a
-    /// Go-parity divergence, and is registered as debt in `TODO.md` rather than
-    /// fixed here.
+    /// and still costs gigabytes (measured at this head 3.2–7.5 GB peak RSS on
+    /// 125 KiB–1 MiB crafted inputs, 2.2–7.9 GB across builds; the previous
+    /// reader costs 1.3–4.0 GB and Go's own config path 8.4 GB on the same
+    /// file). That residual is pre-existing, is not a Go-parity divergence, and
+    /// is registered as debt in `TODO.md` rather than fixed here.
     ///
     /// The proportional part mirrors `yaml.v2`'s `allowedAliasRatio`
     /// (`max(100_000, input.len() * 100)`), but a ratio on its own buys an
