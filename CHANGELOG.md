@@ -197,7 +197,13 @@ User-facing release notes for frp-rs.
   (`metadatas: {\n\tk: v\n}` → `tabs disallowed within this context (block indentation)`), and a
   multi-line flow collection whose continuation is unindented (`x: [1,\n2]` → `invalid indentation
   in flow construct`) — re-indent the continuation or quote/convert the flow collection to block
-  style. Full divergence register: `TODO.md` and the `format.rs` doc comments.
+  style. An alias bomb is refused too: the reader budgets the expanded tree at `input.len() * 100`
+  nodes clamped to `100_000 ..= 400_000` and refuses the expansion (`alias expansion limit
+  exceeded`) before cloning the subtree, so padding the file with inert bytes cannot buy an
+  allowance — a 1 MiB padded 40-level bomb that would otherwise reach ~12 GB is now refused in
+  ~0.05 s at ~48 MB peak RSS. A document that *honestly* exceeds the ceiling (roughly 200 000
+  mapping entries, far beyond any real config) reports `document exceeds the node limit`. Full
+  divergence register: `TODO.md` and the `format.rs` doc comments.
 - **`quinn-proto` moves 0.11.17 → 0.11.18 for RUSTSEC-2026-0338, RUSTSEC-2026-0340 and
   RUSTSEC-2026-0343** (all three carry `patched = >=0.11.18`, and the version they were
   reported against was the only affected dependency in the tree), so QUIC builds pick up the

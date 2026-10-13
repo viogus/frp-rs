@@ -4345,9 +4345,10 @@ fn parse_yaml(yaml: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
 /// Measured before the fix: 22 levels took 15.9 s and 2,565,636,096 B peak RSS,
 /// 26 levels did not finish in 60 s. Go rejects the same shape in 0.08 s
 /// ("document contains excessive aliasing") and the previous reader in 0.07 s
-/// ("repetition limit exceeded"). The budget is `max(100_000, input.len()*100)`
-/// nodes, and the check runs **before** the subtree is cloned, so the test
-/// asserts the error without ever materialising the expanded tree.
+/// ("repetition limit exceeded"). The budget is `input.len()*100` clamped into
+/// `100_000 ..= 400_000` nodes, and the check runs **before** the subtree is
+/// cloned, so the test asserts the error without ever materialising the
+/// expanded tree.
 #[test]
 fn test_yaml_alias_expansion_is_bounded() {
     let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
@@ -4381,6 +4382,66 @@ fn test_yaml_alias_expansion_is_bounded() {
         linear.push_str(&format!("m{level}: &a{level} [*a{}]\n", level - 1));
     }
     parse_yaml(&linear).expect("linear alias reuse stays within the budget");
+}
+
+/// Padding a tiny alias bomb with inert bytes must not buy it an allowance.
+///
+/// Before the absolute ceiling the budget was purely `input.len() * 100`, so a
+/// 100 KB file was allowed ten million nodes and this shape expanded to ~1.2 GB
+/// before it was refused. The ceiling is what refuses it: the padding raises the
+/// proportional allowance but not the cap, so the bomb dies as soon as the
+/// doubling tries to cross `400_000` nodes.
+#[test]
+fn test_yaml_padded_alias_bomb_is_bounded() {
+    let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
+    for level in 1..=40 {
+        source.push_str(&format!(
+            "m{level}: &a{level} [*a{}, *a{}]\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    let mut filler = 0usize;
+    while source.len() < 100_000 {
+        source.push_str(&format!("inert{filler}: 1\n"));
+        filler += 1;
+    }
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("the padded bomb must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("alias expansion limit exceeded"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the padded bomb must be refused fast, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A document that is simply bigger than the absolute node ceiling is reported
+/// as a large document, not as an alias bomb. 400,010 one-token flow scalars is
+/// the cheapest input that crosses `400_000` nodes; the message must be the
+/// node-limit one, and it must arrive without materialising gigabytes.
+#[test]
+fn test_yaml_node_ceiling_reports_a_node_limit() {
+    let body = "1,".repeat(400_010);
+    let source = format!("k: [{body}]\n");
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("a document past the ceiling is refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("document exceeds the node limit (400000 nodes)"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the ceiling must be reached promptly, took {:?}",
+        started.elapsed()
+    );
 }
 
 /// The duplicate-key check is a set lookup, not a scan of the entries so far:

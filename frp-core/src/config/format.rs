@@ -149,11 +149,19 @@ fn json_to_toml(v: serde_json::Value) -> toml::Value {
 /// scanner reads as `invalid indentation in flow construct` — while the
 /// tab-continued form is accepted.
 ///
+/// One more loud refusal is new here and not shared with Go: a document that
+/// expands past `400_000` nodes is refused (`document exceeds the node limit`),
+/// and so is an alias expansion past the same per-document budget. That is far
+/// beyond any real config — roughly 200 000 mapping entries — and it is what
+/// bounds worst-case memory when an alias bomb is padded with inert bytes; Go
+/// bounds the same shape with `allowedAliasRatio`.
+///
 /// # Errors
 ///
 /// `YAML parse error: …` for malformed input, a duplicate mapping key, more than
 /// one document, a tab used for indentation, a `...` without a document, an
-/// unresolvable alias, an alias expansion past the size budget, or an explicitly
+/// unresolvable alias, an alias expansion or a document past the node budget
+/// (`YamlReceiver::new`), or an explicitly
 /// tagged scalar (`!!int`) whose body does not match its tag; `YAML merge key
 /// (``<<``) error: …` for a merge key whose value is not a mapping or a sequence
 /// of mappings.
@@ -403,17 +411,39 @@ impl yaml_rust2::parser::MarkedEventReceiver for YamlReceiver {
     }
 }
 
+/// The error message for an insertion that pushed the node count past `budget`.
+///
+/// An alias clone is charged for the whole subtree it copies (`contribution > 1`),
+/// so tripping the budget that way is an alias bomb. A plain node is charged one,
+/// so the document itself is past the absolute ceiling — a large but honest
+/// config, which must not be reported as an alias bomb.
+fn over_budget_message(contribution: usize, budget: usize) -> String {
+    if contribution > 1 {
+        "alias expansion limit exceeded".to_string()
+    } else {
+        format!("document exceeds the node limit ({budget} nodes)")
+    }
+}
+
 impl YamlReceiver {
-    /// A receiver whose alias-expansion budget is derived from the input size.
+    /// A receiver whose expansion budget is derived from the input size and then
+    /// clamped to an absolute ceiling.
     ///
-    /// The bound mirrors `yaml.v2`'s `allowedAliasRatio`: a document may expand
-    /// to at most `max(100_000, input.len() * 100)` nodes. A node costs at least
-    /// one input byte, so 100× cannot reject a document that was written out in
-    /// full, while the exponential alias bomb is refused in milliseconds instead
-    /// of allocating gigabytes.
+    /// The proportional part mirrors `yaml.v2`'s `allowedAliasRatio`
+    /// (`max(100_000, input.len() * 100)`), but a ratio on its own is **not** a
+    /// memory bound: comments, blank lines, `%` directives and a legitimately
+    /// large config are inert bytes that inflate the allowance without adding a
+    /// single node, so padding a tiny alias bomb out to 1 MiB would buy it a
+    /// 100-million-node allowance (measured: 5.42 s / 12.1 GB peak RSS).
+    ///
+    /// The absolute ceiling is what actually bounds the worst case: whatever the
+    /// padding claims, the expanded tree may not pass
+    /// `input.len() * 100` clamped into `100_000 ..= 400_000` nodes — tens of MB
+    /// at the ~120 B/node measured, not gigabytes. `400_000` is the order of
+    /// magnitude of Go's `alias_ratio_range_low`.
     fn new(input_len: usize) -> Self {
         Self {
-            alias_budget: input_len.saturating_mul(100).max(100_000),
+            alias_budget: input_len.saturating_mul(100).clamp(100_000, 400_000),
             ..Self::default()
         }
     }
@@ -501,7 +531,7 @@ impl YamlReceiver {
                     if self.expanded_nodes.saturating_add(*size) > self.alias_budget {
                         return Err(yaml_rust2::scanner::ScanError::new_string(
                             mark,
-                            "alias expansion limit exceeded".to_string(),
+                            over_budget_message(*size, self.alias_budget),
                         ));
                     }
                     let (node, size) = (node.clone(), *size);
@@ -547,7 +577,7 @@ impl YamlReceiver {
         if self.expanded_nodes > self.alias_budget {
             return Err(yaml_rust2::scanner::ScanError::new_string(
                 mark,
-                "alias expansion limit exceeded".to_string(),
+                over_budget_message(contribution, self.alias_budget),
             ));
         }
         // Valid anchor ids start at 1, as in `YamlLoader`.
@@ -1996,5 +2026,34 @@ mod yaml_scalar_rule_tests {
         for source in ["", "a: 1\n", "...foo\n", "a: \n"] {
             assert!(!yaml_has_document_end_marker(source), "{source:?}");
         }
+    }
+
+    /// The proportional rule alone is not a memory bound: inert bytes inflate it,
+    /// so a padded alias bomb would be allowed millions of nodes. The absolute
+    /// ceiling is what bounds the expanded tree, and it must not let a large
+    /// input raise the allowance above it.
+    #[test]
+    fn the_expansion_budget_is_clamped_to_an_absolute_ceiling() {
+        assert_eq!(YamlReceiver::new(1_048_576).alias_budget, 400_000);
+        assert_eq!(YamlReceiver::new(4_000).alias_budget, 400_000);
+        assert_eq!(YamlReceiver::new(892).alias_budget, 100_000);
+        assert_eq!(YamlReceiver::new(0).alias_budget, 100_000);
+        // Below the ceiling the ratio still applies, so a genuinely large
+        // document is not refused for being large while it is still honest.
+        assert_eq!(YamlReceiver::new(2_000).alias_budget, 200_000);
+    }
+
+    /// An alias clone is a bomb; a plain node at the ceiling is just a big
+    /// document. The two must not share an error message.
+    #[test]
+    fn over_budget_messages_name_the_right_cause() {
+        assert_eq!(
+            over_budget_message(2, 400_000),
+            "alias expansion limit exceeded"
+        );
+        assert_eq!(
+            over_budget_message(1, 400_000),
+            "document exceeds the node limit (400000 nodes)"
+        );
     }
 }
