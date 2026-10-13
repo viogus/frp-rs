@@ -906,7 +906,7 @@ mechanism.
 The surface is much smaller than a proxy type's, and unlike a proxy type it has
 **no config allow-list at all**:
 
-- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:276`) is the only
+- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:294`) is the only
   dispatcher. It matches `plugin_cfg.plugin_type.as_str()` and returns
   `Err(frp_core::Error::Config("unknown plugin type: <name>"))` for anything it
   does not know — at *runtime*, when frpc starts the plugin, not at config load.
@@ -4026,7 +4026,7 @@ is default-on (`frp-server/Cargo.toml:46`). The `http-proxy` feature is
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
-of its own (`frp-client/src/plugin/mod.rs:333`), so it follows the opt-in
+of its own (`frp-client/src/plugin/mod.rs:351`), so it follows the opt-in
 `vnet` tier: it is named in the Opt-in row above and is the one client plugin
 not counted in Keep.
 
