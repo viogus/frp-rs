@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=0cbf09cac68d561c7e2f688f684f4763daf7c441505b3c099b22d4e4a80f9386
+          guard_data_pin=b4eac560a61a9b8e48e2c1575113ebb72f3ddbf9cab913092805cbaea81d65bd
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -4505,13 +4505,11 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: cargo audit (dependency vulnerability scan)
         # RUSTSEC-2026-0194/0195 (quick-xml via the opt-in pprof profiling
-        # path), RUSTSEC-2023-0071 (rsa Marvin sidechannel, unreachable —
-        # frp-rs only verifies RSA signatures, never private-key ops) and
-        # RUSTSEC-2024-0449 (unsafe-libyaml unmaintained, no patched version
-        # exists — operator-supplied config only) are documented pre-existing
-        # issues with no upstream fix. Full rationale in CLAUDE.md
-        # "Security audit" and deny.toml [advisories].
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0449
+        # path) and RUSTSEC-2023-0071 (rsa Marvin sidechannel, unreachable —
+        # frp-rs only verifies RSA signatures, never private-key ops) are
+        # documented pre-existing issues with no upstream fix. Full rationale
+        # in CLAUDE.md "Security audit" and deny.toml [advisories].
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071
       - name: cargo deny check (advisories + licenses + bans + sources)
         # --all-features so the graph matches Cargo.lock (which cargo audit
         # scans): opt-in deps like pprof -> inferno -> quick-xml are otherwise

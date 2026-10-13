@@ -10,11 +10,18 @@ repository = "https://github.com/viogus/frp-rs"
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# YAML config support; justification recorded at the workspace dependency
-# ([workspace.dependencies].serde_yaml_ng). Non-optional because config
-# loading is compiled into both frps and frpc (+~250KB to each release
-# binary).
-serde_yaml_ng.workspace = true
+# YAML config support. The full justification (why a YAML parser is needed, the
+# rejected alternatives with their measured cost, and the lock delta) is recorded
+# at the workspace dependency, `[workspace.dependencies].yaml-rust2`.
+#
+# Non-optional because config loading is compiled into both frps and frpc, so
+# every release tier carries it. Measured on this host (macOS arm64, rustc 1.98.0,
+# the declared release profile: fat LTO, opt-level=z, strip=symbols,
+# panic=abort) against the pre-migration baseline at `1357b7dc`
+# (frps 5,428,304 B / frpc 4,428,432 B): frps 5,411,568 B and frpc 4,411,648 B,
+# i.e. -16,736 B (-0.308 %) and -16,784 B (-0.379 %). The swap is therefore
+# size-neutral-or-smaller, not the ~+250 KB the previous YAML dependency cost.
+yaml-rust2.workspace = true
 bpaf.workspace = true
 toml.workspace = true
 anyhow.workspace = true

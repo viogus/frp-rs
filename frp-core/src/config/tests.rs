@@ -4330,6 +4330,841 @@ proxies:
     assert_eq!(merged.remote_port, 7001);
 }
 
+// ─── YAML parser fidelity rows (yaml-rust2 swap) ─────────────────────────
+
+/// Parse a YAML document through the format layer only, so a row can pin the
+/// parser's own behaviour without the config defaults in the way.
+fn parse_yaml(yaml: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
+    super::format::parse_to_toml_value(yaml, super::format::ConfigFormat::Yaml)
+}
+
+/// A "billion laughs" alias document must be refused by the expansion budget,
+/// not expanded. The document is generated, so growth is exponential in the
+/// number of levels while the input stays tiny.
+///
+/// Measured before the fix: 22 levels took 15.9 s and 2,565,636,096 B peak RSS,
+/// 26 levels did not finish in 60 s. Go rejects the same shape in 0.08 s
+/// ("document contains excessive aliasing") and the previous reader in 0.07 s
+/// ("repetition limit exceeded"). The budget is 100× the input byte length,
+/// clamped into `100_000 ..= 400_000` nodes, and the check runs **before** the
+/// subtree is cloned, so the test asserts the error without ever materialising
+/// the expanded tree.
+#[test]
+fn test_yaml_alias_expansion_is_bounded() {
+    let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
+    for level in 1..=40 {
+        source.push_str(&format!(
+            "m{level}: &a{level} [*a{}, *a{}]\n",
+            level - 1,
+            level - 1
+        ));
+    }
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("the alias bomb must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("alias expansion limit exceeded"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the bomb must be refused fast, took {:?}",
+        started.elapsed()
+    );
+
+    // The budget only bites on exponential expansion: a small document that
+    // reuses one anchor a few times is still accepted, and so is the same
+    // 40-level shape when each level references the previous one only once
+    // (linear growth stays under `100_000`).
+    let mut linear = String::from("serverAddr: &a0 127.0.0.1\n");
+    for level in 1..=40 {
+        linear.push_str(&format!("m{level}: &a{level} [*a{}]\n", level - 1));
+    }
+    parse_yaml(&linear).expect("linear alias reuse stays within the budget");
+}
+
+/// Padding a tiny alias bomb with inert bytes must not buy it an allowance.
+///
+/// Before the absolute ceiling the budget was purely 100× the input byte
+/// length, so a 100 KB file was allowed ten million nodes and this shape
+/// expanded to ~1.2 GB before it was refused. The ceiling is what refuses it:
+/// the padding raises the proportional allowance but not the cap, so the bomb
+/// dies as soon as the doubling tries to cross `400_000` nodes.
+#[test]
+fn test_yaml_padded_alias_bomb_is_bounded() {
+    let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
+    for level in 1..=40 {
+        source.push_str(&format!(
+            "m{level}: &a{level} [*a{}, *a{}]\n",
+            level - 1,
+            level - 1
+        ));
+    }
+    let mut filler = 0usize;
+    while source.len() < 100_000 {
+        source.push_str(&format!("inert{filler}: 1\n"));
+        filler += 1;
+    }
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("the padded bomb must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("alias expansion limit exceeded"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the padded bomb must be refused fast, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A document that is simply bigger than the absolute node ceiling is reported
+/// as a large document, not as an alias bomb. 400,010 one-token flow scalars is
+/// the cheapest input that crosses `400_000` nodes; the message must be the
+/// node-limit one, and it must arrive without materialising gigabytes.
+#[test]
+fn test_yaml_node_ceiling_reports_a_node_limit() {
+    let body = "1,".repeat(400_010);
+    let source = format!("k: [{body}]\n");
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("a document past the ceiling is refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("document exceeds the node limit (400000 nodes)"),
+        "unexpected error: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the ceiling must be reached promptly, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// The duplicate-key check is a set lookup, not a scan of the entries so far:
+/// 20k keys took 8.51 s before the fix (the previous reader: 0.24 s) and the
+/// cost is quadratic. This pins both the speed and the error semantics.
+#[test]
+fn test_yaml_many_keys_are_checked_in_linear_time() {
+    let mut source = String::new();
+    for key in 0..20_000 {
+        source.push_str(&format!("key{key}: {key}\n"));
+    }
+
+    let started = std::time::Instant::now();
+    let value = parse_yaml(&source).expect("20k distinct keys parse");
+    let elapsed = started.elapsed();
+    assert_eq!(value.as_table().map(toml::value::Table::len), Some(20_000));
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "20k keys must not be quadratic, took {elapsed:?}"
+    );
+
+    // The set must not make the duplicate error any less precise, and it must
+    // not collapse two *different* keys that render the same way.
+    let mut duplicate = source.clone();
+    duplicate.push_str("key0: 1\n");
+    let error = parse_yaml(&duplicate).expect_err("a duplicate key is still an error");
+    assert!(
+        format!("{error:#}").contains(r#"duplicate entry with key "key0""#),
+        "unexpected error: {error:#}"
+    );
+}
+
+/// The recorded removal contract for RUSTSEC-2024-0449 requires the parser swap
+/// to implement the documented YAML 1.1 boolean behaviour rather than preserve
+/// the previous string behaviour, because that behaviour is exactly what the
+/// item removes. Every row here failed before the swap with
+/// `invalid type: string "no", expected a boolean`.
+#[test]
+fn test_yaml_1_1_booleans_apply_to_a_bool_field() {
+    for (spelling, expected) in [
+        ("y", true),
+        ("Y", true),
+        ("yes", true),
+        ("Yes", true),
+        ("YES", true),
+        ("true", true),
+        ("True", true),
+        ("TRUE", true),
+        ("on", true),
+        ("On", true),
+        ("ON", true),
+        ("n", false),
+        ("N", false),
+        ("no", false),
+        ("No", false),
+        ("NO", false),
+        ("false", false),
+        ("False", false),
+        ("FALSE", false),
+        ("off", false),
+        ("Off", false),
+        ("OFF", false),
+    ] {
+        let yaml = format!("server_addr: \"127.0.0.1\"\nserver_port: 7000\ntcp_mux: {spelling}\n");
+        let cfg = load_client_config_from_yaml(&yaml)
+            .unwrap_or_else(|e| panic!("tcp_mux: {spelling} should be a boolean, got: {e}"));
+        assert_eq!(cfg.tcp_mux, expected, "tcp_mux: {spelling}");
+    }
+}
+
+/// The other half of the 1.1 contract: quoting opts out, and the loader's own
+/// resolution is untouched. A quoted or block scalar is never re-typed.
+#[test]
+fn test_yaml_quoted_and_block_scalars_are_never_retyped() {
+    let value = parse_yaml(
+        r#"
+quoted_yes: "yes"
+quoted_017: "017"
+block_017: |
+  017
+quoted_bool: "true"
+plain_bool: true
+"#,
+    )
+    .unwrap();
+    for key in ["quoted_yes", "quoted_017", "quoted_bool"] {
+        assert!(
+            value.get(key).and_then(toml::Value::as_str).is_some(),
+            "{key} must stay a string"
+        );
+    }
+    assert_eq!(
+        value.get("quoted_yes").and_then(toml::Value::as_str),
+        Some("yes")
+    );
+    assert_eq!(
+        value.get("quoted_017").and_then(toml::Value::as_str),
+        Some("017")
+    );
+    assert_eq!(
+        value
+            .get("block_017")
+            .and_then(toml::Value::as_str)
+            .map(str::trim),
+        Some("017")
+    );
+    assert_eq!(
+        value.get("plain_bool").and_then(toml::Value::as_bool),
+        Some(true)
+    );
+}
+
+/// CHANGE: a plain number resolves exactly as Go frp's own YAML reader does
+/// (`gopkg.in/yaml.v2` v2.4.0: `strconv.ParseInt(plain, 0, 64)` after removing
+/// every `_`), so a leading-zero body is **octal** — `017` is 15, not 17 — and
+/// `0b101` is binary. Every expected value below was measured against the Go frp
+/// v0.71.0 binary through `serverPort` (see the parity contract); the previous
+/// reader returned the *string* `"017"` for the first row and 5 for `0b101`.
+#[test]
+fn test_yaml_plain_numbers_resolve_like_go() {
+    let value = parse_yaml(
+        r#"
+leading_zero: 017
+negative_leading_zero: -017
+signed_leading_zero: +017
+padded: 007
+padded_large: 07000
+padded_max: 07777
+double_zero: 00
+triple_zero: 000
+underscore: 1_000
+underscores_everywhere: 7_9_1_1
+signed_decimal: +7911
+hex: 0x115c
+octal_prefix: 0o17
+invalid_octal: 008
+invalid_octal_large: 080000
+float_fallback: 09999
+binary: 0b101
+binary_zero: 0b0
+integral_real: 7777.0
+exponent_real: 1e3
+"#,
+    )
+    .unwrap();
+    for (key, expected) in [
+        ("leading_zero", 15),
+        ("negative_leading_zero", -15),
+        ("signed_leading_zero", 15),
+        ("padded", 7),
+        ("padded_large", 3584),
+        ("padded_max", 4095),
+        ("double_zero", 0),
+        ("triple_zero", 0),
+        ("underscore", 1000),
+        ("underscores_everywhere", 7911),
+        ("signed_decimal", 7911),
+        ("hex", 4444),
+        ("octal_prefix", 15),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_integer),
+            Some(expected),
+            "{key}"
+        );
+    }
+    // Not integers for Go, but not strings either: the invalid octal falls
+    // through to the float rule, and `json.Marshal` renders an integral float
+    // without a fraction, so an integer field accepts all of these.
+    for (key, expected) in [
+        ("invalid_octal", 8),
+        ("invalid_octal_large", 80000),
+        ("float_fallback", 9999),
+        ("binary", 5),
+        ("binary_zero", 0),
+        ("integral_real", 7777),
+        ("exponent_real", 1000),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_integer),
+            Some(expected),
+            "{key}"
+        );
+    }
+}
+
+/// Go's resolver picks the numeric branch with `resolveTable[in[0]]`, and `'_'`
+/// is not one of its starts, so an underscore-prefixed scalar stays a string
+/// there. Removing the underscores *before* that first-byte check retyped both
+/// directions: `server_port: _100` silently bound port 100 (Go: `cannot
+/// unmarshal string into int`) and `name: _1` became `invalid type: integer 1,
+/// expected a string` (Go: the string `_1`).
+#[test]
+fn test_yaml_underscore_prefixed_numbers_are_strings() {
+    let error = load_client_config_from_yaml("server_addr: 127.0.0.1\nserver_port: _100\n")
+        .expect_err("`_100` is a string for Go, so it cannot bind a port");
+    assert!(
+        format!("{error:#}").contains("_100"),
+        "the error must name the offending text: {error:#}"
+    );
+
+    for body in ["_100", "_1", "__1", "_0x10", "_1.5"] {
+        let value = parse_yaml(&format!("k: {body}\n")).unwrap();
+        assert_eq!(
+            value.get("k").and_then(toml::Value::as_str),
+            Some(body),
+            "{body:?} must stay the string it was written as"
+        );
+    }
+
+    // A sign *does* enter Go's numeric branch, and the `_` is then removed.
+    let value = parse_yaml("k: +_100\n").unwrap();
+    assert_eq!(value.get("k").and_then(toml::Value::as_integer), Some(100));
+}
+
+/// The scalars that are *not* numbers for Go and must stay strings: a timestamp,
+/// a clock time, an overflowing float (Go's `ParseFloat` fails on `1e1000`, so
+/// the text is kept), a bare integer prefix, and a mixed-case boolean word.
+#[test]
+fn test_yaml_non_numeric_scalars_stay_strings() {
+    let value = parse_yaml(
+        r#"
+date: 2001-12-14
+clock: 1:30
+overflow: 1e1000
+bare_hex: 0x
+bare_binary: 0b
+mixed_case_bool: nO
+"#,
+    )
+    .unwrap();
+    for (key, expected) in [
+        ("date", "2001-12-14"),
+        ("clock", "1:30"),
+        ("overflow", "1e1000"),
+        ("bare_hex", "0x"),
+        ("bare_binary", "0b"),
+        ("mixed_case_bool", "nO"),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_str),
+            Some(expected),
+            "{key}"
+        );
+    }
+}
+/// A duplicated key used to keep the last value silently; it is now a loud parse
+/// error. This is **not** a change against the previous `serde_yaml_ng` reader,
+/// which also errored (`YAML parse error: metadatas: duplicate entry with key
+/// "a"`); the divergence that remains is against Go, which keeps the last value.
+#[test]
+fn test_yaml_duplicate_key_is_an_error() {
+    let err = parse_yaml("a: 1\na: 2\n").expect_err("duplicate key must be refused");
+    let message = err.to_string();
+    assert!(
+        message.starts_with("YAML parse error:"),
+        "prefix kept: {message}"
+    );
+    assert!(
+        message.contains("duplicate entry with key \"a\""),
+        "{message}"
+    );
+    assert!(message.contains("line 2"), "position reported: {message}");
+}
+
+/// CHANGE-3: the previous reader rejected a second document
+/// (`deserializing from YAML containing more than one document is not
+/// supported`), and the loader underneath now returns every document, so the
+/// rejection is preserved explicitly.
+#[test]
+fn test_yaml_multiple_documents_are_an_error() {
+    let err = parse_yaml("---\na: 1\n---\nb: 2\n").expect_err("multiple documents refused");
+    let message = err.to_string();
+    assert!(
+        message.starts_with("YAML parse error:"),
+        "prefix kept: {message}"
+    );
+    assert!(
+        message.contains("more than one document is not supported"),
+        "{message}"
+    );
+}
+
+/// A non-finite real has no JSON/TOML representation, so it falls back to the
+/// canonical scalar text (`.inf`, `-.inf`, `.nan` — what the previous reader
+/// produced); a typed numeric field then fails loudly instead of silently
+/// reading null. Go fails to marshal these at all.
+#[test]
+fn test_yaml_non_finite_floats_fall_back_to_raw_text() {
+    let value =
+        parse_yaml("a: .inf\nb: -.inf\nc: .nan\nd: .Inf\ne: +.INF\nf: -.nan\ng: !!float .NaN\n")
+            .unwrap();
+    for (key, expected) in [
+        ("a", ".inf"),
+        ("b", "-.inf"),
+        ("c", ".nan"),
+        ("d", ".inf"),
+        ("e", ".inf"),
+        // Neither reader resolves a signed NaN spelling, so it stays as written.
+        ("f", "-.nan"),
+        ("g", ".nan"),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_str),
+            Some(expected),
+            "{key}"
+        );
+    }
+}
+/// YAML keys may be any scalar; the JSON/TOML key is their rendered text. Reals
+/// render the way the previous reader's `serde_json::Number` did (`1e1` →
+/// `10.0`), while integers, booleans and nulls render from their resolved value
+/// (so `017` becomes the key `15`, Go's reading).
+#[test]
+fn test_yaml_non_string_keys_are_rendered() {
+    let value = parse_yaml(
+        "1: one\ntrue: bool-key\n~: null-key\n1.50: real-key\n1e1: exponent-key\n\
+         1E3: upper-key\n017: octal-key\n.Inf: inf-key\n0b101: binary-key\n",
+    )
+    .unwrap();
+    for (key, expected) in [
+        ("1", "one"),
+        ("true", "bool-key"),
+        ("", "null-key"),
+        ("1.5", "real-key"),
+        ("10.0", "exponent-key"),
+        ("1000.0", "upper-key"),
+        ("15", "octal-key"),
+        (".inf", "inf-key"),
+        ("5", "binary-key"),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_str),
+            Some(expected),
+            "key {key:?}"
+        );
+    }
+}
+
+/// A bare `y` **key** is resolved by the same rules as a value (Go does the
+/// same), so it is renamed to `true`; quoting it keeps the name. This is the
+/// registered key-renaming change.
+#[test]
+fn test_yaml_bool_shaped_keys_are_renamed_unless_quoted() {
+    let value = parse_yaml("y: 1\n\"y\": 2\nn: 3\n\"n\": 4\n").unwrap();
+    assert_eq!(value.get("true").and_then(toml::Value::as_integer), Some(1));
+    assert_eq!(value.get("y").and_then(toml::Value::as_integer), Some(2));
+    assert_eq!(
+        value.get("false").and_then(toml::Value::as_integer),
+        Some(3)
+    );
+    assert_eq!(value.get("n").and_then(toml::Value::as_integer), Some(4));
+}
+/// Every null spelling Go resolves becomes null — an empty value, `~`, `null`,
+/// `Null` and `NULL` (the previous reader already resolved the last two to null
+/// as well, so this row is not a change against it). The TOML projection of
+/// null is an empty string.
+#[test]
+fn test_yaml_null_spellings_resolve_to_null() {
+    let value = parse_yaml("a:\nb: ~\nc: null\nd: Null\ne: NULL\n").unwrap();
+    for key in ["a", "b", "c", "d", "e"] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_str),
+            Some(""),
+            "{key}"
+        );
+    }
+}
+
+/// The tag decides first, whatever the written style: `!!str 017` is the string
+/// `017` while `!!int "017"` is 15 (both measured in Go). The core scalars whose
+/// body does not match their tag (`!!int notanint`) are errors rather than
+/// silently converted values, a non-core tag is dropped while the text is kept,
+/// and the remaining core tags **keep their text as written even when the body
+/// does not match the tag**: `!!binary` is not decoded and `!!timestamp` is not
+/// validated, so `!!timestamp garbage` is accepted here where Go rejects it
+/// (registered divergence, not a silent value change).
+#[test]
+fn test_yaml_tags_are_resolved_or_rejected() {
+    let value = parse_yaml(
+        r#"
+as_str: !!str 017
+as_int: !!int 017
+as_int_quoted: !!int "017"
+as_int_hex: !!int 0x10
+as_int_binary: !!int 0b101
+as_float: !!float 1.5
+as_float_int: !!float 017
+as_float_octal_010: !!float 010
+as_float_octal_0777: !!float 0777
+as_float_octal_015: !!float 015
+as_bool: !!bool yes
+as_bool_true: !!bool True
+as_null: !!null NULL
+as_null_empty: !!null ""
+custom: !Custom foo
+custom_number: !Custom 7000
+binary: !!binary aGk=
+timestamp: !!timestamp 2001-12-14
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        value.get("as_str").and_then(toml::Value::as_str),
+        Some("017")
+    );
+    for (key, expected) in [
+        ("as_int", 15),
+        ("as_int_quoted", 15),
+        ("as_int_hex", 16),
+        ("as_int_binary", 5),
+        // Go's `resolve` runs `ParseInt(plain, 0, 64)` before its float shape,
+        // so `!!float 017` is the legacy octal 15 (not 17); the integral float64
+        // then reaches an integer field as 15.
+        ("as_float_int", 15),
+        ("as_float_octal_010", 8),
+        ("as_float_octal_0777", 511),
+        ("as_float_octal_015", 13),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_integer),
+            Some(expected),
+            "{key}"
+        );
+    }
+    assert_eq!(
+        value.get("as_float").and_then(toml::Value::as_float),
+        Some(1.5)
+    );
+    for key in ["as_bool", "as_bool_true"] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_bool),
+            Some(true),
+            "{key}"
+        );
+    }
+    for key in ["as_null", "as_null_empty"] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_str),
+            Some(""),
+            "{key}"
+        );
+    }
+    for (key, expected) in [
+        ("custom", "foo"),
+        ("custom_number", "7000"),
+        ("binary", "aGk="),
+        ("timestamp", "2001-12-14"),
+    ] {
+        assert_eq!(
+            value.get(key).and_then(toml::Value::as_str),
+            Some(expected),
+            "{key}"
+        );
+    }
+
+    for bad in [
+        "a: !!int notanint\n",
+        "a: !!bool nO\n",
+        "a: !!null nope\n",
+        "a: !!float notanumber\n",
+    ] {
+        let err = parse_yaml(bad).expect_err("a tag/body mismatch must be refused");
+        let message = err.to_string();
+        assert!(message.starts_with("YAML parse error:"), "{message}");
+        assert!(message.contains("does not match its"), "{bad} -> {message}");
+    }
+}
+/// Anchors and aliases resolve; an alias naming no anchor is an error, never a
+/// silently dropped value.
+#[test]
+fn test_yaml_anchors_resolve_and_unknown_aliases_error() {
+    let value = parse_yaml("base: &b\n  x: 1\ncopy: *b\n").unwrap();
+    assert_eq!(
+        value
+            .get("copy")
+            .and_then(|v| v.get("x"))
+            .and_then(toml::Value::as_integer),
+        Some(1)
+    );
+
+    let err = parse_yaml("a: *nope\n").expect_err("an unknown anchor must be refused");
+    assert!(err.to_string().contains("unknown anchor"), "{err}");
+}
+
+/// Merge keys keep the YAML 1.1 `Value::apply_merge` semantics: for a sequence
+/// of mappings an EARLIER entry wins over a later one, while an explicitly
+/// written key wins over every merge source.
+#[test]
+fn test_yaml_merge_key_sequence_earlier_entry_wins() {
+    // NB: the keys are deliberately not bare `y`/`n`, which YAML 1.1 reads as
+    // booleans (see `test_yaml_1_1_booleans_apply_to_a_bool_field`).
+    let value = parse_yaml(
+        r#"
+a: &a
+  x: 1
+b: &b
+  x: 2
+  other: 9
+merged:
+  <<: [*a, *b]
+  z: 3
+"#,
+    )
+    .unwrap();
+    let merged = value.get("merged").expect("merged table");
+    assert_eq!(
+        merged.get("x").and_then(toml::Value::as_integer),
+        Some(1),
+        "earlier merge source wins"
+    );
+    assert_eq!(
+        merged.get("other").and_then(toml::Value::as_integer),
+        Some(9)
+    );
+    assert_eq!(merged.get("z").and_then(toml::Value::as_integer), Some(3));
+}
+
+/// An explicit key always beats the merge, and the `<<` key itself never
+/// survives into the parsed value.
+#[test]
+fn test_yaml_merge_key_explicit_key_wins() {
+    let value = parse_yaml(
+        r#"
+base: &base
+  x: 1
+  other: 2
+merged:
+  <<: *base
+  x: 5
+"#,
+    )
+    .unwrap();
+    let merged = value.get("merged").expect("merged table");
+    assert_eq!(merged.get("x").and_then(toml::Value::as_integer), Some(5));
+    assert_eq!(
+        merged.get("other").and_then(toml::Value::as_integer),
+        Some(2)
+    );
+    assert!(merged.get("<<").is_none(), "merge key must be consumed");
+}
+
+/// Merging anything that is not a mapping (or a sequence of mappings) is an
+/// error with the pre-existing prefix.
+#[test]
+fn test_yaml_merge_key_non_mapping_is_an_error() {
+    for yaml in ["merged:\n  <<: 5\n", "s: &s 5\nmerged:\n  <<: *s\n"] {
+        let err = parse_yaml(yaml).expect_err("a non-mapping merge must be refused");
+        let message = err.to_string();
+        assert!(
+            message.starts_with("YAML merge key (`<<`) error:"),
+            "prefix kept: {message}"
+        );
+    }
+}
+
+/// A quoted `"<<"` is an ordinary key, not the merge key: YAML 1.1 gives the
+/// merge type to the plain scalar only.
+#[test]
+fn test_yaml_quoted_merge_key_is_a_literal_key() {
+    let value = parse_yaml("merged:\n  \"<<\": 5\n").unwrap();
+    assert_eq!(
+        value
+            .get("merged")
+            .and_then(|v| v.get("<<"))
+            .and_then(toml::Value::as_integer),
+        Some(5)
+    );
+}
+
+/// A leading byte-order mark is stripped, as the previous reader did (and Go
+/// does); `yaml-rust2`'s scanner keeps it, which would rename the first key.
+#[test]
+fn test_yaml_leading_bom_is_stripped() {
+    let value = parse_yaml("\u{feff}server_addr: 127.0.0.1\n").unwrap();
+    assert_eq!(
+        value.get("server_addr").and_then(toml::Value::as_str),
+        Some("127.0.0.1")
+    );
+}
+
+/// A tab where indentation is required is an error, as it is in Go frp and was
+/// in the previous reader; `yaml-rust2` alone reads `\ta: 1` as the mapping
+/// `{a: 1}`, silently accepting a file both others reject.
+#[test]
+fn test_yaml_tab_indentation_is_an_error() {
+    for yaml in [
+        "\ta: 1\n",
+        " \ta: 1\n",
+        "- \ta: 1\n",
+        "a: 1\n \tb: 2\n",
+        "x: |\n  \tfoo\n",
+        "x: >\n  \tfoo\n",
+    ] {
+        let err = parse_yaml(yaml).expect_err("tab indentation must be refused");
+        let message = err.to_string();
+        assert!(message.starts_with("YAML parse error:"), "{message}");
+        assert!(
+            message.contains("tab character cannot be used for indentation"),
+            "{yaml:?} -> {message}"
+        );
+        assert!(message.contains("line "), "{message}");
+    }
+    // ...and accepted where Go accepts it: as separation inside a line, inside a
+    // flow collection, and after a block scalar's indentation is established.
+    for yaml in [
+        "a: \t1\n",
+        "x: [\t1, 2]\n",
+        "x: [1,\n\t2]\n",
+        // (Go also allows a tab on a continuation line of a flow mapping, but
+        // `yaml-rust2` refuses that shape on its own — a loud pre-existing
+        // rejection, registered in the change report, not a tab rule of ours.)
+        "x: |\n  a\n  \tb\n",
+    ] {
+        parse_yaml(yaml).unwrap_or_else(|e| panic!("{yaml:?} must parse, got: {e}"));
+    }
+}
+
+/// `...` with no document is refused, as the previous reader and Go do, while
+/// genuinely empty input (and a comment-only file) is null, and `...` after a
+/// document is fine.
+#[test]
+fn test_yaml_document_end_marker_needs_a_document() {
+    let err = parse_yaml("...\n").expect_err("a bare `...` must be refused");
+    assert!(
+        err.to_string()
+            .contains("did not find expected node content"),
+        "{err}"
+    );
+    let null = toml::Value::String(String::new());
+    assert_eq!(parse_yaml("").unwrap(), null);
+    assert_eq!(parse_yaml("# comment only\n").unwrap(), null);
+    assert_eq!(parse_yaml("%YAML 1.1\n---\n").unwrap(), null);
+    assert!(parse_yaml("a: 1\n...\n").is_ok(), "`...` after a document");
+}
+
+/// A merge source that itself has a `<<` contributes its *resolved* fields, so
+/// no `<<` key leaks into the merged mapping.
+#[test]
+fn test_yaml_nested_merge_sources_contribute_resolved_fields() {
+    let value = parse_yaml(
+        r#"
+root: &root
+  x: 1
+mid: &mid
+  <<: *root
+  z: 3
+merged:
+  <<: *mid
+"#,
+    )
+    .unwrap();
+    let merged = value.get("merged").expect("merged table");
+    assert_eq!(merged.get("x").and_then(toml::Value::as_integer), Some(1));
+    assert_eq!(merged.get("z").and_then(toml::Value::as_integer), Some(3));
+    assert!(merged.get("<<").is_none(), "no merge key survives");
+    assert!(
+        value.get("mid").and_then(|mid| mid.get("<<")).is_none(),
+        "the source is resolved too"
+    );
+}
+
+/// `!!merge` on the `<<` key merges exactly like the plain form, and a merge key
+/// on a mapping inside a sequence is still a merge key.
+#[test]
+fn test_yaml_tagged_and_nested_merge_keys_still_merge() {
+    let value = parse_yaml(
+        r#"
+base: &base
+  x: 1
+merged:
+  !!merge "<<": *base
+list:
+  - <<: *base
+  - other: 2
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        value
+            .get("merged")
+            .and_then(|v| v.get("x"))
+            .and_then(toml::Value::as_integer),
+        Some(1)
+    );
+    let list = value
+        .get("list")
+        .and_then(toml::Value::as_array)
+        .expect("a sequence");
+    assert_eq!(
+        list[0].get("x").and_then(toml::Value::as_integer),
+        Some(1),
+        "a merge key inside a sequence element merges"
+    );
+    assert_eq!(
+        list[1].get("other").and_then(toml::Value::as_integer),
+        Some(2)
+    );
+}
+
+/// Two `<<` keys in one mapping are a duplicate key, and a duplicate key is
+/// refused (one of the deliberate loud differences); the previous reader kept
+/// the last value silently.
+#[test]
+fn test_yaml_two_merge_keys_are_a_duplicate_error() {
+    let err = parse_yaml("a: &a\n  x: 1\nb: &b\n  x: 2\nmerged:\n  <<: *a\n  <<: *b\n")
+        .expect_err("a second `<<` is a duplicate key");
+    let message = err.to_string();
+    assert!(
+        message.contains("duplicate entry with key \"<<\""),
+        "{message}"
+    );
+}
+
+/// An alias cannot itself carry an anchor (`&b *a` is not valid YAML), so an
+/// alias chain has no defined form; the parser refuses it loudly instead of
+/// resolving half of it.
+#[test]
+fn test_yaml_alias_chains_are_refused() {
+    let err = parse_yaml("first: &a 1\nsecond: &b *a\nthird: *b\n")
+        .expect_err("an anchored alias is invalid YAML");
+    assert!(err.to_string().starts_with("YAML parse error:"), "{err}");
+}
 #[test]
 fn test_yaml_include_file_merged() {
     let dir = tempfile::tempdir().unwrap();
@@ -8205,7 +9040,7 @@ fn legacy_ini_typed_array_root_visitor_is_collected() {
 /// reserved-root bypass keys on the **port** keys and never on `type`, because
 /// keying it on `type` would collect every typed settings root and contradict
 /// `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:10581`) and the `[web_server] type`-only v1
+/// (`frp-core/src/config/tests.rs:11416`) and the `[web_server] type`-only v1
 /// boundary. This test pins the strict verdict so the delta is measured rather
 /// than silent.
 #[test]
@@ -8283,7 +9118,7 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:1991`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
-/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:259-275`), so the
+/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:1270-1286`), so the
 /// header is kept verbatim as the top-level key `includes.foo` and only the
 /// exact-key match in `process_includes` skipped it. The strict check then
 /// refuses `includes.foo` as an unknown field where Go v0.71.0 is rc 0 in both
@@ -12638,7 +13473,7 @@ path = "/tmp/does-not-matter"
 /// an `[includes]` *section* are independent in `gopkg.in/ini.v1`, and the legacy
 /// reader ignores every default-section key (`LoadAllProxyConfsFromIni` skips
 /// `ini.DefaultSection`, `pkg/config/legacy/client.go:255-257`) — the sections
-/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:376`)
+/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:1387`)
 /// used to keep the scalar and drop the section's keys, which hid a real
 /// `[includes]` section from the typeless-visitor guard and the collector, and
 /// then the `.ini`-only scalar scrub
@@ -12996,7 +13831,7 @@ fn legacy_ini_default_section_start_beside_start_section_both_modes() {
 /// both loader modes (`json: cannot unmarshal string into Go value of type
 /// v1.rawClientConfig`). frp-rs keeps its v1 reading instead — rc 0, zero proxies
 /// (the scalar wins the section-name collision, `insert_ini_section`,
-/// `frp-core/src/config/format.rs:376`). This pin records the measured,
+/// `frp-core/src/config/format.rs:1387`). This pin records the measured,
 /// deliberate divergence so a later change cannot pick it up silently.
 #[test]
 fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
@@ -13951,10 +14786,10 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `[webServer]` is rc 1 (`json: cannot unmarshal string into Go value of type
 /// v1.rawClientConfig`), and `log`, two collisions, and the server twins
 /// `webServer` / `log` / `transport` likewise. The replacement at
-/// `frp-core/src/config/format.rs:389` is therefore gated on `legacy_ini`
-/// (`frp-core/src/config/format.rs:223`); the legacy `[common]` case keeps the
+/// `frp-core/src/config/format.rs:1400` is therefore gated on `legacy_ini`
+/// (`frp-core/src/config/format.rs:1234`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:12650`).
+/// `frp-core/src/config/tests.rs:13485`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -14205,7 +15040,7 @@ fn legacy_ini_common_start_list_selects_named_sections() {
 /// matches no section, and `startAll` stays false. `frp-core/src/config/format.rs`
 /// instead infers a TOML array for `[..]` literals — a deliberate frp-rs
 /// extension for slice-typed fields — so the dispatch used to see the
-/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:428`) keeps
+/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:1439`) keeps
 /// this one key as its text, and the trailing `cfg.start` assertions are those
 /// same pieces after Go's comma split and trim. Measured on Go v0.71.0 (rc 0,
 /// no proxy registered): `["start"]` beside a `[start]` section, `["p1","p2"]`,
@@ -14370,7 +15205,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:12845`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:13680`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
@@ -14448,14 +15283,14 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// asks `GetSection("common")` in `DetectLegacyINIFormat`
 /// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
 /// it, so the file never reaches the legacy reader. frp-rs nests the dotted
-/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:323`)
+/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1334`)
 /// and the collector's own detector (`frp-core/src/config/normalize.rs:1183`)
 /// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
 /// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the
 /// non-strict refusal is the loose-only divergence the item calls a follow-up.
 /// Recorded deliberate: making the two detectors agree would mean dropping
 /// `common` from the dotted-section roots, which the `[common.webServer.tls]`
-/// spelling pinned at `frp-core/src/config/tests.rs:7405` still needs. A mutant
+/// spelling pinned at `frp-core/src/config/tests.rs:8240` still needs. A mutant
 /// that forces `legacy_ini` false in the collector loads this file non-strict.
 #[test]
 fn dotted_common_only_section_is_legacy_for_the_collector_both_modes() {
@@ -14520,7 +15355,7 @@ fn default_section_header_is_an_ordinary_section_both_modes() {
 /// and loads zero proxies. The strict rc agrees; only the message and the
 /// non-strict verdict diverge, and matching Go's non-strict message would mean
 /// addressing the array element as `proxies[0]`, which the `.ini` reader does not
-/// do (pinned as out of scope at `frp-core/src/config/tests.rs:12887`). Both
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:13722`). Both
 /// modes pinned.
 #[test]
 fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
@@ -14556,7 +15391,7 @@ fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
 /// (`frp-core/src/config/normalize.rs:2331`) and loads `p2`, rc 0. Recorded
 /// deliberate: making a missing port fatal is a separate design question, and the
 /// sibling skip paths are pinned as intentional at
-/// `frp-core/src/config/tests.rs:10587` / `:10612`. Both modes pinned.
+/// `frp-core/src/config/tests.rs:11422` / `:11447`. Both modes pinned.
 #[test]
 fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
     let dir = tempfile::tempdir().unwrap();
@@ -14590,14 +15425,14 @@ fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
 /// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
 /// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
 /// and would contradict `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:10637`). The item calls this a design question
+/// (`frp-core/src/config/tests.rs:11472`). The item calls this a design question
 /// about whether frp-rs keeps supporting v1 settings roots in `.ini` at all, so
 /// the divergence is recorded deliberate rather than forced. The sibling
 /// typeless/port-less shape (`c2.ini`, `[p] custom_domains = ["a.com"]`) is
 /// pinned the same way both modes: Go collects `p` (rc 0), frp-rs keeps it a v1
 /// section (`unknown field "p"` strict, rc 0 non-strict), matching
 /// `typeless_ini_section_without_ports_stays_a_v1_section`
-/// (`frp-core/src/config/tests.rs:7658`).
+/// (`frp-core/src/config/tests.rs:8493`).
 #[test]
 fn legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes() {
     let dir = tempfile::tempdir().unwrap();
