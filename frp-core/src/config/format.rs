@@ -419,10 +419,10 @@ impl yaml_rust2::parser::MarkedEventReceiver for YamlReceiver {
 ///
 /// `is_alias` is passed by the caller, never inferred from the size of the
 /// charge: an alias of a *scalar* is charged one node, exactly like a plain
-/// scalar, so the charge cannot tell a scalar-alias bomb from a large but honest
-/// document. The `Event::Alias` pre-clone check passes `true`; `insert` passes
-/// `false` for every node it counts itself, because the alias path's own charge
-/// can no longer trip the check there (its pre-check uses the same arithmetic).
+/// scalar, so the charge cannot tell a scalar-alias bomb from a large but
+/// honest document — the label follows the charge that crossed the budget, not
+/// the document's composition. `Event::Alias` passes `true`; `insert` passes
+/// `false` — the alias path pre-checks the same arithmetic and never reaches it.
 fn over_budget_message(is_alias: bool, budget: usize) -> String {
     if is_alias {
         "alias expansion limit exceeded".to_string()
@@ -440,8 +440,8 @@ impl YamlReceiver {
     /// millions of nodes — including the padded form, where a tiny bomb is
     /// diluted with inert bytes to buy a huge proportional allowance. Measured
     /// through the real entry point: a 1 MiB file whose bomb would expand to
-    /// ~100 million nodes is refused in 47 ms at 50.8 MB peak RSS instead of
-    /// 5.42 s at 12.1 GB.
+    /// ~100 million nodes is refused in ~0.05 s at ~49 MiB peak RSS instead of
+    /// 5.42 s at 11.3 GiB.
     ///
     /// It is **not** a memory bound. A node may carry a string as long as the
     /// input and an alias deep-copies the whole string, while the charge is one
@@ -453,13 +453,18 @@ impl YamlReceiver {
     /// path 8.4 GB on the same file). That residual is pre-existing, is not a
     /// Go-parity divergence, and is registered as debt in `TODO.md` rather than fixed.
     ///
-    /// The proportional part mirrors `yaml.v2`'s `allowedAliasRatio`
-    /// (`max(100_000, input.len() * 100)`), but a ratio on its own buys an
-    /// allowance for free: comments, blank lines, `%` directives and a
-    /// legitimately large config are inert bytes that inflate it without adding
-    /// a single node. The absolute ceiling is what keeps the node count bounded
-    /// whatever the padding claims; `400_000` is the order of magnitude of Go's
-    /// `alias_ratio_range_low`.
+    /// The proportional part is the *previous* reader's rule, not `yaml.v2`'s:
+    /// `serde_yaml_ng` refused once its jump count passed the document's event
+    /// count times 100. Go bounds aliasing by ratio instead — comparing the
+    /// alias count with the resolved-node count via `allowedAliasRatio`, which
+    /// returns 0.99 below `alias_ratio_range_low = 400_000`, 0.10 above
+    /// `alias_ratio_range_high = 4_000_000` and scales linearly in between,
+    /// with no input-length term; the ceiling here *equals* that low value
+    /// exactly. A ratio alone still buys an allowance for free, though:
+    /// comments, blank lines, `%` directives and a legitimately large config
+    /// are inert bytes that inflate the input length without adding a single
+    /// node, so the absolute ceiling is what keeps the node count bounded
+    /// whatever the padding claims.
     fn new(input_len: usize) -> Self {
         Self {
             alias_budget: input_len.saturating_mul(100).clamp(100_000, 400_000),

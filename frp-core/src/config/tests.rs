@@ -4345,10 +4345,10 @@ fn parse_yaml(yaml: &str) -> Result<toml::Value, Box<dyn std::error::Error>> {
 /// Measured before the fix: 22 levels took 15.9 s and 2,565,636,096 B peak RSS,
 /// 26 levels did not finish in 60 s. Go rejects the same shape in 0.08 s
 /// ("document contains excessive aliasing") and the previous reader in 0.07 s
-/// ("repetition limit exceeded"). The budget is `input.len()*100` clamped into
-/// `100_000 ..= 400_000` nodes, and the check runs **before** the subtree is
-/// cloned, so the test asserts the error without ever materialising the
-/// expanded tree.
+/// ("repetition limit exceeded"). The budget is 100× the input byte length,
+/// clamped into `100_000 ..= 400_000` nodes, and the check runs **before** the
+/// subtree is cloned, so the test asserts the error without ever materialising
+/// the expanded tree.
 #[test]
 fn test_yaml_alias_expansion_is_bounded() {
     let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
@@ -4386,11 +4386,11 @@ fn test_yaml_alias_expansion_is_bounded() {
 
 /// Padding a tiny alias bomb with inert bytes must not buy it an allowance.
 ///
-/// Before the absolute ceiling the budget was purely `input.len() * 100`, so a
-/// 100 KB file was allowed ten million nodes and this shape expanded to ~1.2 GB
-/// before it was refused. The ceiling is what refuses it: the padding raises the
-/// proportional allowance but not the cap, so the bomb dies as soon as the
-/// doubling tries to cross `400_000` nodes.
+/// Before the absolute ceiling the budget was purely 100× the input byte
+/// length, so a 100 KB file was allowed ten million nodes and this shape
+/// expanded to ~1.2 GB before it was refused. The ceiling is what refuses it:
+/// the padding raises the proportional allowance but not the cap, so the bomb
+/// dies as soon as the doubling tries to cross `400_000` nodes.
 #[test]
 fn test_yaml_padded_alias_bomb_is_bounded() {
     let mut source = String::from("serverAddr: &a0 127.0.0.1\n");
@@ -9118,7 +9118,7 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:1991`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
-/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:1265-1281`), so the
+/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:1270-1286`), so the
 /// header is kept verbatim as the top-level key `includes.foo` and only the
 /// exact-key match in `process_includes` skipped it. The strict check then
 /// refuses `includes.foo` as an unknown field where Go v0.71.0 is rc 0 in both
@@ -13473,7 +13473,7 @@ path = "/tmp/does-not-matter"
 /// an `[includes]` *section* are independent in `gopkg.in/ini.v1`, and the legacy
 /// reader ignores every default-section key (`LoadAllProxyConfsFromIni` skips
 /// `ini.DefaultSection`, `pkg/config/legacy/client.go:255-257`) — the sections
-/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:1382`)
+/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:1387`)
 /// used to keep the scalar and drop the section's keys, which hid a real
 /// `[includes]` section from the typeless-visitor guard and the collector, and
 /// then the `.ini`-only scalar scrub
@@ -13831,7 +13831,7 @@ fn legacy_ini_default_section_start_beside_start_section_both_modes() {
 /// both loader modes (`json: cannot unmarshal string into Go value of type
 /// v1.rawClientConfig`). frp-rs keeps its v1 reading instead — rc 0, zero proxies
 /// (the scalar wins the section-name collision, `insert_ini_section`,
-/// `frp-core/src/config/format.rs:1382`). This pin records the measured,
+/// `frp-core/src/config/format.rs:1387`). This pin records the measured,
 /// deliberate divergence so a later change cannot pick it up silently.
 #[test]
 fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
@@ -14786,8 +14786,8 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `[webServer]` is rc 1 (`json: cannot unmarshal string into Go value of type
 /// v1.rawClientConfig`), and `log`, two collisions, and the server twins
 /// `webServer` / `log` / `transport` likewise. The replacement at
-/// `frp-core/src/config/format.rs:1395` is therefore gated on `legacy_ini`
-/// (`frp-core/src/config/format.rs:1229`); the legacy `[common]` case keeps the
+/// `frp-core/src/config/format.rs:1400` is therefore gated on `legacy_ini`
+/// (`frp-core/src/config/format.rs:1234`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
 /// `frp-core/src/config/tests.rs:13485`).
 #[test]
@@ -15040,7 +15040,7 @@ fn legacy_ini_common_start_list_selects_named_sections() {
 /// matches no section, and `startAll` stays false. `frp-core/src/config/format.rs`
 /// instead infers a TOML array for `[..]` literals — a deliberate frp-rs
 /// extension for slice-typed fields — so the dispatch used to see the
-/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:1434`) keeps
+/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:1439`) keeps
 /// this one key as its text, and the trailing `cfg.start` assertions are those
 /// same pieces after Go's comma split and trim. Measured on Go v0.71.0 (rc 0,
 /// no proxy registered): `["start"]` beside a `[start]` section, `["p1","p2"]`,
@@ -15283,7 +15283,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// asks `GetSection("common")` in `DetectLegacyINIFormat`
 /// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
 /// it, so the file never reaches the legacy reader. frp-rs nests the dotted
-/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1329`)
+/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1334`)
 /// and the collector's own detector (`frp-core/src/config/normalize.rs:1183`)
 /// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
 /// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the

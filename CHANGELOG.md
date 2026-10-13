@@ -197,18 +197,23 @@ User-facing release notes for frp-rs.
   (`metadatas: {\n\tk: v\n}` → `tabs disallowed within this context (block indentation)`), and a
   multi-line flow collection whose continuation is unindented (`x: [1,\n2]` → `invalid indentation
   in flow construct`) — re-indent the continuation or quote/convert the flow collection to block
-  style. An alias bomb is refused too: the reader budgets the expanded tree at `input.len() * 100`
-  nodes clamped to `100_000 ..= 400_000` and refuses the expansion (`alias expansion limit
-  exceeded`) before cloning the subtree, so padding the file with inert bytes cannot buy an
-  allowance — a 1 MiB padded 40-level bomb that would otherwise reach ~12 GB is now refused in
-  ~0.05 s at ~48 MB peak RSS. The budget bounds expanded **node count**, not bytes: a large scalar
+  style. An alias bomb is refused too: the reader budgets the expanded tree at 100× the input
+  byte length, clamped to `100_000 ..= 400_000` nodes, and refuses the expansion (`alias expansion
+  limit exceeded`) before cloning the subtree, so padding the file with inert bytes cannot buy an
+  allowance: a 1 MiB padded 40-level bomb that would otherwise reach ~11.3 GiB is now refused in
+  ~0.05 s at ~49 MiB peak RSS. The budget bounds expanded **node count**, not bytes: a large scalar
   anchor re-expanded many times stays under the ceiling and can still cost gigabytes (measured
   3.2–7.5 GB peak RSS at this head, 2.2–7.9 GB across repeated probe runs of the same code, on
   125 KiB–1 MiB crafted inputs; the pre-swap reader costs 1.3–4.0 GB and
   Go's own config path 8.4 GB on the same file, so this residual is pre-existing debt rather than
-  a new divergence, and it is filed in `TODO.md`). A document that *honestly* exceeds the ceiling
-  (roughly 200 000 mapping entries, far beyond any real config) reports `document exceeds the node
-  limit`. Full divergence register: `TODO.md` and the `format.rs` doc comments.
+  a new divergence, and it is filed in `TODO.md`). The proportional part of the budget is the
+  previous reader's repetition limit, while the `400_000` ceiling *equals* Go's
+  `alias_ratio_range_low` exactly — Go itself bounds aliasing by ratio, with no input-length term.
+  A document that exceeds the ceiling on a plain node reports `document exceeds the node limit`
+  (roughly 200 000 mapping entries, far beyond any real config); the alias message is chosen by the
+  charge that crossed the budget, so a mostly-alias document whose crossing charge is a plain node
+  reports the node-limit message instead. Full divergence register: `TODO.md` and the `format.rs`
+  doc comments.
 - **`quinn-proto` moves 0.11.17 → 0.11.18 for RUSTSEC-2026-0338, RUSTSEC-2026-0340 and
   RUSTSEC-2026-0343** (all three carry `patched = >=0.11.18`, and the version they were
   reported against was the only affected dependency in the tree), so QUIC builds pick up the
