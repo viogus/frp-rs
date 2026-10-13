@@ -9,7 +9,19 @@ User-facing release notes for frp-rs.
 > write the same detail in both; see the
 > [docs conventions](docs/README.md#conventions-for-these-docs).
 
-## Unreleased
+## v0.71.0 — re-release (2026-10-13)
+
+Supersedes the 2026-09-13 v0.71.0 build (commit `41c3ad60`). Same version
+number, per the Go-alignment rule — Go frp has not released a newer number.
+All assets re-built and re-published from commit `8ea1d8e3`.
+
+225 commits (`#323`–`#541`, plus 7 direct pushes), 374 files,
++157102/−40329: Go CLI parity (the cobra-shaped `--help` documents, `frps
+verify`, Go's bool and proxy flag spellings, subcommand resolution after
+leading root flags), the YAML config loader moved to a maintained parser,
+strict-mode and legacy-`.ini` config fixes, build-aware listener-port
+warnings, reload/auth diagnostics, a client plugin listener leak fix, and
+dependency/CI hygiene. Version stays aligned at 0.71.0.
 
 ### Features
 - **Every `--help` surface now renders cobra's document, not bpaf's.** The help documents were
