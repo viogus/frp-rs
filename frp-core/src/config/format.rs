@@ -447,11 +447,11 @@ impl YamlReceiver {
     /// input and an alias deep-copies the whole string, while the charge is one
     /// node per alias whatever the string's length — so a single large scalar
     /// anchor re-expanded a few thousand times stays far below `400_000` nodes
-    /// and still costs gigabytes (measured at this head 3.2–7.5 GB peak RSS on
-    /// 125 KiB–1 MiB crafted inputs, 2.2–7.9 GB across builds; the previous
-    /// reader costs 1.3–4.0 GB and Go's own config path 8.4 GB on the same
-    /// file). That residual is pre-existing, is not a Go-parity divergence, and
-    /// is registered as debt in `TODO.md` rather than fixed here.
+    /// and still costs gigabytes (measured 3.2–7.5 GB peak RSS at this head, and
+    /// 2.2–7.9 GB across repeated probe runs of the same code, on 125 KiB–1 MiB
+    /// crafted inputs; the previous reader costs 1.3–4.0 GB and Go's own config
+    /// path 8.4 GB on the same file). That residual is pre-existing, is not a
+    /// Go-parity divergence, and is registered as debt in `TODO.md` rather than fixed.
     ///
     /// The proportional part mirrors `yaml.v2`'s `allowedAliasRatio`
     /// (`max(100_000, input.len() * 100)`), but a ratio on its own buys an
@@ -2100,8 +2100,8 @@ mod yaml_scalar_rule_tests {
     /// than one" does not identify an alias: a document that re-expands a
     /// one-character scalar hundreds of thousands of times is a pure alias bomb,
     /// yet it used to be reported as a large but honest document. The receiver is
-    /// driven by hand because the real budget floors at `100_000` nodes, which a
-    /// one-node alias cannot reach from an input small enough for the suite.
+    /// driven by hand to keep the test small — a real fixture reaching the
+    /// `100_000`-node floor costs ~200 KB–2 MB, more than this test is worth.
     #[test]
     fn a_scalar_alias_past_the_budget_reports_the_alias_limit() {
         let mut sink = FirstMarker(None);
@@ -2135,7 +2135,7 @@ mod yaml_scalar_rule_tests {
         }
         let error = receiver
             .handle(yaml_rust2::parser::Event::Alias(1), mark)
-            .expect_err("the third alias passes the three-node budget");
+            .expect_err("the third alias exceeds the three-node budget");
         let message = error.to_string();
         assert!(
             message.starts_with("alias expansion limit exceeded"),

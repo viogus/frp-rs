@@ -203,7 +203,8 @@ User-facing release notes for frp-rs.
   allowance — a 1 MiB padded 40-level bomb that would otherwise reach ~12 GB is now refused in
   ~0.05 s at ~48 MB peak RSS. The budget bounds expanded **node count**, not bytes: a large scalar
   anchor re-expanded many times stays under the ceiling and can still cost gigabytes (measured
-  2.2–7.9 GB peak RSS on 125 KiB–1 MiB crafted inputs; the pre-swap reader costs 1.3–4.0 GB and
+  3.2–7.5 GB peak RSS at this head, 2.2–7.9 GB across repeated probe runs of the same code, on
+  125 KiB–1 MiB crafted inputs; the pre-swap reader costs 1.3–4.0 GB and
   Go's own config path 8.4 GB on the same file, so this residual is pre-existing debt rather than
   a new divergence, and it is filed in `TODO.md`). A document that *honestly* exceeds the ceiling
   (roughly 200 000 mapping entries, far beyond any real config) reports `document exceeds the node
