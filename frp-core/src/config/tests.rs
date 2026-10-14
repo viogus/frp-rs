@@ -9118,7 +9118,7 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:1991`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
-/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:1270-1286`), so the
+/// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:1369-1385`), so the
 /// header is kept verbatim as the top-level key `includes.foo` and only the
 /// exact-key match in `process_includes` skipped it. The strict check then
 /// refuses `includes.foo` as an unknown field where Go v0.71.0 is rc 0 in both
@@ -13473,7 +13473,7 @@ path = "/tmp/does-not-matter"
 /// an `[includes]` *section* are independent in `gopkg.in/ini.v1`, and the legacy
 /// reader ignores every default-section key (`LoadAllProxyConfsFromIni` skips
 /// `ini.DefaultSection`, `pkg/config/legacy/client.go:255-257`) — the sections
-/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:1387`)
+/// are what it parses. `insert_ini_section` (`frp-core/src/config/format.rs:1486`)
 /// used to keep the scalar and drop the section's keys, which hid a real
 /// `[includes]` section from the typeless-visitor guard and the collector, and
 /// then the `.ini`-only scalar scrub
@@ -13831,7 +13831,7 @@ fn legacy_ini_default_section_start_beside_start_section_both_modes() {
 /// both loader modes (`json: cannot unmarshal string into Go value of type
 /// v1.rawClientConfig`). frp-rs keeps its v1 reading instead — rc 0, zero proxies
 /// (the scalar wins the section-name collision, `insert_ini_section`,
-/// `frp-core/src/config/format.rs:1387`). This pin records the measured,
+/// `frp-core/src/config/format.rs:1486`). This pin records the measured,
 /// deliberate divergence so a later change cannot pick it up silently.
 #[test]
 fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
@@ -14786,8 +14786,8 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `[webServer]` is rc 1 (`json: cannot unmarshal string into Go value of type
 /// v1.rawClientConfig`), and `log`, two collisions, and the server twins
 /// `webServer` / `log` / `transport` likewise. The replacement at
-/// `frp-core/src/config/format.rs:1400` is therefore gated on `legacy_ini`
-/// (`frp-core/src/config/format.rs:1234`); the legacy `[common]` case keeps the
+/// `frp-core/src/config/format.rs:1499` is therefore gated on `legacy_ini`
+/// (`frp-core/src/config/format.rs:1333`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
 /// `frp-core/src/config/tests.rs:13485`).
 #[test]
@@ -15040,7 +15040,7 @@ fn legacy_ini_common_start_list_selects_named_sections() {
 /// matches no section, and `startAll` stays false. `frp-core/src/config/format.rs`
 /// instead infers a TOML array for `[..]` literals — a deliberate frp-rs
 /// extension for slice-typed fields — so the dispatch used to see the
-/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:1439`) keeps
+/// *elements*. `ini_value_for_key` (`frp-core/src/config/format.rs:1538`) keeps
 /// this one key as its text, and the trailing `cfg.start` assertions are those
 /// same pieces after Go's comma split and trim. Measured on Go v0.71.0 (rc 0,
 /// no proxy registered): `["start"]` beside a `[start]` section, `["p1","p2"]`,
@@ -15283,7 +15283,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// asks `GetSection("common")` in `DetectLegacyINIFormat`
 /// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
 /// it, so the file never reaches the legacy reader. frp-rs nests the dotted
-/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1334`)
+/// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1433`)
 /// and the collector's own detector (`frp-core/src/config/normalize.rs:1183`)
 /// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
 /// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the
@@ -15644,4 +15644,43 @@ fn feature_gated_port_keys_are_accepted_while_the_compiled_field_set_follows_the
             }
         }
     }
+}
+
+/// A *large scalar* anchor re-expanded many times is bounded by the expanded
+/// byte ceiling, not the node budget: each copy charges one node but duplicates
+/// the whole string. Before the byte ceiling this shape — a 64 KiB anchor with
+/// 20 000 references, ~200 KB of input — stayed three orders of magnitude under
+/// the `100_000`-node floor while duplicating ~1.3 GB (measured 3.2–7.5 GB peak
+/// RSS on the four crafted `flow_*`/`amp_*` inputs). The byte check runs before
+/// the subtree is cloned, so the test asserts the refusal without materialising
+/// the tree. Appended at EOF so it shifts no line a `PATH:NNN` cite points at.
+#[test]
+fn test_yaml_scalar_alias_bomb_is_byte_bounded() {
+    let scalar = "x".repeat(64 * 1024);
+    let mut source = format!("serverAddr: &big {scalar}\n");
+    for i in 0..20_000 {
+        source.push_str(&format!("dup{i}: *big\n"));
+    }
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("the scalar-alias bomb must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("alias expansion limit exceeded")
+            && message.contains("expanded value bytes"),
+        "expected the byte ceiling, got: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the byte ceiling must be reached promptly, took {:?}",
+        started.elapsed()
+    );
+
+    // Reuse well under the ceiling is still accepted, so the cap bounds the
+    // blow-up and not aliasing itself: 8 × 64 KiB = 512 KiB < 16 MiB.
+    let mut small = format!("serverAddr: &big {scalar}\n");
+    for i in 0..8 {
+        small.push_str(&format!("dup{i}: *big\n"));
+    }
+    parse_yaml(&small).expect("8 × 64 KiB is under the 16 MiB ceiling");
 }
