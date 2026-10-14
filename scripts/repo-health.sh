@@ -2486,7 +2486,7 @@ CLAIMS = [
     # (backticks/bold) but still pin the sentence: entries pin exact wording by
     # design, so a real reword reports "claim not found" and the entry must be
     # updated with it. Deliberately NOT pinned: docs/developing.md's crates.io
-    # `max_stable_version` 0.23.45 — a crates.io fact that moves independently
+    # `max_stable_version` 0.23.46 — a crates.io fact that moves independently
     # of the vendored copy, not a statement of the vendored version.
     ('CLAUDE.md',              r'当前\s*`?([0-9]+\.[0-9]+\.[0-9]+)',        canon_version, 'frp-core/Cargo.toml version'),
     ('CLAUDE.md',              r'README at `?([0-9]+\.[0-9]+\.[0-9]+)',     canon_version, 'frp-core/Cargo.toml version'),
