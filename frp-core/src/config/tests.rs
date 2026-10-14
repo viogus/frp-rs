@@ -15684,3 +15684,31 @@ fn test_yaml_scalar_alias_bomb_is_byte_bounded() {
     }
     parse_yaml(&small).expect("8 × 64 KiB is under the 16 MiB ceiling");
 }
+
+/// A non-core tag carries its own strings, and an alias deep-copies them: a
+/// scalar whose payload is a huge *tag* rather than its text must hit the byte
+/// ceiling too. The first cut charged only the text, so a 64 KiB tag aliased
+/// 20 000 times was accepted at ~1.33 GB peak RSS. Appended at EOF so it shifts
+/// no line a `PATH:NNN` cite points at.
+#[test]
+fn test_yaml_tag_alias_bomb_is_byte_bounded() {
+    let tag = "a".repeat(64 * 1024);
+    let mut source = format!("serverAddr: &big !{tag} A\n");
+    for i in 0..20_000 {
+        source.push_str(&format!("dup{i}: *big\n"));
+    }
+
+    let started = std::time::Instant::now();
+    let error = parse_yaml(&source).expect_err("the tag-alias bomb must be refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("alias expansion limit exceeded")
+            && message.contains("expanded value bytes"),
+        "expected the byte ceiling, got: {message}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the tag-alias ceiling must be reached promptly, took {:?}",
+        started.elapsed()
+    );
+}

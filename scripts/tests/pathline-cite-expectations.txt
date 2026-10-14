@@ -55,7 +55,7 @@ docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	
 docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	62
 docs/config.md	668	-	97410f5562191f30	-	absolute	docs/developing.md	docs/config.md:668	4082
 docs/deployment.md	900	-	4459a65e565615ca	-	absolute	frp-core/src/config/tests.rs	docs/deployment.md:900	12638
-docs/developing.md	3891	-	cecf8d5752cf151c	-	absolute	scripts/repo-health.sh	docs/developing.md:3891	2477
+docs/developing.md	3891	-	f5cdbd4e6493ff81	-	absolute	scripts/repo-health.sh	docs/developing.md:3891	2478
 frp-client/src/admin.rs	1149	-	11314c6e379da4e8	-	absolute	.github/workflows/ci.yml	frp-client/src/admin.rs:1149	4064
 frp-client/src/admin.rs	1149	-	11314c6e379da4e8	-	absolute	docs/config.md	frp-client/src/admin.rs:1149	192
 frp-client/src/admin.rs	1164	-	4c89606352d037fc	-	absolute	docs/config.md	frp-client/src/admin.rs:1164	192
@@ -599,5 +599,5 @@ scripts/tests/repo-health-fixtures.sh	628	-	6018ad7271207f2f	-	absolute	scripts/
 scripts/tests/repo-health-fixtures.sh	666	-	ea3a01e306ae784f	-	absolute	.github/workflows/ci.yml	scripts/tests/repo-health-fixtures.sh:666	270
 scripts/tests/rss-soak-run-dir.sh	57	-	b73144f48f56d3ae	-	absolute	scripts/frp-stress/baselines/README.md	scripts/tests/rss-soak-run-dir.sh:57	122
 scripts/tests/rss-soak-run-dir.sh	93	-	4aba9fd2ed383d4a	-	absolute	scripts/frp-stress/baselines/README.md	scripts/tests/rss-soak-run-dir.sh:93	125
-vendor/rustls/README-FRP-RS.md	66	-	ea930d789612cd2f	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:66	2472
-vendor/rustls/README-FRP-RS.md	93	-	a8bac60c191a2a91	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:93	2474
+vendor/rustls/README-FRP-RS.md	112	-	061ba1967b15cb2c	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:112	2475
+vendor/rustls/README-FRP-RS.md	66	-	da2f3d4cfb7eb930	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:66	2472

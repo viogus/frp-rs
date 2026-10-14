@@ -3887,11 +3887,11 @@ covered by any gate and are the ones that have actually been missed before.
       - confirm the `health` job still reports a README for every vendored crate.
       *Exit condition to watch:* `vendor/rustls` can be deleted as soon as the
       workspace moves to rustls ≥ 0.24, which has `invalid_sni_policy` natively.
-      As of **2026-10-04** that upgrade is still **blocked upstream**: crates.io's
-      `max_stable_version` and `newest_version` are `0.23.45` and the only 0.24
-      artifacts are the prereleases `0.24.0-dev.0` and `0.24.0-dev.1`, so the trigger and plan are tracked in
+      As of **2026-10-14** that upgrade is still **blocked upstream**: crates.io's
+      `max_stable_version` and `newest_version` are `0.23.46` and the only 0.24
+      artifacts are the prereleases `0.24.0-dev.0` and `0.24.0-dev.2`, so the trigger and plan are tracked in
       [`../TODO.md`](../TODO.md). The vendored line is current in the meantime
-      (`0.23.45`, the GHSA-2mjx-qc3c-rqvc fix).
+      (`0.23.46`, the RUSTSEC-2026-0346/-0347/-0348/-0349 fix).
       *Owner:* the sole maintainer — there is no second reviewer for this repo
       (see the bus-factor item in the backlog), so this checklist line **is** the
       control.

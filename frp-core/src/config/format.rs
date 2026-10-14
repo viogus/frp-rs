@@ -500,7 +500,7 @@ fn own_node_bytes(node: &YamlNode) -> usize {
         YamlNode::Str(s) => s.len(),
         YamlNode::Resolved(Yaml::String(s) | Yaml::Real(s)) => s.len(),
         YamlNode::Resolved(_) => 0,
-        YamlNode::Tagged(_, text) => text.len(),
+        YamlNode::Tagged(tag, text) => text.len() + tag.handle.len() + tag.suffix.len(),
         YamlNode::Bad(reason) => reason.len(),
         YamlNode::Seq(_) | YamlNode::Map(_) => 0,
     }
@@ -2212,6 +2212,21 @@ mod yaml_scalar_rule_tests {
         ) {
             self.0.get_or_insert(mark);
         }
+    }
+
+    /// A tag carries two strings (`handle`, `suffix`) that an alias deep-copies
+    /// like the scalar text; charging only the text let a 64 KiB tag bypass the
+    /// byte ceiling (a 64 KiB tag aliased 20 000 times was accepted at ~1.33 GB
+    /// peak RSS before this was charged).
+    #[test]
+    fn own_node_bytes_charges_a_tags_own_strings() {
+        use yaml_rust2::parser::Tag;
+        let tag = Tag {
+            handle: "!".to_string(),
+            suffix: "a".repeat(64 * 1024),
+        };
+        let node = YamlNode::Tagged(Box::new(tag), "x".to_string());
+        assert_eq!(own_node_bytes(&node), 64 * 1024 + 1 + 1);
     }
 
     /// A scalar alias is charged **one** node per copy, so "the charge is bigger

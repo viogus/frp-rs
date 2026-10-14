@@ -142,10 +142,25 @@ fi
 # --- audit -------------------------------------------------------------------
 # --no-yanked: the question is advisories, and the yank check needs registry
 # index metadata the synthetic lock deliberately does not fetch.
+#
+# Fail-closed against cargo-audit's *project-local config*: cargo-audit reads
+# `./.cargo/audit.toml` (and `$CARGO_HOME/audit.toml`) and merges its
+# `[advisories] ignore` list additively, so a checked-in `.cargo/audit.toml`
+# would silently suppress exactly the advisories this step exists to surface.
+# The audit therefore runs with its working directory inside `$tmp` (no
+# `.cargo/audit.toml` is discovered there) and a repo-local one is refused
+# outright before the run.
+if [ -e "$repo_root/.cargo/audit.toml" ] || [ -L "$repo_root/.cargo/audit.toml" ]; then
+    printf 'FAIL %s/.cargo/audit.toml exists — cargo-audit would merge its [advisories] ignore list\n' "$repo_root" >&2
+    printf '      into this check, which is the blindness the check exists to close. Remove it\n' >&2
+    printf '      (a user-level $CARGO_HOME/audit.toml is still honoured by cargo-audit itself).\n' >&2
+    exit 1
+fi
+
 args=(--no-yanked --file "$lock" -D warnings)
 [ "$no_fetch" = 1 ] && args+=(--no-fetch)
 
-if ! cargo audit "${args[@]}"; then
+if ! ( cd "$tmp" && cargo audit "${args[@]}" ); then
     printf '\nFAIL the vendored advisory check found an advisory for a currently pinned version.\n' >&2
     printf '      Review https://rustsec.org/ and re-vendor or bump the affected crate; a green\n' >&2
     printf '      `cargo deny check` / `cargo audit` on the patched tree does NOT cover this.\n' >&2

@@ -748,17 +748,16 @@ pub(super) fn process_client_hello<'m>(
         Some(ServerNamePayload::SingleDnsName(dns_name)) => Some(dns_name.to_lowercase_owned()),
         Some(ServerNamePayload::IpAddress) => None,
         Some(ServerNamePayload::Invalid) => {
-            // frp-rs vendored patch: Go frp v0.70.1 XTCP QUIC visitors send
-            // the peer address ("ip:port") as the TLS SNI hostname, which
-            // rustls 0.23 parses as `Invalid` and rejects with a fatal alert.
-            // Treat an invalid SNI as "no SNI" — the equivalent of the
-            // upstream `ServerConfig::invalid_sni_policy = IgnoreAll` added
-            // in rustls 0.24-dev (drop this patch when frp-rs upgrades past
-            // rustls 0.23). Server-side only; the TLS session is unaffected
-            // (SNI is advisory for cert selection) and frp's XTCP QUIC runs
-            // on self-signed certs with InsecureSkipVerify, so there is no
-            // authentication regression. See
-            // docs/archive/notes/2026-08-04-mimalloc-throughput-ab.md §6.
+            // frp-rs vendored patch: Go frp XTCP QUIC visitors send the peer
+            // address ("ip:port") as the TLS SNI hostname, which rustls 0.23
+            // parses as `Invalid` and rejects with a fatal alert. Treat an
+            // invalid SNI as "no SNI" — the equivalent of the upstream
+            // `ServerConfig::invalid_sni_policy = IgnoreAll` added in
+            // rustls 0.24 (drop this patch when frp-rs upgrades past 0.23).
+            // Server-side only; SNI is advisory for cert selection and frp's
+            // XTCP QUIC runs on self-signed certs with InsecureSkipVerify, so
+            // there is no authentication regression. See
+            // docs/archive/notes/2026-08-04-xtcp-quic-sni-compat.md.
             None
         }
         None => None,

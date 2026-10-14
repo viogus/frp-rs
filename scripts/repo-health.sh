@@ -2461,7 +2461,7 @@ CLAIMS = [
     ('CLAUDE.md',              r'pinned by russh ([0-9.]+) \(latest\)',    v_russh,    'vendor/russh/Cargo.toml'),
     ('CLAUDE.md',              r'SSH feature chain \(russh ([0-9.]+)',     v_russh,    'vendor/russh/Cargo.toml'),
     ('docs/architecture.md',   r'vendors rustls \(([0-9.]+) at',           v_rustls,   'vendor/rustls/Cargo.toml'),
-    ('docs/developing.md',     r'\(`([0-9.]+)`, the GHSA-2mjx',            v_rustls,   'vendor/rustls/Cargo.toml'),
+    ('docs/developing.md',     r'\(`([0-9.]+)`, the RUSTSEC-2026-0346',  v_rustls,   'vendor/rustls/Cargo.toml'),
     # The frp-rs-authored vendored notes restate their version several times;
     # one entry per file checks every frp-rs statement of it (the optional
     # backtick covers "vendors `crate` X.Y.Z"), plus the "Diff from crates.io"
@@ -2469,9 +2469,10 @@ CLAIMS = [
     # (`Vendored` / `vendors` / `crates.io`), so an unrelated upstream version
     # in the same file (e.g. "hashicorp yamux v0.1.1") cannot satisfy or trip
     # it. Deliberately OUT OF SCOPE, with reasons:
-    #   vendor/rustls/README-FRP-RS.md:66  — the 0.23.43 -> 0.23.45 bump history
-    #                                        (a historical version, not current)
-    #   vendor/rustls/README-FRP-RS.md:93  — crates.io `max_stable_version` /
+    #   vendor/rustls/README-FRP-RS.md:66  — the bump-history bullets, a list of
+    #                                        historical versions, not the current
+    #                                        one
+    #   vendor/rustls/README-FRP-RS.md:112 — crates.io `max_stable_version` /
     #                                        `newest_version`, which move
     #                                        independently of this vendored copy
     #   docs/developing.md:3891             — the same crates.io fact
