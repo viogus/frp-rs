@@ -4515,3 +4515,11 @@ jobs:
         # scans): opt-in deps like pprof -> inferno -> quick-xml are otherwise
         # invisible to the license/advisory checks.
         run: cargo deny --all-features check
+      # Appended at EOF so no existing `ci.yml:<n>` citation is renumbered by
+      # this step. The three `[patch.crates-io]` crates have no registry source,
+      # so cargo-deny and cargo-audit drop them *before* the advisory lookup:
+      # a vulnerability in a vendored version is invisible to the two steps
+      # above. This re-derives the verdict from the versions pinned in
+      # `vendor/*/Cargo.toml` and fails the job on a match.
+      - name: cargo audit vendored crates out of band (patched tree is invisible to advisory checks)
+        run: bash scripts/vendored-advisory-check.sh

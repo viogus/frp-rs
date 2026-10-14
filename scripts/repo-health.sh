@@ -844,7 +844,8 @@ for v in vendor/*/; do
   [ "$readme" = "MISSING" ] && fail=1
 done
 printf '\n  Each vendored crate must document WHY and its EXIT CONDITION.\n'
-printf '  A vendored copy pins the crate: track upstream advisories by hand.\n'
+printf '  A vendored copy pins the crate: track upstream advisories by hand, and\n'
+printf '  the security job runs scripts/vendored-advisory-check.sh out of band.\n'
 
 # ---------------------------------------------------------------- toolchain
 hdr "Toolchain pin"

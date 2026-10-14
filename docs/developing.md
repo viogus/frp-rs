@@ -3869,9 +3869,16 @@ covered by any gate and are the ones that have actually been missed before.
 - [ ] **Security audit** —
       `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071`
       and `cargo deny check`.
-- [ ] **Vendored crates — the step no tool covers.** `[patch.crates-io]` pins
-      `rustls`, `yamux` and `russh`, so **`cargo update` will not pick up upstream
-      security releases for them**. Before every release:
+- [ ] **Vendored crates — advisory coverage is automated, the re-vendor decision is not.**
+      `[patch.crates-io]` pins `rustls`, `yamux` and `russh`, so **`cargo update`
+      will not pick up upstream security releases for them**. Before every release:
+      - the `security` job runs `scripts/vendored-advisory-check.sh`, which audits
+        the versions pinned in `vendor/*/Cargo.toml` against the advisory DB **out
+        of band** of the patched tree (cargo-audit and cargo-deny drop a
+        path-patched crate *before* the advisory lookup, so the normal scans cannot
+        see it); a matching advisory fails the job. Run it by hand with
+        `--no-fetch` when offline (local DB, possibly stale) or without it to
+        fetch the current DB;
       - check <https://github.com/rustls/rustls/releases> for 0.23.x security
         backports and re-vendor if needed (frp-rs patches TLS code — this is the
         highest-risk item on this list);
