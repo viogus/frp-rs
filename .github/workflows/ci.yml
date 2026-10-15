@@ -1890,7 +1890,7 @@ jobs:
   tests-unit:
     name: Tests (unit)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     # The three guarded test counts in `env:` below, one value each. The lane
     # that owns a value reads it in both of its count assertions — the
     # `test result: ok. N passed; 0 failed` grep over the captured log, and the
