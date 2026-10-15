@@ -434,7 +434,7 @@ else
     bad "the workflow declares $health_keys top-level health job keys: only one is read, so a second copy could carry a reverted path unnoticed"
 fi
 
-guard_region_pin=4eb650cf8a3afd5bacf4d2794a43d02c1313004bf255a9c3847ff63b20297ca6
+guard_region_pin=12d2c866ef277df3609ce85d2ade1fab80cbfe72b832e89da46c19b2728b2ee3
 region_pin=$(sha_of "$region")
 if [ "$region_pin" = "$guard_region_pin" ]; then
     ok "the health job's text still hashes to the pinned region ($guard_region_pin)"

@@ -844,7 +844,8 @@ for v in vendor/*/; do
   [ "$readme" = "MISSING" ] && fail=1
 done
 printf '\n  Each vendored crate must document WHY and its EXIT CONDITION.\n'
-printf '  A vendored copy pins the crate: track upstream advisories by hand.\n'
+printf '  A vendored copy pins the crate: track upstream advisories by hand, and\n'
+printf '  the security job runs scripts/vendored-advisory-check.sh out of band.\n'
 
 # ---------------------------------------------------------------- toolchain
 hdr "Toolchain pin"
@@ -2460,7 +2461,7 @@ CLAIMS = [
     ('CLAUDE.md',              r'pinned by russh ([0-9.]+) \(latest\)',    v_russh,    'vendor/russh/Cargo.toml'),
     ('CLAUDE.md',              r'SSH feature chain \(russh ([0-9.]+)',     v_russh,    'vendor/russh/Cargo.toml'),
     ('docs/architecture.md',   r'vendors rustls \(([0-9.]+) at',           v_rustls,   'vendor/rustls/Cargo.toml'),
-    ('docs/developing.md',     r'\(`([0-9.]+)`, the GHSA-2mjx',            v_rustls,   'vendor/rustls/Cargo.toml'),
+    ('docs/developing.md',     r'\(`([0-9.]+)`, the RUSTSEC-2026-0346',  v_rustls,   'vendor/rustls/Cargo.toml'),
     # The frp-rs-authored vendored notes restate their version several times;
     # one entry per file checks every frp-rs statement of it (the optional
     # backtick covers "vendors `crate` X.Y.Z"), plus the "Diff from crates.io"
@@ -2468,12 +2469,13 @@ CLAIMS = [
     # (`Vendored` / `vendors` / `crates.io`), so an unrelated upstream version
     # in the same file (e.g. "hashicorp yamux v0.1.1") cannot satisfy or trip
     # it. Deliberately OUT OF SCOPE, with reasons:
-    #   vendor/rustls/README-FRP-RS.md:66  — the 0.23.43 -> 0.23.45 bump history
-    #                                        (a historical version, not current)
-    #   vendor/rustls/README-FRP-RS.md:93  — crates.io `max_stable_version` /
+    #   vendor/rustls/README-FRP-RS.md:66  — the bump-history bullets, a list of
+    #                                        historical versions, not the current
+    #                                        one
+    #   vendor/rustls/README-FRP-RS.md:112 — crates.io `max_stable_version` /
     #                                        `newest_version`, which move
     #                                        independently of this vendored copy
-    #   docs/developing.md:3883             — the same crates.io fact
+    #   docs/developing.md:3891             — the same crates.io fact
     ('vendor/rustls/README-FRP-RS.md', r'(?:Vendored|vendors|crates\.io)\s+`?rustls`?\s*([0-9]+\.[0-9]+\.[0-9]+)', v_rustls, 'vendor/rustls/Cargo.toml'),
     ('vendor/yamux/README-FRP-RS.md',  r'(?:Vendored|vendors|crates\.io)\s+`?yamux`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_yamux,  'vendor/yamux/Cargo.toml'),
     ('vendor/russh/README-FRP-RS.md',  r'(?:Vendored|vendors|crates\.io)\s+`?russh`?\s*([0-9]+\.[0-9]+\.[0-9]+)',  v_russh,  'vendor/russh/Cargo.toml'),
@@ -2484,7 +2486,7 @@ CLAIMS = [
     # (backticks/bold) but still pin the sentence: entries pin exact wording by
     # design, so a real reword reports "claim not found" and the entry must be
     # updated with it. Deliberately NOT pinned: docs/developing.md's crates.io
-    # `max_stable_version` 0.23.45 — a crates.io fact that moves independently
+    # `max_stable_version` 0.23.46 — a crates.io fact that moves independently
     # of the vendored copy, not a statement of the vendored version.
     ('CLAUDE.md',              r'当前\s*`?([0-9]+\.[0-9]+\.[0-9]+)',        canon_version, 'frp-core/Cargo.toml version'),
     ('CLAUDE.md',              r'README at `?([0-9]+\.[0-9]+\.[0-9]+)',     canon_version, 'frp-core/Cargo.toml version'),

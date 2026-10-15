@@ -1,6 +1,6 @@
-# Vendored rustls 0.23.45 (frp-rs)
+# Vendored rustls 0.23.46 (frp-rs)
 
-This directory vendors `rustls` 0.23.45 (crates.io) with **one** server-side
+This directory vendors `rustls` 0.23.46 (crates.io) with **one** server-side
 patch, wired in via `[patch.crates-io]` in the workspace root `Cargo.toml`
 (`rustls = { path = "vendor/rustls" }`).
 
@@ -63,7 +63,26 @@ first flight instead of a fatal alert. It runs in CI as part of
 
 ## Security release history of the vendored line
 
-- **0.23.43 → 0.23.45 (this bump).** 0.23.45 fixes
+- **0.23.45 → 0.23.46 (this bump).** 0.23.46 (2026-10-14) fixes four advisories
+  published together, all `patched = [">= 0.23.46"]`:
+  [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346)
+  (`Debug` impls for `Tls12/Tls13ClientSessionValue` exposed TLS secrets,
+  GHSA-c8m5-c952-6cm4),
+  [RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347)
+  (buffered application data sent to the outer server after ECH rejection,
+  GHSA-vp88-798v-h67f),
+  [RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348)
+  (Brotli certificate decompression could allocate up to 1 GiB before
+  authentication, GHSA-h2v8-394m-p7vv — the non-default `brotli` feature, not
+  compiled here), and
+  [RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349)
+  (an unauthenticated ServerHello could downgrade later connections to
+  classical key exchange, GHSA-w44r-93j7-qv28). Re-vendored by hand because the
+  path patch takes the crate out of `cargo update`'s reach — exactly the manual
+  step in "Maintenance obligation" below. The four were surfaced by the new
+  `scripts/vendored-advisory-check.sh` security step, which the 2026-10-03
+  local DB did not yet carry.
+- **0.23.43 → 0.23.45.** 0.23.45 fixes
   [GHSA-2mjx-qc3c-rqvc](https://github.com/rustls/rustls/security/advisories/GHSA-2mjx-qc3c-rqvc)
   (medium, published 2026-09-14): TLS 1.3 handshake messages were incorrectly
   accepted across encryption-level boundaries — a peer could send handshake
@@ -89,11 +108,10 @@ moves to rustls ≥ 0.24**, which adds
 exact semantics of this patch, as a supported knob. At that point set the policy
 on the XTCP QUIC `ServerConfig` and drop the vendored tree.
 
-**As of 2026-09-17 that release does not exist:** crates.io reports
-`max_stable_version = 0.23.45`, `newest_version = 0.23.45`, and the only 0.24
-artifact is `0.24.0-dev.1` — a **prerelease** (published 2026-07-23,
-`edition = "2024"`, `rust_version = "1.85"`). A prerelease is not an option for
-the shipped TLS stack. The 0.24 migration is tracked in [`TODO.md`](../../TODO.md)
+**As of 2026-10-14 that release does not exist:** crates.io reports
+`max_stable_version = 0.23.46`, `newest_version = 0.23.46`, and the only 0.24
+artifact is `0.24.0-dev.2` — a **prerelease**. A prerelease is not an option
+for the shipped TLS stack. The 0.24 migration is tracked in [`TODO.md`](../../TODO.md)
 with the exact trigger (`max_stable_version` ≥ 0.24).
 
 ## Maintenance obligation until then
@@ -115,10 +133,10 @@ Because the crate is patched, `cargo update` will **not** pick up upstream
    the XTCP QUIC compat scenarios — `bash scripts/download-go-frp.sh && bash scripts/compat-test.sh --verbose`
    plus the daily `xtcp-compat.yml` matrix.
 
-## Diff from crates.io rustls 0.23.45
+## Diff from crates.io rustls 0.23.46
 
 Everything outside the `Some(ServerNamePayload::Invalid)` arm of
-`src/server/hs.rs` is byte-identical to crates.io rustls 0.23.45 (apart from
+`src/server/hs.rs` is byte-identical to crates.io rustls 0.23.46 (apart from
 `Cargo.lock`, `benches/` and `examples/`, which are not vendored). The patch
 carries an inline `// frp-rs vendored patch:` comment at the site so it can be
 found with `grep -rn "frp-rs vendored patch" vendor/`.
