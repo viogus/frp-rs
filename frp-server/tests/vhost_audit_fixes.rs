@@ -213,6 +213,46 @@ async fn assert_rejected_and_not_forwarded(
     );
 }
 
+/// Byte-exact sibling of `assert_rejected_and_not_forwarded`: read the whole
+/// response to EOF, compare every byte, then assert no StartWorkConn. Used
+/// where the full render is pinned (R2 F4: a prefix-only assertion stayed
+/// green when the auth challenge header was deleted).
+async fn assert_exact_rejection_and_not_forwarded(
+    client: &mut tokio::net::TcpStream,
+    work_conn: &mut tokio::net::TcpStream,
+    expect: &[u8],
+) {
+    let bytes = read_until_eof(client).await;
+    assert_eq!(
+        bytes,
+        expect,
+        "unexpected response bytes: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "rejected request must not reach a backend (StartWorkConn sent)"
+    );
+}
+
+/// Go `http.Error(401)` render for an origin-form vhost request with failed
+/// Basic Auth (pkg/util/vhost/http.go:275-277): Content-Length 13,
+/// Content-Type, the `Www-Authenticate` challenge (net/http canonical casing)
+/// and nosniff, then the StatusText body with Go's trailing '\n'. Pinned
+/// byte-for-byte so the challenge cannot silently disappear (R2 F4).
+const GO_VHOST_401_RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
+    Content-Length: 13\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Www-Authenticate: Basic realm=\"Restricted\"\r\n\
+    X-Content-Type-Options: nosniff\r\n\
+    \r\n\
+    Unauthorized\n";
+
 /// Read raw bytes until the end of the HTTP/1.1 request head (`\r\n\r\n`).
 /// Returns the head plus any body bytes that arrived with it.
 async fn read_forwarded_head(work_conn: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -343,7 +383,12 @@ async fn test_vhost_basic_auth_rejects_bad_or_missing_credentials() {
             .write_all(request.as_bytes())
             .await
             .expect("send request");
-        assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 401").await;
+        assert_exact_rejection_and_not_forwarded(
+            &mut client,
+            &mut work_conn,
+            GO_VHOST_401_RESPONSE,
+        )
+        .await;
         drop(client);
         println!("{label}: 401 verified");
     }
@@ -483,7 +528,8 @@ async fn test_vhost_body_cannot_carry_authorization() {
         .await
         .expect("send request");
 
-    assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 401").await;
+    assert_exact_rejection_and_not_forwarded(&mut client, &mut work_conn, GO_VHOST_401_RESPONSE)
+        .await;
     drop(client);
     drop(_provider);
 }
@@ -1754,4 +1800,363 @@ async fn test_https_declared_response_headers_tls_handshake_completes() {
     drop(client_tls);
     drop(backend_tls);
     drop(_provider);
+}
+
+// ---------------------------------------------------------------
+// Go frp v0.71.1 #5562: HTTP-vhost CONNECT body / Transfer-Encoding
+// rejection (`connectHandler`: `req.ContentLength > 0 ||
+// len(req.TransferEncoding) > 0` → plain `http.Error(400)` before the
+// hijack), plus the early-data regression net for #5556.
+// ---------------------------------------------------------------
+
+/// Go v0.71.1 `http.Error(rw, http.StatusText(400), 400)` render, probed
+/// against the real release binary (`/tmp/frp_0.71.1_darwin_arm64/frps`,
+/// vhost `http` proxy, raw CONNECT):
+///
+/// `HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain;
+/// charset=utf-8\r\nX-Content-Type-Options: nosniff\r\nDate: ...\r\n
+/// Content-Length: 12\r\n\r\nBad Request\n`
+///
+/// frp-rs omits the net/http server-layer Date header and fixes the field
+/// order (Content-Length first) — the same raw-write scoping as the 401/407
+/// `http.Error` arms and the NotFoundResponse writer. Fields, values, body
+/// and length are byte-identical to the probe.
+const GO_CONNECT_BODY_400: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\
+    Content-Length: 12\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    X-Content-Type-Options: nosniff\r\n\
+    \r\n\
+    Bad Request\n";
+
+/// Read from `conn` until `needle` appears, returning everything read.
+async fn read_until_seen(conn: &mut tokio::net::TcpStream, needle: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while !buf.windows(needle.len()).any(|w| w == needle) {
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), conn.read(&mut chunk))
+            .await
+            .expect("timeout waiting for expected bytes")
+            .expect("read expected bytes");
+        assert!(n > 0, "unexpected EOF waiting for {needle:?}");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    buf
+}
+
+/// CONNECT + `Content-Length: 1` (+ the body byte) must answer Go's exact
+/// 400 and must NOT dispatch a user conn to the provider — no work conn is
+/// requested, so the pooled work conn stays silent.
+#[tokio::test]
+async fn test_vhost_connect_body_400_and_no_backend_dial() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "conn-body-gate",
+            vec!["conn-body-gate.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // Head + body byte in ONE write: the head reader consumes both, so the
+    // 400 close cannot race a still-buffered body byte (which would RST the
+    // response on BSD/macOS).
+    client
+        .write_all(
+            b"CONNECT conn-body-gate.example.com:443 HTTP/1.1\r\n\
+              Host: conn-body-gate.example.com:443\r\n\
+              Content-Length: 1\r\n\
+              \r\n\
+              X",
+        )
+        .await
+        .expect("send CONNECT with body");
+
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        GO_CONNECT_BODY_400,
+        "CONNECT + Content-Length: 1 must answer the byte-exact Go 400, got: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    // The gate runs before any work conn is requested: the pooled work conn
+    // must stay silent (a forwarded request would carry StartWorkConn).
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(&mut work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "body-bearing CONNECT must not reach a backend (StartWorkConn sent)"
+    );
+
+    drop(client);
+}
+
+/// CONNECT + any `Transfer-Encoding` must answer the same byte-exact 400
+/// and dial no backend (v0.71.1's gate is `len(req.TransferEncoding) > 0`).
+#[tokio::test]
+async fn test_vhost_connect_transfer_encoding_400_and_no_backend_dial() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "conn-te-gate",
+            vec!["conn-te-gate.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let mut work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT conn-te-gate.example.com:443 HTTP/1.1\r\n\
+              Host: conn-te-gate.example.com:443\r\n\
+              Transfer-Encoding: chunked\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT with Transfer-Encoding");
+
+    let bytes = read_until_eof(&mut client).await;
+    assert_eq!(
+        bytes,
+        GO_CONNECT_BODY_400,
+        "CONNECT + Transfer-Encoding must answer the byte-exact Go 400, got: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(&mut work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "Transfer-Encoding CONNECT must not reach a backend (StartWorkConn sent)"
+    );
+
+    drop(client);
+}
+
+/// Control row: `Content-Length: 0` is NOT a body for Go (`> 0`), so the
+/// CONNECT still tunnels — the raw head is forwarded and bytes flow both
+/// ways.
+#[tokio::test]
+async fn test_vhost_connect_content_length_zero_still_tunnels() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "conn-cl0",
+            vec!["conn-cl0.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"CONNECT conn-cl0.example.com:443 HTTP/1.1\r\n\
+              Host: conn-cl0.example.com:443\r\n\
+              Content-Length: 0\r\n\
+              \r\n",
+        )
+        .await
+        .expect("send CONNECT");
+
+    let (mut work_conn, _swc) = take_start_work_conn(addr, &run_id, work_conn).await;
+    let forwarded = read_forwarded_head(&mut work_conn).await;
+    let text = String::from_utf8_lossy(&forwarded);
+    assert!(
+        text.starts_with("CONNECT conn-cl0.example.com:443 HTTP/1.1\r\n"),
+        "CONNECT head must be forwarded raw: {text}"
+    );
+
+    // The tunnel is live in both directions: client bytes reach the work
+    // conn, backend bytes reach the client.
+    client.write_all(b"TUNNEL-IN").await.expect("client write");
+    let mut tunnel = [0u8; 9];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        work_conn.read_exact(&mut tunnel),
+    )
+    .await
+    .expect("timeout waiting for tunnel bytes")
+    .expect("work conn read");
+    assert_eq!(&tunnel, b"TUNNEL-IN", "tunnel bytes must reach the backend");
+
+    work_conn
+        .write_all(b"TUNNEL-OUT")
+        .await
+        .expect("backend write");
+    let mut back = [0u8; 10];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.read_exact(&mut back),
+    )
+    .await
+    .expect("timeout waiting for tunnel echo")
+    .expect("client read");
+    assert_eq!(&back, b"TUNNEL-OUT", "tunnel bytes must reach the client");
+
+    drop(client);
+    drop(work_conn);
+}
+
+/// Control row: a plain GET that declares a body still proxies normally
+/// (the new gate is CONNECT-only).
+#[tokio::test]
+async fn test_vhost_get_with_body_still_proxies() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "get-body",
+            vec!["get-body.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    client
+        .write_all(
+            b"GET /x HTTP/1.1\r\n\
+              Host: get-body.example.com\r\n\
+              Content-Length: 5\r\n\
+              \r\n\
+              hello",
+        )
+        .await
+        .expect("send GET with body");
+
+    let (mut work_conn, _swc) = take_start_work_conn(addr, &run_id, work_conn).await;
+    let forwarded = read_until_seen(&mut work_conn, b"hello").await;
+    let text = String::from_utf8_lossy(&forwarded);
+    assert!(
+        text.starts_with("GET /x HTTP/1.1\r\n"),
+        "GET request line must be forwarded: {text}"
+    );
+    assert!(
+        text.ends_with("hello"),
+        "GET body must be forwarded after the head: {text:?}"
+    );
+
+    // The backend response comes back through the same tunnel.
+    work_conn
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        .await
+        .expect("backend response");
+    let response = read_until_seen(&mut client, b"ok").await;
+    assert!(
+        String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200 OK\r\n"),
+        "backend response must reach the client: {:?}",
+        String::from_utf8_lossy(&response)
+    );
+
+    drop(client);
+    drop(work_conn);
+}
+
+/// Regression net for #5556 (A3): tunnel payload that arrives in the SAME
+/// client write as the CONNECT head must reach the backend after the head,
+/// and the tunnel must then echo both ways. Existing CONNECT tests send the
+/// head, wait for the forwarded head, and only then send tunnel bytes, so
+/// none of them exercises the buffered `pre_read` tail path.
+#[tokio::test]
+async fn test_vhost_connect_forwards_early_data_in_order() {
+    let (addr, vhost_addr, cfg) = vhost_pair();
+    let (_handle, _) = start_test_server(cfg).await;
+
+    let (_provider, run_id) = register_proxy(
+        addr,
+        FrpMessage::NewProxy(Box::new(http_proxy(
+            "conn-early",
+            vec!["conn-early.example.com".into()],
+            None,
+            None,
+        ))),
+    )
+    .await;
+    let work_conn = pool_work_conn(addr, &run_id).await;
+
+    let mut client = tokio::net::TcpStream::connect(vhost_addr)
+        .await
+        .expect("vhost connect");
+    // ONE write: the CONNECT head and the first tunnel bytes. The vhost head
+    // reader keeps the tail in `pre_read`, and the bridge must write it to
+    // the backend before reading anything else from the socket.
+    client
+        .write_all(
+            b"CONNECT conn-early.example.com:443 HTTP/1.1\r\n\
+              Host: conn-early.example.com:443\r\n\
+              \r\n\
+              EARLY-TUNNEL-BYTES",
+        )
+        .await
+        .expect("send CONNECT with early data");
+
+    let (mut work_conn, _swc) = take_start_work_conn(addr, &run_id, work_conn).await;
+    let forwarded = read_until_seen(&mut work_conn, b"EARLY-TUNNEL-BYTES").await;
+    let text = String::from_utf8_lossy(&forwarded);
+    let head_end = forwarded
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| p + 4)
+        .expect("forwarded CONNECT head terminator");
+    assert!(
+        text.starts_with("CONNECT conn-early.example.com:443 HTTP/1.1\r\n"),
+        "CONNECT head must be forwarded raw: {text}"
+    );
+    assert!(
+        head_end <= forwarded.len() - b"EARLY-TUNNEL-BYTES".len()
+            && &forwarded[head_end..head_end + b"EARLY-TUNNEL-BYTES".len()]
+                == b"EARLY-TUNNEL-BYTES",
+        "early data must follow the head terminator in one ordered stream: {text:?}"
+    );
+
+    // The tunnel is live after the buffered tail: echo bytes back.
+    work_conn
+        .write_all(b"EARLY-ECHO")
+        .await
+        .expect("backend echo");
+    let echo = read_until_seen(&mut client, b"EARLY-ECHO").await;
+    assert_eq!(
+        echo, b"EARLY-ECHO",
+        "backend bytes must come back on the same tunnel"
+    );
+
+    drop(client);
+    drop(work_conn);
 }
