@@ -6,9 +6,9 @@
 //! `VnetTunTxMap`/`VnetTunSubnetMap` aliases those items share.
 //!
 //! Its reconnect backoff (`virtual_net_reconnect_delay`, `VirtualNetTunnelEnd`,
-//! `wait_after_virtual_net_error`) mirrors Go frp's virtual_net plugin: the
-//! setup-failure backoff dates from v0.71.0, the bounded (non-overflowing)
-//! delay computation from v0.71.1.
+//! `next_reconnect_delay`, `wait_after_virtual_net_round`) mirrors Go frp's
+//! virtual_net plugin: the setup-failure backoff dates from v0.71.0, the
+//! bounded (non-overflowing) delay computation from v0.71.1.
 //!
 //! Split out of `frp-client/src/visitor.rs` by the plan's P3 seam 4
 //! (`docs/refactor-large-modules.md` P3, `visitor/vnet.rs`) as a pure move:
@@ -151,27 +151,87 @@ enum VirtualNetTunnelEnd {
     Error,
 }
 
-/// Account for one failed `virtual_net` reconnect attempt: bump the
-/// consecutive-error counter, log it as upstream does, then wait out the
-/// exponential backoff. Returns `true` when shutdown was requested.
+/// The per-round Go frp reconnect rule: advance the consecutive-error counter
+/// for one finished round and return the delay to wait before the next attempt.
+///
+/// * `Error` — bump the counter (saturating) and back off 60/120/240/300 s.
+/// * `Clean` — reset the counter to 0 and wait the fixed 10 s. Go resets only
+///   on a clean close, never on a successful connection.
+/// * `Shutdown` — no reconnect is scheduled; the caller returns (`None`).
+///
+/// This is the only place the counter moves. [`wait_after_virtual_net_round`]
+/// only logs and sleeps around it, and the reconnect loop only calls that
+/// wrapper, so the decision has exactly one implementation.
+#[cfg(feature = "vnet")]
+fn next_reconnect_delay(
+    consecutive_errors: &mut u32,
+    end: VirtualNetTunnelEnd,
+) -> Option<Duration> {
+    match end {
+        VirtualNetTunnelEnd::Shutdown => None,
+        VirtualNetTunnelEnd::Clean => {
+            *consecutive_errors = 0;
+            Some(VIRTUAL_NET_RECONNECT_CLEAN_DELAY)
+        }
+        VirtualNetTunnelEnd::Error => {
+            *consecutive_errors = consecutive_errors.saturating_add(1);
+            Some(virtual_net_reconnect_delay(*consecutive_errors))
+        }
+    }
+}
+
+/// Account for one finished `virtual_net` round: apply [`next_reconnect_delay`],
+/// log the delay as upstream does, then wait for it (interruptibly). Returns
+/// `true` when shutdown was requested or the round was our own shutdown, i.e.
+/// when the caller must leave the reconnect loop.
+#[cfg(feature = "vnet")]
+async fn wait_after_virtual_net_round(
+    visitor_name: &str,
+    shutdown: &Arc<AtomicBool>,
+    consecutive_errors: &mut u32,
+    end: VirtualNetTunnelEnd,
+) -> bool {
+    let previous = *consecutive_errors;
+    let Some(delay) = next_reconnect_delay(consecutive_errors, end) else {
+        // Our own shutdown schedules no reconnect; the caller returns.
+        return true;
+    };
+    if end == VirtualNetTunnelEnd::Error {
+        warn!(
+            visitor_name = %visitor_name,
+            consecutive_errors = *consecutive_errors,
+            delay_secs = delay.as_secs(),
+            "virtual_net visitor '{}' reconnecting after {} consecutive error(s), waiting {}s",
+            visitor_name,
+            *consecutive_errors,
+            delay.as_secs()
+        );
+    } else if previous > 0 {
+        info!(
+            visitor_name = %visitor_name,
+            consecutive_errors = previous,
+            "virtual_net visitor '{}' tunnel closed cleanly, resetting error counter (was {})",
+            visitor_name,
+            previous
+        );
+    }
+    wait_for_shutdown_or_delay(shutdown, delay).await
+}
+
+/// Shorthand for the pre-tunnel failure sites, which are always error rounds.
 #[cfg(feature = "vnet")]
 async fn wait_after_virtual_net_error(
     visitor_name: &str,
     shutdown: &Arc<AtomicBool>,
     consecutive_errors: &mut u32,
 ) -> bool {
-    *consecutive_errors = consecutive_errors.saturating_add(1);
-    let delay = virtual_net_reconnect_delay(*consecutive_errors);
-    warn!(
-        visitor_name = %visitor_name,
-        consecutive_errors = *consecutive_errors,
-        delay_secs = delay.as_secs(),
-        "virtual_net visitor '{}' reconnecting after {} consecutive error(s), waiting {}s",
+    wait_after_virtual_net_round(
         visitor_name,
-        *consecutive_errors,
-        delay.as_secs()
-    );
-    wait_for_shutdown_or_delay(shutdown, delay).await
+        shutdown,
+        consecutive_errors,
+        VirtualNetTunnelEnd::Error,
+    )
+    .await
 }
 
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
@@ -493,38 +553,12 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
-        match tunnel_end {
-            // Deliberately defensive, not the live exit: a `Shutdown` end means
-            // the signal was set, so the check just above has normally already
-            // returned. Kept explicit so every end state is named (and a future
-            // reorder cannot fall into the backoff at shutdown).
-            VirtualNetTunnelEnd::Shutdown => return,
-            VirtualNetTunnelEnd::Clean => {
-                // Go resets the counter only on a clean close, not on a
-                // successful connection: a tunnel that keeps dying right
-                // after it is established stays on the fixed 10s delay
-                // instead of drifting into the error backoff.
-                if consecutive_errors > 0 {
-                    info!(
-                        visitor_name = %name,
-                        consecutive_errors,
-                        "virtual_net visitor '{}' tunnel closed cleanly, resetting error counter (was {})",
-                        name,
-                        consecutive_errors
-                    );
-                    consecutive_errors = 0;
-                }
-                if wait_for_shutdown_or_delay(&shutdown, VIRTUAL_NET_RECONNECT_CLEAN_DELAY).await {
-                    return;
-                }
-            }
-            // Setup failed before the data plane (split / cipher constructor):
-            // error path and exponential backoff.
-            VirtualNetTunnelEnd::Error => {
-                if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
-                    return;
-                }
-            }
+        // The one place the Go round rule is applied. `Shutdown` normally
+        // already returned at the check above; the wrapper still answers
+        // `true` for it, so a reorder cannot make the loop wait at shutdown.
+        if wait_after_virtual_net_round(&name, &shutdown, &mut consecutive_errors, tunnel_end).await
+        {
+            return;
         }
     }
 }
@@ -865,6 +899,70 @@ mod tests {
             virtual_net_reconnect_delay(u32::MAX),
             Duration::from_secs(300)
         );
+    }
+
+    /// The per-round decision the reconnect loop applies, pinned as a sequence:
+    /// error rounds climb 60 -> 120 -> 240 -> 300 and bump the counter, a clean
+    /// round resets it and waits the fixed 10 s, and the reset therefore makes
+    /// the next error round start over at 60 s. Also pins shutdown (no delay,
+    /// counter untouched) and saturation at `u32::MAX`.
+    #[test]
+    fn next_reconnect_delay_pins_error_and_clean_rounds() {
+        let mut n = 0u32;
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(n, 1, "one error round counts one consecutive error");
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(n, 2);
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(n, 3);
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(n, 4);
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(300)),
+            "further errors stay capped"
+        );
+        assert_eq!(n, 5);
+
+        // A clean close resets the counter and takes the fixed 10 s delay.
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Clean),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(n, 0, "clean resets the consecutive-error count");
+        // ...so the next error round starts the schedule over at 60 s.
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(n, 1);
+
+        // Our own shutdown schedules no reconnect and must not touch the count.
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Shutdown),
+            None
+        );
+        assert_eq!(n, 1);
+
+        // Saturation: the increment cannot overflow or panic.
+        n = u32::MAX;
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(n, u32::MAX);
     }
 
     /// Spawn `run_virtual_net_tunnel_io` over the given transport with no TUN
