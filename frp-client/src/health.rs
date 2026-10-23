@@ -39,6 +39,52 @@ pub(crate) struct HealthCheckConfig {
     pub session_gen: Arc<AtomicU64>,
 }
 
+/// Upper bound on how long the monitor blocks before re-reading its `cancel`
+/// flag.
+///
+/// The cancel plumbing is a plain `Arc<AtomicBool>` (`Service::health_cancels`):
+/// every source — the CloseProxy handler, reload removal, session teardown —
+/// only *stores* `true`, so it cannot wake an async waiter. The monitor bridges
+/// that flag into an interruptible wait by polling it at this cadence, matching
+/// the existing in-tree shutdown-wait idiom (`wait_session_dead` in
+/// `frp-client/src/nat_hole.rs`, `wait_sudp_shutdown` in
+/// `frp-client/src/visitor/sudp.rs`, `wait_for_shutdown_or_delay` in
+/// `frp-client/src/visitor/vnet.rs`).
+///
+/// Go frp v0.71.1 is event-driven here (`Monitor.waitForNextCheck` selects on
+/// `ctx.Done()`), so the only observable difference is shutdown latency:
+/// bounded by one tick (100 ms) instead of a whole inter-check interval
+/// (default 10 s) or probe timeout (3 s).
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Go frp v0.71.0 compat: pause before the first probe, so many proxies
+/// registering at client startup do not fire a thundering herd of checks.
+const STARTUP_DELAY: Duration = Duration::from_millis(500);
+
+/// Resolve once `cancel` is set. Polled — see [`CANCEL_POLL_INTERVAL`].
+async fn cancelled(cancel: &Arc<AtomicBool>) {
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+    }
+}
+
+/// Sleep for `dur`, cut short when `cancel` is set.
+///
+/// Returns `true` when cancellation won the race. Mirrors Go frp v0.71.1
+/// `Monitor.waitForNextCheck` (`client/health/health.go`):
+/// `select { case <-monitor.ctx.Done(): return false; case <-timerC: ... }` —
+/// the inter-check wait must not delay shutdown.
+async fn sleep_or_cancel(dur: Duration, cancel: &Arc<AtomicBool>) -> bool {
+    tokio::select! {
+        biased;
+        _ = cancelled(cancel) => true,
+        _ = tokio::time::sleep(dur) => false,
+    }
+}
+
 /// Run a health check for a proxy.
 /// Supports "tcp" (connect only) and "http" (GET + check 2xx status).
 ///
@@ -47,6 +93,13 @@ pub(crate) struct HealthCheckConfig {
 ///   - On max_failed: calls statusFailedFn (sends Close event), keeps running
 ///   - On recovery after failure: calls statusNormalFn (sends Recover event)
 ///   - Only stops when `cancel` is set (proxy removed, not on health failure).
+///
+/// Shutdown (Go frp v0.71.1 parity, `Monitor.checkWorker`/`waitForNextCheck`):
+/// the startup pause, the in-flight probe and the inter-check wait are all
+/// raced against `cancel`, so the worker exits promptly on Stop instead of
+/// outliving it by up to one interval (10 s default) or one probe timeout.
+/// A probe cancelled in flight is DROPPED without handling its result, exactly
+/// like Go's post-`doCheck` `ctx.Err()` re-check.
 pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     let HealthCheckConfig {
         proxy_name,
@@ -84,78 +137,114 @@ pub(crate) async fn run_health_check(config: HealthCheckConfig) {
     // Go frp v0.70.1 compat: add 500ms startup delay before the first check.
     // This prevents a thundering herd of health checks when many proxies
     // register simultaneously at client startup.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    loop {
-        // Check cancellation before each check cycle.
-        if cancel.load(Ordering::Relaxed) {
-            info!(proxy_name = %proxy_name, "Health check cancelled for '{}'", proxy_name);
-            return;
+    //
+    // Go frp v0.71.1: the pause is interruptible — `Stop()` must be able to
+    // release a worker that has not probed yet (checkWorker returns as soon as
+    // ctx is done), so a cancel during startup must not hold the task for the
+    // remaining pause.
+    //
+    // Every exit from this loop means cancellation: the loop only breaks when
+    // `cancel` was observed while starting up, before a probe, during a probe,
+    // or while waiting for the next check. The log therefore lives once, after
+    // the block, instead of at each observation point.
+    'monitor: {
+        if sleep_or_cancel(STARTUP_DELAY, &cancel).await {
+            break 'monitor;
         }
 
-        // Re-arm on a control-session boundary (see `seen_gen` above). The
-        // new state keeps `was_healthy=false`, so Close cannot fire before
-        // this session's first successful probe — exactly a fresh Go Monitor.
-        let gen = session_gen.load(Ordering::Relaxed);
-        if gen != seen_gen {
-            debug!(proxy_name = %proxy_name, session_gen = gen, "Health check: control session changed, re-arming registration state for '{}'", proxy_name);
-            state = HealthState::new();
-            seen_gen = gen;
-        }
-
-        // Run check first, then sleep (Go frp compat: check happens immediately on start,
-        // then sleep for interval duration before the next check).
-        let result = if check_type == "http" {
-            run_http_check(&local_addr, &check_url, timeout, &hc_headers).await
-        } else {
-            run_tcp_check(&local_addr, timeout).await
-        };
-
-        // Close is only ever fired from a FAILURE tick (Go frp: statusFailedFn
-        // runs in the error branch). The old guard ran on every tick, so the
-        // first success after a failure sent Recover AND re-fired Close in the
-        // same tick (failures was monotonic and was_failed had just been cleared)
-        // — flapping CloseProxy/NewProxy every health interval.
-        match state.on_check(result.is_ok(), max_failed) {
-            HealthAction::Recover => {
-                // Service recovered. Notify control loop to re-register.
-                info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
-                // try_send: during a reconnect the control-loop consumer
-                // is gone and the bounded channel may be full — blocking
-                // here would pause health probing. On failure keep
-                // was_failed=true so the next successful check retries.
-                if health_tx
-                    .try_send(HealthEvent::Recover(proxy_name.clone()))
-                    .is_ok()
-                {
-                    state.confirm_recover();
-                }
+        loop {
+            // Check cancellation before each check cycle.
+            if cancel.load(Ordering::Relaxed) {
+                break 'monitor;
             }
-            HealthAction::Close => {
-                warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
+
+            // Re-arm on a control-session boundary (see `seen_gen` above). The
+            // new state keeps `was_healthy=false`, so Close cannot fire before
+            // this session's first successful probe — exactly a fresh Go Monitor.
+            let gen = session_gen.load(Ordering::Relaxed);
+            if gen != seen_gen {
+                debug!(proxy_name = %proxy_name, session_gen = gen, "Health check: control session changed, re-arming registration state for '{}'", proxy_name);
+                state = HealthState::new();
+                seen_gen = gen;
+            }
+
+            // Run check first, then sleep (Go frp compat: check happens immediately on start,
+            // then sleep for interval duration before the next check).
+            // The probe runs under the same cancellation race as Go's
+            // `doCtx` (derived from the monitor ctx): dropping this future
+            // closes the probe socket/connect, it cannot outlive the monitor.
+            let probe = async {
+                if check_type == "http" {
+                    run_http_check(&local_addr, &check_url, timeout, &hc_headers).await
+                } else {
+                    run_tcp_check(&local_addr, timeout).await
+                }
+            };
+            let result = tokio::select! {
+                biased;
+                _ = cancelled(&cancel) => break 'monitor,
+                r = probe => r,
+            };
+
+            // Go checkWorker re-checks ctx after doCheck and returns without
+            // handling the result of a probe that raced cancellation; do the
+            // same so shutdown never emits a stale Close/Recover event.
+            if cancel.load(Ordering::Relaxed) {
+                break 'monitor;
+            }
+
+            // Close is only ever fired from a FAILURE tick (Go frp: statusFailedFn
+            // runs in the error branch). The old guard ran on every tick, so the
+            // first success after a failure sent Recover AND re-fired Close in the
+            // same tick (failures was monotonic and was_failed had just been cleared)
+            // — flapping CloseProxy/NewProxy every health interval.
+            match state.on_check(result.is_ok(), max_failed) {
+                HealthAction::Recover => {
+                    // Service recovered. Notify control loop to re-register.
+                    info!(proxy_name = %proxy_name, "Health check recovered for '{}', sending Recover event", proxy_name);
+                    // try_send: during a reconnect the control-loop consumer
+                    // is gone and the bounded channel may be full — blocking
+                    // here would pause health probing. On failure keep
+                    // was_failed=true so the next successful check retries.
+                    if health_tx
+                        .try_send(HealthEvent::Recover(proxy_name.clone()))
+                        .is_ok()
+                    {
+                        state.confirm_recover();
+                    }
+                }
+                HealthAction::Close => {
+                    warn!(proxy_name = %proxy_name, max_failed = %max_failed, "Health check: proxy '{}' exceeded max failures ({}), sending Close event",
                     proxy_name, max_failed);
-                // try_send: during a reconnect the consumer may be gone and the
-                // channel full — never block probing. On failure keep
-                // was_failed=false; the next failed check retries the Close.
-                if health_tx
-                    .try_send(HealthEvent::Close(proxy_name.clone()))
-                    .is_ok()
-                {
-                    state.confirm_close();
+                    // try_send: during a reconnect the consumer may be gone and the
+                    // channel full — never block probing. On failure keep
+                    // was_failed=false; the next failed check retries the Close.
+                    if health_tx
+                        .try_send(HealthEvent::Close(proxy_name.clone()))
+                        .is_ok()
+                    {
+                        state.confirm_close();
+                    }
+                    // Keep running -- monitor for recovery (Go frp compat).
                 }
-                // Keep running -- monitor for recovery (Go frp compat).
+                HealthAction::None => {}
             }
-            HealthAction::None => {}
-        }
 
-        if let Err(e) = result {
-            warn!(proxy_name = %proxy_name, failures = %state.failures, error = %e, "Health check FAIL for '{}' ({}): {}", proxy_name, state.failures, e);
-        } else {
-            debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
-        }
+            if let Err(e) = result {
+                warn!(proxy_name = %proxy_name, failures = %state.failures, error = %e, "Health check FAIL for '{}' ({}): {}", proxy_name, state.failures, e);
+            } else {
+                debug!(proxy_name = %proxy_name, "Health check OK for '{}'", proxy_name);
+            }
 
-        tokio::time::sleep(interval).await;
+            // Go v0.71.1 waitForNextCheck: the inter-check wait is
+            // interruptible, so Stop does not have to wait out the interval.
+            if sleep_or_cancel(interval, &cancel).await {
+                break 'monitor;
+            }
+        }
     }
+
+    info!(proxy_name = %proxy_name, "Health check cancelled for '{}'", proxy_name);
 }
 
 /// Action a health-check monitor should take after one probe result.
@@ -1526,5 +1615,192 @@ mod tests {
         assert_eq!(parse_status_code("HTTP/1.1 20"), None);
         assert_eq!(parse_status_code("FOO 200 OK"), None);
         assert_eq!(parse_status_code(""), None);
+    }
+
+    // --- Go v0.71.1 shutdown parity: interruptible monitor wait ---
+    //
+    // Go `Monitor.checkWorker` (client/health/health.go) races every wait
+    // against `monitor.ctx`: `doCtx` cancels an in-flight probe, and
+    // `waitForNextCheck` selects on `ctx.Done()` instead of sleeping out the
+    // interval. `Monitor.Done()` then lets a test observe worker exit. The
+    // tests below pin the same three observable properties on the Rust
+    // monitor. The spawned task's JoinHandle is the `Done()` analogue — the
+    // production spawn site (`spawn_health_checks`) still detaches it, so no
+    // visibility beyond this module is needed.
+
+    /// Spawn a monitor the way `spawn_health_checks` does and hand back the
+    /// task handle so the test can await worker exit (Go `Done()`).
+    fn spawn_monitor_for_test(
+        check_type: &str,
+        local_addr: &str,
+        check_url: &str,
+        interval: Duration,
+        timeout: Duration,
+        cancel: Arc<AtomicBool>,
+    ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<HealthEvent>) {
+        let (health_tx, health_rx) = mpsc::channel(8);
+        let config = HealthCheckConfig {
+            proxy_name: "test.proxy".into(),
+            local_addr: local_addr.into(),
+            check_type: check_type.into(),
+            check_url: check_url.into(),
+            hc_headers: Vec::new(),
+            interval,
+            timeout,
+            max_failed: 1,
+            health_tx,
+            cancel,
+            session_gen: Arc::new(AtomicU64::new(0)),
+        };
+        (tokio::spawn(run_health_check(config)), health_rx)
+    }
+
+    /// Go `TestMonitorStopCancelsWork/interval wait`: Stop releases the
+    /// inter-check wait, it does not sleep out the interval. RED before the
+    /// fix: the worker sits in `sleep(30s)` and the 1 s join times out.
+    #[tokio::test]
+    async fn monitor_exits_promptly_when_cancelled_during_interval_wait() {
+        use std::sync::atomic::Ordering;
+
+        // A backend that accepts the first TCP probe and fires `accepted`;
+        // that tells the test the worker finished its first check and is
+        // now in the 30 s inter-check wait.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let backend = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let _ = sock.read(&mut [0u8; 1]).await;
+                let _ = accepted_tx.send(());
+            }
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (handle, _health_rx) = spawn_monitor_for_test(
+            "tcp",
+            &addr,
+            "",
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            cancel.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("first probe did not reach the backend")
+            .expect("backend dropped before signalling");
+        // Let the worker process the probe result and enter the interval wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let cancelled_at = std::time::Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("monitor did not exit within 1 s of cancellation")
+            .expect("monitor task panicked");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(1),
+            "monitor exit took {:?} (interval was 30 s)",
+            cancelled_at.elapsed()
+        );
+        backend.abort();
+    }
+
+    /// The 500 ms startup pause is interruptible too: Go's checkWorker checks
+    /// `ctx.Err()` before its first `doCheck`, so a Stop landing during the
+    /// pause must not hold the task for the rest of it. RED before the fix:
+    /// the worker sleeps the remaining ~350 ms before noticing the flag.
+    #[tokio::test]
+    async fn monitor_exits_promptly_when_cancelled_during_startup_delay() {
+        use std::sync::atomic::Ordering;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Never probed: the cancel below lands inside the startup pause, so
+        // the (closed) address is irrelevant.
+        let (handle, _health_rx) = spawn_monitor_for_test(
+            "tcp",
+            "127.0.0.1:1",
+            "",
+            Duration::from_secs(30),
+            Duration::from_secs(3),
+            cancel.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !handle.is_finished(),
+            "monitor exited before it could be cancelled during the startup pause"
+        );
+
+        let cancelled_at = std::time::Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("monitor did not exit within 1 s of cancellation")
+            .expect("monitor task panicked");
+        // ~350 ms of the pause remained when the flag was set; a fix that
+        // ignored cancellation would take at least that long.
+        assert!(
+            cancelled_at.elapsed() < Duration::from_millis(300),
+            "monitor exit took {:?}; the startup pause was not interrupted",
+            cancelled_at.elapsed()
+        );
+    }
+
+    /// Go `TestMonitorStopCancelsWork/in-flight check`: Stop aborts the probe
+    /// in flight (Go's `doCtx` deadline derives from the monitor ctx), so the
+    /// peer observes the connection close instead of the worker waiting out
+    /// the 5 s probe timeout. Dropping the probe future closes the socket.
+    #[tokio::test]
+    async fn monitor_cancels_in_flight_probe_on_cancel() {
+        use std::sync::atomic::Ordering;
+        use tokio::sync::oneshot;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (request_tx, request_rx) = oneshot::channel();
+        let (eof_tx, eof_rx) = oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let _ = request_tx.send(());
+            // Hold the request open; the cancelled probe must close its side.
+            let mut sink = [0u8; 64];
+            loop {
+                match sock.read(&mut sink).await {
+                    Ok(0) | Err(_) => {
+                        let _ = eof_tx.send(());
+                        return;
+                    }
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let url = format!("http://{addr}/healthz");
+        let (handle, _health_rx) = spawn_monitor_for_test(
+            "http",
+            &addr,
+            &url,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+            cancel.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), request_rx)
+            .await
+            .expect("probe request did not reach the backend")
+            .expect("backend dropped before signalling");
+        cancel.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(1), eof_rx)
+            .await
+            .expect("cancelled probe did not close its socket (in-flight probe not aborted)")
+            .expect("backend dropped before observing EOF");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("monitor did not exit within 1 s of cancellation")
+            .expect("monitor task panicked");
+        backend.abort();
     }
 }
