@@ -72,6 +72,11 @@ impl ControlWriter {
     /// Try to enqueue `msg` for the writer task. Never blocks. Returns an
     /// error when the writer has failed, the channel is full (peer slow) or
     /// the connection is being torn down.
+    ///
+    /// `Ok(())` means the message was accepted by the writer funnel, **not
+    /// that it was delivered**: a shutdown that becomes observable after the
+    /// final check still discards a buffered message (Go frp v0.71.1 #5561
+    /// `enqueue` — "A nil error does not guarantee delivery").
     pub(crate) fn send(&self, msg: FrpMessage, v2: bool) -> Result<(), String> {
         if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("control writer failed".to_string());
@@ -83,7 +88,15 @@ impl ControlWriter {
             tokio::sync::mpsc::error::TrySendError::Closed(_) => {
                 "control channel closed".to_string()
             }
-        })
+        })?;
+        // Shutdown may have become observable while the message was being
+        // enqueued (the writer task can fail and drop the receiver between
+        // the check above and this `try_send`): do not report success then
+        // (Go frp v0.71.1 #5561 post-enqueue re-check).
+        if self.failed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("control writer failed".to_string());
+        }
+        Ok(())
     }
 
     pub(crate) fn is_failed(&self) -> bool {
@@ -223,8 +236,9 @@ struct SessionCtx {
     /// Server-advertised auth scopes, for heartbeat auth decisions.
     server_scopes: Vec<String>,
     /// Per-session shutdown flag; set only when a stop was requested (the
-    /// stop_rx arm in the message loop, or the reconnect backoff race), read
-    /// at teardown. Never set on error/reconnect exits.
+    /// stop-token arm in the message loop or registration phase, or the
+    /// reconnect backoff race), read at teardown. Never set on
+    /// error/reconnect exits.
     shutdown_flag: Arc<AtomicBool>,
     /// Session start time, used to reset the backoff counter when a session
     /// runs healthily for a long time (Go frp's FastBackoffManager only
@@ -346,11 +360,12 @@ pub struct Service {
     reload_tx: mpsc::Sender<ReloadRequest>,
     /// Receiver side of reload channel — consumed by run().
     reload_rx: std::sync::Mutex<Option<mpsc::Receiver<ReloadRequest>>>,
-    /// Channel to trigger graceful shutdown from external signal (SIGTERM)
-    /// or the admin API. The receiver is consumed by run().
-    stop_tx: mpsc::Sender<()>,
-    /// Receiver side of stop channel — consumed by run().
-    stop_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    /// Cancellation token for graceful shutdown from an external signal
+    /// (SIGTERM) or the admin API. `run()` observes it at every startup
+    /// phase (dial/login, registration), at the backoff sleeps and in the
+    /// message loop; it is one-shot and idempotent, so a stop issued before
+    /// `run()` means "never start".
+    stop: CancellationToken,
     /// STUN server address for XTCP NAT traversal.
     nat_hole_stun_server: String,
     /// Channel from work connection tasks to the control loop for XTCP (provider side).
@@ -818,7 +833,7 @@ impl Service {
         let proxy_info_map = Arc::new(RwLock::new(map));
 
         let (reload_tx, reload_rx) = mpsc::channel::<ReloadRequest>(64);
-        let (stop_tx, stop_rx) = mpsc::channel::<()>(1);
+        let stop = CancellationToken::new();
         let (xtcp_tx, xtcp_rx) = mpsc::channel::<XtcpNotification>(64);
         let (visitor_tx, visitor_rx) = mpsc::channel::<VisitorRequest>(64);
         let (health_tx, health_rx) = mpsc::channel::<HealthEvent>(16);
@@ -869,8 +884,7 @@ impl Service {
             config_file,
             reload_tx,
             reload_rx: std::sync::Mutex::new(Some(reload_rx)),
-            stop_tx,
-            stop_rx: std::sync::Mutex::new(Some(stop_rx)),
+            stop,
             nat_hole_stun_server,
             xtcp_tx,
             xtcp_rx: std::sync::Mutex::new(Some(xtcp_rx)),

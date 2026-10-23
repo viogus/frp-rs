@@ -925,9 +925,10 @@ async fn register_proxies_aborts_on_control_write_failure() {
     // registration must return false promptly (without it, the loop would
     // wait out REGISTRATION_RESPONSE_TIMEOUT for a response to a request
     // the server never received — the 5s test timeout catches that).
+    let stop = CancellationToken::new();
     let completed = tokio::time::timeout(
         Duration::from_secs(5),
-        service.register_proxies(&mut ctx, &cfg, std::slice::from_ref(&proxy), 1),
+        service.register_proxies(&mut ctx, &cfg, std::slice::from_ref(&proxy), 1, &stop),
     )
     .await
     .expect("register_proxies must exit promptly on a control write failure");
@@ -1739,4 +1740,83 @@ async fn construction_refuses_a_non_exact_auth_method() {
             "{bad:?} must keep the auth tag (EXIT_AUTH/3)"
         );
     }
+}
+
+/// G-D (Go frp v0.71.1 #5561): `ControlWriter::send` must not report
+/// success once the writer task's failure is observable — a send that
+/// races the writer's death must return `Err`, not `Ok` for a message the
+/// closed channel discards. The writer task here writes to a duplex whose
+/// far end is dropped, so its first write fails with BrokenPipe and it
+/// marks the shared `failed` flag.
+///
+/// `Ok(())` otherwise means "accepted by the writer funnel, not
+/// delivered" (Go's doc sentence); the exact post-enqueue re-check window
+/// (failure observed between the `failed` load and `try_send`) is a few
+/// instructions wide and cannot be forced without a test hook, so this
+/// pins the coarse contract: after `wait_failed()` resolves, `send`
+/// returns `Err`.
+#[tokio::test]
+async fn control_writer_send_after_failure_returns_err() {
+    let (client, server) = tokio::io::duplex(64);
+    // Drop the far end: every write from the writer task fails.
+    drop(server);
+    let (read_half, mut write_half) = tokio::io::split(client);
+    drop(read_half);
+
+    let (tx, rx) = mpsc::channel::<(FrpMessage, bool)>(8);
+    let failed = Arc::new(AtomicBool::new(false));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let writer = Arc::new(ControlWriter {
+        tx,
+        failed: failed.clone(),
+        notify: notify.clone(),
+    });
+    // The same loop shape as the production writer task in
+    // `session.rs::spawn_session_tasks`: write FIFO, mark failed, wake the
+    // control loop, exit.
+    let writer_task = tokio::spawn(async move {
+        let mut rx = rx;
+        while let Some((msg, v2)) = rx.recv().await {
+            if write_msg(&mut write_half, &msg, v2).await.is_err() {
+                failed.store(true, Ordering::SeqCst);
+                notify.notify_waiters();
+                break;
+            }
+        }
+    });
+
+    // Enqueue one message; the writer task attempts it, fails, and drops
+    // the receiver. This first send may legitimately return `Ok` (it was
+    // accepted by the funnel) — the contract under test is the one after
+    // the failure is observable.
+    let _ = writer.send(
+        FrpMessage::Ping(msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        }),
+        false,
+    );
+
+    tokio::time::timeout(Duration::from_secs(1), writer.wait_failed())
+        .await
+        .expect("the writer task's failure must be observable via wait_failed()");
+
+    // The failure is now observable: a send must report it. This is the
+    // coarse contract (the pre-enqueue check also catches this state); the
+    // few-instruction post-enqueue window cannot be forced without a test
+    // hook, so the test pins "no success once the failure is observable".
+    let err = writer
+        .send(
+            FrpMessage::Ping(msg::Ping {
+                privilege_key: None,
+                timestamp: None,
+            }),
+            false,
+        )
+        .expect_err("a send after the writer failed must not report success");
+    assert_eq!(err, "control writer failed");
+
+    writer_task
+        .await
+        .expect("the writer task must exit after the failed write");
 }

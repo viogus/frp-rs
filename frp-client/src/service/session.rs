@@ -116,20 +116,26 @@ impl Service {
 
     /// Request a graceful shutdown. Safe to call from signal handler.
     /// Returns immediately; the actual shutdown happens asynchronously in run().
+    /// Idempotent: a second request is a no-op (Go frp v0.71.1's `closed`
+    /// flag makes a pre-`run()` close mean "never start").
     pub fn request_stop(&self) {
-        match self.stop_tx.try_send(()) {
-            Ok(()) => tracing::info!("Stop requested, initiating graceful shutdown"),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::warn!("Stop channel full — a stop request is already queued");
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("Stop channel closed — service already shutting down");
-            }
+        if self.stop.is_cancelled() {
+            tracing::warn!("Stop already requested — service already shutting down");
+            return;
         }
+        self.stop.cancel();
+        tracing::info!("Stop requested, initiating graceful shutdown");
     }
 
     #[instrument(skip(self))]
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Go frp v0.71.1 lifecycle: a close observed before Run means Run
+        // must not start. Return before dialling/logging in/registering —
+        // nothing has been spawned yet, so there is nothing to tear down.
+        if self.stop.is_cancelled() {
+            info!("Stop requested before run; not starting");
+            return Ok(());
+        }
         let cfg_snapshot = self.cfg.read().await.clone();
         info!(
             version = %frp_core::VERSION, server_addr = %cfg_snapshot.server_addr, server_port = %cfg_snapshot.server_port,
@@ -194,18 +200,12 @@ impl Service {
             .take()
             .expect("visitor_rx already taken — run() called twice?");
         let nat_hole_stun_server = self.nat_hole_stun_server.clone();
-        let mut stop_rx = self
-            .stop_rx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .expect("stop_rx already taken — run() called twice?");
 
         // Handle of the spawned admin HTTP server task; aborted on shutdown
         // (cancel_detached_tasks). Only spawned with the `admin` feature.
         #[cfg(feature = "admin")]
         let mut admin_handle: Option<tokio::task::JoinHandle<()>> =
-            self.spawn_admin_server(&_reload_tx, &self.stop_tx).await;
+            self.spawn_admin_server(&_reload_tx, &self.stop).await;
         #[cfg(not(feature = "admin"))]
         let mut admin_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -270,7 +270,17 @@ impl Service {
                 )
                 .await
             {
-                Ok(ctx) => ctx,
+                Ok(Some(ctx)) => ctx,
+                Ok(None) => {
+                    // The stop token was cancelled while dialling or waiting
+                    // for LoginResp (Go frp v0.71.1: ctx cancel aborts the
+                    // dialer). No session exists, so the clean exit is the
+                    // same as the cancelled login-backoff path below.
+                    info!("Stop requested during login, shutting down");
+                    self.cancel_detached_tasks(&health_cancels, admin_handle)
+                        .await;
+                    return Ok(());
+                }
                 Err(e) => {
                     consecutive_err_count += 1;
                     warn!(attempt = %consecutive_err_count, error = %e, "Login failed (attempt {}): {}", consecutive_err_count, e);
@@ -310,9 +320,9 @@ impl Service {
                     };
                     // Race the backoff against a stop request: with
                     // login_fail_exit = false and an unreachable server, the
-                    // plain sleep below would hold a buffered admin/signal
-                    // stop (cap-1 stop_tx) until a login eventually succeeds —
-                    // shutdown would hang indefinitely (Go client/service.go
+                    // plain sleep below would hold a stop (SIGTERM/admin)
+                    // until a login eventually succeeds — shutdown would hang
+                    // indefinitely (Go client/service.go
                     // loopLoginUntilSuccess has no stop path either; this is
                     // client-side robustness beyond parity, same shape as the
                     // reconnect-sleep select below). There is no ctx on the
@@ -320,7 +330,7 @@ impl Service {
                     // above), so this branch only cancels the detached
                     // health/admin tasks and returns.
                     tokio::select! {
-                        Some(()) = stop_rx.recv() => {
+                        _ = self.stop.cancelled() => {
                             info!("Stop requested while waiting to retry login, shutting down");
                             self.cancel_detached_tasks(&health_cancels, admin_handle).await;
                             return Ok(());
@@ -358,7 +368,7 @@ impl Service {
             // session continuation below is then skipped and the session
             // goes straight to teardown + reconnect.
             let aborted = !self
-                .register_proxies(&mut ctx, &cfg_local, &proxies, pool_count)
+                .register_proxies(&mut ctx, &cfg_local, &proxies, pool_count, &self.stop)
                 .await;
 
             // Control writes are funneled through a bounded channel to a
@@ -401,14 +411,35 @@ impl Service {
                 // Phase 5: split the stream, spawn the writer task and vnet
                 // controllers, cancel the previous session's visitor
                 // listeners, and spawn the current session's visitors.
-                self.spawn_session_tasks(
-                    &mut ctx,
-                    &cfg_local,
-                    &proxies,
-                    &protocol,
-                    &nat_hole_stun_server,
-                )
-                .await?;
+                //
+                // A split failure is a session error, but it must not skip
+                // cleanup (Go frp v0.71.1 `defer svr.stop()`): run the same
+                // teardown as every other exit and cancel the detached
+                // health/admin tasks before propagating the error. The
+                // writer task and visitors were never spawned, so teardown's
+                // abort/await steps are no-ops here.
+                if let Err(e) = self
+                    .spawn_session_tasks(
+                        &mut ctx,
+                        &cfg_local,
+                        &proxies,
+                        &protocol,
+                        &nat_hole_stun_server,
+                    )
+                    .await
+                {
+                    self.teardown_session(
+                        &mut ctx,
+                        #[cfg(feature = "tcp-mux")]
+                        &mut prev_yamux,
+                        &health_cancels,
+                        &mut admin_handle,
+                    )
+                    .await;
+                    self.cancel_detached_tasks(&health_cancels, admin_handle.take())
+                        .await;
+                    return Err(e.into());
+                }
 
                 // The message loop handles config reloads (try_reload), which
                 // take the config write lock — the snapshot read guard must be
@@ -426,7 +457,7 @@ impl Service {
                             reload_rx: &mut reload_rx,
                             xtcp_rx: &mut xtcp_rx,
                             visitor_rx: &mut visitor_rx,
-                            stop_rx: &mut stop_rx,
+                            stop: &self.stop,
                             health_cancels: &health_cancels,
                             nat_hole_stun_server: &nat_hole_stun_server,
                         },
@@ -492,7 +523,7 @@ impl Service {
             // Race the backoff against a stop request: an admin/signal stop
             // must not be held up by up to 20s of reconnect sleep.
             tokio::select! {
-                Some(()) = stop_rx.recv() => {
+                _ = self.stop.cancelled() => {
                     info!("Stop requested while waiting to reconnect, shutting down");
                     ctx.shutdown_flag.store(true, Ordering::SeqCst);
                     self.cancel_detached_tasks(&health_cancels, admin_handle).await;
@@ -511,6 +542,9 @@ impl Service {
     ///
     /// Returns the per-session state on success; on failure returns the
     /// error so run() can apply backoff + reconnect exactly as before.
+    /// Returns `Ok(None)` when the stop token was cancelled before or during
+    /// the dial/login (Go frp v0.71.1: ctx cancel aborts the dialer);
+    /// run() then runs the clean-stop exit instead of a login failure.
     /// Backoff counters (consecutive_err_count, fast_retry_timestamps,
     /// previous_run_id) stay in run() scope — `did_login_once` is passed in
     /// so it is set at login success (before the encryption wrap), matching
@@ -523,7 +557,12 @@ impl Service {
         pool_count: i32,
         previous_run_id: String,
         did_login_once: &mut bool,
-    ) -> Result<SessionCtx, frp_core::Error> {
+    ) -> Result<Option<SessionCtx>, frp_core::Error> {
+        // A stop that landed after run()'s top check but before this call
+        // must not dial at all.
+        if self.stop.is_cancelled() {
+            return Ok(None);
+        }
         // Owned copies of the snapshot fields the work-conn config needs.
         // `handle_req_work_conn` (which builds the same config) also runs from
         // the message loop, where the snapshot guard is no longer held, so the
@@ -618,7 +657,17 @@ impl Service {
         // after its CONNECT response), and that failure must take the
         // same retry/exit path as a login error — never panic (release
         // binaries build with panic=abort).
-        let enc_result = match ctl.login().await {
+        // Race the whole dial + LoginResp wait against the stop token: a
+        // SIGTERM delivered while the client is dialling or waiting for
+        // LoginResp must not wait out the dial timeout / the 10s login
+        // read timeout. Go frp v0.71.1 cancels `svr.ctx`, which aborts the
+        // dialer and closes the control connection; dropping the login
+        // future here drops the socket at the same point.
+        let login_result = tokio::select! {
+            r = ctl.login() => r,
+            _ = self.stop.cancelled() => return Ok(None),
+        };
+        let enc_result = match login_result {
             Ok(r) => {
                 *did_login_once = true;
                 *self.server_auth_scopes.write().await = ctl.server_auth_scopes.clone();
@@ -688,7 +737,7 @@ impl Service {
             .unwrap_or_default();
         let server_scopes = self.server_auth_scopes.read().await.clone();
 
-        Ok(SessionCtx {
+        Ok(Some(SessionCtx {
             control_stream: Some(control_stream),
             run_id,
             yamux,
@@ -745,7 +794,7 @@ impl Service {
             proxy_retry_interval: None,
             waitstart_seen: HashMap::new(),
             cfg_user: String::new(),
-        })
+        }))
     }
 
     /// Phase 5 of one connection attempt: split the control stream into
@@ -1300,7 +1349,7 @@ impl Service {
     async fn spawn_admin_server(
         &self,
         reload_tx: &mpsc::Sender<ReloadRequest>,
-        stop_tx: &mpsc::Sender<()>,
+        stop: &CancellationToken,
     ) -> Option<tokio::task::JoinHandle<()>> {
         let cfg_snapshot = self.cfg.read().await.clone();
         if cfg_snapshot.web_server.port > 0 {
@@ -1323,7 +1372,7 @@ impl Service {
                 proxy_metrics: self.proxy_metrics.clone(),
                 proxies: self.proxy_info_map.clone(),
                 reload_tx: reload_tx.clone(),
-                stop_tx: stop_tx.clone(),
+                stop: stop.clone(),
                 config_path: self.config_file.clone(),
                 store: self.store_source.clone(),
                 web_server_tls_enable_seen: Arc::new(std::sync::atomic::AtomicU8::new(seeded)),

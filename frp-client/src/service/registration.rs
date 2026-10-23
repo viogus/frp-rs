@@ -224,6 +224,7 @@ impl Service {
         cfg_local: &ClientConfig,
         proxies: &[frp_core::config::ProxyConfig],
         pool_count: i32,
+        stop: &CancellationToken,
     ) -> bool {
         // Register proxies using IoStream directly (supports TCP and TLS).
         // Pipelined: write ALL NewProxy frames first, then collect the
@@ -484,6 +485,7 @@ impl Service {
                 tokio::pin!(timer);
                 let mut timer_fired = false;
                 let mut watchdog_fired = false;
+                let mut stop_fired = false;
                 let mut resp_msg: Option<FrpMessage> = None;
                 tokio::select! {
                     // Poll whichever stage is in flight. The stage future
@@ -523,6 +525,19 @@ impl Service {
                     },
                     _ = &mut timer => timer_fired = true,
                     _ = &mut watchdog => watchdog_fired = true,
+                    // A stop requested while the server is silent must
+                    // abort the registration wait immediately (Go frp
+                    // v0.71.1 ctx cancel), not after up to
+                    // REGISTRATION_RESPONSE_TIMEOUT (30s) / the heartbeat
+                    // watchdog. `CancellationToken::cancelled` is
+                    // cancel-safe, so a stop that lands after this arm
+                    // loses the select still fires on the next iteration.
+                    _ = stop.cancelled() => stop_fired = true,
+                }
+                if stop_fired {
+                    info!("Stop requested during registration, shutting down");
+                    ctx.shutdown_flag.store(true, Ordering::SeqCst);
+                    aborted = true;
                 }
                 if watchdog_fired {
                     warn!(timeout = %ctx.hb_timeout, "Heartbeat timeout ({}s) during registration, reconnecting...", ctx.hb_timeout);
