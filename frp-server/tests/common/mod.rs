@@ -166,10 +166,13 @@ pub async fn pump_tcp_bridge(
     // Both conns drop here, fully closed.
 }
 
-/// Go frp v0.71.0 `NotFoundResponse` (pkg/util/http/http.go) — the exact
-/// 404 answer frps writes on a vhost/tcpmux route miss (and control-gone)
-/// when no `custom_404_page` is configured. Probe-verified byte-exact vs
-/// the Go v0.71.0 binary: 92-byte head + 489-byte body = 581 bytes total.
+/// Go frp `NotFoundResponse` (pkg/util/http/http.go) — the exact 404 answer
+/// frps writes on a vhost/tcpmux route miss (and control-gone) when no
+/// `custom_404_page` is configured. Probe-verified byte-exact against the
+/// Go binary at the compat target (v0.71.0, re-checked for v0.71.1): 92-byte
+/// head + 489-byte body = 581 bytes total. The `Server:` line carries this
+/// crate's version, exactly as the Go binary carries its own, so it is
+/// interpolated here and needs no bump when the compat target moves.
 /// The response is written raw — Go's stdlib http.Server-layer headers
 /// (Date, charset) are absent on frp's own responses.
 #[allow(dead_code)] // used by the tcpmux and vhost_audit_fixes bins only
@@ -177,7 +180,9 @@ pub const GO_404_NOT_FOUND_RESPONSE: &str = concat!(
     "HTTP/1.1 404 Not Found\r\n",
     "Content-Length: 489\r\n",
     "Content-Type: text/html\r\n",
-    "Server: frp/0.71.0\r\n",
+    "Server: frp/",
+    env!("CARGO_PKG_VERSION"),
+    "\r\n",
     "\r\n",
     "<!DOCTYPE html>\n",
     "<html>\n",
