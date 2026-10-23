@@ -171,7 +171,7 @@ not be cited for them.
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | zero warnings (pinned toolchain) |
 | `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** The in-tree test-function total is not stable either — it changes with every test-adding PR, and the same tree has measured differently in CI vs locally — so read it from `bash scripts/repo-health.sh` ("Tests") instead of storing it |
 | `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
-| `unsafe` (`repo-health.sh`) | frp-core: 21 blocks + 3 `unsafe fn` + 1 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 38 blocks. Every block carries a `// SAFETY:` comment |
+| `unsafe` (`repo-health.sh`) | frp-core: 25 blocks + 3 `unsafe fn` + 1 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 40 blocks. Every block carries a `// SAFETY:` comment |
 | `scripts/compat-test.sh` vs Go frp v0.71.1 | 86 passed, 0 failed |
 | `scripts/protocol-matrix.sh` | 11/11 transport rows move data |
 | Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |

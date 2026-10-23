@@ -78,8 +78,12 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize)>
             capacity = actual as usize;
         }
     }
-    let read_async = AsyncFd::new(read)?;
-    let write_async = AsyncFd::new(write)?;
+    // SAFETY: `read` is the pipe end's sole owner and stays open for the
+    // `AsyncFd`'s lifetime, so `AsyncFd::register`'s I/O-safety contract holds.
+    let read_async = unsafe { AsyncFd::register(read) }?;
+    // SAFETY: `write` is the other pipe end's sole owner and stays open for the
+    // `AsyncFd`'s lifetime, so the same contract holds.
+    let write_async = unsafe { AsyncFd::register(write) }?;
     Ok((read_async, write_async, capacity))
 }
 
@@ -481,8 +485,13 @@ async fn bridge_splice_with_linger(
     let work_owned: OwnedFd = work_std.into();
 
     // Step 2: Wrap in AsyncFd for epoll-driven readiness.
-    let user_async = AsyncFd::new(user_owned)?;
-    let work_async = AsyncFd::new(work_owned)?;
+    // SAFETY: `user_owned` is the sole owner of the user descriptor and stays
+    // open for the `AsyncFd`'s lifetime, so `AsyncFd::register`'s I/O-safety
+    // contract holds.
+    let user_async = unsafe { AsyncFd::register(user_owned) }?;
+    // SAFETY: `work_owned` is the sole owner of the work descriptor and stays
+    // open for the `AsyncFd`'s lifetime, so the same contract holds.
+    let work_async = unsafe { AsyncFd::register(work_owned) }?;
 
     // Step 3: Create two pipe pairs (one per direction). Each pair reports
     // its achieved capacity so the splice length arguments use the real size
