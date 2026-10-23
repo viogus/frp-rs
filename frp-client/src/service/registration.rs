@@ -204,6 +204,37 @@ fn reg_frame_payload_read(
     })
 }
 
+/// Write one pipelined registration frame (`NewProxy`/`NewVisitorConn`),
+/// racing the service stop token.
+///
+/// A peer that answers LoginResp and then stops reading fills the TCP windows,
+/// so `write_v1_frame(...).await` blocks indefinitely — a token arm that only
+/// covers the response-read loop (the `select!` below) would never be reached
+/// (R2 P2). Returns `None` when a stop won the race: the frame may be
+/// partially written, so the caller must set `write_failed` and abort the
+/// phase (the stream is dropped on teardown; a partial frame is harmless).
+async fn write_reg_frame(
+    ctx: &mut SessionCtx,
+    msg: &FrpMessage,
+    stop: &CancellationToken,
+) -> Option<Result<(), frp_core::Error>> {
+    let v2 = ctx.v2;
+    let stream = ctx
+        .control_stream
+        .as_mut()
+        .expect("control_stream available before split");
+    tokio::select! {
+        result = async move {
+            if v2 {
+                stream.write_v2_frame(msg).await
+            } else {
+                stream.write_v1_frame(msg).await
+            }
+        } => Some(result),
+        _ = stop.cancelled() => None,
+    }
+}
+
 impl Service {
     /// Phase 4 of one connection attempt: pipelined NewProxy/NewVisitorConn
     /// writes (all frames first, then the responses in a single read loop),
@@ -236,6 +267,10 @@ impl Service {
         // hitting the server mid-registration) are handled here instead of
         // dropped: skipping them left the pool empty after login and let
         // the server's work-conn wait stall for up to 10s.
+        // Set when the stop token fires inside the pipelined write batch
+        // (R2 P2): a peer that stops reading wedges `write_v1_frame` before
+        // the response loop — and its stop arm — is ever reached.
+        let mut stop_during_write = false;
         for (idx, p) in proxies.iter().enumerate() {
             // Go frp v0.71.0: a health-checked proxy is NOT registered until
             // its FIRST successful probe (proxy_wrapper health=1 → CheckFailed
@@ -268,18 +303,12 @@ impl Service {
                 "Registering proxy '{}' type={} remote_port={} local={}",
                 p.name, p.proxy_type, p.remote_port, local_addr);
             let wire_name = wire_proxy_name(&cfg_local.user, &p.name);
-            let write_result = if ctx.v2 {
-                ctx.control_stream
-                    .as_mut()
-                    .expect("control_stream available before split")
-                    .write_v2_frame(&np)
-                    .await
-            } else {
-                ctx.control_stream
-                    .as_mut()
-                    .expect("control_stream available before split")
-                    .write_v1_frame(&np)
-                    .await
+            let write_result = match write_reg_frame(ctx, &np, stop).await {
+                Some(result) => result,
+                None => {
+                    stop_during_write = true;
+                    break;
+                }
             };
             if let Err(e) = write_result {
                 // A failed write leaves the stream state undefined; record
@@ -330,18 +359,12 @@ impl Service {
                 Some(cfg_local.user.as_str()).filter(|s| !s.is_empty()),
                 &v.server_name,
             );
-            let write_result = if ctx.v2 {
-                ctx.control_stream
-                    .as_mut()
-                    .expect("control_stream available before split")
-                    .write_v2_frame(&nvc)
-                    .await
-            } else {
-                ctx.control_stream
-                    .as_mut()
-                    .expect("control_stream available before split")
-                    .write_v1_frame(&nvc)
-                    .await
+            let write_result = match write_reg_frame(ctx, &nvc, stop).await {
+                Some(result) => result,
+                None => {
+                    stop_during_write = true;
+                    break;
+                }
             };
             if let Err(e) = write_result {
                 ctx.write_failed = true;
@@ -349,6 +372,15 @@ impl Service {
                 continue;
             }
             ctx.pending_visitors.push((wire_name, idx));
+        }
+
+        if stop_during_write {
+            // Same clean-stop outcome as the response-loop stop arm: mark the
+            // session for shutdown, and `write_failed` skips the response
+            // phase (the cancelled write left the stream mid-frame).
+            info!("Stop requested during registration, shutting down");
+            ctx.shutdown_flag.store(true, Ordering::SeqCst);
+            ctx.write_failed = true;
         }
 
         // Collect responses. NewProxyResp/NewVisitorConnResp are matched to
