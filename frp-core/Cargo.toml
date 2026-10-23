@@ -1,6 +1,6 @@
 [package]
 name = "frp-core"
-version = "0.71.0"
+version = "0.71.1"
 edition = "2021"
 license = "MIT"
 description = "Shared protocol, transport and configuration library for frp-rs"

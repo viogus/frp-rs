@@ -9,6 +9,95 @@ User-facing release notes for frp-rs.
 > write the same detail in both; see the
 > [docs conventions](docs/README.md#conventions-for-these-docs).
 
+## v0.71.1 — 2026-10-24
+
+Tracks Go frp v0.71.1 (`0.71.1` released 2026-10-14; our compat target moves with
+it). The Go release is 25 commits / 49 files: two of its seven note items turned out
+to be behaviour frp-rs already had, and one is a Go-only build requirement, so the
+port is six changes plus two regression tests. The wire protocol did not change:
+the existing frp-rs binaries pass the **full compat suite against the Go v0.71.1
+binaries (86 passed, 0 failed)** before any of these patches.
+
+### Fixes
+
+- **HTTP virtual-host CONNECT with a body is rejected.** A `CONNECT` carrying a
+  positive `Content-Length`, any `Transfer-Encoding`, duplicate `Content-Length`
+  headers or a folded `Content-Length` continuation is now answered with Go's exact
+  `400 Bad Request` (12-byte `Bad Request\n` body) before anything is forwarded to a
+  provider, instead of tunnelling those bytes — the request-smuggling shape Go
+  v0.71.1 closed (`#5562`). Non-CONNECT requests, `Content-Length: 0`, HTTP/2 (h2c)
+  CONNECT early data and the auth-before-body order are unchanged; early data that
+  arrived in the same segment as the head keeps reaching the backend in order (now
+  pinned by a regression test).
+- **frps releases its main listening socket at shutdown** instead of after the
+  graceful drain. Previously a reconnecting frpc completed the TCP handshake during
+  the drain (default 30 s) and then hung instead of getting `ECONNREFUSED`; the
+  listener is now dropped as soon as cancellation is observed (including when the
+  accept-rate limiter is throttling). The SSH gateway's `accept()` is also raced
+  against shutdown, so its port no longer stays bound behind a blocked accept.
+- **frpc honours a stop request during startup.** The stop signal is a single
+  cancellation token now, observed while dialling, while waiting for the login
+  response, and while waiting for registration — a SIGTERM during a stalled
+  registration no longer waits out the 30 s registration timeout (or 10 s login
+  timeout). A stop requested before `run()` means the client never dials, and the
+  one error exit that skipped teardown (`spawn_session_tasks` split failure) now
+  runs it. Behaviour beyond Go: Go only aborts the dial; frp-rs also aborts the
+  login/registration waits.
+- **Control writes cannot report success after the writer died.** `ControlWriter::send`
+  re-checks the writer's failure flag after enqueueing and returns an error for a
+  message the closed channel would drop, matching Go v0.71.1's dispatcher contract.
+- **The client health monitor exits promptly on shutdown** (`≤100 ms` instead of up
+  to one check interval / probe timeout). The failure counter and `maxFailed`
+  semantics were already Go v0.71.1 parity (landed 2026-09-02) — Go caught up with
+  frp-rs there.
+- **The `virtual_net` visitor adopts Go's reconnection backoff.** A failed setup now
+  waits 60 s, 120 s, 240 s, then 300 s (bounded, no shift overflow) instead of
+  retrying every 10 s, while a cleanly ended tunnel keeps the 10 s retry and resets
+  the counter — Go's behaviour since v0.71.0, whose overflow v0.71.1 fixed.
+
+### Tests
+
+- Server-side bandwidth limiting: new end-to-end test proving the work connection is
+  torn down when the user closes (the Rust analogue of Go's new e2e; mutation-verified
+  to fail on the Go defect shape).
+- vhost CONNECT: body/`Transfer-Encoding`/duplicate/`folded Connection-Length` rejections,
+  the `Content-Length: 0` control, the `GET`-with-body control, early data ordering, and
+  the full byte-exact 401 render.
+- Client shutdown: stop-before-run (no dial), stop during login, stop during
+  registration, and the control-writer failure contract.
+- Health monitor: three tests proving the monitor exits promptly from the interval
+  wait, the startup pause and an in-flight probe.
+- `virtual_net`: the delay table (including `u32::MAX`), the per-round decision
+  (error increments / clean resets), and four tunnel-end classification cases.
+
+### Verified at parity (no change needed)
+
+Go v0.71.1's health-check `failedTimes` reset (frp-rs had it since 2026-09-02), the
+stuck-control-connection fixes (frp-rs's single-task message loop already cancels the
+read on write failure), the server-side work-conn close on limiter teardown (frp-rs
+has no wrapper type; release is single-ownership drop plus an explicit half-close),
+the vnet route-ownership check (`same_channel` token), the daily-counter DST bug
+(frp-rs uses an exact UTC epoch-day index, so the defect is structurally impossible),
+and the websocket listener accept/close race (no handoff channel exists).
+
+### Notes
+
+- **Go 1.26 source-build requirement**: not applicable — frp-rs never compiles Go, and
+  the compat harness downloads prebuilt release tarballs.
+- **`fatedier/yamux` v0.2.0**: no action. frp-rs vendors the Rust `paritytech/yamux`
+  0.14.0; Go v0.71.0 already used the fatedier fork through a `replace`, and v0.2.0
+  differs from that pin only in license headers and four discarded errors. No wire,
+  keepalive, window or reset change.
+- **`x/crypto` 0.54 → 0.56 (SSH channel fixes)**: no counterpart to port (the gateway
+  is `russh`-based). A read-only audit of the six channel-lifecycle classes found five
+  already handled or structurally impossible; the sixth (unexpected message types on an
+  established channel) and a pre-existing unrelated gap (peer `EOF` is not propagated to
+  the work connection) are filed as backlog items rather than rushed into this release.
+- **Known divergence (pre-existing, filed as backlog)**: dashboard "today" traffic
+  buckets rotate on a **UTC** day boundary where Go uses the local calendar date.
+- The Go compatibility target (`scripts/compat-test.sh`, `download-go-frp.sh`,
+  `compat.yml`, `xtcp-compat.yml`) now defaults to 0.71.1.
+
 ## v0.71.0 — re-release (2026-10-13)
 
 Supersedes the 2026-09-13 v0.71.0 build (commit `41c3ad60`). Same version

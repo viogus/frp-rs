@@ -27,7 +27,7 @@ read the [main README](../README.md) first, then pick from the tables below.
 
 | Document | What it covers |
 |---|---|
-| [Go frp Compatibility Audit](go-frp-compat-audit.md) | Full cross-compat analysis against Go frp v0.71.0 |
+| [Go frp Compatibility Audit](go-frp-compat-audit.md) | Full cross-compat analysis against Go frp v0.71.1 |
 | [Development Log](history/development-log.md) | Round-by-round hardening / audit history (findings and fixes) |
 | [Feature Backlog (historical)](history/feature-backlog.md) | The former root `TODO.md` — parity/feature tracking, fully resolved |
 | [Audit reports](audit/) | Dated point-in-time audit reports |

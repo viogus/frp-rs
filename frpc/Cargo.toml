@@ -1,6 +1,6 @@
 [package]
 name = "frpc"
-version = "0.71.0"
+version = "0.71.1"
 edition = "2021"
 license = "MIT"
 description = "frp-rs client binary (frpc) — protocol-compatible with Go frp"

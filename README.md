@@ -25,7 +25,7 @@ a reverse proxy that exposes services on a private network to the public interne
 It speaks the same wire protocol as the Go version, so it can replace *either* the
 client or the server side on its own.
 
-**Current version: frp-rs 0.71.0**, the Go frp release it is compatible with — the
+**Current version: frp-rs 0.71.1**, the Go frp release it is compatible with — the
 version number is deliberately not independent (see
 [Versioning](CLAUDE.md#versioning-mandatory)).
 
@@ -33,7 +33,7 @@ version number is deliberately not independent (see
   to a Go `frps`, and an frp-rs `frps` serves Go `frpc` clients, with the same config
   files, encryption and authentication. This is a CI gate rather than a claim:
   `scripts/compat-test.sh` runs 86 scenarios plus a 17-case XTCP pairwise matrix
-  against the **real Go frp v0.71.0 release** in both directions on every push, and
+  against the **real Go frp v0.71.1 release** in both directions on every push, and
   `scripts/protocol-matrix.sh` asserts that all 11 transport rows actually move
   bytes. Each of those counts is re-measured by `scripts/repo-health.sh`, which
   fails if this line drifts.
@@ -264,7 +264,7 @@ The full argument, including what frp-rs is *not*, is in
 1. **Adopt it one side at a time.** Wire-compatible in both directions with the same
    config files: replace one binary, leave the other side exactly as it is, roll back
    by putting the old file back. Evidence rather than promise — 86 `compat-test.sh`
-   scenarios plus a 17-case XTCP pairwise matrix against the real Go frp v0.71.0, both
+   scenarios plus a 17-case XTCP pairwise matrix against the real Go frp v0.71.1, both
    directions, on every push; 11/11 transport rows moving bytes in
    `protocol-matrix.sh`. `scripts/repo-health.sh` re-measures each of those counts.
 2. **It runs where a 17 MB binary does not fit.** The `tiny` and `micro` tiers are a
