@@ -598,32 +598,52 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
 /// case-insensitively, and trim SP/HTAB around values (the same conventions
 /// as `validate_vhost_head_lines`).
 ///
-/// Semantics, decided from the Go source plus probes of the real v0.71.1
-/// binary (transcript in the port report):
-/// * `Content-Length` present with a value that parses as u64 `> 0` → true;
-///   `0` / `000` / ` 0\t` alone → false (Go's `> 0` — the request still
-///   tunnels). Duplicate lines: any positive line wins (`0` + `5` → true);
-///   `0` + `0` → false (Go accepts identical duplicates and tunnels; a
-///   mismatched duplicate is a Go read-time 400).
-/// * `Content-Length` present but EMPTY or unparseable (`abc`, `+5`, `-1`)
-///   → true, fail closed. Go's server rejects every such shape with a 400 at
-///   read time (`parseContentLength`, probe-confirmed), before
-///   `connectHandler` could run; the frp-rs head validator does not model
-///   `Content-Length`, so this gate is the only place that can refuse them.
-///   (frp-rs renders its `http.Error`-shaped 400 here where Go's server
-///   layer renders the generic `Connection: close` 400 — same status,
-///   different body; accepted divergence.)
-/// * ANY `Transfer-Encoding` header → true. Go's gate only ever sees a
-///   single valid `chunked` on HTTP/1.1 (an empty/unsupported TE answers a
-///   read-time 501, probe-confirmed, and HTTP/1.0 ignores TE); frp-rs has no
+/// Rules (chosen from the Go source plus probes of the real v0.71.1 binary;
+/// transcript in the port report):
+/// * exactly one `Content-Length` whose OWS-trimmed value parses as u64 `0`
+///   (`0`, `00`, ` 0\t`) → no body → false; the CONNECT still tunnels.
+/// * exactly one `Content-Length` with a positive value → true.
+/// * MORE THAN ONE `Content-Length` line → true, for ANY values. Go's read
+///   layer compares the trimmed values and rejects a CONFLICTING duplicate
+///   (`0` + `00`, or `0` + `5`) with a 400 before the handler is ever called
+///   (net/http transfer.go:671-690; probe-confirmed); it accepts
+///   byte-identical duplicates (`0` + `0` tunnels — probe-confirmed), which
+///   this rule deliberately over-rejects (fail closed). `0` + `00` conflicts
+///   as STRINGS in Go even though both mean zero, so rejecting that input is
+///   status-correct.
+/// * `Content-Length` present but EMPTY, unparseable (`abc`, `+5`, `-1`) or
+///   overflowing u64 → true. Go's read layer 400s these
+///   (`parseContentLength`, probe-confirmed).
+/// * an obs-fold continuation line immediately after a `Content-Length`
+///   header → true: Go unfolds `Content-Length: 0` + ` 5` into the value
+///   `0 5` and rejects it at read time (probe-confirmed). Go would TUNNEL the
+///   folded-empty-then-zero shape (`Content-Length:` + ` 0`, value `0`,
+///   probe-confirmed), which this gate already rejects through the
+///   empty-value rule above — a deliberate fail-closed over-rejection.
+/// * ANY `Transfer-Encoding` header → true. Go's gate only ever sees a single
+///   valid `chunked` on HTTP/1.1 (an empty/unsupported TE answers a read-time
+///   501, probe-confirmed, and HTTP/1.0 ignores TE); frp-rs has no
 ///   server-level TE validation, so it fails closed on every TE shape.
-/// * No such header (or an obs-fold continuation line, which can never name
-///   a header) → false.
+/// * otherwise → false (a folded continuation of any OTHER header can never
+///   name a header, so it contributes nothing; probe-confirmed tunnel).
+///
+/// Rendering divergence for the read-time classes: where Go's server rejects
+/// during parsing (invalid/duplicate/folded Content-Length; unsupported or
+/// empty TE) it closes with its generic `Connection: close` 400 (or a 501 for
+/// TE) and never calls `connectHandler`; frp-rs answers with the
+/// handler-shaped `http.Error` 400 instead — same status for the CL shapes,
+/// 400-vs-501 for TE, and for the duplicate/fold shapes there is no Go
+/// handler render to compare against.
 pub(super) fn connect_head_has_body(head: &[u8]) -> bool {
     let mut lines = head.split(|&b| b == b'\n');
     // Skip the request line: it cannot name a header (and a CONNECT
     // authority-form target may contain a colon-terminated lookalike).
     let _ = lines.next();
+    // Number of Content-Length header LINES seen so far, and whether the
+    // physically preceding header line was one (so a fold continuation
+    // belongs to its value).
+    let mut content_length_lines = 0usize;
+    let mut after_content_length = false;
     for raw in lines {
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         // The head-terminating blank line: everything after it is body or
@@ -634,17 +654,30 @@ pub(super) fn connect_head_has_body(head: &[u8]) -> bool {
         }
         // obs-fold continuation of the preceding header — Go's MIME reader
         // merges it into that line's value, so it can never introduce a new
-        // header. A folded CL/TE value is exotic and out of scope (Go's
-        // server rejects the merged shape at read time).
+        // header. A continuation of a Content-Length value is folded body
+        // framing (Go unfolds and rejects `0 5`); a continuation of anything
+        // else contributes nothing.
         if matches!(line.first(), Some(b' ' | b'\t')) {
+            if after_content_length {
+                return true;
+            }
             continue;
         }
+        after_content_length = false;
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             continue;
         };
         let name = &line[..colon];
         let value = trim_ows(&line[colon + 1..]);
         if name.eq_ignore_ascii_case(b"content-length") {
+            content_length_lines += 1;
+            if content_length_lines > 1 {
+                // Duplicate Content-Length line: Go rejects a conflicting
+                // duplicate at read time and only accepts identical ones;
+                // fail closed on every duplicate (see the doc comment).
+                return true;
+            }
+            after_content_length = true;
             if !content_length_is_zero(value) {
                 return true;
             }

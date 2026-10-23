@@ -345,8 +345,11 @@ fn test_count_host_headers() {
 /// (`req.ContentLength > 0 || len(req.TransferEncoding) > 0`). The end-to-end
 /// byte render and the "no backend dial" assertion live in
 /// `frp-server/tests/vhost_audit_fixes.rs`; this table pins the head scanner's
-/// edge cases. Everything Go's server rejects at read time (empty/unparseable
-/// Content-Length, unsupported TE) is fail-closed `true` here.
+/// edge cases. Everything Go's read layer rejects (empty/unparseable or
+/// conflicting-duplicate Content-Length, folded Content-Length, unsupported
+/// TE) is fail-closed `true` here — including shapes Go would tunnel
+/// (identical duplicate zeros, folded-empty-then-zero), which are deliberate
+/// over-rejections.
 #[test]
 fn test_connect_head_has_body() {
     let head = |headers: &str| {
@@ -371,8 +374,8 @@ fn test_connect_head_has_body() {
         head("CONTENT-LENGTH: 5\r\n").as_bytes()
     ));
 
-    // Content-Length: 0 (Go's `> 0`) → still tunnels; OWS and leading zeros
-    // are legal framing.
+    // Single Content-Length: 0 (Go's `> 0`) → still tunnels; OWS and leading
+    // zeros are legal framing.
     assert!(!connect_head_has_body(
         head("Content-Length: 0\r\n").as_bytes()
     ));
@@ -383,17 +386,24 @@ fn test_connect_head_has_body() {
         head("Content-Length:  0\t\r\n").as_bytes()
     ));
 
-    // Duplicate Content-Length: any positive value wins; two zeros still
-    // tunnel (Go accepts identical duplicates, probe-confirmed; a mismatched
-    // duplicate is a read-time 400 → fail closed below).
-    assert!(!connect_head_has_body(
-        head("Content-Length: 0\r\nContent-Length: 0\r\n").as_bytes()
+    // Duplicate Content-Length → always fail closed (R2 F1). Go's read layer
+    // rejects conflicting values (probe: `0`+`00` → 400, `0`+`5` → 400) and
+    // accepts identical ones (`0`+`0` → tunnels); identical duplicates are a
+    // deliberate over-rejection here.
+    assert!(connect_head_has_body(
+        head("Content-Length: 0\r\nContent-Length: 00\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: 00\r\nContent-Length: 0\r\n").as_bytes()
     ));
     assert!(connect_head_has_body(
         head("Content-Length: 0\r\nContent-Length: 5\r\n").as_bytes()
     ));
     assert!(connect_head_has_body(
         head("Content-Length: 5\r\nContent-Length: 0\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: 0\r\nContent-Length: 0\r\n").as_bytes()
     ));
 
     // Empty / unparseable Content-Length → fail closed (Go's
@@ -464,10 +474,27 @@ fn test_connect_head_has_body() {
         b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nContent-Length 5\r\n\r\n"
     ));
 
-    // A folded continuation line never introduces a header (it belongs to
-    // the previous value; folded CL/TE is out of scope).
+    // A folded continuation line never introduces a header for itself, but
+    // a fold immediately after Content-Length is folded body framing → fail
+    // closed (R2 F2/F3): Go unfolds `0` + ` 5` to "0 5" and 400s at read
+    // time. The folded-empty-then-zero shape is also rejected here (by the
+    // empty-CL rule) although Go unfolds it to "0" and tunnels — deliberate
+    // fail-closed over-rejection.
+    assert!(connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nHost: tunnel.example.com:443\r\nContent-Length: 0\r\n 5\r\n\r\nhello"
+    ));
+    assert!(connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nHost: tunnel.example.com:443\r\nContent-Length: 0\r\n\t5\r\n\r\n"
+    ));
+    assert!(connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nHost: tunnel.example.com:443\r\nContent-Length:\r\n 0\r\n\r\n"
+    ));
+    // A fold of any OTHER header contributes nothing.
     assert!(!connect_head_has_body(
         b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nX-Foo: a\r\n Content-Length: 5\r\n\r\n"
+    ));
+    assert!(!connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nX-Foo: a\r\n b\r\n\r\n"
     ));
 }
 

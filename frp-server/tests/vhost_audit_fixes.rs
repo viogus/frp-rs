@@ -213,6 +213,46 @@ async fn assert_rejected_and_not_forwarded(
     );
 }
 
+/// Byte-exact sibling of `assert_rejected_and_not_forwarded`: read the whole
+/// response to EOF, compare every byte, then assert no StartWorkConn. Used
+/// where the full render is pinned (R2 F4: a prefix-only assertion stayed
+/// green when the auth challenge header was deleted).
+async fn assert_exact_rejection_and_not_forwarded(
+    client: &mut tokio::net::TcpStream,
+    work_conn: &mut tokio::net::TcpStream,
+    expect: &[u8],
+) {
+    let bytes = read_until_eof(client).await;
+    assert_eq!(
+        bytes,
+        expect,
+        "unexpected response bytes: {:?}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let swc = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        read_msg_v1(work_conn),
+    )
+    .await;
+    assert!(
+        swc.is_err(),
+        "rejected request must not reach a backend (StartWorkConn sent)"
+    );
+}
+
+/// Go `http.Error(401)` render for an origin-form vhost request with failed
+/// Basic Auth (pkg/util/vhost/http.go:275-277): Content-Length 13,
+/// Content-Type, the `Www-Authenticate` challenge (net/http canonical casing)
+/// and nosniff, then the StatusText body with Go's trailing '\n'. Pinned
+/// byte-for-byte so the challenge cannot silently disappear (R2 F4).
+const GO_VHOST_401_RESPONSE: &[u8] = b"HTTP/1.1 401 Unauthorized\r\n\
+    Content-Length: 13\r\n\
+    Content-Type: text/plain; charset=utf-8\r\n\
+    Www-Authenticate: Basic realm=\"Restricted\"\r\n\
+    X-Content-Type-Options: nosniff\r\n\
+    \r\n\
+    Unauthorized\n";
+
 /// Read raw bytes until the end of the HTTP/1.1 request head (`\r\n\r\n`).
 /// Returns the head plus any body bytes that arrived with it.
 async fn read_forwarded_head(work_conn: &mut tokio::net::TcpStream) -> Vec<u8> {
@@ -343,7 +383,12 @@ async fn test_vhost_basic_auth_rejects_bad_or_missing_credentials() {
             .write_all(request.as_bytes())
             .await
             .expect("send request");
-        assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 401").await;
+        assert_exact_rejection_and_not_forwarded(
+            &mut client,
+            &mut work_conn,
+            GO_VHOST_401_RESPONSE,
+        )
+        .await;
         drop(client);
         println!("{label}: 401 verified");
     }
@@ -483,7 +528,8 @@ async fn test_vhost_body_cannot_carry_authorization() {
         .await
         .expect("send request");
 
-    assert_rejected_and_not_forwarded(&mut client, &mut work_conn, "HTTP/1.1 401").await;
+    assert_exact_rejection_and_not_forwarded(&mut client, &mut work_conn, GO_VHOST_401_RESPONSE)
+        .await;
     drop(client);
     drop(_provider);
 }

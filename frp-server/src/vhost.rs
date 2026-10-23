@@ -654,6 +654,11 @@ async fn handle_http1_request<S>(
             // Transfer-Encoding is answered with a plain `http.Error(400)`
             // BEFORE the hijack — no connection to the provider is created,
             // no work conn is requested, no `NewUserConn` plugin hook runs.
+            // The scanner also fails closed on the Content-Length shapes Go's
+            // read layer rejects before the handler: duplicate lines
+            // (conflicting values are a Go 400; identical zeros are a
+            // deliberate over-rejection) and obs-folded values (Go unfolds
+            // and 400s `0` + ` 5`). See `connect_head_has_body`.
             // The head plus any body bytes are exactly Go's pre-hijack view,
             // so the scan runs over `forward.request_head` (for CONNECT this
             // is the raw head + tail: no rewrite/inject/hop-strip applies).
