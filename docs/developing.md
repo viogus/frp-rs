@@ -618,7 +618,7 @@ For a server-side test that speaks the raw V1 protocol, the harness is
 `frp-server/tests/common/mod.rs`: `register_tcp_proxy`, `open_tcp_proxy_bridge`
 and `pump_tcp_bridge` (`frp-server/tests/common/mod.rs:22`, `:81`, `:135`) drive
 the control channel and the work connection directly, and `start_test_server`
-(`:387`) boots frps in-process. Use it when the interesting behaviour is in
+(`:392`) boots frps in-process. Use it when the interesting behaviour is in
 registration, not in the client.
 
 **What you must add, and what review will ask for.** The round-trip test proves
@@ -916,7 +916,7 @@ The surface is much smaller than a proxy type's, and unlike a proxy type it has
   `local_addr`, the task's `JoinHandle`, and a shutdown sender. Existing plugins
   in `frp-client/src/plugin/` are the templates; pick the closest one
   (`socks5.rs` for a protocol speaker, `static_file.rs` for a trivial one).
-- `frp-client/src/service.rs:730` starts plugins for `p.plugin`. `virtual_net`
+- `frp-client/src/service.rs:731` starts plugins for `p.plugin`. `virtual_net`
   is special-cased there because its work connections go to the shared vnet
   controller in `frp-client/src/work_conn.rs`.
 - Server-side plugins are a **different** surface: `frp-server/src/plugin/mod.rs`
@@ -1435,7 +1435,7 @@ single easiest mistake to make in this repository.
 
 | Gate | What it establishes |
 |---|---|
-| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.71.0 | Wire and behavioural parity with the reference implementation |
+| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.71.1 | Wire and behavioural parity with the reference implementation |
 | `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination |
 | Daily `xtcp-compat.yml` on a VPS | XTCP hole punching against Go frpc across a real NAT |
 
@@ -1570,7 +1570,7 @@ The compat tests require Go frp binaries. Download them first:
 bash scripts/download-go-frp.sh
 ```
 
-This downloads Go frp v0.71.0 binaries to `/tmp/frp_<version>_<os>_<arch>/` (for
+This downloads Go frp v0.71.1 binaries to `/tmp/frp_<version>_<os>_<arch>/` (for
 example `/tmp/frp_0.71.1_linux_amd64/`) — that is where `compat-test.sh` looks for
 them. Override the location with `GO_FRP_DIR=/path/to/dir`. The CI gate is
 `.github/workflows/compat.yml`.

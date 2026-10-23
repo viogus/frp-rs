@@ -12607,3 +12607,16 @@ other.
   the full gate set (fmt, clippy `-D warnings`, workspace tests, tiny/micro tiers, the
   compat suite against Go 0.71.1, `protocol-matrix`, both cite guards, `repo-health`)
   before merging to `main`.
+
+- [ ] **HTTP 404 head shape may diverge from Go on some vhost paths.**
+  Evidence: the v0.71.1 release review probed a Go frp 0.71.1 **GET** route miss on a vhost and got
+  a stdlib `http.Server`-shaped 404 (143-byte head: `Date`, `Content-Type: text/html; charset=utf-8`,
+  `Connection: close`, no `Server` header; 632 bytes total), while frp-rs writes frp's own raw 404
+  head (92-byte head, `Server: frp/<version>`, no `Date`; 581 bytes) — the shape
+  `GO_404_NOT_FOUND_RESPONSE` pins for the tcpmux raw path, which a tcpmux CONNECT route miss on the
+  Go binary does match. The GET/vhost surface was never compared byte-for-byte; `Content-Length: 489`
+  is identical in both shapes, so the bodies agree.
+  Done-when: a Go 0.71.1 probe of (a) a tcpmux CONNECT route miss, (b) a plain-HTTP vhost GET route
+  miss and (c) a vhost with `custom_404_page` decides whether the difference is the header set or
+  only the layer that writes it; then either pin the observed Go bytes per path or record the
+  divergence in `docs/go-frp-compat-audit.md`.

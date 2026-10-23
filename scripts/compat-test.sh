@@ -5285,7 +5285,7 @@ test_r2g_tcpmux() {
 
 echo "============================================="
 echo " frp-rs Cross-Compatibility Test Suite"
-echo " Go frp v0.71.0 <-> Rust frp-rs"
+echo " Go frp v0.71.1 <-> Rust frp-rs"
 echo "============================================="
 echo ""
 

@@ -147,6 +147,7 @@ async fn expect_port_closed(addr: SocketAddr, budget: Duration, what: &str) {
 /// because cancellation closed it. `TcpListener::bind` (through tokio) sets
 /// only `SO_REUSEADDR`, not `SO_REUSEPORT`, so an already-listening socket on
 /// the same address makes it fail with `EADDRINUSE`.
+#[cfg(feature = "ssh")]
 async fn expect_port_bindable(addr: SocketAddr, budget: Duration, what: &str) {
     let deadline = tokio::time::Instant::now() + budget;
     loop {

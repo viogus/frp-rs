@@ -35,7 +35,7 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # shellcheck source=lib/remote-frps-reap.sh
 source "$SCRIPT_DIR/lib/remote-frps-reap.sh"
 VPS_USER="${XTCP_VPS_USER:-frp-test}"
-GO_FRP_VERSION="${GO_FRP_VERSION:-0.71.0}"
+GO_FRP_VERSION="${GO_FRP_VERSION:-0.71.1}"
 # VPS target is always linux/amd64
 GO_FRP_ARCH="linux_amd64"
 REMOTE_DIR="/tmp/frp-xtcp-test"

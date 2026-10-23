@@ -16,7 +16,7 @@
 //! test its own `#[cfg(feature = "quic")]`, so those two features are
 //! deliberately *not* folded into this gate: `kcp` is the only feature this
 //! target needs. (Measured by adding the missing `tcp-mux` gate on the two
-//! imports at `frp-core/src/xtcp_session.rs:40`, the sole blocker in the
+//! imports at `frp-core/src/xtcp_session.rs:46-47`, the sole blocker in the
 //! `--features kcp --all-targets` run: with it, that run is green.)
 #![cfg(feature = "kcp")]
 

@@ -53,7 +53,7 @@ jobs:
 
       # No Go toolchain is needed: the Go frp side is downloaded as a prebuilt
       # release tarball by `scripts/download-go-frp.sh`, which is exactly why
-      # `/tmp/frp_0.71.0_linux_amd64/` below is the one Go path worth caching.
+      # `/tmp/frp_0.71.1_linux_amd64/` below is the one Go path worth caching.
       - name: Cache cargo + go-frp
         if: steps.check.outputs.configured == 'true'
         uses: actions/cache@v4
