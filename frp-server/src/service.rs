@@ -1028,6 +1028,19 @@ impl Service {
             }
         }
 
+        // Release the main accept socket *now*, at cancellation, not when
+        // `run()` returns. Dropping it closes the port: a reconnecting frpc
+        // gets ECONNREFUSED and backs off instead of completing a TCP
+        // handshake into an unserviced backlog and hanging until its own
+        // 10 s login-read deadline expires. Go frp v0.71.1 does the same
+        // (`closeResources` closes `svr.listener`; called from `Close()`,
+        // which `context.AfterFunc(ctx, …)` triggers at cancellation) —
+        // without this the main port stays bound for the whole drain
+        // (`graceful_shutdown_timeout`, default 30 s), while every other
+        // listener (vhost/kcp/quic/ws/dashboard) is already closed by its
+        // own select-on-token arm.
+        drop(listener);
+
         // --- Graceful drain phase ---
         // Accept loop has stopped. Let existing bridge connections finish.
         let drain_timeout = Duration::from_secs(self.cfg.graceful_shutdown_timeout);
