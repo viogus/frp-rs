@@ -222,9 +222,14 @@ impl SshListener {
             // before the await only handles the case where the token is
             // already cancelled on entry; otherwise the SSH port stays bound
             // (and silently backlogs dialers) until some connection happens to
-            // arrive. Same shape as the vhost/tcpmux/dashboard accept loops
-            // and Go's `sshTunnelGateway.Close()` from `closeResources`.
+            // arrive. Same select-on-token shape as the vhost/tcpmux accept
+            // loops and Go's `sshTunnelGateway.Close()` from `closeResources`.
+            // `biased;` puts the token first: when both arms are ready (a dial
+            // arrives exactly at the cancellation instant) shutdown wins and no
+            // connection is admitted after cancellation, which is what Go's
+            // listener-close-at-Close gets by construction.
             let (stream, peer_addr) = tokio::select! {
+                biased;
                 _ = self.state.shutdown_token.cancelled() => {
                     tracing::info!("SSH tunnel gateway shutting down");
                     return Ok(());
@@ -233,7 +238,9 @@ impl SshListener {
                     Ok(conn) => conn,
                     Err(e) => {
                         // Accept error classification unchanged: log and retry;
-                        // only cancellation (above) ends the loop.
+                        // only cancellation (above) ends the loop. `biased;`
+                        // does not change this: the token arm is terminal, this
+                        // arm still `continue`s on any accept error.
                         tracing::error!(error = %e, "SSH accept error: {}", e);
                         continue;
                     }

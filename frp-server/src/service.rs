@@ -891,7 +891,22 @@ impl Service {
                         // hold a conn_semaphore slot while we wait (parity with
                         // the vhost/tcpmux accept loops).
                         drop(permit);
-                        tokio::time::sleep(wait).await;
+                        // Race the wait against shutdown. This sleep is inside
+                        // the accept arm, outside the outer `select!`, so a
+                        // cancellation arriving during it would otherwise be
+                        // observed only when it ends — up to `1/max_accept_rate`
+                        // (the limiter's wait is capped at 1 s) after the token
+                        // fires, delaying `drop(listener)` below by that much.
+                        // Breaking here keeps the release immediate in every
+                        // configuration; `max_accept_rate` is Rust-only (Go has
+                        // no counterpart), so parity is unaffected either way.
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = self.state.shutdown_token.cancelled() => {
+                                info!("Accept loop stopped for graceful shutdown (during accept rate-limit wait)");
+                                break;
+                            }
+                        }
                         continue;
                     }
                     spawn_boxed(Box::pin(async move {
@@ -1036,9 +1051,26 @@ impl Service {
         // (`closeResources` closes `svr.listener`; called from `Close()`,
         // which `context.AfterFunc(ctx, …)` triggers at cancellation) —
         // without this the main port stays bound for the whole drain
-        // (`graceful_shutdown_timeout`, default 30 s), while every other
-        // listener (vhost/kcp/quic/ws/dashboard) is already closed by its
-        // own select-on-token arm.
+        // (`graceful_shutdown_timeout`, default 30 s).
+        //
+        // Every other accept loop in this crate already selects on this same
+        // token, so each closes its listener at cancellation too: HTTP vhost
+        // (`vhost.rs`), HTTPS vhost (`vhost/https.rs`), tcpmux (`tcpmux.rs`),
+        // and the KCP/QUIC/WebSocket listeners (`service/listeners.rs`). The
+        // dashboard is not an accept loop: it is an axum server stopped by
+        // `with_graceful_shutdown` on the token (`dashboard.rs`). The main
+        // listener was the one exception, closed only when `run()` returned.
+        // (Under the Rust-only `max_accept_rate` > 0 every one of those loops,
+        // like this one, has an in-arm rate-limit sleep that can delay its
+        // close by up to 1 s; only this loop's wait is raced against the
+        // token, above.)
+        //
+        // The accept loop observes cancellation on its next poll, with one
+        // exception: the accept arm's sleeps run outside the outer `select!` —
+        // the rate-limiter wait and the 100 ms accept-error backoff. The
+        // rate-limit wait is now itself raced against the token (see above), so
+        // the only remaining delay is the 100 ms backoff, reachable only after
+        // a failed `accept()`.
         drop(listener);
 
         // --- Graceful drain phase ---
