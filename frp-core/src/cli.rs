@@ -595,7 +595,7 @@ pub struct FrpsArgs {
     /// above 24 h is accepted here and then silently shortened. Measured by the
     /// unit pin `frp-server/src/vhost/tests.rs:252` (`test_clamp_vhost_timeout`):
     /// `0 → 60`, `-1 → 60`, `86400 → 86400`, `86401 → 86400`, `i64::MAX →
-    /// 86400`; the cap is `frp-server/src/vhost.rs:120`
+    /// 86400`; the cap is `frp-server/src/vhost.rs:128`
     /// (`VHOST_TIMEOUT_CAP_SECS`).
     pub vhost_http_timeout: Option<i64>,
     pub strict_config: bool,

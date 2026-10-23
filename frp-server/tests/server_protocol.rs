@@ -675,8 +675,8 @@ Connection: close\r\n\
 // dev-dependency on frp-client pulls it in), so `detect_and_strip_magic`
 // returns `ConnectionType::WebSocket` and the `not(feature = "websocket")` arm
 // warns `WebSocket connection from {} but WebSocket feature not enabled,
-// dropping` and drops the connection (frp-server/src/service.rs:994, arm at
-// :961). With `--no-default-features --features websocket`, this case is
+// dropping` and drops the connection (frp-server/src/service.rs:1009, arm at
+// :976). With `--no-default-features --features websocket`, this case is
 // 1 passed / 0 failed.
 #[cfg(feature = "websocket")]
 #[tokio::test]
