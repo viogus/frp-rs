@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=581 weak=100 ambiguous=2 excluded=101 foreign_reported=1102 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=d28703aa8ad1ac48 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=581 weak=99 ambiguous=2 excluded=101 foreign_reported=1102 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=e105cef4e2c292e7 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1517
@@ -339,7 +339,7 @@ frp-core/src/msg.rs	694	699	2d3748ed9d43c0a1	981b6bd3b6da21de	absolute	frp-core/
 frp-core/src/transport/mod.rs	2254	-	ece8f0b0300abc24	-	absolute	frp-core/src/transport/mod.rs	transport/mod.rs:2254	3281
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2437
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	frp-core/src/config/tests.rs	frp-core/src/unsafe_features.rs:10	12627
-frp-core/src/xtcp_session.rs	46	47	eaf40f1d976d9518	948dba0a9cf1976c	absolute	frp-core/tests/xtcp_p2p.rs	frp-core/src/xtcp_session.rs:46-47	19
+frp-core/src/xtcp_session.rs	47	-	948dba0a9cf1976c	-	absolute	frp-core/tests/xtcp_p2p.rs	frp-core/src/xtcp_session.rs:47	19
 frp-server/Cargo.toml	45	-	7fd8440b0bf7bf6c	-	absolute	docs/developing.md	frp-server/Cargo.toml:45	4030
 frp-server/Cargo.toml	46	-	5f892a3adab944b5	-	absolute	docs/developing.md	frp-server/Cargo.toml:46	4029
 frp-server/Cargo.toml	47	-	517eb8fa69c9ff42	-	absolute	docs/developing.md	frp-server/Cargo.toml:47	4027
