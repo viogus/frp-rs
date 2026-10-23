@@ -32,9 +32,9 @@ pub(crate) use head::count_host_headers;
 #[cfg(test)]
 use head::{canonicalize_authority, extract_host_header};
 use head::{
-    extract_basic_auth, extract_basic_auth_named, extract_raw_request_host, has_nonempty_header,
-    parse_vhost_request_line, request_line_minor_gte_1, validate_vhost_head_lines, HeadLineVerdict,
-    RequestLine,
+    connect_head_has_body, extract_basic_auth, extract_basic_auth_named, extract_raw_request_host,
+    has_nonempty_header, parse_vhost_request_line, request_line_minor_gte_1,
+    validate_vhost_head_lines, HeadLineVerdict, RequestLine,
 };
 
 /// Go frp v0.71.0 `NotFoundResponse` writer (pkg/util/http/http.go) —
@@ -48,36 +48,44 @@ use head::{
 /// (custom_404_page) replacing the builtin HTML when non-empty.
 pub(crate) use frp_core::bridge::write_not_found_response;
 
-/// Write the Go `http.Error` auth-fail render (pkg/util/vhost/http.go
-/// ServeHTTP: `rw.Header().Set(...); http.Error(rw, http.StatusText(code),
-/// code)` → Content-Type: text/plain; charset=utf-8 + X-Content-Type-Options:
-/// nosniff + Content-Length + the StatusText body with a trailing '\n').
-/// The fixed fields match Go; the Date header Go's http.Server layer adds
-/// to the live render is omitted in this raw write, and header order is
-/// fixed (Content-Length first) rather than Go's writer order — the same
-/// scoping the NotFoundResponse arms document (shape parity of the
-/// frp-rs-built response, not a live-server byte capture).
-async fn write_http_error_auth_response(
+/// Write Go's `http.Error` render (pkg/util/vhost/http.go ServeHTTP:
+/// `rw.Header().Set(...); http.Error(rw, http.StatusText(code), code)` →
+/// Content-Type: text/plain; charset=utf-8, X-Content-Type-Options: nosniff,
+/// Content-Length, and the StatusText body with a trailing '\n').
+/// `extra_header` is the challenge header the auth arms set before
+/// `http.Error` (401 `Www-Authenticate` / 407 `Proxy-Authenticate`); it is
+/// `None` for the v0.71.1 CONNECT body-gate 400, which has no extra field.
+/// The fixed fields match Go; the Date header Go's http.Server layer adds to
+/// the live render is omitted in this raw write, and header order is fixed
+/// (Content-Length first) rather than Go's writer order — the same scoping
+/// the NotFoundResponse arms document (shape parity of the frp-rs-built
+/// response, not a live-server byte capture). Probed against the Go v0.71.1
+/// binary: same fields and values (Date aside), same body, same length —
+/// `HTTP/1.1 400 Bad Request` / `Content-Type: text/plain; charset=utf-8` /
+/// `X-Content-Type-Options: nosniff` / `Content-Length: 12` / `Bad Request\n`.
+async fn write_http_error_response(
     stream: &mut (impl tokio::io::AsyncWriteExt + Unpin),
     status_line: &str,
-    auth_header: &str,
+    extra_header: Option<&str>,
     body: &str,
 ) {
-    let head = format!(
+    let mut head = format!(
         "HTTP/1.1 {status_line}\r\n\
          Content-Length: {}\r\n\
-         Content-Type: text/plain; charset=utf-8\r\n\
-         {auth_header}\r\n\
-         X-Content-Type-Options: nosniff\r\n\
-         \r\n",
+         Content-Type: text/plain; charset=utf-8\r\n",
         body.len()
     );
+    if let Some(extra_header) = extra_header {
+        head.push_str(extra_header);
+        head.push_str("\r\n");
+    }
+    head.push_str("X-Content-Type-Options: nosniff\r\n\r\n");
     if let Err(e) = stream.write_all(head.as_bytes()).await {
-        tracing::debug!(error = %e, "failed to write auth error response header");
+        tracing::debug!(error = %e, "failed to write HTTP error response header");
         return;
     }
     if let Err(e) = stream.write_all(body.as_bytes()).await {
-        tracing::debug!(error = %e, "failed to write auth error response body");
+        tracing::debug!(error = %e, "failed to write HTTP error response body");
     }
 }
 
@@ -641,6 +649,29 @@ async fn handle_http1_request<S>(
     .await
     {
         Ok(forward) => {
+            // Go frp v0.71.1 `connectHandler` gate (pkg/util/vhost/http.go:
+            // 209-212): a CONNECT declaring a positive Content-Length or any
+            // Transfer-Encoding is answered with a plain `http.Error(400)`
+            // BEFORE the hijack — no connection to the provider is created,
+            // no work conn is requested, no `NewUserConn` plugin hook runs.
+            // The head plus any body bytes are exactly Go's pre-hijack view,
+            // so the scan runs over `forward.request_head` (for CONNECT this
+            // is the raw head + tail: no rewrite/inject/hop-strip applies).
+            //
+            // Placement is deliberate on both axes:
+            // * AFTER `resolve_vhost_request` returns Ok: Go's ServeHTTP runs
+            //   `checkRouteAuthByRequest` before `connectHandler`, so a
+            //   credential-less CONNECT still answers 401/407 first.
+            // * HTTP/1.1 face only (this function): `resolve_vhost_request`
+            //   is shared with the h2c front, where a CONNECT's DATA frames
+            //   ARE the tunnel's early data and the synthesized HTTP/1 head
+            //   even carries `Transfer-Encoding: chunked` — a head-text gate
+            //   there would reject valid h2c traffic.
+            if is_connect && connect_head_has_body(&forward.request_head) {
+                write_http_error_response(&mut stream, "400 Bad Request", None, "Bad Request\n")
+                    .await;
+                return;
+            }
             // DELIBERATE DIVERGENCE (audit round 9, F4 — documented, not
             // fixed): the HTTP/1.1 vhost path is a RAW BYTE RELAY — one
             // routed backend per client connection. `forward` carries the
@@ -734,10 +765,10 @@ async fn handle_http1_request<S>(
             // Required\n", 30 bytes). The bare 3-line 407 (no body, no
             // Content-Length) this arm used to write diverged (round-3
             // review).
-            write_http_error_auth_response(
+            write_http_error_response(
                 &mut stream,
                 "407 Proxy Authentication Required",
-                "Proxy-Authenticate: Basic realm=\"Restricted\"",
+                Some("Proxy-Authenticate: Basic realm=\"Restricted\""),
                 "Proxy Authentication Required\n",
             )
             .await;
@@ -751,10 +782,10 @@ async fn handle_http1_request<S>(
             // textproto.CanonicalMIMEHeaderKey — probe vs go1.25.12 and Go
             // frp v0.71.0 both emit Www-Authenticate; registry casing
             // "WWW-Authenticate" never reaches the wire).
-            write_http_error_auth_response(
+            write_http_error_response(
                 &mut stream,
                 "401 Unauthorized",
-                "Www-Authenticate: Basic realm=\"Restricted\"",
+                Some("Www-Authenticate: Basic realm=\"Restricted\""),
                 "Unauthorized\n",
             )
             .await;

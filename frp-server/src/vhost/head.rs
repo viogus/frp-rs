@@ -581,6 +581,107 @@ pub(crate) fn count_host_headers(request: &str) -> usize {
         .count()
 }
 
+/// Go frp v0.71.1 `connectHandler` body gate (pkg/util/vhost/http.go:209-212):
+///
+/// ```go
+/// if req.ContentLength > 0 || len(req.TransferEncoding) > 0 {
+///     http.Error(rw, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+///     return
+/// }
+/// ```
+///
+/// Byte-oriented over the RAW request bytes (`handle_http1_request`'s
+/// `pre_read` / the forwarded CONNECT head, which still carries the tail
+/// bytes that arrived with the head): skip the request line, scan only up to
+/// the first blank line — bytes past it are entity body or CONNECT tunnel
+/// early data and must never be parsed as headers — match names
+/// case-insensitively, and trim SP/HTAB around values (the same conventions
+/// as `validate_vhost_head_lines`).
+///
+/// Semantics, decided from the Go source plus probes of the real v0.71.1
+/// binary (transcript in the port report):
+/// * `Content-Length` present with a value that parses as u64 `> 0` → true;
+///   `0` / `000` / ` 0\t` alone → false (Go's `> 0` — the request still
+///   tunnels). Duplicate lines: any positive line wins (`0` + `5` → true);
+///   `0` + `0` → false (Go accepts identical duplicates and tunnels; a
+///   mismatched duplicate is a Go read-time 400).
+/// * `Content-Length` present but EMPTY or unparseable (`abc`, `+5`, `-1`)
+///   → true, fail closed. Go's server rejects every such shape with a 400 at
+///   read time (`parseContentLength`, probe-confirmed), before
+///   `connectHandler` could run; the frp-rs head validator does not model
+///   `Content-Length`, so this gate is the only place that can refuse them.
+///   (frp-rs renders its `http.Error`-shaped 400 here where Go's server
+///   layer renders the generic `Connection: close` 400 — same status,
+///   different body; accepted divergence.)
+/// * ANY `Transfer-Encoding` header → true. Go's gate only ever sees a
+///   single valid `chunked` on HTTP/1.1 (an empty/unsupported TE answers a
+///   read-time 501, probe-confirmed, and HTTP/1.0 ignores TE); frp-rs has no
+///   server-level TE validation, so it fails closed on every TE shape.
+/// * No such header (or an obs-fold continuation line, which can never name
+///   a header) → false.
+pub(super) fn connect_head_has_body(head: &[u8]) -> bool {
+    let mut lines = head.split(|&b| b == b'\n');
+    // Skip the request line: it cannot name a header (and a CONNECT
+    // authority-form target may contain a colon-terminated lookalike).
+    let _ = lines.next();
+    for raw in lines {
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        // The head-terminating blank line: everything after it is body or
+        // tunnel early data (the bytes Go's Hijack leaves in
+        // `buffered.Reader`), never header material.
+        if line.is_empty() {
+            break;
+        }
+        // obs-fold continuation of the preceding header — Go's MIME reader
+        // merges it into that line's value, so it can never introduce a new
+        // header. A folded CL/TE value is exotic and out of scope (Go's
+        // server rejects the merged shape at read time).
+        if matches!(line.first(), Some(b' ' | b'\t')) {
+            continue;
+        }
+        let Some(colon) = line.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        let value = trim_ows(&line[colon + 1..]);
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if !content_length_is_zero(value) {
+                return true;
+            }
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return true;
+        }
+    }
+    false
+}
+
+/// `true` only for a Content-Length value Go reads as exactly 0: OWS-trimmed
+/// ASCII digits parsing to u64 `0` (leading zeros fine). An empty or
+/// unparseable value returns `false` on purpose — the caller treats anything
+/// that is not a confirmed zero as a body declaration, and Go rejects those
+/// shapes at read time.
+fn content_length_is_zero(value: &[u8]) -> bool {
+    if value.is_empty() || !value.iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .is_some_and(|n| n == 0)
+}
+
+/// Trim leading/trailing SP/HTAB (Go `textproto.TrimString`) without
+/// assuming UTF-8 — header values may carry obs-text.
+fn trim_ows(value: &[u8]) -> &[u8] {
+    let is_ows = |b: &u8| matches!(b, b' ' | b'\t');
+    let start = value.iter().position(|b| !is_ows(b)).unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|b| !is_ows(b))
+        .map_or(start, |i| i + 1);
+    &value[start..end]
+}
+
 /// Canonicalize an authority value (host[:port] or [v6]:port) for vhost
 /// routing — port strip, bracket handling, exactly one trailing dot.
 /// Go frp `CanonicalHost` semantics (pkg/util/http/http.go:54-67), shared

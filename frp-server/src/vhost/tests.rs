@@ -341,6 +341,136 @@ fn test_count_host_headers() {
     );
 }
 
+/// Go frp v0.71.1 `connectHandler` gate unit pin
+/// (`req.ContentLength > 0 || len(req.TransferEncoding) > 0`). The end-to-end
+/// byte render and the "no backend dial" assertion live in
+/// `frp-server/tests/vhost_audit_fixes.rs`; this table pins the head scanner's
+/// edge cases. Everything Go's server rejects at read time (empty/unparseable
+/// Content-Length, unsupported TE) is fail-closed `true` here.
+#[test]
+fn test_connect_head_has_body() {
+    let head = |headers: &str| {
+        format!("CONNECT tunnel.example.com:443 HTTP/1.1\r\nHost: tunnel.example.com:443\r\n{headers}\r\n")
+    };
+
+    // Absent framing headers → no body (the plain CONNECT tunnels).
+    assert!(!connect_head_has_body(head("").as_bytes()));
+    assert!(!connect_head_has_body(head("X-Whatever: 1\r\n").as_bytes()));
+
+    // Content-Length > 0 → body.
+    assert!(connect_head_has_body(
+        head("Content-Length: 5\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: 1\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("content-length: 5\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("CONTENT-LENGTH: 5\r\n").as_bytes()
+    ));
+
+    // Content-Length: 0 (Go's `> 0`) → still tunnels; OWS and leading zeros
+    // are legal framing.
+    assert!(!connect_head_has_body(
+        head("Content-Length: 0\r\n").as_bytes()
+    ));
+    assert!(!connect_head_has_body(
+        head("Content-Length: 000\r\n").as_bytes()
+    ));
+    assert!(!connect_head_has_body(
+        head("Content-Length:  0\t\r\n").as_bytes()
+    ));
+
+    // Duplicate Content-Length: any positive value wins; two zeros still
+    // tunnel (Go accepts identical duplicates, probe-confirmed; a mismatched
+    // duplicate is a read-time 400 → fail closed below).
+    assert!(!connect_head_has_body(
+        head("Content-Length: 0\r\nContent-Length: 0\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: 0\r\nContent-Length: 5\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: 5\r\nContent-Length: 0\r\n").as_bytes()
+    ));
+
+    // Empty / unparseable Content-Length → fail closed (Go's
+    // parseContentLength 400s these at read time: probes `CL empty`,
+    // `CL space`, `CL abc`, `CL +5`, `CL -1` all answered 400).
+    assert!(connect_head_has_body(
+        head("Content-Length:\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length:   \r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: abc\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: +5\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Content-Length: -1\r\n").as_bytes()
+    ));
+    // u64 overflow is unparseable here; Go's 63-bit ParseUint 400s it too.
+    assert!(connect_head_has_body(
+        head("Content-Length: 99999999999999999999999\r\n").as_bytes()
+    ));
+
+    // ANY Transfer-Encoding → fail closed. Go's server only lets a single
+    // valid `chunked` through on 1.1 (empty/other TE → 501 at read time) and
+    // ignores TE on HTTP/1.0; frp-rs has no such validation.
+    assert!(connect_head_has_body(
+        head("Transfer-Encoding: chunked\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("transfer-encoding: chunked\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Transfer-Encoding:\r\n").as_bytes()
+    ));
+    assert!(connect_head_has_body(
+        head("Transfer-Encoding: identity\r\n").as_bytes()
+    ));
+
+    // Tail bytes after the head terminator are tunnel early data, never
+    // headers — even if they look like framing lines.
+    assert!(!connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nHost: tunnel.example.com:443\r\n\r\ncontent-length: 5\r\n"
+    ));
+    assert!(!connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nHost: tunnel.example.com:443\r\n\r\nEARLY-TUNNEL-BYTES"
+    ));
+    assert!(connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nContent-Length: 1\r\n\r\nX"
+    ));
+
+    // Bare-LF heads (textproto legal) parse the same way.
+    assert!(connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\nContent-Length: 5\n\n"
+    ));
+    assert!(!connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\nContent-Length: 0\n\n"
+    ));
+
+    // The request line is skipped: an authority-form target cannot smuggle
+    // a framing header (and a header without a colon is not a header).
+    assert!(!connect_head_has_body(
+        b"CONNECT content-length:5:443 HTTP/1.1\r\nHost: x\r\n\r\n"
+    ));
+    assert!(!connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nContent-Length 5\r\n\r\n"
+    ));
+
+    // A folded continuation line never introduces a header (it belongs to
+    // the previous value; folded CL/TE is out of scope).
+    assert!(!connect_head_has_body(
+        b"CONNECT tunnel.example.com:443 HTTP/1.1\r\nX-Foo: a\r\n Content-Length: 5\r\n\r\n"
+    ));
+}
+
 #[test]
 fn test_parse_vhost_request_line_versions() {
     // F1 (audit round 9): Go 1.25 parseRequestLine requires TWO literal
