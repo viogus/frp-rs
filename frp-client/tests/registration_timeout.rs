@@ -83,10 +83,10 @@ async fn dead_server_during_registration_reconnects_within_heartbeat_timeout() {
         // and the client dials again. A mock that handled only two
         // connections would leave the third Login unanswered. This test
         // exercises the timeout/watchdog path, not the stop path: the stop
-        // token can now abort a dial or a LoginResp wait (Go v0.71.1
-        // lifecycle), but the mock still answers every reconnect so each
-        // session settles and the final request_stop has a live session to
-        // end (the stop is issued after the second login completes).
+        // token aborts a dial and (stronger than Go) a LoginResp wait, but
+        // the mock still answers every reconnect so each session settles
+        // and the final request_stop has a live session to end (the stop
+        // is issued after the second login completes).
         let mut login2_tx = Some(login2_tx);
         loop {
             let (conn, _) = listener.accept().await.expect("reconnect control conn");

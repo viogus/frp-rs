@@ -1,8 +1,11 @@
-//! Go frp v0.71.1 lifecycle (55107d0): cancelling the service context during
-//! startup aborts the dialer / LoginResp wait immediately. frp-rs's
-//! `Service::stop` token is raced inside `connect_and_login`, so a `SIGTERM`
-//! (or admin `/api/stop`) that lands while the client waits for LoginResp
-//! must end `run()` promptly instead of waiting out the 10s login timeout.
+//! frp-rs shutdown during login — stronger than Go frp v0.71.1, not parity:
+//! Go's `svr.ctx` cancel aborts the dial, while the LoginResp read has its
+//! own 10s deadline and `Run` waits for blocked startup
+//! (`TestServiceStartupShutdownLeavesCleanupToRun`). frp-rs races the whole
+//! `connect_and_login` (dial + LoginResp wait) against its `Service::stop`
+//! token, so a `SIGTERM` (or admin `/api/stop`) that lands while the client
+//! waits for LoginResp ends `run()` promptly instead of waiting out the 10s
+//! login timeout.
 //!
 //! Oracle: the mock accepts the control connection and reads Login but never
 //! answers; `request_stop()` after the Login frame arrives must make `run()`

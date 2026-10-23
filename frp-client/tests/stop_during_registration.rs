@@ -1,9 +1,12 @@
-//! Go frp v0.71.1 lifecycle (55107d0): a stop during the registration phase
-//! must abort the `NewProxy` response wait immediately, not wait out
-//! `REGISTRATION_RESPONSE_TIMEOUT` (30s at default; 5s overridden here) or
-//! the heartbeat watchdog. `register_proxies` races the `Service::stop`
-//! token in its response-loop `select!`, sets `ctx.shutdown_flag` and
-//! returns `false`, so `run()` takes the normal teardown + clean-stop path.
+//! frp-rs shutdown during registration — stronger than Go frp v0.71.1, not
+//! parity: a stop must abort the `NewProxy` response wait immediately, not
+//! wait out `REGISTRATION_RESPONSE_TIMEOUT` (30s at default; 5s overridden
+//! here) or the heartbeat watchdog. Go bounds each proxy's registration with
+//! its own startErrTimeout in a goroutine and does not cancel that wait on
+//! ctx cancel, so extending the stop signal to the registration wait is an
+//! frp-rs extension. `register_proxies` races the `Service::stop` token in
+//! its response-loop `select!`, sets `ctx.shutdown_flag` and returns
+//! `false`, so `run()` takes the normal teardown + clean-stop path.
 //!
 //! `FRP_REGISTRATION_RESPONSE_TIMEOUT_MS` is process-global and read once
 //! (LazyLock), so this test is the only `#[tokio::test]` in this binary, as

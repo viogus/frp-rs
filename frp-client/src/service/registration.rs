@@ -526,12 +526,12 @@ impl Service {
                     _ = &mut timer => timer_fired = true,
                     _ = &mut watchdog => watchdog_fired = true,
                     // A stop requested while the server is silent must
-                    // abort the registration wait immediately (Go frp
-                    // v0.71.1 ctx cancel), not after up to
-                    // REGISTRATION_RESPONSE_TIMEOUT (30s) / the heartbeat
-                    // watchdog. `CancellationToken::cancelled` is
-                    // cancel-safe, so a stop that lands after this arm
-                    // loses the select still fires on the next iteration.
+                    // abort the registration wait immediately, not after
+                    // up to REGISTRATION_RESPONSE_TIMEOUT (30s) / the
+                    // heartbeat watchdog. This extends the stop signal to
+                    // registration (stronger than Go, which bounds it per
+                    // proxy). `CancellationToken::cancelled` is cancel-safe,
+                    // so a stop landing after this arm is polled still fires.
                     _ = stop.cancelled() => stop_fired = true,
                 }
                 if stop_fired {

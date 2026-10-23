@@ -273,9 +273,9 @@ impl Service {
                 Ok(Some(ctx)) => ctx,
                 Ok(None) => {
                     // The stop token was cancelled while dialling or waiting
-                    // for LoginResp (Go frp v0.71.1: ctx cancel aborts the
-                    // dialer). No session exists, so the clean exit is the
-                    // same as the cancelled login-backoff path below.
+                    // for LoginResp. Go's ctx cancel aborts only the dial;
+                    // aborting the LoginResp wait is stronger than Go (see
+                    // connect_and_login). Clean exit as in login backoff.
                     info!("Stop requested during login, shutting down");
                     self.cancel_detached_tasks(&health_cancels, admin_handle)
                         .await;
@@ -543,8 +543,8 @@ impl Service {
     /// Returns the per-session state on success; on failure returns the
     /// error so run() can apply backoff + reconnect exactly as before.
     /// Returns `Ok(None)` when the stop token was cancelled before or during
-    /// the dial/login (Go frp v0.71.1: ctx cancel aborts the dialer);
-    /// run() then runs the clean-stop exit instead of a login failure.
+    /// the dial/login; cancelling the dial matches Go v0.71.1, and aborting
+    /// the LoginResp wait is stronger than Go (it has a 10s read deadline).
     /// Backoff counters (consecutive_err_count, fast_retry_timestamps,
     /// previous_run_id) stay in run() scope — `did_login_once` is passed in
     /// so it is set at login success (before the encryption wrap), matching
@@ -660,9 +660,9 @@ impl Service {
         // Race the whole dial + LoginResp wait against the stop token: a
         // SIGTERM delivered while the client is dialling or waiting for
         // LoginResp must not wait out the dial timeout / the 10s login
-        // read timeout. Go frp v0.71.1 cancels `svr.ctx`, which aborts the
-        // dialer and closes the control connection; dropping the login
-        // future here drops the socket at the same point.
+        // read timeout. Go's ctx cancel aborts the dial, but its LoginResp
+        // read is only bounded by its own 10s deadline and Run waits for
+        // blocked startup; aborting that wait here is stronger than Go.
         let login_result = tokio::select! {
             r = ctl.login() => r,
             _ = self.stop.cancelled() => return Ok(None),

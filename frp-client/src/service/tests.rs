@@ -1742,19 +1742,19 @@ async fn construction_refuses_a_non_exact_auth_method() {
     }
 }
 
-/// G-D (Go frp v0.71.1 #5561): `ControlWriter::send` must not report
-/// success once the writer task's failure is observable — a send that
-/// races the writer's death must return `Err`, not `Ok` for a message the
-/// closed channel discards. The writer task here writes to a duplex whose
-/// far end is dropped, so its first write fails with BrokenPipe and it
-/// marks the shared `failed` flag.
+/// G-D (Go frp v0.71.1 #5561): `ControlWriter::send` reports `Err` once the
+/// writer task's failure is observable — a send that races the writer's
+/// death must not return `Ok` for a message the closed channel discards.
+/// The writer task here writes to a duplex whose far end is dropped, so its
+/// first write fails with BrokenPipe and it marks the shared `failed` flag.
 ///
-/// `Ok(())` otherwise means "accepted by the writer funnel, not
-/// delivered" (Go's doc sentence); the exact post-enqueue re-check window
-/// (failure observed between the `failed` load and `try_send`) is a few
-/// instructions wide and cannot be forced without a test hook, so this
-/// pins the coarse contract: after `wait_failed()` resolves, `send`
-/// returns `Err`.
+/// This is a **coarse-contract** test: it pins "no success once the writer
+/// failure is observable" through the pre-enqueue `failed` check. It does
+/// NOT force the few-instruction post-enqueue window (the failure landing
+/// between the `failed` load and `try_send`, which the Go #5561 re-check
+/// covers); that window needs a production test hook, which this fix
+/// deliberately does not add. `Ok(())` otherwise means "accepted by the
+/// writer funnel, not delivered".
 #[tokio::test]
 async fn control_writer_send_after_failure_returns_err() {
     let (client, server) = tokio::io::duplex(64);
