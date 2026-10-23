@@ -61,7 +61,7 @@ open item in [`TODO.md`](../TODO.md).
 
 #### 4. Operational knobs Go frp does not have
 
-- **UDP bandwidth limiting.** Go frp v0.71.0's UDP forwarder has **no limiter at
+- **UDP bandwidth limiting.** Go frp v0.71.1's UDP forwarder has **no limiter at
   all**; frp-rs applies the same `bandwidthLimit` semantics it uses for TCP.
 - **SSH gateway per-IP login throttling** plus `ssh_session_idle_timeout`. Go's
   gateway has only `authorized_keys` public-key auth — no password path and no

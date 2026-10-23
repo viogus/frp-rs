@@ -496,7 +496,7 @@ at startup rather than silently failing.
 
 ## Proxy Virtual Net Plugin (`[proxies.plugin] type = "virtual_net"`)
 
-The Go frp v0.71.0 `virtual_net` proxy plugin exposes the client's TUN device
+The Go frp v0.71.1 `virtual_net` proxy plugin exposes the client's TUN device
 to remote `virtual_net` visitors. It does not bind a local listener. When the
 server assigns a work connection to this proxy, frpc hands the connection to
 the vnet controller: bytes from the remote tunnel are written into the local
@@ -525,7 +525,7 @@ default binaries), and a valid IPv4 `[virtualNet] address`.
 
 ## Visitor Virtual Net Plugin (`[visitors.plugin] type = "virtual_net"`)
 
-Go frp v0.71.0 also supports a visitor-side `virtual_net` plugin. It does not
+Go frp v0.71.1 also supports a visitor-side `virtual_net` plugin. It does not
 bind a local TCP listener; instead it advertises `destinationIP` as a host
 route through the virtual network routing path.
 

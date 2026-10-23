@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=581 weak=101 ambiguous=2 excluded=101 foreign_reported=1102 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=4a359178b2484cf4 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=581 weak=100 ambiguous=2 excluded=101 foreign_reported=1102 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=d28703aa8ad1ac48 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2278	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2278	1517
@@ -491,7 +491,7 @@ frp-server/src/vhost/router.rs	262	-	251d634ce68ced5e	-	absolute	docs/developing
 frp-server/src/vhost/tests.rs	252	-	4e534f384740e0d0	-	absolute	frp-core/src/cli.rs	frp-server/src/vhost/tests.rs:252	596
 frp-server/tests/common/mod.rs	135	-	bb2ec6dfccd8bb19	-	shorthand	docs/developing.md	:135	619
 frp-server/tests/common/mod.rs	22	-	575a0ae30262fd7e	-	absolute	docs/developing.md	frp-server/tests/common/mod.rs:22	619
-frp-server/tests/common/mod.rs	392	-	4298db5f2a238e69	-	shorthand	docs/developing.md	:392	621
+frp-server/tests/common/mod.rs	393	-	7f05826a6d63e68e	-	shorthand	docs/developing.md	:393	621
 frp-server/tests/common/mod.rs	81	-	026bf69fd3e1c91c	-	shorthand	docs/developing.md	:81	619
 frp-server/tests/server_protocol.rs	101	-	7bff240782fd2e55	-	absolute	docs/developing.md	server_protocol.rs:101	1464
 frp-server/tests/server_protocol.rs	393	-	86d6baeb453f065f	-	absolute	frp-server/tests/server_protocol.rs	server_protocol.rs:393	357

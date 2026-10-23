@@ -109,7 +109,7 @@ detail with Go source references is in the
   divergences are listed in the audit.
 - **`pprof` endpoints** — `/debug/pprof/*` is a placeholder (no Go-style CPU
   profiles); `/healthz` and pprof sit outside auth, matching Go.
-- **UDP bandwidth limiting is an frp-rs extension** — Go v0.71.0's UDP forwarder has
+- **UDP bandwidth limiting is an frp-rs extension** — Go frp v0.71.1's UDP forwarder has
   no limiter. Direction semantics match the TCP bridge, and the default stays
   unlimited unless a rate is configured.
 - **The SSH gateway fails closed** — with no `authorized_keys` and no server token it
