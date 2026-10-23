@@ -5,6 +5,11 @@
 //! (`wait_for_shutdown_or_delay`, `wait_for_shutdown_signal`) and the
 //! `VnetTunTxMap`/`VnetTunSubnetMap` aliases those items share.
 //!
+//! Its reconnect backoff (`virtual_net_reconnect_delay`, `VirtualNetTunnelEnd`,
+//! `next_reconnect_delay`, `wait_after_virtual_net_round`) mirrors Go frp's
+//! virtual_net plugin: the setup-failure backoff dates from v0.71.0, the
+//! bounded (non-overflowing) delay computation from v0.71.1.
+//!
 //! Split out of `frp-client/src/visitor.rs` by the plan's P3 seam 4
 //! (`docs/refactor-large-modules.md` P3, `visitor/vnet.rs`) as a pure move:
 //! every moved line is byte-for-byte identical to its base text (the seam-4
@@ -86,10 +91,155 @@ pub(crate) struct VirtualNetVisitorConfig {
     pub tls_key_file: Option<String>,
     pub v2: bool,
 }
+
+// --- Reconnect backoff (Go frp `pkg/plugin/visitor/virtual_net.go`) ---
+// The setup-failure backoff dates from v0.71.0; v0.71.1 makes its delay
+// computation bounded so a large error count cannot overflow the shift.
+
+#[cfg(feature = "vnet")]
+const VIRTUAL_NET_RECONNECT_BASE_DELAY: Duration = Duration::from_secs(60);
+#[cfg(feature = "vnet")]
+const VIRTUAL_NET_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
+#[cfg(feature = "vnet")]
+const VIRTUAL_NET_RECONNECT_CLEAN_DELAY: Duration = Duration::from_secs(10);
+
+/// Go frp `virtualNetReconnectDelay` (`pkg/plugin/visitor/virtual_net.go`):
+/// 60s, 120s, 240s, then the 300s cap.
+///
+/// The backoff itself dates from v0.71.0, which computed it inline as
+/// `min(60s << (n-1), 300s)`: `1<<n` overflows `int`, so the product wraps to
+/// a **zero or negative** `time.Duration` for large counts (measured: negative
+/// at n = 52/53, exactly 0 s for n >= 54, including the 329769 upstream saw),
+/// `min(..., 300s)` keeps that value, and `time.After` then fires immediately —
+/// the retry storm v0.71.1 fixed by bounding the shift before it happens
+/// (n <= 1 and n >= 4 never shift). This mirrors the bounded form, so no shift
+/// is performed for large counts and `u32::MAX` cannot overflow.
+#[cfg(feature = "vnet")]
+fn virtual_net_reconnect_delay(consecutive_errors: u32) -> Duration {
+    if consecutive_errors <= 1 {
+        return VIRTUAL_NET_RECONNECT_BASE_DELAY;
+    }
+    if consecutive_errors >= 4 {
+        return VIRTUAL_NET_RECONNECT_MAX_DELAY;
+    }
+    VIRTUAL_NET_RECONNECT_BASE_DELAY * (1u32 << (consecutive_errors - 1))
+}
+
+/// How [`run_virtual_net_tunnel_io`] ended, for the reconnect backoff.
+///
+/// Go frp reports only *tunnel-establishment* failures through
+/// `CloseWithError`: `client/visitor/stcp.go` and `client/visitor/xtcp.go` set
+/// `tunnelErr` on the dial / `NewVisitorConn` / response / encryption-wrap
+/// paths and nowhere else, so only those reach the plugin's error branch. Once
+/// `libio.Join` returns, the conn is closed with `Close()` and a nil error
+/// whatever the join outcome (the join errors are discarded in stcp and only
+/// trace-logged in xtcp), which the plugin takes as a clean close.
+#[cfg(feature = "vnet")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VirtualNetTunnelEnd {
+    /// Our own shutdown signal: the caller returns without waiting.
+    Shutdown,
+    /// The tunnel reached its data plane and then ended — local side closed,
+    /// peer EOF, or a data-plane IO error. Go closes all of these with a nil
+    /// error, so they take the clean 10s delay and reset the error counter.
+    Clean,
+    /// The tunnel never reached its data plane and failed before it: the
+    /// stream split, or cipher *construction* (RNG/key). Go's counterpart —
+    /// a `wrapVisitorConn` failure — is a `CloseWithError`. A failed IV flush
+    /// is **not** here: Go writes the IV lazily inside `libio.Join` and
+    /// discards that write error, so it is a [`Clean`](Self::Clean) end.
+    Error,
+}
+
+/// The per-round Go frp reconnect rule: advance the consecutive-error counter
+/// for one finished round and return the delay to wait before the next attempt.
+///
+/// * `Error` — bump the counter (saturating) and back off 60/120/240/300 s.
+/// * `Clean` — reset the counter to 0 and wait the fixed 10 s. Go resets only
+///   on a clean close, never on a successful connection.
+/// * `Shutdown` — no reconnect is scheduled; the caller returns (`None`).
+///
+/// This is the only place the counter moves. [`wait_after_virtual_net_round`]
+/// only logs and sleeps around it, and the reconnect loop only calls that
+/// wrapper, so the decision has exactly one implementation.
+#[cfg(feature = "vnet")]
+fn next_reconnect_delay(
+    consecutive_errors: &mut u32,
+    end: VirtualNetTunnelEnd,
+) -> Option<Duration> {
+    match end {
+        VirtualNetTunnelEnd::Shutdown => None,
+        VirtualNetTunnelEnd::Clean => {
+            *consecutive_errors = 0;
+            Some(VIRTUAL_NET_RECONNECT_CLEAN_DELAY)
+        }
+        VirtualNetTunnelEnd::Error => {
+            *consecutive_errors = consecutive_errors.saturating_add(1);
+            Some(virtual_net_reconnect_delay(*consecutive_errors))
+        }
+    }
+}
+
+/// Account for one finished `virtual_net` round: apply [`next_reconnect_delay`],
+/// log the delay as upstream does, then wait for it (interruptibly). Returns
+/// `true` when shutdown was requested or the round was our own shutdown, i.e.
+/// when the caller must leave the reconnect loop.
+#[cfg(feature = "vnet")]
+async fn wait_after_virtual_net_round(
+    visitor_name: &str,
+    shutdown: &Arc<AtomicBool>,
+    consecutive_errors: &mut u32,
+    end: VirtualNetTunnelEnd,
+) -> bool {
+    let previous = *consecutive_errors;
+    let Some(delay) = next_reconnect_delay(consecutive_errors, end) else {
+        // Our own shutdown schedules no reconnect; the caller returns.
+        return true;
+    };
+    if end == VirtualNetTunnelEnd::Error {
+        warn!(
+            visitor_name = %visitor_name,
+            consecutive_errors = *consecutive_errors,
+            delay_secs = delay.as_secs(),
+            "virtual_net visitor '{}' reconnecting after {} consecutive error(s), waiting {}s",
+            visitor_name,
+            *consecutive_errors,
+            delay.as_secs()
+        );
+    } else if previous > 0 {
+        info!(
+            visitor_name = %visitor_name,
+            consecutive_errors = previous,
+            "virtual_net visitor '{}' tunnel closed cleanly, resetting error counter (was {})",
+            visitor_name,
+            previous
+        );
+    }
+    wait_for_shutdown_or_delay(shutdown, delay).await
+}
+
+/// Shorthand for the pre-tunnel failure sites, which are always error rounds.
+#[cfg(feature = "vnet")]
+async fn wait_after_virtual_net_error(
+    visitor_name: &str,
+    shutdown: &Arc<AtomicBool>,
+    consecutive_errors: &mut u32,
+) -> bool {
+    wait_after_virtual_net_round(
+        visitor_name,
+        shutdown,
+        consecutive_errors,
+        VirtualNetTunnelEnd::Error,
+    )
+    .await
+}
+
 /// Run the packet loop over an established `virtual_net` visitor tunnel.
 ///
 /// After the NewVisitorConn handshake, tunnel bytes are wrapped in the same
 /// compress → encrypt / decrypt → decompress pipeline used by work conns.
+///
+/// Returns how the tunnel ended so the caller can pick the reconnect delay.
 #[cfg(feature = "vnet")]
 #[allow(clippy::too_many_arguments)]
 async fn run_virtual_net_tunnel_io(
@@ -102,13 +252,13 @@ async fn run_virtual_net_tunnel_io(
     use_encryption: bool,
     use_compression: bool,
     key: [u8; 16],
-) {
+) -> VirtualNetTunnelEnd {
     let mut packet_rx = packet_rx;
     let (server_r, server_w) = match server_conn.into_split() {
         Ok(parts) => parts,
         Err(e) => {
             warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel split failed: {}", e);
-            return;
+            return VirtualNetTunnelEnd::Error;
         }
     };
     // into_split already returns boxed halves — only the encrypted branch
@@ -126,35 +276,38 @@ async fn run_virtual_net_tunnel_io(
             Ok(w) => crate::work_conn::TunnelPacketWriter::Encrypted(w),
             Err(e) => {
                 warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel IV generation failed: {}", e);
-                return;
+                return VirtualNetTunnelEnd::Error;
             }
         }
     } else {
         crate::work_conn::TunnelPacketWriter::Plain(server_w)
     };
     if let Err(e) = packet_writer.flush().await {
+        // Go sends the IV lazily inside `libio.Join` and discards that write
+        // error (stcp) / trace-logs it (xtcp), so a failed IV flush is a clean
+        // end with the nil-error `Close()` the plugin resets on — only cipher
+        // *construction* above is the counterpart of Go's wrap failure.
         warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel IV flush failed: {}", e);
-        return;
+        return VirtualNetTunnelEnd::Clean;
     }
 
-    let mut tunnel_closed = false;
-    while !tunnel_closed {
+    loop {
         tokio::select! {
             _ = wait_for_shutdown_signal(&shutdown) => {
                 info!(visitor_name = %name, "virtual_net visitor '{}' shutting down", name);
-                break;
+                return VirtualNetTunnelEnd::Shutdown;
             }
             packet = packet_rx.recv() => {
                 match packet {
                     Some(pkt) => {
                         if let Err(e) = packet_writer.write_packet(&pkt, use_compression).await {
                             warn!(visitor_name = %name, error = %e, "virtual_net visitor '{}': tunnel write error: {}", name, e);
-                            tunnel_closed = true;
+                            break;
                         }
                     }
                     None => {
                         debug!(visitor_name = %name, "virtual_net visitor packet channel closed");
-                        tunnel_closed = true;
+                        break;
                     }
                 }
             }
@@ -162,7 +315,7 @@ async fn run_virtual_net_tunnel_io(
                 match packet {
                     Ok(None) => {
                         debug!(visitor_name = %name, "virtual_net visitor tunnel closed by peer");
-                        tunnel_closed = true;
+                        break;
                     }
                     Ok(Some(pkt)) => {
                         if !deliver_tunnel_ingress(&name, pkt, &vnet_tun_tx, &tun_subnets).await {
@@ -171,12 +324,14 @@ async fn run_virtual_net_tunnel_io(
                     }
                     Err(e) => {
                         warn!(visitor_name = %name, error = %e, "virtual_net visitor '{}': tunnel read error: {}", name, e);
-                        tunnel_closed = true;
+                        break;
                     }
                 }
             }
         }
     }
+    // Every data-plane exit above is a `Close()` (nil error) in Go frp.
+    VirtualNetTunnelEnd::Clean
 }
 /// Run a no-bind `virtual_net` visitor tunnel.
 ///
@@ -222,6 +377,11 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         v2,
     } = config;
 
+    // Go frp `consecutiveErrors` (v0.71.0, unchanged in v0.71.1): only
+    // *failed* reconnect attempts (establishment failures) bump it; a clean
+    // close of an established tunnel resets it. A successful connection does
+    // not reset it.
+    let mut consecutive_errors: u32 = 0;
     'reconnect: loop {
         if shutdown.load(Ordering::Relaxed) {
             return;
@@ -254,7 +414,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             Ok(io) => io,
             Err(e) => {
                 warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': dial server failed: {}", name, e);
-                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                     return;
                 }
                 continue 'reconnect;
@@ -274,7 +434,8 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
                 }
                 Err(e) => {
                     warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': yamux wrap failed: {}", name, e);
-                    if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await
+                    {
                         return;
                     }
                     continue 'reconnect;
@@ -295,7 +456,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         );
         if let Err(e) = server_conn.write_v1_frame(&nvc).await {
             warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': send NewVisitorConn failed: {}", name, e);
-            if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+            if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                 return;
             }
             continue 'reconnect;
@@ -310,7 +471,8 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             Ok(Ok(FrpMessage::NewVisitorConnResp(resp))) => {
                 if let Some(err) = resp.error {
                     warn!(visitor_name = %name, error = %err, "Virtual net visitor '{}': tunnel setup failed: {}", name, err);
-                    if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                    if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await
+                    {
                         return;
                     }
                     continue 'reconnect;
@@ -323,21 +485,21 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             }
             Ok(Ok(other)) => {
                 warn!(visitor_name = %name, type_byte = %other.v1_type_byte(), "Virtual net visitor received unexpected response type");
-                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                     return;
                 }
                 continue 'reconnect;
             }
             Ok(Err(e)) => {
                 warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': read tunnel response failed: {}", name, e);
-                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                     return;
                 }
                 continue 'reconnect;
             }
             Err(_elapsed) => {
                 warn!(visitor_name = %name, timeout = ?resp_timeout, "Virtual net visitor '{}': timed out waiting for tunnel response", name);
-                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                     return;
                 }
                 continue 'reconnect;
@@ -356,7 +518,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             Ok(false) => return,
             Err(e) => {
                 warn!(visitor_name = %name, error = %e, "Virtual net visitor '{}': route registration failed: {}", name, e);
-                if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+                if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                     return;
                 }
                 continue 'reconnect;
@@ -371,7 +533,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         );
 
         let key = frp_core::encryption::derive_key(&secret_key);
-        run_virtual_net_tunnel_io(
+        let tunnel_end = run_virtual_net_tunnel_io(
             server_conn,
             name.clone(),
             packet_rx,
@@ -391,7 +553,11 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         if shutdown.load(Ordering::Relaxed) {
             return;
         }
-        if wait_for_shutdown_or_delay(&shutdown, Duration::from_secs(10)).await {
+        // The one place the Go round rule is applied. `Shutdown` normally
+        // already returned at the check above; the wrapper still answers
+        // `true` for it, so a reorder cannot make the loop wait at shutdown.
+        if wait_after_virtual_net_round(&name, &shutdown, &mut consecutive_errors, tunnel_end).await
+        {
             return;
         }
     }
@@ -715,6 +881,255 @@ mod tests {
                 .is_err(),
             "ambiguous fallback must not broadcast to tun-b"
         );
+    }
+
+    /// Go frp v0.71.1 `virtualNetReconnectDelay`: 60s, 120s, 240s, then the
+    /// 300s cap. Counts at/past the shift width and `u32::MAX` must clamp, not
+    /// shift (Go had to add the bound because the old `1<<n` overflowed).
+    #[test]
+    fn virtual_net_reconnect_delay_matches_go_backoff() {
+        assert_eq!(virtual_net_reconnect_delay(0), Duration::from_secs(60));
+        assert_eq!(virtual_net_reconnect_delay(1), Duration::from_secs(60));
+        assert_eq!(virtual_net_reconnect_delay(2), Duration::from_secs(120));
+        assert_eq!(virtual_net_reconnect_delay(3), Duration::from_secs(240));
+        assert_eq!(virtual_net_reconnect_delay(4), Duration::from_secs(300));
+        assert_eq!(virtual_net_reconnect_delay(5), Duration::from_secs(300));
+        assert_eq!(virtual_net_reconnect_delay(64), Duration::from_secs(300));
+        assert_eq!(
+            virtual_net_reconnect_delay(u32::MAX),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// The per-round decision the reconnect loop applies, pinned as a sequence:
+    /// error rounds climb 60 -> 120 -> 240 -> 300 and bump the counter, a clean
+    /// round resets it and waits the fixed 10 s, and the reset therefore makes
+    /// the next error round start over at 60 s. Also pins shutdown (no delay,
+    /// counter untouched) and saturation at `u32::MAX`.
+    #[test]
+    fn next_reconnect_delay_pins_error_and_clean_rounds() {
+        let mut n = 0u32;
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(n, 1, "one error round counts one consecutive error");
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(n, 2);
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(n, 3);
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(n, 4);
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(300)),
+            "further errors stay capped"
+        );
+        assert_eq!(n, 5);
+
+        // A clean close resets the counter and takes the fixed 10 s delay.
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Clean),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(n, 0, "clean resets the consecutive-error count");
+        // ...so the next error round starts the schedule over at 60 s.
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(n, 1);
+
+        // Our own shutdown schedules no reconnect and must not touch the count.
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Shutdown),
+            None
+        );
+        assert_eq!(n, 1);
+
+        // Saturation: the increment cannot overflow or panic.
+        n = u32::MAX;
+        assert_eq!(
+            next_reconnect_delay(&mut n, VirtualNetTunnelEnd::Error),
+            Some(Duration::from_secs(300))
+        );
+        assert_eq!(n, u32::MAX);
+    }
+
+    /// Spawn `run_virtual_net_tunnel_io` over the given transport with no TUN
+    /// channels registered, so a test can drive one exit path and read back how
+    /// the tunnel ended. No real time is waited for.
+    fn spawn_tunnel_io(
+        tunnel: Box<dyn frp_core::transport::AsyncReadWrite>,
+        use_encryption: bool,
+        shutdown: Arc<AtomicBool>,
+    ) -> (
+        tokio::task::JoinHandle<VirtualNetTunnelEnd>,
+        mpsc::Sender<Vec<u8>>,
+    ) {
+        let key = frp_core::encryption::derive_key("visitor-secret");
+        let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(16);
+        let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let task = tokio::spawn(run_virtual_net_tunnel_io(
+            frp_core::transport::IoStream::SshChannel(tunnel),
+            "vnet-visitor".to_string(),
+            packet_rx,
+            txs,
+            subnets,
+            shutdown,
+            use_encryption,
+            false,
+            key,
+        ));
+        (task, packet_tx)
+    }
+
+    /// A scripted tunnel transport for the data-plane failure tests: the read
+    /// side is either an injected error or permanently pending, and the write
+    /// side either fails or accepts bytes. Deterministic — unlike a `duplex`
+    /// peer, whose close would race the pending read with the EOF branch.
+    struct ScriptedTunnel {
+        read_err: Option<std::io::ErrorKind>,
+        write_err: Option<std::io::ErrorKind>,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedTunnel {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.read_err {
+                Some(kind) => std::task::Poll::Ready(Err(kind.into())),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ScriptedTunnel {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            match self.write_err {
+                Some(kind) => std::task::Poll::Ready(Err(kind.into())),
+                None => std::task::Poll::Ready(Ok(buf.len())),
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Peer EOF after establishment: Go's `libio.Join` returns normally and the
+    /// conn is closed with a nil error (stcp discards the join errors, xtcp
+    /// only trace-logs them), so this is the clean 10s path.
+    #[tokio::test]
+    async fn tunnel_io_peer_eof_is_a_clean_end() {
+        let (server, peer) = tokio::io::duplex(8192);
+        let (task, _packet_tx) =
+            spawn_tunnel_io(Box::new(server), false, Arc::new(AtomicBool::new(false)));
+        drop(peer);
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
+    }
+
+    /// Local route channel closed while the peer is still open: the local side
+    /// ended the tunnel, which Go reports through `Close()` (nil error).
+    #[tokio::test]
+    async fn tunnel_io_local_route_close_is_a_clean_end() {
+        let (server, _peer) = tokio::io::duplex(8192);
+        let (task, packet_tx) =
+            spawn_tunnel_io(Box::new(server), false, Arc::new(AtomicBool::new(false)));
+        drop(packet_tx);
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
+    }
+
+    /// Our own shutdown is not a reconnect at all: the caller returns.
+    #[tokio::test]
+    async fn tunnel_io_shutdown_reports_shutdown() {
+        let (server, _peer) = tokio::io::duplex(8192);
+        let (task, _packet_tx) =
+            spawn_tunnel_io(Box::new(server), false, Arc::new(AtomicBool::new(true)));
+        assert_eq!(
+            task.await.expect("tunnel task"),
+            VirtualNetTunnelEnd::Shutdown
+        );
+    }
+
+    /// A data-plane write error after establishment: `libio.Join` returns it,
+    /// stcp discards it (xtcp trace-logs it) and the conn is closed with a nil
+    /// error, so the plugin takes the clean 10s path.
+    #[tokio::test]
+    async fn tunnel_io_write_error_is_a_clean_end() {
+        let (task, packet_tx) = spawn_tunnel_io(
+            Box::new(ScriptedTunnel {
+                read_err: None,
+                write_err: Some(std::io::ErrorKind::BrokenPipe),
+            }),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        packet_tx
+            .send(vec![0x45])
+            .await
+            .expect("queue a packet for the tunnel writer");
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
+    }
+
+    /// A data-plane read error (`next_packet` yields `Err`) is likewise clean:
+    /// Go discards / trace-logs the join error and then closes with nil.
+    #[tokio::test]
+    async fn tunnel_io_read_error_is_a_clean_end() {
+        let (task, _packet_tx) = spawn_tunnel_io(
+            Box::new(ScriptedTunnel {
+                read_err: Some(std::io::ErrorKind::ConnectionReset),
+                write_err: None,
+            }),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
+    }
+
+    /// The encrypted writer's IV flush fails before any data flows, but Go
+    /// writes the IV lazily inside `libio.Join` and discards that write error,
+    /// so this is the **clean** end — only cipher *construction* (RNG/key) is
+    /// the counterpart of Go's `wrapVisitorConn` failure, and that cannot be
+    /// forced without an RNG seam. The scripted transport rejects the IV write
+    /// while its read side stays pending, so the flush arm is the only way out.
+    #[tokio::test]
+    async fn tunnel_io_iv_flush_failure_is_a_clean_end() {
+        let (task, _packet_tx) = spawn_tunnel_io(
+            Box::new(ScriptedTunnel {
+                read_err: None,
+                write_err: Some(std::io::ErrorKind::BrokenPipe),
+            }),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
     }
 
     #[cfg(feature = "compression")]
