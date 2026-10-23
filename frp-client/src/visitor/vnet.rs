@@ -107,12 +107,13 @@ const VIRTUAL_NET_RECONNECT_CLEAN_DELAY: Duration = Duration::from_secs(10);
 /// 60s, 120s, 240s, then the 300s cap.
 ///
 /// The backoff itself dates from v0.71.0, which computed it inline as
-/// `min(60s << (n-1), 300s)`: `1<<n` overflows `int` to a negative
-/// `time.Duration` for large counts, `min(negative, 300s)` keeps it, and
-/// `time.After` then fires immediately — the retry storm v0.71.1 fixed by
-/// bounding the shift before it happens (n <= 1 and n >= 4 never shift). This
-/// mirrors the bounded form, so no shift is performed for large counts and
-/// `u32::MAX` cannot overflow.
+/// `min(60s << (n-1), 300s)`: `1<<n` overflows `int`, so the product wraps to
+/// a **zero or negative** `time.Duration` for large counts (measured: negative
+/// at n = 52/53, exactly 0 s for n >= 54, including the 329769 upstream saw),
+/// `min(..., 300s)` keeps that value, and `time.After` then fires immediately —
+/// the retry storm v0.71.1 fixed by bounding the shift before it happens
+/// (n <= 1 and n >= 4 never shift). This mirrors the bounded form, so no shift
+/// is performed for large counts and `u32::MAX` cannot overflow.
 #[cfg(feature = "vnet")]
 fn virtual_net_reconnect_delay(consecutive_errors: u32) -> Duration {
     if consecutive_errors <= 1 {
@@ -142,8 +143,11 @@ enum VirtualNetTunnelEnd {
     /// peer EOF, or a data-plane IO error. Go closes all of these with a nil
     /// error, so they take the clean 10s delay and reset the error counter.
     Clean,
-    /// The tunnel never reached its data plane (split / cipher setup failed).
-    /// Go's counterpart — a `wrapVisitorConn` failure — is a `CloseWithError`.
+    /// The tunnel never reached its data plane and failed before it: the
+    /// stream split, or cipher *construction* (RNG/key). Go's counterpart —
+    /// a `wrapVisitorConn` failure — is a `CloseWithError`. A failed IV flush
+    /// is **not** here: Go writes the IV lazily inside `libio.Join` and
+    /// discards that write error, so it is a [`Clean`](Self::Clean) end.
     Error,
 }
 
@@ -219,8 +223,12 @@ async fn run_virtual_net_tunnel_io(
         crate::work_conn::TunnelPacketWriter::Plain(server_w)
     };
     if let Err(e) = packet_writer.flush().await {
+        // Go sends the IV lazily inside `libio.Join` and discards that write
+        // error (stcp) / trace-logs it (xtcp), so a failed IV flush is a clean
+        // end with the nil-error `Close()` the plugin resets on — only cipher
+        // *construction* above is the counterpart of Go's wrap failure.
         warn!(visitor_name = %name, error = %e, "virtual_net visitor tunnel IV flush failed: {}", e);
-        return VirtualNetTunnelEnd::Error;
+        return VirtualNetTunnelEnd::Clean;
     }
 
     loop {
@@ -486,7 +494,10 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             return;
         }
         match tunnel_end {
-            // Our own shutdown ended the tunnel; the route is already removed.
+            // Deliberately defensive, not the live exit: a `Shutdown` end means
+            // the signal was set, so the check just above has normally already
+            // returned. Kept explicit so every end state is named (and a future
+            // reorder cannot fall into the backoff at shutdown).
             VirtualNetTunnelEnd::Shutdown => return,
             VirtualNetTunnelEnd::Clean => {
                 // Go resets the counter only on a clean close, not on a
@@ -507,7 +518,8 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
                     return;
                 }
             }
-            // Setup failed after the handshake (split / cipher): error path.
+            // Setup failed before the data plane (split / cipher constructor):
+            // error path and exponential backoff.
             VirtualNetTunnelEnd::Error => {
                 if wait_after_virtual_net_error(&name, &shutdown, &mut consecutive_errors).await {
                     return;
@@ -855,11 +867,11 @@ mod tests {
         );
     }
 
-    /// Spawn `run_virtual_net_tunnel_io` over a `tokio::io::duplex` server
-    /// half with no TUN channels registered, so a test can drive one exit path
-    /// and read back how the tunnel ended. No real time is waited for.
+    /// Spawn `run_virtual_net_tunnel_io` over the given transport with no TUN
+    /// channels registered, so a test can drive one exit path and read back how
+    /// the tunnel ended. No real time is waited for.
     fn spawn_tunnel_io(
-        server: tokio::io::DuplexStream,
+        tunnel: Box<dyn frp_core::transport::AsyncReadWrite>,
         use_encryption: bool,
         shutdown: Arc<AtomicBool>,
     ) -> (
@@ -871,7 +883,7 @@ mod tests {
         let txs: VnetTunTxMap = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let subnets: VnetTunSubnetMap = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let task = tokio::spawn(run_virtual_net_tunnel_io(
-            frp_core::transport::IoStream::SshChannel(Box::new(server)),
+            frp_core::transport::IoStream::SshChannel(tunnel),
             "vnet-visitor".to_string(),
             packet_rx,
             txs,
@@ -884,13 +896,63 @@ mod tests {
         (task, packet_tx)
     }
 
+    /// A scripted tunnel transport for the data-plane failure tests: the read
+    /// side is either an injected error or permanently pending, and the write
+    /// side either fails or accepts bytes. Deterministic — unlike a `duplex`
+    /// peer, whose close would race the pending read with the EOF branch.
+    struct ScriptedTunnel {
+        read_err: Option<std::io::ErrorKind>,
+        write_err: Option<std::io::ErrorKind>,
+    }
+
+    impl tokio::io::AsyncRead for ScriptedTunnel {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.read_err {
+                Some(kind) => std::task::Poll::Ready(Err(kind.into())),
+                None => std::task::Poll::Pending,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for ScriptedTunnel {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            match self.write_err {
+                Some(kind) => std::task::Poll::Ready(Err(kind.into())),
+                None => std::task::Poll::Ready(Ok(buf.len())),
+            }
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     /// Peer EOF after establishment: Go's `libio.Join` returns normally and the
     /// conn is closed with a nil error (stcp discards the join errors, xtcp
     /// only trace-logs them), so this is the clean 10s path.
     #[tokio::test]
     async fn tunnel_io_peer_eof_is_a_clean_end() {
         let (server, peer) = tokio::io::duplex(8192);
-        let (task, _packet_tx) = spawn_tunnel_io(server, false, Arc::new(AtomicBool::new(false)));
+        let (task, _packet_tx) =
+            spawn_tunnel_io(Box::new(server), false, Arc::new(AtomicBool::new(false)));
         drop(peer);
         assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
     }
@@ -900,7 +962,8 @@ mod tests {
     #[tokio::test]
     async fn tunnel_io_local_route_close_is_a_clean_end() {
         let (server, _peer) = tokio::io::duplex(8192);
-        let (task, packet_tx) = spawn_tunnel_io(server, false, Arc::new(AtomicBool::new(false)));
+        let (task, packet_tx) =
+            spawn_tunnel_io(Box::new(server), false, Arc::new(AtomicBool::new(false)));
         drop(packet_tx);
         assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
     }
@@ -909,23 +972,66 @@ mod tests {
     #[tokio::test]
     async fn tunnel_io_shutdown_reports_shutdown() {
         let (server, _peer) = tokio::io::duplex(8192);
-        let (task, _packet_tx) = spawn_tunnel_io(server, false, Arc::new(AtomicBool::new(true)));
+        let (task, _packet_tx) =
+            spawn_tunnel_io(Box::new(server), false, Arc::new(AtomicBool::new(true)));
         assert_eq!(
             task.await.expect("tunnel task"),
             VirtualNetTunnelEnd::Shutdown
         );
     }
 
-    /// A setup failure after the handshake — here the encrypted writer's IV
-    /// flush into an already-closed peer — is the counterpart of Go's
-    /// `wrapVisitorConn` failure, which is reported via `CloseWithError`, so it
-    /// takes the exponential error path.
+    /// A data-plane write error after establishment: `libio.Join` returns it,
+    /// stcp discards it (xtcp trace-logs it) and the conn is closed with a nil
+    /// error, so the plugin takes the clean 10s path.
     #[tokio::test]
-    async fn tunnel_io_cipher_setup_failure_is_an_error() {
-        let (server, peer) = tokio::io::duplex(8192);
-        drop(peer);
-        let (task, _packet_tx) = spawn_tunnel_io(server, true, Arc::new(AtomicBool::new(false)));
-        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Error);
+    async fn tunnel_io_write_error_is_a_clean_end() {
+        let (task, packet_tx) = spawn_tunnel_io(
+            Box::new(ScriptedTunnel {
+                read_err: None,
+                write_err: Some(std::io::ErrorKind::BrokenPipe),
+            }),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        packet_tx
+            .send(vec![0x45])
+            .await
+            .expect("queue a packet for the tunnel writer");
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
+    }
+
+    /// A data-plane read error (`next_packet` yields `Err`) is likewise clean:
+    /// Go discards / trace-logs the join error and then closes with nil.
+    #[tokio::test]
+    async fn tunnel_io_read_error_is_a_clean_end() {
+        let (task, _packet_tx) = spawn_tunnel_io(
+            Box::new(ScriptedTunnel {
+                read_err: Some(std::io::ErrorKind::ConnectionReset),
+                write_err: None,
+            }),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
+    }
+
+    /// The encrypted writer's IV flush fails before any data flows, but Go
+    /// writes the IV lazily inside `libio.Join` and discards that write error,
+    /// so this is the **clean** end — only cipher *construction* (RNG/key) is
+    /// the counterpart of Go's `wrapVisitorConn` failure, and that cannot be
+    /// forced without an RNG seam. The scripted transport rejects the IV write
+    /// while its read side stays pending, so the flush arm is the only way out.
+    #[tokio::test]
+    async fn tunnel_io_iv_flush_failure_is_a_clean_end() {
+        let (task, _packet_tx) = spawn_tunnel_io(
+            Box::new(ScriptedTunnel {
+                read_err: None,
+                write_err: Some(std::io::ErrorKind::BrokenPipe),
+            }),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(task.await.expect("tunnel task"), VirtualNetTunnelEnd::Clean);
     }
 
     #[cfg(feature = "compression")]
