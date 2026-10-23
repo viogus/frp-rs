@@ -81,10 +81,12 @@ async fn dead_server_during_registration_reconnects_within_heartbeat_timeout() {
         // session dies at the heartbeat watchdog ~3s after login (during
         // registration on the first sessions, from the message loop later)
         // and the client dials again. A mock that handled only two
-        // connections would leave the third Login unanswered; a blocked
-        // `ctl.login()` cannot be interrupted by request_stop, so the
-        // runner's 5s stop timeout would fail the test (flake window:
-        // request_stop landing >3s after the second login).
+        // connections would leave the third Login unanswered. This test
+        // exercises the timeout/watchdog path, not the stop path: the stop
+        // token aborts a dial and (stronger than Go) a LoginResp wait, but
+        // the mock still answers every reconnect so each session settles
+        // and the final request_stop has a live session to end (the stop
+        // is issued after the second login completes).
         let mut login2_tx = Some(login2_tx);
         loop {
             let (conn, _) = listener.accept().await.expect("reconnect control conn");

@@ -19,6 +19,11 @@ pub trait ControlSink: Send + Sync {
     /// Enqueue `msg` for delivery. Returns `Ok(())` once the message is
     /// accepted by the writer funnel; `Err` when the writer has failed or
     /// the bounded queue is full.
+    ///
+    /// `Ok(())` means accepted, **not delivered**: a shutdown or writer
+    /// failure that becomes observable after the final check still discards
+    /// a buffered message (Go frp v0.71.1 #5561: a nil error does not
+    /// guarantee delivery).
     fn send_msg(&self, msg: FrpMessage, v2: bool) -> Result<(), String>;
 
     /// Whether the underlying writer task has failed (control connection

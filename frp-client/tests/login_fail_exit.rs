@@ -169,8 +169,9 @@ async fn login_fail_exit_false_retries_login() {
 
 /// `login_fail_exit = false` + stop during the initial-login backoff:
 /// request_stop() must end run() promptly (round-8 fix — the backoff sleep
-/// select!s stop_rx; a bare sleep would hold the run loop until the ~2.0-
-/// 2.2s backoff elapsed, ignoring the stop request).
+/// is raced against the service's `CancellationToken`; a bare sleep would
+/// hold the run loop until the ~2.0-2.2s backoff elapsed, ignoring the
+/// stop request).
 #[tokio::test]
 async fn login_fail_exit_false_stop_during_initial_login_backoff() {
     common::init_tracing();

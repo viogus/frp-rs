@@ -103,7 +103,7 @@ pub struct AdminState {
     pub proxy_metrics: Arc<ProxyMetricsRegistry>,
     pub proxies: Arc<RwLock<HashMap<String, ProxyRuntimeInfo>>>,
     pub reload_tx: mpsc::Sender<ReloadRequest>,
-    pub stop_tx: mpsc::Sender<()>,
+    pub stop: tokio_util::sync::CancellationToken, // /api/stop cancels it (idempotent)
     pub config_path: Option<String>,
     /// Optional file-backed store. When present, `/api/store/*` routes are
     /// registered and CRUD operations trigger a reload after persisting.
@@ -627,7 +627,7 @@ async fn handle_delete_store_visitor(
 }
 
 async fn handle_stop(State(state): State<AdminState>) -> &'static str {
-    let _ = state.stop_tx.try_send(());
+    state.stop.cancel();
     "stop success"
 }
 
@@ -1750,12 +1750,12 @@ passwd = "socks-pass"
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(StoreSource::new(&path).unwrap());
         let (reload_tx, reload_rx) = mpsc::channel(16);
-        let (stop_tx, _stop_rx) = mpsc::channel(1);
+        let stop = tokio_util::sync::CancellationToken::new();
         let state = AdminState {
             proxy_metrics: Arc::new(frp_core::metrics::ProxyMetricsRegistry::new()),
             proxies: Arc::new(RwLock::new(HashMap::new())),
             reload_tx,
-            stop_tx,
+            stop,
             config_path: None,
             store: Some(store),
             web_server_tls_enable_seen: Arc::new(AtomicU8::new(0)),
