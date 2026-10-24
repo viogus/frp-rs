@@ -3911,14 +3911,14 @@ jobs:
         # *declared* literal so a count and its literal lowered in one edit
         # still red. Re-derived with
         # `cargo test -p frp-server --features dashboard --lib --color never --
-        # --list` (61 `^vhost::tests::` lines; the same 61 under
+        # --list` (62 `^vhost::tests::` lines; the same 62 under
         # `--all-features`), and the filtered run's summary measured as
-        # `test result: ok. 61 passed; 0 failed`.
+        # `test result: ok. 62 passed; 0 failed`.
         shell: bash
         run: |
           set -eo pipefail
-          expected=61
-          expected_floor=61
+          expected=62
+          expected_floor=62
           case "$expected_floor" in
             ''|*[!0-9]*)
               echo "::error::frp-server vhost guard: expected_floor must be a non-negative integer (got '$expected_floor')"
@@ -4216,8 +4216,8 @@ jobs:
         # http_plugin_ping.rs (#![cfg(feature = "http-proxy")] — the last two
         # are the pair this change gated). `cargo test -p frp-server
         # --no-default-features --test <t> -- --list` reports 0 tests for each.
-        # Item-by-item escapes exist too: vhost_audit_fixes.rs declares 21
-        # tests, 2 tls-gated per item, so 19 are compiled and those 2 are not.
+        # Item-by-item escapes exist too: vhost_audit_fixes.rs declares 26
+        # tests, 2 tls-gated per item, so 24 are compiled and those 2 are not.
         # (mock_oidc.rs also reports 0 tests but is not whole-file-cfg'd empty —
         # no inner #[cfg], compiled as its own test target, simply declaring no
         # tests.)
