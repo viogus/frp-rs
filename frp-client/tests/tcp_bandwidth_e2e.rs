@@ -12,13 +12,24 @@
 //! directions and ALL concurrent connections of the proxy (a single
 //! `*rate.Limiter` wired into `limit.NewReader` AND `limit.NewWriter`). With
 //! `"server"` only the server creates it; with `"client"` only the client.
+//!
+//! Go v0.71.1 regression (`71b3197`, e2e "Server Bandwidth Limit closes work
+//! connection when user disconnects"): a server-side limiter must NOT keep
+//! the work connection open after the user closes. frp-rs has no limiter
+//! wrapper type — the bucket is a parameter threaded into
+//! `bridge_plain_rate_limited` — so the Go bug (a `Close` closure that
+//! re-enters the wrapper it was just installed on) is structurally absent.
+//! `server_bandwidth_limit_closes_work_conn_when_user_closes` below pins the
+//! teardown invariant end-to-end so a future refactor that introduces a
+//! transport-layer wrapper cannot silently recreate it.
 
 mod common;
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use frp_client::service::Service as ClientService;
@@ -41,9 +52,14 @@ fn tcp_proxy(name: &str, local_port: u16, remote_port: u16, bw: &str, mode: &str
     }
 }
 
-/// Start frps + a single frpc with one TCP proxy and wait for the tunnel.
-/// Returns the public proxy address on frps.
-async fn start_stack(
+/// Start frps + a single frpc with one TCP proxy pointing at `echo_port`,
+/// and wait for the tunnel. Returns the public proxy address on frps.
+///
+/// The local backend is the caller's responsibility: the rate tests use
+/// [`start_echo_server`], the teardown test installs a backend that reports
+/// when its connection closes. Binding the backend before this call keeps a
+/// backend failure ("address already in use") distinct from a wedged tunnel.
+async fn start_stack_with_backend(
     server_port: u16,
     echo_port: u16,
     tcp_port: u16,
@@ -53,7 +69,6 @@ async fn start_stack(
     common::init_tracing();
     let server_addr: SocketAddr = format!("127.0.0.1:{}", server_port).parse().unwrap();
     start_frps(server_port, "test-token").await;
-    start_echo_server(echo_port);
     wait_for_port(server_addr, Duration::from_secs(5))
         .await
         .expect("server port ready");
@@ -77,6 +92,18 @@ async fn start_stack(
     });
 
     format!("127.0.0.1:{}", tcp_port).parse().unwrap()
+}
+
+/// [`start_stack_with_backend`] over the readiness-only echo backend.
+async fn start_stack(
+    server_port: u16,
+    echo_port: u16,
+    tcp_port: u16,
+    bw: &str,
+    mode: &str,
+) -> SocketAddr {
+    start_echo_server(echo_port);
+    start_stack_with_backend(server_port, echo_port, tcp_port, bw, mode).await
 }
 
 /// Connect to the proxy and push a small probe through until the tunnel is
@@ -173,4 +200,145 @@ async fn tcp_bandwidth_limits_client_mode() {
         elapsed < Duration::from_secs(15),
         "expected ~3 s, took {elapsed:?} — pathologically slow"
     );
+}
+
+/// A backend connection that the peer closed after the first message.
+/// `first_message` identifies which connection closed: every tunnel probe
+/// carries a different token, so a warm-up probe's close can never be
+/// mistaken for the connection under test.
+#[derive(Debug)]
+struct BackendClosed {
+    first_message: Vec<u8>,
+}
+
+/// Local TCP backend shaped like upstream's v0.71.1 e2e local server: echo
+/// the first message, then drain the socket until the peer closes it, and
+/// report that close on the returned channel.
+///
+/// The listener is bound before this function returns, so a bind failure is
+/// the test's failure (not a silently wedged tunnel), and the backend is
+/// ready before frpc can dial it.
+async fn start_close_reporting_echo(port: u16) -> mpsc::UnboundedReceiver<BackendClosed> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("close-reporting echo bind");
+    let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let closed_tx = closed_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 1024];
+                let first_message = match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                        buf[..n].to_vec()
+                    }
+                };
+                // Drain until the peer closes. A read error (RST) is not the
+                // clean close this backend reports; only EOF is.
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(_) => return,
+                    }
+                }
+                let _ = stream.shutdown().await;
+                let _ = closed_tx.send(BackendClosed { first_message });
+            });
+        }
+    });
+    closed_rx
+}
+
+/// Like [`connect_tunnel`], but returns the unique token this round trip
+/// carried so the matching [`BackendClosed`] report can be recognised.
+///
+/// A retry that never completes its echo uses a token that never matches, so
+/// the previous attempt's eventual close cannot satisfy the assertion.
+async fn connect_tunnel_token(addr: SocketAddr) -> Result<(TcpStream, Vec<u8>), String> {
+    let start = Instant::now();
+    let mut attempt = 0u32;
+    while start.elapsed() < Duration::from_secs(10) {
+        let token = format!("tcp-bandwidth-teardown-{attempt}").into_bytes();
+        attempt += 1;
+        if let Ok(mut stream) = TcpStream::connect(addr).await {
+            if stream.write_all(&token).await.is_ok() {
+                let mut echo = vec![0u8; token.len()];
+                let echoed = timeout(Duration::from_secs(1), stream.read_exact(&mut echo))
+                    .await
+                    .map(|r| r.map(|_| ()))
+                    .is_ok();
+                if echoed && echo == token {
+                    return Ok((stream, token));
+                }
+            }
+            // Tunnel not bridged yet (or a half-open conn) — retry with a
+            // fresh token.
+            let _ = stream.shutdown().await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err("TCP tunnel not ready within timeout".into())
+}
+
+/// Go v0.71.1 regression (upstream `71b3197`, e2e "Server Bandwidth Limit
+/// closes work connection when user disconnects"): a server-side bandwidth
+/// limiter must not keep a work connection open after the user closes.
+///
+/// frp-rs's limiter is a parameter threaded into the bridge, and half-close
+/// is the explicit `shutdown_bridge` → `w.shutdown()` (the work conn is
+/// released by single-ownership drop, never by a close callback), so the Go
+/// bug cannot exist while that shape holds. This test pins the observable
+/// end-to-end: with `bandwidth_limit = "10MB"` and
+/// `bandwidth_limit_mode = "server"`, the user's FIN must reach the local
+/// backend through the rate-limited bridge.
+///
+/// Oracle: the backend (frpc's local dial target) sees EOF within 5 s of the
+/// user closing. If a limiter wrapper swallowed the close — the Go defect —
+/// the work conn would never half-close, the EOF would never propagate, and
+/// the bridge would park forever; the wait times out instead.
+#[tokio::test]
+async fn server_bandwidth_limit_closes_work_conn_when_user_closes() {
+    let server_port = allocate_port();
+    let tcp_port = allocate_port();
+    let echo_port = allocate_port();
+
+    // Backend first (bound eagerly), then the stack that dials it.
+    let mut closed_rx = start_close_reporting_echo(echo_port).await;
+    let addr = start_stack_with_backend(server_port, echo_port, tcp_port, "10MB", "server").await;
+    let (mut stream, token) = connect_tunnel_token(addr).await.expect("tunnel ready");
+
+    // The user closes its side while the server-side 10 MB/s (i.e. 10 MiB/s)
+    // bucket is active for this proxy. Keep the socket alive across the
+    // assertion: a clean FIN, not an RST from dropping unread data.
+    stream.shutdown().await.expect("shutdown user conn");
+
+    // 5 s mirrors upstream's bound. The failure mode is an unbounded park
+    // (the bridge join never observes EOF), while the healthy path is a
+    // loopback FIN round trip — ~ms, two-plus orders of magnitude inside the
+    // bound, so a loaded CI host has ample headroom.
+    let closed = timeout(Duration::from_secs(5), async {
+        while let Some(closed) = closed_rx.recv().await {
+            if closed.first_message == token {
+                return closed;
+            }
+        }
+        panic!("backend close-report channel closed before the conn under test closed");
+    })
+    .await
+    .expect(
+        "local backend never observed EOF 5 s after the user closed — the \
+         server-side bandwidth limiter kept the work conn open (Go v0.71.1 \
+         `71b3197` regression)",
+    );
+
+    assert_eq!(
+        closed.first_message, token,
+        "the closed backend conn must be the one the test drove"
+    );
+    drop(stream);
 }

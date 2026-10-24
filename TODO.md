@@ -12556,3 +12556,67 @@ other.
   Evidence. The five new tests: `config::format::tests::over_byte_budget_messages_name_the_right_cause` pins the distinct wording; `config::format::tests::a_scalar_alias_bomb_reports_the_byte_limit` drives the receiver with a 20-byte byte budget and a huge node budget, proving the **byte** path refuses while the node path is three orders of magnitude away; `config::tests::test_yaml_scalar_alias_bomb_is_byte_bounded` is the end-to-end scalar-alias shape — a 64 KiB anchor with 20 000 references (~200 KB input, ~1.3 GB duplicated before this change) — and now refuses with `alias expansion limit exceeded (16777216 expanded value bytes)` in **0.10 s at 28.5 MiB peak RSS** (`/usr/bin/time -l`, 20.5 MiB memory footprint), while 8 × 64 KiB (512 KiB) still parses. That is the same shape as `flow_64k_20000b.yaml`; the other three (`flow_128k_30000`, `amp_1m_1024`, `amp_1m_4096`) are bounded by the same absolute cap by construction, since the charge is the cloned subtree's bytes checked before the clone, whatever the anchor's size. **The adversarial review then found a bypass, fixed here:** the byte charge counted only a `Tagged` node's scalar *text*, not the tag's own `handle`/`suffix` strings, so a 64 KiB tag on a 1-byte scalar, aliased 20 000 times, was accepted at **~1.33 GB peak RSS** (the reviewer's probe: input 314 435 B; the text-only charge stayed orders of magnitude under the cap while each alias deep-cloned the 64 KiB tag). `own_node_bytes` now charges `tag.handle.len() + tag.suffix.len()` too, and `config::format::tests::own_node_bytes_charges_a_tags_own_strings` + `config::tests::test_yaml_tag_alias_bomb_is_byte_bounded` pin it (the latter is the same 20 000-alias shape with the payload in the tag; it now refuses at the byte ceiling). `cargo test -p frp-core --all-features --lib config::` → 460 passed (455 before, +5), `cargo clippy -p frp-core --all-targets --all-features -- -D warnings` clean, `cargo fmt --all -- --check` clean. Both the module doc and the `YamlReceiver::new`/`MAX_EXPANDED_BYTES` doc now state the two budgets (node count and bytes) and carry the measured figure; the old "bounds nodes, not bytes" wording and the `TODO.md` debt pointer are gone.
 
   Pathline fallout, handled in the same commit. Inserting the receiver/const code above line 1234 shifted seven `PATH:NNN` cites into `frp-core/src/config/format.rs` (all by +99; the recorded fingerprints are byte-identical at the new lines), and the end-to-end test was **appended at EOF** of `frp-core/src/config/tests.rs` precisely so it shifts no cited line (the first draft inserted it mid-file and moved 39 lines of cited content — reverted). `scripts/repo-health.sh:2476`'s cite of the vendored-crates bullet moved `docs/developing.md:3883` → `:3891` because this PR's own docs edit shifted it. The expectation table was re-baked with `--write` (581 records, 581/0; `weak`/`ambiguous`/`excluded` set pins unchanged, so the moves are renumbers, not newly weak cites), and the two pins that a regeneration requires moved with it: `.github/workflows/ci.yml`'s `guard_data_pin` `b4eac560…` → `8ade415a…`, and (because that line sits in the guarded `health` region) `scripts/tests/health-step-log-privacy.sh`'s `guard_region_pin` recomputed to `9b90e742…`. Guards verified green on the final tree: `pathline-cite-guard.sh` 581/0 and `health-step-log-privacy.sh` 109/0.
+
+- [x] **Go frp v0.71.1 alignment and the frp-rs v0.71.1 release.**
+  Evidence: Go frp released `0.71.1` on 2026-10-14 (25 commits, 49 files, +3349/−240).
+  Reconciled every production change against this tree with five read-only triage passes
+  (`vhost`/CONNECT, websocket, client lifecycle/health, server lifecycle/dispatcher,
+  counter/limiter/vnet, plus deps/version surface), then a sixth audit for the `x/crypto`
+  SSH channel fixes. Baseline: the pre-change frp-rs binaries already pass the full compat
+  suite against the Go v0.71.1 binaries (**86 passed, 0 failed**), so v0.71.1 changed no
+  wire behaviour; every gap was lifecycle or boundary semantics.
+  **Fixed (each with its own reviewed PR, two reviews incl. one adversarial, on the
+  release integration branch):** HTTP-vhost CONNECT bodies/`Transfer-Encoding`/duplicate
+  or folded `Content-Length` now get Go's byte-exact 400 instead of being tunnelled; frps
+  drops its main listener at cancellation instead of after the graceful drain (and the SSH
+  accept is cancellable); frpc treats stop as a cancellation token observed during
+  dial/login/registration (SIGTERM no longer waits out a 10 s/30 s phase), never starts if
+  stopped first, and runs teardown on the split-error exit; `ControlWriter::send`
+  re-checks the writer's failure after enqueueing; the health monitor's waits are
+  cancellable (≤100 ms exit); the `virtual_net` visitor adopts Go's 60/120/240/300 s
+  setup-failure backoff (bounded, no overflow) with a clean-end 10 s retry and counter
+  reset. Regression tests added for the server-side bandwidth-limiter teardown and
+  vhost CONNECT early data.
+  **Verified at parity, not changed:** health `failedTimes` reset and consecutive
+  `maxFailed` (frp-rs had them since `6d6a381b`), the stuck-control write-failure path
+  (single-task loop), server lifecycle core (no externally callable `Close`, token
+  shutdown, vhost listener owned by its task), limiter teardown (no wrapper type),
+  vnet route ownership (`same_channel`), daily-counter DST (UTC epoch-day index), the
+  websocket accept/close race, the `fatedier/yamux` v0.2.0 migration (vendored Rust
+  yamux; the Go fork was already in use since v0.71.0), and the Go 1.26 build
+  requirement (frp-rs never compiles Go).
+  **Version surface:** 5 `Cargo.toml`s, `frp-core/src/lib.rs` `VERSION`,
+  `scripts/download-frp-rs.sh`, `README.md`, `CLAUDE.md`, `docs/{developing,README,
+  go-frp-compat-audit,architecture}.md` and `Cargo.lock` bumped to `0.71.1`; the Go
+  compat target pins (`scripts/compat-test.sh`, `scripts/download-go-frp.sh`,
+  `.github/workflows/{compat,xtcp-compat}.yml`) default to 0.71.1.
+  **Filed as backlog rather than this release:** dashboard daily counters use a UTC day
+  boundary where Go uses the local calendar date (needs a cross-platform local-date
+  design); the SSH gateway does not propagate a peer `EOF` to the frps work connection
+  (read-until-EOF protocols hang; pre-existing, MEDIUM); the SSH gateway keeps no
+  channel-type registry, so `exec`/`env` on an established `forwarded-tcpip` channel is
+  dispatched (authenticated client, own session; LOW).
+  **Done-when:** the v0.71.1 tag builds and publishes the 13-target × 3-tier release
+  assets, and `bash scripts/repo-health.sh` plus the compat suite against Go 0.71.1 are
+  green on that commit — met by the release below.
+  **Progress (2026-10-24, `v0.71.1`).** Six change PRs (#544 server shutdown, #545 vnet
+  backoff, #546 health shutdown, #547 limiter regression test, #548 vhost CONNECT, #549
+  client lifecycle) reviewed and merged onto an integration branch together with one
+  records commit (all cite re-pointings, the expectation-table re-bake and the `ci.yml`
+  `guard_data_pin` re-pin) and the version/CHANGELOG commit above; the combined tree ran
+  the full gate set (fmt, clippy `-D warnings`, workspace tests, tiny/micro tiers, the
+  compat suite against Go 0.71.1, `protocol-matrix`, both cite guards, `repo-health`)
+  before merging to `main`.
+
+- [ ] **HTTP 404 head shape may diverge from Go on some vhost paths.**
+  Evidence: the v0.71.1 release review probed a Go frp 0.71.1 **GET** route miss on a vhost and got
+  a stdlib `http.Server`-shaped 404 (143-byte head: `Date`, `Content-Type: text/html; charset=utf-8`,
+  `Connection: close`, no `Server` header; 632 bytes total), while frp-rs writes frp's own raw 404
+  head (92-byte head, `Server: frp/<version>`, no `Date`; 581 bytes) — the shape
+  `GO_404_NOT_FOUND_RESPONSE` pins for the tcpmux raw path, which a tcpmux CONNECT route miss on the
+  Go binary does match. The GET/vhost surface was never compared byte-for-byte; `Content-Length: 489`
+  is identical in both shapes, so the bodies agree.
+  Done-when: a Go 0.71.1 probe of (a) a tcpmux CONNECT route miss, (b) a plain-HTTP vhost GET route
+  miss and (c) a vhost with `custom_404_page` decides whether the difference is the header set or
+  only the layer that writes it; then either pin the observed Go bytes per path or record the
+  divergence in `docs/go-frp-compat-audit.md`.

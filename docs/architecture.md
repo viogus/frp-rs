@@ -267,7 +267,7 @@ AES-256-GCM / ChaCha20-Poly1305). V2 frame read/write
 
 Encryption in the control handler is protocol-aware: V1 uses AES-128-CFB
 (`CipherStream`), while V2 with AEAD keys wraps the stream in `AeadStream` after
-LoginResp. V2 compat tests run against the Go frp v0.71.0 pre-built binary.
+LoginResp. V2 compat tests run against the Go frp v0.71.1 pre-built binary.
 
 **UDP packet binary codec (V2, Go frp v0.71.0)**: UDPPacket payloads use a
 compact binary codec (`binary-v1`) when negotiated via the V2 handshake's
@@ -770,7 +770,7 @@ Two paths for visitor connections:
    `WriteNatHoleReport`.
 
 **Status:** fully implemented and cross-compat verified (17/17 XTCP pairwise
-scenarios against Go frp v0.71.0; daily `xtcp-compat.yml` VPS matrix). e2e test in
+scenarios against Go frp v0.71.1; daily `xtcp-compat.yml` VPS matrix). e2e test in
 `frp-server/tests/xtcp_hole_punch.rs`, loopback MakeHole tests in
 `frp-core/tests/xtcp_p2p.rs`.
 

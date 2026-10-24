@@ -750,9 +750,9 @@ async fn run_normal(mut args: FrpcRunArgs) {
     };
 
     // SIGINT/SIGTERM → graceful shutdown (Ctrl+C; docker stop / systemctl stop
-    // send SIGTERM). request_stop() wakes run()'s stop channel; the session
-    // loop exits cleanly. Both signals take the same path and request_stop()
-    // is idempotent, so repeat signals are harmless.
+    // send SIGTERM). request_stop() cancels the service's CancellationToken;
+    // the run loop observes it at startup and in the session loop, so both
+    // signals take the same idempotent path and repeat signals are harmless.
     #[cfg(unix)]
     {
         let stop_svc = service.clone();

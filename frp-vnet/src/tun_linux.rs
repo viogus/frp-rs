@@ -104,7 +104,10 @@ impl LinuxTun {
         // fd and it refers to a valid open /dev/net/tun descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-        let async_fd = AsyncFd::new(fd)?;
+        // SAFETY: `fd` is the sole owner of this /dev/net/tun descriptor and it
+        // stays open for the `AsyncFd`'s lifetime, so `AsyncFd::register`'s
+        // I/O-safety contract holds.
+        let async_fd = unsafe { AsyncFd::register(fd) }?;
         tracing::info!(name = %name, "Linux TUN device opened");
 
         Ok(Box::new(LinuxTun {

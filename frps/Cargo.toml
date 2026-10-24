@@ -1,6 +1,6 @@
 [package]
 name = "frps"
-version = "0.71.0"
+version = "0.71.1"
 edition = "2021"
 license = "MIT"
 description = "frp-rs server binary (frps) — protocol-compatible with Go frp"

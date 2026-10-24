@@ -173,7 +173,10 @@ impl MacOSTun {
         // SAFETY: fd was obtained from socket() above and is now configured
         // as non-blocking; we are transferring ownership to OwnedFd.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let async_fd = AsyncFd::new(owned)?;
+        // SAFETY: `owned` is the sole owner of this fd (transferred from the
+        // socket() above) and it stays open for the `AsyncFd`'s lifetime, so
+        // `AsyncFd::register`'s I/O-safety contract holds.
+        let async_fd = unsafe { AsyncFd::register(owned) }?;
 
         tracing::info!(name = %name, "macOS utun device opened");
         Ok(Box::new(MacOSTun {

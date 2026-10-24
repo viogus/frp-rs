@@ -61,8 +61,9 @@ open item in [`TODO.md`](../TODO.md).
 
 #### 4. Operational knobs Go frp does not have
 
-- **UDP bandwidth limiting.** Go frp v0.71.0's UDP forwarder has **no limiter at
-  all**; frp-rs applies the same `bandwidthLimit` semantics it uses for TCP.
+- **UDP bandwidth limiting in `client`/`both` mode.** Go frp v0.71.1 applies the
+  per-proxy limiter to its UDP forwarder only on the **server** side; frp-rs also applies
+  the same `bandwidthLimit` semantics on the client and in `both` mode, as it does for TCP.
 - **SSH gateway per-IP login throttling** plus `ssh_session_idle_timeout`. Go's
   gateway has only `authorized_keys` public-key auth — no password path and no
   throttle.
@@ -147,7 +148,7 @@ cargo build --release -p frps -p frpc --no-default-features --features micro
 
 #### 4. Go frp 没有的运维旋钮
 
-- **UDP 带宽限制。** Go frp v0.71.0 的 UDP forwarder **完全没有 limiter**；frp-rs 对 UDP 应用与 TCP 相同的 `bandwidthLimit` 语义。
+- **UDP 带宽限制（`client`/`both` 模式）。** Go frp v0.71.1 只在 **server** 侧对 UDP forwarder 应用 per-proxy limiter；frp-rs 在 client 与 `both` 模式下也对 UDP 应用与 TCP 相同的 `bandwidthLimit` 语义。
 - **SSH 网关按 IP 的登录节流**，以及 `ssh_session_idle_timeout`。Go 的网关只有 `authorized_keys` 公钥认证——没有密码路径，也没有节流。
 - **`frpc verify --strict-config`**：未知配置键直接报错，而不是静默忽略。
 

@@ -53,7 +53,7 @@ jobs:
 
       # No Go toolchain is needed: the Go frp side is downloaded as a prebuilt
       # release tarball by `scripts/download-go-frp.sh`, which is exactly why
-      # `/tmp/frp_0.71.0_linux_amd64/` below is the one Go path worth caching.
+      # `/tmp/frp_0.71.1_linux_amd64/` below is the one Go path worth caching.
       - name: Cache cargo + go-frp
         if: steps.check.outputs.configured == 'true'
         uses: actions/cache@v4
@@ -62,7 +62,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/release/
-            /tmp/frp_0.71.0_linux_amd64/
+            /tmp/frp_0.71.1_linux_amd64/
           key: ${{ runner.os }}-xtcp-${{ hashFiles('**/Cargo.toml') }}-v3
           restore-keys: |
             ${{ runner.os }}-xtcp-${{ hashFiles('**/Cargo.toml') }}-
@@ -79,13 +79,13 @@ jobs:
 
       - name: Download Go frp
         if: steps.check.outputs.configured == 'true'
-        run: bash scripts/download-go-frp.sh 0.71.0
+        run: bash scripts/download-go-frp.sh 0.71.1
 
       - name: Run XTCP compat tests
         if: steps.check.outputs.configured == 'true'
         run: |
           bash scripts/compat-test.sh \
-            --go-version 0.71.0 \
+            --go-version 0.71.1 \
             --frps-remote "$XTCP_VPS_HOST" \
             --xtcp-only \
             --shard ${{ matrix.shard }}/4 \

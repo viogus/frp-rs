@@ -618,7 +618,7 @@ For a server-side test that speaks the raw V1 protocol, the harness is
 `frp-server/tests/common/mod.rs`: `register_tcp_proxy`, `open_tcp_proxy_bridge`
 and `pump_tcp_bridge` (`frp-server/tests/common/mod.rs:22`, `:81`, `:135`) drive
 the control channel and the work connection directly, and `start_test_server`
-(`:387`) boots frps in-process. Use it when the interesting behaviour is in
+(`:393`) boots frps in-process. Use it when the interesting behaviour is in
 registration, not in the client.
 
 **What you must add, and what review will ask for.** The round-trip test proves
@@ -699,7 +699,7 @@ executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
   This is the only build §2.6 needs; the in-process test in §2.5 needs none.
 - The Go pair must be present even for a Rust↔Rust scenario, because the preflight
   checks all four paths. `scripts/download-go-frp.sh` fetches it (`--go-version`
-  overrides the default `0.71.0`).
+  overrides the default `0.71.1`).
 - The certs are checked for every scenario, TLS-less ones included.
 
 Add your scenario function beside the existing ones and register it with the other
@@ -916,7 +916,7 @@ The surface is much smaller than a proxy type's, and unlike a proxy type it has
   `local_addr`, the task's `JoinHandle`, and a shutdown sender. Existing plugins
   in `frp-client/src/plugin/` are the templates; pick the closest one
   (`socks5.rs` for a protocol speaker, `static_file.rs` for a trivial one).
-- `frp-client/src/service.rs:715` starts plugins for `p.plugin`. `virtual_net`
+- `frp-client/src/service.rs:731` starts plugins for `p.plugin`. `virtual_net`
   is special-cased there because its work connections go to the shared vnet
   controller in `frp-client/src/work_conn.rs`.
 - Server-side plugins are a **different** surface: `frp-server/src/plugin/mod.rs`
@@ -932,7 +932,7 @@ in 2.7 applies unchanged.
 
 The release path is [§ 6. Release Process](#6-release-process): a pre-release
 checklist, the mandatory version alignment (frp-rs's version *is* the Go frp
-version it tracks — currently `0.71.0`; `frp-vnet` is the documented exception),
+version it tracks — currently `0.71.1`; `frp-vnet` is the documented exception),
 and `bash scripts/repo-health.sh` as the local mirror of the `health` CI job.
 Run `bash scripts/repo-health.sh` before you trust any number in the docs: the
 countable figures are generated, the doc-figure gate covers only an enumerated
@@ -1435,7 +1435,7 @@ single easiest mistake to make in this repository.
 
 | Gate | What it establishes |
 |---|---|
-| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.71.0 | Wire and behavioural parity with the reference implementation |
+| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.71.1 | Wire and behavioural parity with the reference implementation |
 | `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination |
 | Daily `xtcp-compat.yml` on a VPS | XTCP hole punching against Go frpc across a real NAT |
 
@@ -1570,8 +1570,8 @@ The compat tests require Go frp binaries. Download them first:
 bash scripts/download-go-frp.sh
 ```
 
-This downloads Go frp v0.71.0 binaries to `/tmp/frp_<version>_<os>_<arch>/` (for
-example `/tmp/frp_0.71.0_linux_amd64/`) — that is where `compat-test.sh` looks for
+This downloads Go frp v0.71.1 binaries to `/tmp/frp_<version>_<os>_<arch>/` (for
+example `/tmp/frp_0.71.1_linux_amd64/`) — that is where `compat-test.sh` looks for
 them. Override the location with `GO_FRP_DIR=/path/to/dir`. The CI gate is
 `.github/workflows/compat.yml`.
 
@@ -3909,7 +3909,7 @@ covered by any gate and are the ones that have actually been missed before.
 ### Version Bumping
 
 **frp-rs 自身版本号严格对齐 Go frp 的发布号** (mandatory): the version
-equals the current compat target Go frp release — currently **0.71.0** — and
+equals the current compat target Go frp release — currently **0.71.1** — and
 bumps only when Go frp releases a new number. Update the version in ALL
 sync locations:
 

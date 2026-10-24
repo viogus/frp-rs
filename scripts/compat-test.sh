@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # frp-rs Cross-Compatibility Test Suite
-# Tests Go frp v0.71.0 <-> Rust frp-rs interoperability
+# Tests Go frp v0.71.1 <-> Rust frp-rs interoperability
 # =============================================================================
 #
 # Bounded re-drive of a timing-sensitive scenario
@@ -62,7 +62,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Go version (overridable via env or --go-version flag)
-GO_FRP_VERSION="${GO_FRP_VERSION:-0.71.0}"
+GO_FRP_VERSION="${GO_FRP_VERSION:-0.71.1}"
 # Auto-detect Go frp binary path. Override with GO_FRP_DIR env var.
 GO_FRP_DIR_USER=""  # track if user provided explicit path
 if [[ -n "${GO_FRP_DIR:-}" ]]; then
@@ -180,7 +180,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --frps-remote HOST  Remote VPS address for XTCP tests"
             echo "  --xtcp-only       Run only XTCP tests (skip all other phases)"
             echo "  --shard INDEX/TOTAL  Shard XTCP tests across N jobs (e.g. 0/4)"
-            echo "  --go-version VER  Go frp version (default: 0.71.0)"
+            echo "  --go-version VER  Go frp version (default: 0.71.1)"
             echo ""
             echo "Env: FRP_COMPAT_TEST_DIR  Scratch dir (default: /tmp/frp-compat-test)."
             echo "     Set it per run so concurrent compat runs never share a scratch dir."
@@ -5285,7 +5285,7 @@ test_r2g_tcpmux() {
 
 echo "============================================="
 echo " frp-rs Cross-Compatibility Test Suite"
-echo " Go frp v0.71.0 <-> Rust frp-rs"
+echo " Go frp v0.71.1 <-> Rust frp-rs"
 echo "============================================="
 echo ""
 

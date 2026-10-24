@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=58bca2cedee5a381f8b7609329f3fbf3a6d72781dd27688e3abb5753c5ba0406
+          guard_data_pin=4f12c780b305c8ca607c49341fd5796ab0f2194e52587b8053d9cfeeb6c8aae2
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2127,7 +2127,7 @@ jobs:
       # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
       # tests with the admin feature". The `admin` flag changes the linked
       # client: the child binds its `[webServer]` and announces it
-      # (`frp-client/src/service/session.rs:1357`), which is what made the pre-fix
+      # (`frp-client/src/service/session.rs:1406`), which is what made the pre-fix
       # assertion in `a_config_file_named_after_a_subcommand_stays_a_config_file`
       # a false positive. Re-derived on this tree with
       # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
@@ -2403,7 +2403,9 @@ jobs:
         # crate: `dashboard_port_overlay_record_follows_this_builds_reader` took
         # it 362 at the base (361 passed + 1 failed) to 363; the four
         # `*_reader_answers_from_this_build` pins and the gated-listener records
-        # test took it to 368, all five gated only by this crate's own features
+        # test took it to 368, all five gated only by this crate's own features;
+        # the vhost CONNECT body gate's `test_connect_head_has_body` (#548) is
+        # the 369th.
         # (still a count, not a floor: a floor would let this shape quietly lose one).
         shell: bash
         run: |
@@ -2419,7 +2421,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=368
+          n_expected=369
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1
@@ -3347,7 +3349,7 @@ jobs:
         # `a_config_file_named_after_a_subcommand_stays_a_config_file` was
         # invisible in this configuration. That hid a red: it read run mode's own
         # admin bind line (`frpc admin server starting on 127.0.0.1:<port>`,
-        # `frp-client/src/service/session.rs:1357`) as a dial of the config's
+        # `frp-client/src/service/session.rs:1406`) as a dial of the config's
         # `[webServer]` port.
         #
         # Scoped to the one target that needs the flag rather than the whole
@@ -3909,14 +3911,14 @@ jobs:
         # *declared* literal so a count and its literal lowered in one edit
         # still red. Re-derived with
         # `cargo test -p frp-server --features dashboard --lib --color never --
-        # --list` (61 `^vhost::tests::` lines; the same 61 under
+        # --list` (62 `^vhost::tests::` lines; the same 62 under
         # `--all-features`), and the filtered run's summary measured as
-        # `test result: ok. 61 passed; 0 failed`.
+        # `test result: ok. 62 passed; 0 failed`.
         shell: bash
         run: |
           set -eo pipefail
-          expected=61
-          expected_floor=61
+          expected=62
+          expected_floor=62
           case "$expected_floor" in
             ''|*[!0-9]*)
               echo "::error::frp-server vhost guard: expected_floor must be a non-negative integer (got '$expected_floor')"
@@ -4214,8 +4216,8 @@ jobs:
         # http_plugin_ping.rs (#![cfg(feature = "http-proxy")] — the last two
         # are the pair this change gated). `cargo test -p frp-server
         # --no-default-features --test <t> -- --list` reports 0 tests for each.
-        # Item-by-item escapes exist too: vhost_audit_fixes.rs declares 21
-        # tests, 2 tls-gated per item, so 19 are compiled and those 2 are not.
+        # Item-by-item escapes exist too: vhost_audit_fixes.rs declares 26
+        # tests, 2 tls-gated per item, so 24 are compiled and those 2 are not.
         # (mock_oidc.rs also reports 0 tests but is not whole-file-cfg'd empty —
         # no inner #[cfg], compiled as its own test target, simply declaring no
         # tests.)

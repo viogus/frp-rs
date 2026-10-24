@@ -215,17 +215,36 @@ impl SshListener {
         let auth_timeout = self.auth_deadline;
 
         loop {
-            // Check for graceful shutdown before blocking on accept.
-            if self.state.shutdown_token.is_cancelled() {
-                tracing::info!("SSH tunnel gateway shutting down");
-                return Ok(());
-            }
-            let (stream, peer_addr) = match listener.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::error!(error = %e, "SSH accept error: {}", e);
-                    continue;
+            // Wrapping the accept in a select — rather than polling the
+            // token before it — is what makes shutdown interrupt a *blocked*
+            // `accept()`: cancellation drops the pending accept future,
+            // `run` returns, and the listener closes with this scope. Polling
+            // before the await only handles the case where the token is
+            // already cancelled on entry; otherwise the SSH port stays bound
+            // (and silently backlogs dialers) until some connection happens to
+            // arrive. Same select-on-token shape as the vhost/tcpmux accept
+            // loops and Go's `sshTunnelGateway.Close()` from `closeResources`.
+            // `biased;` puts the token first: when both arms are ready (a dial
+            // arrives exactly at the cancellation instant) shutdown wins and no
+            // connection is admitted after cancellation, which is what Go's
+            // listener-close-at-Close gets by construction.
+            let (stream, peer_addr) = tokio::select! {
+                biased;
+                _ = self.state.shutdown_token.cancelled() => {
+                    tracing::info!("SSH tunnel gateway shutting down");
+                    return Ok(());
                 }
+                accepted = listener.accept() => match accepted {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        // Accept error classification unchanged: log and retry;
+                        // only cancellation (above) ends the loop. `biased;`
+                        // does not change this: the token arm is terminal, this
+                        // arm still `continue`s on any accept error.
+                        tracing::error!(error = %e, "SSH accept error: {}", e);
+                        continue;
+                    }
+                },
             };
 
             tracing::info!(peer_address = %peer_addr, "SSH connection from {}", peer_addr);

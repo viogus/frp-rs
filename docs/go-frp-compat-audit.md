@@ -1,14 +1,14 @@
-# Go frp v0.71.0 → frp-rs Compatibility Audit
+# Go frp v0.71.1 → frp-rs Compatibility Audit
 
 > Source-level comparison. Updated 2026-07-14; compat re-verified against Go
-> frp v0.71.0 2026-08-30/31 (round-18 gates: 86/86 compat, protocol-matrix
+> frp v0.71.1 2026-10-24 (round-18 gates: 86/86 compat, protocol-matrix
 > 11/11).
 
 ## Summary
 
-frp-rs targets Go frp v0.71.0 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 10 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
+frp-rs targets Go frp v0.71.1 wire compatibility. Core tunneling (TCP/UDP/HTTP/STCP/XTCP/SUDP/TCPMux), authentication, encryption, compression, all 5 transports, all 10 client plugins, config coverage, SSH tunnel gateway, V2 AEAD protocol, and XTCP Go↔Rust cross-compat all match Go frp behavior.
 
-**86 non-XTCP compatibility tests and the 17-test XTCP pairwise matrix run against Go frp v0.71.0 (V2 included).**
+**86 non-XTCP compatibility tests and the 17-test XTCP pairwise matrix run against Go frp v0.71.1 (V2 included).**
 
 ---
 
@@ -175,9 +175,9 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 
 ## Go frp Compatibility Notes
 
-frp-rs targets protocol compatibility with Go frp v0.71.0. The full Go frp
-v0.71.0 cross-compatibility suite runs in CI (including the XTCP pairwise
-matrix on VPS and V2 over the v0.71.0 pre-built binaries). Coverage is broad
+frp-rs targets protocol compatibility with Go frp v0.71.1. The full Go frp
+v0.71.1 cross-compatibility suite runs in CI (including the XTCP pairwise
+matrix on VPS and V2 over the v0.71.1 pre-built binaries). Coverage is broad
 but not literally 100% — see [Known Limitations](#known-limitations) below.
 
 The per-surface parity details are in the tables above: V1/V2 wire protocol
@@ -203,7 +203,7 @@ specifics that are not already tabulated:
 
 ## Known Limitations
 
-Current limitations as of frp-rs 0.71.0:
+Current limitations as of frp-rs 0.71.1:
 
 - **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
   the byte level (X-Forwarded-For and requestHeaders are injected, Host

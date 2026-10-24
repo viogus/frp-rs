@@ -77,9 +77,9 @@ pub(super) enum LoopExit {
 }
 
 /// The session-agnostic inputs to the message loop, created once in run()
-/// and outliving sessions. Held by `&mut` borrow (not owned) because run()
-/// needs `stop_rx` and `health_cancels` again after the loop returns — the
-/// reconnect-backoff race and teardown both use them.
+/// and outliving sessions. Held by `&mut`/`&` borrow (not owned) because
+/// run() still needs the receivers, the stop token and `health_cancels`
+/// after the loop returns — the backoff race and teardown both use them.
 pub(super) struct SessionChannels<'a> {
     /// Health-check results from the spawned health check tasks.
     pub(super) health_rx: &'a mut mpsc::Receiver<HealthEvent>,
@@ -89,8 +89,8 @@ pub(super) struct SessionChannels<'a> {
     pub(super) xtcp_rx: &'a mut mpsc::Receiver<XtcpNotification>,
     /// New-visitor requests from spawned visitor listeners (STCP/XTCP).
     pub(super) visitor_rx: &'a mut mpsc::Receiver<VisitorRequest>,
-    /// Stop request from the admin API / signal handler.
-    pub(super) stop_rx: &'a mut mpsc::Receiver<()>,
+    /// Stop token (idempotent; `cancelled()` is cancel-safe).
+    pub(super) stop: &'a CancellationToken,
     /// Cancellation flags for health check tasks, shared with teardown.
     pub(super) health_cancels: &'a Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// STUN server address used for XTCP hole punching.
@@ -427,7 +427,7 @@ impl Service {
                     self.handle_visitor_request_arm(vreq, ctx, &writer, &xtcp_cleanup_tx).await;
                 }
 
-                Some(()) = channels.stop_rx.recv() => {
+                _ = channels.stop.cancelled() => {
                     info!("Stop requested, shutting down");
                     ctx.shutdown_flag.store(true, Ordering::SeqCst);
                     return LoopExit::Shutdown;
@@ -2574,14 +2574,14 @@ mod tests {
         let (_reload_tx, mut reload_rx) = mpsc::channel::<ReloadRequest>(1);
         let (_xtcp_tx, mut xtcp_rx) = mpsc::channel::<XtcpNotification>(1);
         let (_visitor_tx, mut visitor_rx) = mpsc::channel::<VisitorRequest>(1);
-        let (_stop_tx, mut stop_rx) = mpsc::channel::<()>(1);
+        let stop = CancellationToken::new();
         let health_cancels = Arc::new(Mutex::new(HashMap::new()));
         let channels = SessionChannels {
             health_rx: &mut health_rx,
             reload_rx: &mut reload_rx,
             xtcp_rx: &mut xtcp_rx,
             visitor_rx: &mut visitor_rx,
-            stop_rx: &mut stop_rx,
+            stop: &stop,
             health_cancels: &health_cancels,
             nat_hole_stun_server: &stun_server,
         };
