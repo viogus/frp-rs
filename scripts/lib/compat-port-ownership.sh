@@ -119,19 +119,19 @@ cpo_port_listening() {
     # The readiness gates do NOT use this: they fail closed (see `cpo_ready_owned`).
     local port="$1"
     if command -v lsof >/dev/null 2>&1; then
-        if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+        if grep -q LISTEN <<<"$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null)"; then
             return 0
         fi
-        if lsof -nP -iUDP:"$port" 2>/dev/null | grep -q .; then
+        if grep -q . <<<"$(lsof -nP -iUDP:"$port" 2>/dev/null)"; then
             return 0
         fi
         return 1
     fi
     if command -v ss >/dev/null 2>&1; then
-        if ss -tln "sport = :$port" 2>/dev/null | grep -q ":$port "; then
+        if grep -q ":$port " <<<"$(ss -tln "sport = :$port" 2>/dev/null)"; then
             return 0
         fi
-        if ss -uln "sport = :$port" 2>/dev/null | grep -q ":$port "; then
+        if grep -q ":$port " <<<"$(ss -uln "sport = :$port" 2>/dev/null)"; then
             return 0
         fi
         return 1

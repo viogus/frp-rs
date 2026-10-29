@@ -137,7 +137,7 @@ run_side() {
   # Ready probe: echo round-trip through the proxy.
   local ok=""
   for i in $(seq 1 15); do
-    if pps_client "$RPORT" 8 0.5 2>/dev/null | grep -q "sent_pps="; then ok=1; break; fi
+    if grep -q "sent_pps=" <<<"$(pps_client "$RPORT" 8 0.5 2>/dev/null)"; then ok=1; break; fi
     sleep 0.5
   done
   [[ -n "$ok" ]] || echo "WARN $label: proxy not ready after 7s" >&2

@@ -546,7 +546,7 @@ check_rc 1 'matrix: nobody listening times out as rc 1' \
 # --- scenario 10: the wiring in the two callers ------------------------------
 
 hdr 'wiring'
-if grep -A25 '^random_port()' "$COMPAT" | grep -q 'cpo_pick_port'; then
+if grep -q 'cpo_pick_port' <<<"$(grep -A25 '^random_port()' "$COMPAT")"; then
   ok 'compat-test.sh: random_port delegates to the ledger'
 else
   bad 'compat-test.sh: random_port delegates to the ledger'
@@ -713,7 +713,7 @@ case "$stub_out" in
     bad 'selector: no RESULTS summary is printed' ;;
   *) ok 'selector: no RESULTS summary is printed' ;;
 esac
-if bash "$COMPAT" --list 2>/dev/null | grep -qx 'test_g2r_tcp_plain'; then
+if grep -qx 'test_g2r_tcp_plain' <<<"$(bash "$COMPAT" --list 2>/dev/null)"; then
   ok 'selector: --list still prints function names'
 else
   bad 'selector: --list still prints function names'

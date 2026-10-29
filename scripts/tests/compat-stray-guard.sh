@@ -1111,7 +1111,7 @@ selfpid=$(spawn_fake "$selfdir")
 LIVE="$LIVE $selfpid"
 seen=false
 for _ in $(seq 1 50); do
-  if pgrep -x frps 2>/dev/null | grep -qx "$selfpid"; then seen=true; break; fi
+  if grep -qx "$selfpid" <<<"$(pgrep -x frps 2>/dev/null)"; then seen=true; break; fi
   sleep 0.1
 done
 hdr 'fixture setup: a symlink named `frps` is visible to `pgrep -x frps`'
@@ -1513,7 +1513,7 @@ victim13=$(spawn_fake "$td13/scenario")
 LIVE="$LIVE $victim13"
 # The fake `ps` is only observable if `pgrep` really lists the victim first.
 for _ in $(seq 1 50); do
-  pgrep -x frps 2>/dev/null | grep -qx "$victim13" && break
+  grep -qx "$victim13" <<<"$(pgrep -x frps 2>/dev/null)" && break
   sleep 0.1
 done
 fakebin13="$WORK/fakebin13"

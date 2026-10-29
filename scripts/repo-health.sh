@@ -1044,7 +1044,7 @@ if [ -f "$TOOLCHAIN_FILE" ]; then
       printf '  FAIL  %s has no `channel = ...` key in its [toolchain] table — the toolchain is not pinned\n' \
         "$TOOLCHAIN_FILE"
       fail=1
-    elif printf '%s' "$tc_channel" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    elif grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' <<<"$tc_channel"; then
       printf '  ok    %s channel = %s (exact version)\n' "$TOOLCHAIN_FILE" "$tc_channel"
     else
       printf '  FAIL  %s channel = "%s" is not an exact X.Y.Z version\n' \
@@ -2566,6 +2566,177 @@ else
   fail=1
 fi
 
+# ------------------------------------------------- pipefail-safe grep pipelines
+# `writer | grep -q` is a false-negative generator under `set -o pipefail`: grep
+# exits at the first match, the writer keeps writing and takes SIGPIPE, and the
+# pipeline's status is 141 — so a *match* reads as a miss. A here-string removes
+# the writer: `grep -q PAT <<<"$captured"`. This gate keeps the shape from
+# coming back; the toolchain-channel test above and the internal-FAIL backstop
+# below are the two sites in this file that motivated it.
+#
+# Detection: a `|` (not `||`) followed by `grep` whose own option words carry the
+# quiet flag in any spelling (`-q`, `-Fq`, `-qx`, `-Eqi`, `--quiet`, `--silent`);
+# options stop at the first non-option word (the pattern) or at `--`. A full-line
+# comment is skipped: a comment quoting the shape is documentation, not code.
+# Scope: every tracked `scripts/**/*.sh` that enables pipefail itself (its own
+# `set … pipefail`, including `set -euo pipefail`), every `scripts/lib/*.sh`
+# whether or not it sets the option (libraries are sourced into callers that do,
+# so the caller's pipefail applies to their pipelines — `compat-port-ownership.sh`
+# was exactly this case), plus every `.github/workflows/*.yml` `run:` block scalar
+# (`run: |` / `run: >`, with the optional chomping/indent indicator) that sets
+# pipefail; a tree with no `.git` falls back to walking `scripts/`.
+#
+# Non-goals, stated rather than silently skipped: `grep -l`/`-L`/`-m` exit early
+# for the same reason. The only such pipelines here are three
+# `printf '%s' "$text" | grep -m1 …` version reads (`extract_ver` and the two
+# inline reads after it): both ends are a few hundred bytes, far under the pipe
+# buffer, so the writer's single write completes before grep can exit and the
+# SIGPIPE race cannot fire. They are left alone; a `-m1` read of anything large
+# enough to block would be a real instance and would have to be rewritten too.
+# A pipeline whose left side is not captured output (`git log | grep -q`,
+# `pgrep … | grep -q`) is equally affected, but whether the writer blocks or
+# dies is not decidable by a mechanical text rule, so this gate matches the
+# shape rather than proving the race. It also does not see `egrep`/`fgrep`,
+# variable-borne flags (`grep $flags`), `|&`, or a pipeline whose `grep` starts
+# on the next line of a line continuation; none of those occur here.
+hdr "Pipefail-safe grep pipelines"
+if [ "$have_python" = 1 ]; then
+  if [ "$git_state" = ok ]; then
+    pipe_scripts=$(git_bounded ls-files -- 'scripts/*.sh'); pipe_rc=$?
+  else
+    pipe_scripts=$(find scripts -type f -name '*.sh' 2>/dev/null); pipe_rc=$?
+  fi
+  if [ "$pipe_rc" -ne 0 ]; then
+    printf '  FAIL  script list for the pipefail-grep scan could not be built (exit %s) — gate not evaluated\n' \
+      "$pipe_rc"
+    fail=1
+  else
+    pipe_hits=$(PIPE_SCAN_FILES="$pipe_scripts" python3 -B - <<'PY'
+import os, re, sys
+
+# The shape is assembled from pieces so this file — itself one of the scripts the
+# scan reads — does not carry the literal it looks for.
+PIPE = "|"
+GREP = "gr" + "ep"
+QUIET_SHORT = re.compile(r"-[A-Za-z]*q[A-Za-z]*$")
+SET_PIPEFAIL = re.compile(r"\b(set|shopt)\b[^#]*\bpipefail\b")
+
+
+def quiet_grep(line, at):
+    """True if grep's option words starting at `at` include the quiet flag."""
+    for tok in line[at:].split():
+        if tok == "--":
+            break
+        if tok.startswith("-") and tok != "-":
+            if tok in ("--quiet", "--silent") or QUIET_SHORT.match(tok):
+                return True
+            continue
+        break
+    return False
+
+
+def violation(line):
+    """True if the line is a pipeline whose right half is a quiet grep."""
+    if line.lstrip().startswith("#"):
+        return False
+    i = 0
+    while True:
+        p = line.find(PIPE, i)
+        if p < 0:
+            return False
+        i = p + 1
+        if line[p + 1:p + 2] == PIPE:
+            i = p + 2
+            continue
+        m = re.compile(r"\s*" + GREP + r"(?=\s|$)").match(line, p + 1)
+        if m and quiet_grep(line, m.end()):
+            return True
+
+
+def sets_pipefail(line):
+    return not line.lstrip().startswith("#") and SET_PIPEFAIL.search(line)
+
+
+def report(path, lineno, line):
+    print("%s:%d: %s" % (path, lineno, line.strip()))
+
+
+for path in os.environ.get("PIPE_SCAN_FILES", "").splitlines():
+    if not path:
+        continue
+    try:
+        with open(path, "r", encoding="utf8", errors="replace") as f:
+            text = f.read()
+    except OSError:
+        continue
+    # A library is scanned even without its own `set … pipefail`: it is sourced
+    # into callers that enable the option, so it inherits their pipeline status.
+    if not path.startswith("scripts/lib/") and not any(
+            sets_pipefail(ln) for ln in text.splitlines()):
+        continue
+    for n, ln in enumerate(text.splitlines(), 1):
+        if violation(ln):
+            report(path, n, ln)
+
+wdir = os.path.join(".github", "workflows")
+try:
+    names = sorted(os.listdir(wdir))
+except OSError:
+    names = []
+for name in names:
+    if not name.endswith((".yml", ".yaml")):
+        continue
+    path = os.path.join(wdir, name)
+    try:
+        with open(path, "r", encoding="utf8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        continue
+    i = 0
+    while i < len(lines):
+        key = re.match(r"^(\s*)run:[ \t]*[|>][-+]?[0-9]?[ \t]*(#.*)?$", lines[i])
+        if not key:
+            # A single-line `run: …` that sets pipefail itself is scanned too.
+            one = re.match(r"^(\s*)run:[ \t]*(.+)$", lines[i])
+            if one and "pipefail" in one.group(2) and violation(lines[i]):
+                report(path, i + 1, lines[i])
+            i += 1
+            continue
+        base = len(key.group(1))
+        block = [(i, lines[i])]
+        j = i + 1
+        while j < len(lines):
+            ln = lines[j]
+            ind = len(ln) - len(ln.lstrip(" "))
+            if ln.strip() and ind <= base:
+                break
+            block.append((j, ln))
+            j += 1
+        if any(sets_pipefail(ln) for _, ln in block):
+            for k, ln in block:
+                if violation(ln):
+                    report(path, k + 1, ln)
+        i = j
+PY
+)
+    pipe_rc=$?
+    if [ "$pipe_rc" -ne 0 ]; then
+      printf '  FAIL  pipefail-grep scan failed (exit %s) — gate not evaluated\n' "$pipe_rc"
+      fail=1
+    elif [ -n "$pipe_hits" ]; then
+      printf '%s\n' "$pipe_hits" | sed 's/^/    /'
+      printf '  FAIL  %s pipeline(s) send output into `grep -q` under pipefail — a match can read as a miss; use a here-string\n' \
+        "$(printf '%s\n' "$pipe_hits" | wc -l | tr -d ' ')"
+      fail=1
+    else
+      printf '  ok    no pipeline sends output into `grep -q` under pipefail (scripts + workflow run blocks)\n'
+    fi
+  fi
+else
+  printf '  FAIL  python3 not found — pipefail-grep scan cannot be evaluated\n'
+  fail=1
+fi
+
 # ---------------------------------------------------------------- sizes
 if [ "${1:-}" = "--sizes" ]; then
   hdr "Release binary sizes (slow — builds)"
@@ -2588,7 +2759,7 @@ fi
 # `file:line:` line, so it cannot forge one.
 if [ "$fail" -eq 0 ]; then
   for captured in "${unsafe_misses:-}" "${index_misses:-}" "${path_report:-}" "${doc_claims:-}"; do
-    if printf '%s\n' "$captured" | grep -q '^  FAIL  '; then
+    if grep -q '^  FAIL  ' <<<"$captured"; then
       printf '  FAIL  internal: a gate printed FAIL but the run would exit 0\n'
       fail=1
       break

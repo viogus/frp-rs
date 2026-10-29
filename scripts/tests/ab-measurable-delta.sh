@@ -331,9 +331,9 @@ hdr "gate reporting: informational by default, hard failure only under AB_GATE_E
 sum="$WORK/summary.md"; : > "$sum"
 out="$(probe 0 'gate_report plain 100.0 82.0 -18.0 3 REGRESSED; echo "FAIL=$FAIL"' "$sum")"
 rc=$?
-if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q '::warning::' \
-   && printf '%s' "$out" | grep -q 'FAIL=1' \
-   && printf '%s' "$out" | grep -q -- '-18.0%'; then
+if [ "$rc" = "0" ] && grep -q '::warning::' <<<"$out" \
+   && grep -q 'FAIL=1' <<<"$out" \
+   && grep -q -- '-18.0%' <<<"$out"; then
   ok "gate_report REGRESSED without enforce -> rc 0, ::warning::, FAIL=1, median row printed"
 else
   bad "gate_report REGRESSED without enforce -> rc $rc, output='$out' (want rc 0 + ::warning:: + FAIL=1)"
@@ -347,8 +347,8 @@ fi
 
 out="$(probe 0 'gate_report plain 100.0 99.0 -1.0 3 pass; echo "FAIL=$FAIL"')"
 rc=$?
-if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q 'FAIL=0' \
-   && ! printf '%s' "$out" | grep -q '::warning::'; then
+if [ "$rc" = "0" ] && grep -q 'FAIL=0' <<<"$out" \
+   && ! grep -q '::warning::' <<<"$out"; then
   ok "gate_report within gate -> rc 0, FAIL=0, no annotation"
 else
   bad "gate_report within gate -> rc $rc, output='$out' (want rc 0 + FAIL=0, no ::warning::)"
@@ -361,16 +361,16 @@ fi
 # would abort the probe exactly as it would abort the script). A demoted gate
 # whose re-arm is unreachable would be a promise nothing witnesses.
 rc=0; out="$(probe 1 'FAIL=1; if gate_final; then echo "inner=0"; else echo "inner=1"; fi')" || rc=$?
-if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q 'A/B GATE FAILED' \
-   && printf '%s' "$out" | grep -q 'inner=1'; then
+if [ "$rc" = "0" ] && grep -q 'A/B GATE FAILED' <<<"$out" \
+   && grep -q 'inner=1' <<<"$out"; then
   ok "gate_final: FAIL=1 under AB_GATE_ENFORCE=1 -> rc 1 (hard failure restored)"
 else
   bad "gate_final under AB_GATE_ENFORCE=1 -> rc $rc, output='$out' (want the FAILED line and the rc-1 branch)"
 fi
 
 rc=0; out="$(probe 0 'FAIL=1; if gate_final; then echo "inner=0"; else echo "inner=1"; fi')" || rc=$?
-if [ "$rc" = "0" ] && printf '%s' "$out" | grep -q 'A/B GATE REGRESSED (informational' \
-   && printf '%s' "$out" | grep -q 'inner=0'; then
+if [ "$rc" = "0" ] && grep -q 'A/B GATE REGRESSED (informational' <<<"$out" \
+   && grep -q 'inner=0' <<<"$out"; then
   ok "gate_final: FAIL=1 without enforce -> rc 0 and the informational tail"
 else
   bad "gate_final informational -> rc $rc, output='$out' (want the REGRESSED (informational) tail and the rc-0 branch)"
@@ -421,7 +421,7 @@ fi
 # The row's before/after must be the medians of the samples the delta came
 # from: before=100 (all three), after=median(60, 75, 98)=75.0. The old code
 # spent two extra measure runs to print columns that did not match the delta.
-if printf '%s' "$got" | grep -q '|100.0|75.0$'; then
+if grep -q '|100.0|75.0$' <<<"$got"; then
   ok "measure_pair_deltas: row before/after are the medians of the same samples"
 else
   bad "measure_pair_deltas row columns did not come from the sampled set: '$got'"

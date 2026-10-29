@@ -225,7 +225,7 @@ lock_out=$(SOAK_LOCK="$empty_lock" SOAK_RUN_DIR="$work/lock-run" SOAK_OUT="$work
     bash "$ROOT/scripts/rss-soak.sh" 60 30 2>&1 >/dev/null)
 lock_rc=$?
 expect_rc 1 "$lock_rc" 'an empty lock is held, not stolen'
-if printf '%s' "$lock_out" | grep -q 'exists but is empty'; then ok 'the empty lock is named'; else bad 'the empty lock was not named'; fi
+if grep -q 'exists but is empty' <<<"$lock_out"; then ok 'the empty lock is named'; else bad 'the empty lock was not named'; fi
 if [ -f "$empty_lock" ]; then ok 'the empty lock file is left in place'; else bad 'the empty lock file was removed'; fi
 
 live_lock="$work/live.lock"
@@ -234,7 +234,7 @@ lock_out=$(SOAK_LOCK="$live_lock" SOAK_RUN_DIR="$work/lock-run2" SOAK_OUT="$work
     bash "$ROOT/scripts/rss-soak.sh" 60 30 2>&1 >/dev/null)
 lock_rc=$?
 expect_rc 1 "$lock_rc" 'a lock held by a live pid refuses a second soak'
-if printf '%s' "$lock_out" | grep -q 'already running'; then ok 'the live holder is named'; else bad 'the live holder was not named'; fi
+if grep -q 'already running' <<<"$lock_out"; then ok 'the live holder is named'; else bad 'the live holder was not named'; fi
 
 end_case 5
 # ---------------------------------------------- meta writer (JSON escaping)

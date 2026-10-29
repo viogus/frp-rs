@@ -427,7 +427,7 @@ done
 
 if command -v file >/dev/null 2>&1; then
   go_desc=$(file -b "$GO_FRPS")
-  printf '%s' "$go_desc" | grep -Eqi "$file_marker" \
+  grep -Eqi "$file_marker" <<<"$go_desc" \
     || { echo "error: Go binary is not for this host ($go_platform): $go_desc" >&2; exit 1; }
 fi
 

@@ -75,7 +75,7 @@ fi
 # on an arm64 host is exactly the mistake this script exists to prevent.
 if command -v file >/dev/null 2>&1; then
   go_desc=$(file -b "$GO_FRPS")
-  if ! printf '%s' "$go_desc" | grep -Eqi "$file_marker"; then
+  if ! grep -Eqi "$file_marker" <<<"$go_desc"; then
     die "Go binary is not for this host.
        host:        $go_platform
        got:         $go_desc

@@ -1471,7 +1471,7 @@ else
   bad "per-file header changed: $first"
 fi
 
-if printf '%s\n' "$DEF" | grep -q 'Largest production functions by CODE lines (top 12)$'; then
+if grep -q 'Largest production functions by CODE lines (top 12)$' <<<"$DEF"; then
   ok "function section header is unchanged"
 else
   bad "function section header changed"
