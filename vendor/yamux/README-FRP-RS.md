@@ -370,8 +370,9 @@ cargo test  --manifest-path vendor/yamux/Cargo.toml --lib
 ```
 
 Set `CARGO_TARGET_DIR` to a scratch path if you do not want a `target/`
-inside the vendor tree; the check also generates `vendor/yamux/Cargo.lock`
-(the tarball's lock is not vendored), which is ignored by `.gitignore`.
+inside the vendor tree; the check also generates a lock file in the vendored
+crate's directory (the tarball's lock is not vendored), which `.gitignore`
+ignores — so it is deliberately not a tracked path.
 Nothing about this crate's own resolution enters the workspace
 `Cargo.lock` — verified: adding the dev-dependency leaves `git diff
 Cargo.lock` empty.
