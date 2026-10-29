@@ -20,13 +20,20 @@
 //! So this test stands up a fake OTLP/HTTP server, builds the provider with the
 //! production helper (`frp_core::logging::build_otel_provider`, the same code
 //! `init_tracing_otel` uses), records and closes one span, flushes, and asserts
-//! that the server received an HTTP `POST /v1/traces`. On the broken wiring the
-//! connection never arrives; on the fix (an async-runtime `BatchSpanProcessor`
-//! spawned on the ambient tokio runtime) it does.
+//! (a) that the server received an HTTP `POST /v1/traces` with a protobuf
+//! content type, (b) that the *body* the server read — exactly `content-length`
+//! bytes — contains the span name as the raw bytes of OTLP `Span.name`
+//! (protobuf field 5, length-delimited), and (c) that `force_flush()` returned
+//! `Ok(())`, i.e. the batch processor answered with the exporter's verdict
+//! rather than merely "a connection arrived". On the broken wiring the
+//! connection never arrives at all; on the fix (an async-runtime
+//! `BatchSpanProcessor` spawned on the ambient tokio runtime) the body carries
+//! the span.
 //!
-//! The assertion is deliberately about the *request*, not the exporter's
-//! verdict: the fake server answers with an empty protobuf body, and an export
-//! error after the request has been sent is not what this test is pinning.
+//! The body is checked as bytes on purpose: a decode helper (or the proto
+//! crate) would have to be trusted to prove that what went over the wire is
+//! what was recorded, and an empty or truncated export would be the very bug
+//! this test exists to catch.
 #![cfg(feature = "otel")]
 
 use std::time::Duration;
@@ -36,6 +43,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing_subscriber::layer::SubscriberExt as _;
 
+/// The `tracing` span name; it must survive into the exported OTLP `Span.name`
+/// bytes (see the module docs).
+const SPAN_NAME: &str = "otel_export_regression_span";
+
 /// How long to wait for the exporter to connect. Short on purpose: a broken
 /// wiring must fail the suite quickly rather than hang it.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -43,6 +54,14 @@ const ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Bound on `force_flush` + `shutdown`; both block the calling thread.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One HTTP request as the fake OTLP server saw it on the wire.
+struct CapturedRequest {
+    /// Request line + headers.
+    head: String,
+    /// Exactly `content-length` body bytes.
+    body: Vec<u8>,
+}
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
@@ -60,9 +79,28 @@ fn content_length(head: &str) -> Option<usize> {
         .and_then(|v| v.trim().parse().ok())
 }
 
-/// Read exactly one HTTP request off `sock`, answer it, and return the request
-/// head (request line + headers) as text.
-async fn serve_one_request(mut sock: tokio::net::TcpStream) -> String {
+/// Encode a protobuf length-delimited field. `tag` is the already-composed
+/// field-number/wire-type byte; only one-byte lengths are needed here (the
+/// span name is 27 bytes), which keeps the helper allocation-free and obvious.
+fn length_delimited_field(tag: u8, value: &[u8]) -> Vec<u8> {
+    assert!(
+        value.len() < 0x80,
+        "test helper only handles one-byte field lengths, got {}",
+        value.len()
+    );
+    let mut out = Vec::with_capacity(2 + value.len());
+    out.push(tag);
+    out.push(value.len() as u8);
+    out.extend_from_slice(value);
+    out
+}
+
+/// Read exactly one HTTP request off `sock`, answer it, and return what was
+/// seen. The body is read to `content-length` (the exporter sends a fixed-size
+/// protobuf payload, so there is no chunked encoding to handle); a missing
+/// length, a truncated body or a read error is a test failure, not something
+/// the assertions downstream should have to guess at.
+async fn serve_one_request(mut sock: tokio::net::TcpStream) -> CapturedRequest {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
     let deadline = tokio::time::Instant::now() + IO_TIMEOUT;
@@ -83,17 +121,33 @@ async fn serve_one_request(mut sock: tokio::net::TcpStream) -> String {
     };
     let head = String::from_utf8_lossy(&buf[..body_start]).into_owned();
 
-    // Body, so the exporter is not left writing into a closed socket while we
-    // answer. Absent `content-length` (chunked) we just answer after the head.
-    if let Some(len) = content_length(&head) {
-        while buf.len() < body_start + len {
-            match tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-                Ok(Err(_)) | Err(_) => break,
-            }
+    // Body: read exactly what `content-length` promised so the span-name
+    // assertion cannot pass on a partial payload.
+    let len = content_length(&head).unwrap_or_else(|| {
+        panic!(
+            "the OTLP export request carries no content-length, so its body cannot be \
+             delimited (chunked encoding is not expected from this exporter); request was:\n{head}"
+        )
+    });
+    let body_end = body_start + len;
+    while buf.len() < body_end {
+        match tokio::time::timeout_at(deadline, sock.read(&mut chunk)).await {
+            Ok(Ok(0)) => panic!(
+                "the OTLP export request body is truncated: content-length says {len} byte(s), \
+                 but the connection closed after {} byte(s): {:?}",
+                buf.len() - body_start,
+                String::from_utf8_lossy(&buf[body_start..])
+            ),
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => panic!("fake OTLP server: reading the export body failed: {e}"),
+            Err(_) => panic!(
+                "timed out reading the OTLP export body: content-length says {len} byte(s), \
+                 but only {} byte(s) arrived",
+                buf.len() - body_start
+            ),
         }
     }
+    let body = buf[body_start..body_end].to_vec();
 
     // Minimal 200 with an empty (valid) protobuf `ExportTraceServiceResponse`.
     let _ = sock
@@ -105,7 +159,7 @@ async fn serve_one_request(mut sock: tokio::net::TcpStream) -> String {
         )
         .await;
     let _ = sock.flush().await;
-    head
+    CapturedRequest { head, body }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -148,6 +202,8 @@ async fn span_is_exported_over_http_to_the_otlp_endpoint() {
     // One span, created and closed on this thread. `with_default` keeps the
     // subscriber thread-local, so nothing leaks into other tests.
     tracing::subscriber::with_default(subscriber, || {
+        // Must stay identical to `SPAN_NAME`: the macro needs a literal, and
+        // the assertions below hold the exported bytes to that constant.
         let span = tracing::info_span!("otel_export_regression_span");
         let _entered = span.enter();
     });
@@ -162,28 +218,67 @@ async fn span_is_exported_over_http_to_the_otlp_endpoint() {
         (flush, shutdown)
     });
 
-    let head = server.await.expect("fake OTLP server task panicked");
+    let request = server.await.expect("fake OTLP server task panicked");
     assert!(
-        head.starts_with("POST /v1/traces "),
-        "expected the OTLP exporter to POST to /v1/traces, got:\n{head}"
+        request.head.starts_with("POST /v1/traces "),
+        "expected the OTLP exporter to POST to /v1/traces, got:\n{}",
+        request.head
     );
     assert!(
-        head.to_ascii_lowercase()
+        request
+            .head
+            .to_ascii_lowercase()
             .contains("content-type: application/x-protobuf"),
-        "expected a protobuf OTLP payload, got:\n{head}"
+        "expected a protobuf OTLP payload, got:\n{}",
+        request.head
     );
 
-    match tokio::time::timeout(FLUSH_TIMEOUT, flusher).await {
-        Ok(Ok((flush, shutdown))) => {
-            assert!(
-                shutdown.is_ok(),
-                "provider shutdown reported an error: {shutdown:?}"
-            );
-            // The export itself may still report an error (the fake server's
-            // answer is minimal); the request above is what this test pins.
-            let _ = flush;
-        }
+    // The wire body, not a decode of it: OTLP encodes `Span.name` as a
+    // length-delimited protobuf string, so the name appears verbatim.
+    let name_bytes = SPAN_NAME.as_bytes();
+    assert!(
+        !request.body.is_empty(),
+        "the OTLP export request carried an empty body (content-length resolved to 0), so no \
+         span was exported; request was:\n{}",
+        request.head
+    );
+    assert!(
+        find(&request.body, name_bytes).is_some(),
+        "the exported OTLP protobuf body ({} byte(s)) does not contain the span name {SPAN_NAME:?} \
+         as raw bytes; body:\n{:?}",
+        request.body.len(),
+        String::from_utf8_lossy(&request.body)
+    );
+    // Stronger than "the literal appears somewhere": the occurrences must be
+    // framed as protobuf field 5 (`Span.name`) wire type 2, i.e. tag byte
+    // (5 << 3) | 2 = 0x2a followed by the name's length. This rejects an
+    // incidental copy of the name (attribute value, scope name) standing in
+    // for the span itself.
+    let framed_name = length_delimited_field(0x2a, name_bytes);
+    assert!(
+        find(&request.body, &framed_name).is_some(),
+        "the exported OTLP protobuf body ({} byte(s)) does not encode {SPAN_NAME:?} as protobuf \
+         field 5 (`Span.name`, tag 0x2a, length-delimited); body:\n{:?}",
+        request.body.len(),
+        String::from_utf8_lossy(&request.body)
+    );
+
+    let (flush, shutdown) = match tokio::time::timeout(FLUSH_TIMEOUT, flusher).await {
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => panic!("flush/shutdown task failed: {e}"),
         Err(_) => panic!("force_flush/shutdown did not finish within {FLUSH_TIMEOUT:?}"),
-    }
+    };
+    // `Ok(())` means the batch processor answered *and* the exporter's verdict
+    // was success — the request above arrived and the server's response was
+    // accepted. A request that arrived while the export failed is not the fix
+    // this test pins.
+    assert!(
+        flush.is_ok(),
+        "provider.force_flush() must return Ok(()) once the batch processor has drained and the \
+         exporter has accepted the server's response, got: {flush:?}"
+    );
+    assert!(
+        shutdown.is_ok(),
+        "provider.shutdown() reported an error: {shutdown:?}"
+    );
 }
