@@ -654,7 +654,7 @@ pub fn build_otel_layer(
             tracing_subscriber::Registry,
             opentelemetry_sdk::trace::Tracer,
         >,
-        opentelemetry_sdk::trace::TracerProvider,
+        opentelemetry_sdk::trace::SdkTracerProvider,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -666,12 +666,17 @@ pub fn build_otel_layer(
         .with_http()
         .with_endpoint(endpoint.to_string())
         .build()?;
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new(vec![KeyValue::new(
+    let resource = Resource::builder_empty()
+        .with_attributes(vec![KeyValue::new(
             "service.name",
             service_name.to_string(),
-        )]))
+        )])
+        .build();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        // 0.33: the batch processor no longer takes a runtime argument; with
+        // the `rt-tokio` feature it uses the ambient tokio runtime.
+        .with_batch_exporter(exporter)
+        .with_resource(resource)
         .build();
     let tracer = provider.tracer("frp-rs");
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))

@@ -52,7 +52,7 @@ serde_json = "1"
 # frp-core suite.
 yaml-rust2 = { version = "0.13", default-features = false }
 bpaf = "0.9"
-toml = "0.8"
+toml = "1.1"
 anyhow = { version = "1", default-features = false, features = ["std"] }
 tracing = "0.1"
 thiserror = "2"
@@ -72,7 +72,12 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 rustls-platform-verifier = "0.7"
 ring = "0.17"
 jsonwebtoken = "9"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# Dev-only (frp-server dashboard integration tests). reqwest 0.13's TLS
+# features either force aws-lc-rs (`rustls`, the banned backend) or panic at
+# `Client::build()` without an installed crypto provider
+# (`rustls-no-provider`), and the tests only hit `http://` localhost URLs —
+# so no TLS feature is enabled at all.
+reqwest = { version = "0.13", default-features = false }
 hyper = { version = "1", default-features = false, features = ["http1", "client"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1"] }
 # Needed for the OIDC HTTP client's custom hyper connector: hyper-util's

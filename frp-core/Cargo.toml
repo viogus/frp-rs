@@ -59,12 +59,16 @@ webpki-roots = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
 chacha20poly1305 = { workspace = true, optional = true }
-rcgen = { version = "0.13", optional = true, default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", optional = true, default-features = false, features = ["ring"] }
 pprof = { workspace = true, optional = true }
-opentelemetry = { version = "0.27", optional = true, default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.27", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", optional = true, default-features = false, features = ["http-proto"] }
-tracing-opentelemetry = { version = "0.28", optional = true, default-features = false }
+opentelemetry = { version = "0.33", optional = true, default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", optional = true, default-features = false, features = ["trace", "rt-tokio"] }
+# `hyper-client` is required: in 0.33 `http-proto` no longer implies an HTTP
+# client (0.27 pulled reqwest through it). The hyper backend reuses the
+# hyper/hyper-util/http-body-util/tokio crates already in the tree — no
+# reqwest (and no aws-lc-rs) enters the otel build.
+opentelemetry-otlp = { version = "0.33", optional = true, default-features = false, features = ["http-proto", "hyper-client"] }
+tracing-opentelemetry = { version = "0.34", optional = true, default-features = false }
 [features]
 default = ["kcp", "quic", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux", "stun"]
 tcp-mux = ["dep:yamux"]
@@ -97,7 +101,7 @@ libc.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = "0.5"
-criterion = "0.5"
+criterion = "0.8"
 proptest = "1.6"
 tempfile = "3"
 

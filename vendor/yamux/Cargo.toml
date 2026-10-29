@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "yamux"
-version = "0.14.0"
+version = "0.14.1"
 authors = ["Parity Technologies <admin@parity.io>"]
 build = false
 autolib = false
@@ -60,8 +60,8 @@ version = "1"
 [dependencies.web-time]
 version = "1"
 
-# frp-rs patch (send-side body-buffer pool): lock-free bounded queue for
-# reusing data-frame body buffers. Already in the workspace dependency tree
+# frp-rs patch (body-buffer pool, send + read side): lock-free bounded queue
+# for reusing data-frame body buffers. Already in the workspace dependency tree
 # (frp-core's KCP chunk pool), so no new crates are added to the build.
 [dependencies.crossbeam-queue]
 version = "0.3"

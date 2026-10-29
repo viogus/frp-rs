@@ -87,7 +87,10 @@ fn ensure_tls_certs(dir: &Path) -> (String, String, String) {
     let mut srv_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
     srv_params.is_ca = IsCa::NoCa;
     let srv_key = KeyPair::generate().unwrap();
-    let srv_cert = srv_params.signed_by(&srv_key, &ca_cert, &ca_key).unwrap();
+    // rcgen 0.14: signing takes an `Issuer` built from the CA's params +
+    // key (the old `signed_by(key, &ca_cert, &ca_key)` form is gone).
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+    let srv_cert = srv_params.signed_by(&srv_key, &issuer).unwrap();
 
     let ca_path = dir.join("ca-cert.pem");
     let srv_cert_path = dir.join("server-cert.pem");

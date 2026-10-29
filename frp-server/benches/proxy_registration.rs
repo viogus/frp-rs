@@ -6,9 +6,11 @@
 //! Filter by name:
 //!   cargo bench -p frp-server --bench proxy_registration -- register_1000
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+// criterion 0.8 deprecated its `black_box` re-export in favour of std's.
 use frp_server::proxy::{ProxyInfo, ProxyManager};
 use std::collections::HashMap;
+use std::hint::black_box;
 
 /// Build a fresh `ProxyInfo` with all fields populated.
 /// `ProxyInfo` does not implement `Default`, so every field is set explicitly.

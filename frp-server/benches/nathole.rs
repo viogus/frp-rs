@@ -7,7 +7,9 @@
 //!   cargo bench -p frp-server -- nat_classify
 //!   cargo bench -p frp-server -- nat_analysis
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+// criterion 0.8 deprecated its `black_box` re-export in favour of std's.
+use std::hint::black_box;
 use std::time::Duration;
 
 // ── NAT classification ─────────────────────────────────────────────────────

@@ -1,8 +1,16 @@
-# Vendored yamux 0.14.0 (frp-rs)
+# Vendored yamux 0.14.1 (frp-rs)
 
-This directory vendors `yamux` 0.14.0 (crates.io, Parity Technologies)
-with five patches, wired in via `[patch.crates-io]` in the workspace
-root `Cargo.toml` (`yamux = { path = "vendor/yamux" }`).
+This directory vendors `yamux` 0.14.1 (crates.io, Parity Technologies)
+with five frp-rs patches, wired in via `[patch.crates-io]` in the
+workspace root `Cargo.toml` (`yamux = { path = "vendor/yamux" }`).
+
+Re-vendored from 0.14.0 on 2026-10-29. The previous fork's separate
+`Sender` for window updates is **not** carried as a patch any more:
+upstream 0.14.1 fixes the same lost-wakeup bug itself (same design,
+field named `window_update_sender`), so that section below is kept only
+as a record of what the fork used to carry. The remaining five patches
+are unchanged in intent and semantics; each was re-applied on top of the
+pristine 0.14.1 sources.
 
 ## License
 
@@ -83,10 +91,19 @@ When bumping yamux upstream: re-apply the `Action::Reset` machinery
 above to the new `src/connection.rs` (the `Action` enum variant, the two
 cap sites, the `pending_reset_frames` bounded queue + send-loop +
 `close()` wiring, and the read-gate exception), or — better — carry the
-patch upstream. The other deviations from crates.io yamux 0.14.0 are
-listed below.
+patch upstream. The other deviations from crates.io yamux are listed
+below.
 
-## Patch: separate mpsc `Sender` for window updates (read-side lost-wakeup deadlock)
+## Upstream in 0.14.1: separate mpsc `Sender` for window updates (read-side lost-wakeup deadlock)
+
+**No local patch needed any more.** Upstream 0.14.1 ships exactly this
+fix (PR paritytech/yamux#279): `Stream` gains
+`window_update_sender: mpsc::Sender<StreamCommand>` (a clone of the same
+channel) and `send_window_update` polls/sends through it, with the same
+one-poller-per-`Sender` rationale documented on the field. The frp-rs
+fork carried the same change as `sender_wu` in the previous vendored
+copy; the two implementations are semantically identical, and the vendor
+tree now uses the upstream one.
 
 `futures::channel::mpsc` assumes a single task polls each `Sender` for
 readiness. While a `Sender` is parked (queue full), `poll_ready` stores
@@ -109,24 +126,11 @@ with both directions idle. Reproduced intermittently (~7.5% of runs) by
 way over a 1 MiB duplex, 4 tasks, `tokio::io::split`), in either
 direction, and in the `poll_close` park as well.
 
-### What changed (src/connection/stream.rs only)
-
-- `Stream` gains `sender_wu: mpsc::Sender<StreamCommand>` — a clone of
-  the same channel, constructed in `new_inbound`/`new_outbound`.
-- `send_window_update` polls/start_sends via `sender_wu` instead of
-  `sender`. Data frames and `CloseStream` keep using `sender`.
-
-The write and read task domains each own their `Sender`, so a parked
-writer's stored waker is never overwritten by the reader's polls. The
-channel's guaranteed-slot accounting (capacity = buffer + senders)
-covers both handles; `parked_queue` wakes whichever sender is parked,
-FIFO.
-
-### Upgrade note
-
-When bumping yamux upstream: re-apply the `sender_wu` field, the two
-constructor clones, and the `send_window_update` sender swap. Carry
-both of these patches upstream if possible.
+The upstream fix is the same shape the fork had (`sender_wu`: one
+dedicated `Sender` handle for the read path, data frames and
+`CloseStream` on the write path), so the fork's fix is retired here.
+`frp-core/tests/mux.rs::mux_2mib_bidirectional_byte_exact` still pins
+the behaviour through the data plane.
 
 ## Patch: per-stream receive-window cap (Go `MaxStreamWindowSize` parity)
 
@@ -248,22 +252,30 @@ was the last per-chunk allocation in the frp-rs bridge data path.
   written — `WriteState::Body` completion in `poll_ready`
   (`src/frame/io.rs`), the point where the body `Vec` becomes
   exclusively owned and would otherwise be dropped. Buffers with
-  capacity above `DEFAULT_SPLIT_SEND_SIZE` (custom `split_send_size`),
-  and any lost to WriteZero / Poisoned / teardown, are simply dropped —
-  the pool dies with the connection.
+  capacity above the configured `split_send_size`, and any lost to
+  WriteZero / Poisoned / teardown, are simply dropped — the pool dies
+  with the connection.
+- The read side is pooled too (round-17 follow-up): `frame::Io` draws
+  read bodies from the same queue at `ReadState::Body` init instead of
+  `vec![0; body_len]` (which zero-filled every byte `poll_read` then
+  overwrote), and `Stream::poll_read` returns a chunk's buffer to the
+  pool once the chunk is fully consumed (`src/connection/stream.rs`).
+  Safety is unchanged: the buffer moves into `Shared::buffer` only after
+  the frame has released it, and comes back to the pool only after the
+  chunk is empty and exclusively owned again.
 - New dependency: `crossbeam-queue = "0.3"` (`Cargo.toml`), already in
   the workspace dependency tree (frp-core's KCP chunk pool uses the
   same queue), so no new crates enter the build.
 
-### Red line: send-side only
+### Red line: never return a body while it is still referenced
 
-The pool must NOT extend to the read side: read bodies are allocated
-per-frame (`vec![0; body_len]` in `ReadState::Body`,
-`src/frame/io.rs` — Go-parity per-frame make, out of scope) and move
-into `Shared::buffer` (`Chunks`), where `Stream::poll_read` consumes
-them lazily, long after the frame object is dropped. Returning a read
-body to the pool at driver time would be a use-after-free. The return
-point above is exclusively on the write path.
+A read body moves into `Shared::buffer` (`Chunks`) and `Stream::poll_read`
+consumes it lazily, long after the frame object is dropped. The read
+side therefore only returns a buffer once the chunk is empty (fully
+consumed and popped) and exclusively owned; returning it at driver time
+would be a use-after-free. The write-side return happens only at
+`WriteState::Body` completion, where the same ownership argument
+holds.
 
 ### Why this is not the round-4 batched write path
 
@@ -275,9 +287,27 @@ are unchanged, so throughput behavior is preserved.
 ### Upgrade note
 
 When bumping yamux upstream: re-apply the `body_pool` field threading
-(`Connection::new`/`Active`/`Io`/`Stream`) and the two hunk sites
-(`poll_write`, `WriteState::Body` completion), or carry the patch
-upstream.
+(`Connection::new`/`Active`/`Io`/`Stream`) and the hunk sites
+(`poll_write`, `WriteState::Body` completion, `ReadState::Body` init,
+`poll_read` consumed-chunk return), or carry the patch upstream.
+
+## Patch: exact outbound-ACK backlog counter (O(1) instead of O(N) scan)
+
+Upstream's `ack_backlog()` scans the whole stream map on every
+`poll_new_outbound`, locking every stream, to see how many outbound
+streams are still awaiting an ACK. frp-rs keeps an exact
+`outbound_unacked: usize` counter in `Active`
+(`src/connection.rs`): incremented on outbound creation and
+decremented on every transition out of `Open { acknowledged: false }`
+(remote ACK, RST, FIN on either frame type, or removal).
+
+Documented divergence: `Stream::poll_close` on an *unacked* outbound
+stream moves it to `SendClosed` without decrementing (the counter lives
+in `Active`, the transition in `Stream`), so a `poll_close`-happy
+caller would see the gate fire 256 streams early. frp never calls
+`poll_close` on mux streams — they are dropped, which goes through
+`on_drop_stream` and does decrement — so the counter is exact for every
+reachable transition. `drop_active` resets it to 0.
 
 ## Minor deviations (not patches)
 
@@ -287,8 +317,12 @@ upstream.
   arm in `src/connection.rs` — now sends a per-stream Reset. Kept for
   upstream parity; benign, remove when upstream drops them.
 
-## Diff from crates.io yamux 0.14.0
+## Diff from crates.io yamux 0.14.1
 
 Everything else in this tree is byte-identical to crates.io yamux
-0.14.0; the full delta is the five patches above plus the two
-`#[allow(dead_code)]` annotations.
+0.14.1; the full delta is the five patches above — per-stream RST on
+inbound stream-cap, per-stream receive-window cap, window-growth seed
+RTT, body-buffer pool, outbound-ACK backlog counter — plus the two
+`#[allow(dead_code)]` annotations, the `crossbeam-queue` dependency in
+`Cargo.toml`, and this README. Verified by diffing the tree against the
+unpacked 0.14.1 tarball.
