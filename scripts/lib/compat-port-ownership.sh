@@ -116,22 +116,29 @@ cpo_ledger_reset() {
 cpo_port_listening() {
     # rc 0 = something is listening or bound on this port now. Used only by the
     # picker; with no census tool it says "free" (the pre-existing behaviour).
-    # The readiness gates do NOT use this: they fail closed (see `cpo_ready_owned`).
+    # The pipefail rewrite here is hygiene, not a semantics change for this pair:
+    # a census tool that fails silently (non-zero exit, nothing on stdout — how
+    # lsof and ss report their errors, measured) is status-equivalent before and
+    # after, "free"/rc 1. The one divergence is a writer that both fails and
+    # prints on stdout: the old pipeline returned 1 under pipefail, the
+    # here-string matches that line and answers rc 0, so the picker skips the
+    # port — the safe direction. The readiness gates do NOT use this: they fail
+    # closed (see `cpo_ready_owned`).
     local port="$1"
     if command -v lsof >/dev/null 2>&1; then
-        if lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+        if grep -q LISTEN <<<"$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null)"; then
             return 0
         fi
-        if lsof -nP -iUDP:"$port" 2>/dev/null | grep -q .; then
+        if grep -q . <<<"$(lsof -nP -iUDP:"$port" 2>/dev/null)"; then
             return 0
         fi
         return 1
     fi
     if command -v ss >/dev/null 2>&1; then
-        if ss -tln "sport = :$port" 2>/dev/null | grep -q ":$port "; then
+        if grep -q ":$port " <<<"$(ss -tln "sport = :$port" 2>/dev/null)"; then
             return 0
         fi
-        if ss -uln "sport = :$port" 2>/dev/null | grep -q ":$port "; then
+        if grep -q ":$port " <<<"$(ss -uln "sport = :$port" 2>/dev/null)"; then
             return 0
         fi
         return 1

@@ -88,7 +88,7 @@ set -uo pipefail
 # Pinning an ordered assertion list would need a second instrumented counter per
 # scenario, which this suite does not keep; the count is what can be pinned, and
 # that residual gap is recorded in the batch-E report.
-MIN_CHECKS=32
+MIN_CHECKS=54
 checks=0
 fail=0
 tmp=""
@@ -170,8 +170,8 @@ hdr() { printf '%s\n' "---------------------------------------------------------
 # guard. The list is not exhaustive: the reject-direction block just above the
 # assertion and the `region_hash_verdict … || return 1` call are the same shape.
 # Each still needs the pin refreshed to stay green.
-SCEN6_REGION_SHA='7d31d2b613e1e578c7050a5328cb677f4aac2eba1c6d9a7248f0216d1dd06af7'
-SCEN7_REGION_SHA='941be4f7805b74ff79b691e463f91dd011a1b549cd17995f09542ff8d3f40500'
+SCEN6_REGION_SHA='9f32c57bc07022cc09891dd48d9b2f6ea850fd1c46699347d7ada54ab0c2a36d'
+SCEN7_REGION_SHA='29a7f41ebd18474d7520ae3c97a6fd3d9ff9b037d9d09eb0acdf9447f7eee59d'
 PINNED_REGIONS='scenario-6 scenario-7'
 PINNED_REGION_COUNT=2
 # Known vectors the hashing tool must reproduce, and the path the read-path
@@ -1053,7 +1053,7 @@ assert_exit_mapping() {
   else
     bad "$1: process rc is $rc (expected 1 — a bare exit 3/fail=3 regression?)"
   fi
-  if printf '%s\n' "$out" | grep -qF -- "$2"; then
+  if grep -qF -- "$2" <<<"$out"; then
     ok "$1: the expected FAIL row is printed"
   else
     bad "$1: expected FAIL row missing: $2"
@@ -1087,17 +1087,17 @@ t=$TREE
 wf="$t/.github/workflows/"$'a\nC forged.yml'
 printf 'name: probe\non: push\njobs:\n  a:\n    steps:\n      - uses: actions-rust-lang/setup-rust-toolchain@v1\n        with:\n          toolchain: 1.98.0\n' > "$wf"
 run_gate "$t"
-if printf '%s\n' "$out" | grep -q 'workflow path with a newline in its name was not scanned'; then
+if grep -q 'workflow path with a newline in its name was not scanned' <<<"$out"; then
   ok 'newline path: the workflow is refused by name'
 else
   bad 'newline path: no refusal naming the workflow'
 fi
-if printf '%s\n' "$out" | grep -q 'toolchain:.*input(s)'; then
+if grep -q 'toolchain:.*input(s)' <<<"$out"; then
   bad 'newline path: a forged toolchain: hit was parsed from the split line'
 else
   ok 'newline path: no forged hit from the split path'
 fi
-if printf '%s\n' "$out" | grep -q 'toolchain input scan not evaluated'; then
+if grep -q 'toolchain input scan not evaluated' <<<"$out"; then
   ok 'newline path: the scan reports itself not evaluated (fail-closed)'
 else
   bad 'newline path: the scan did not report itself not evaluated'
@@ -1122,17 +1122,17 @@ dir="$t/.github/workflows/"$'sub\nC forged.yml'
 mkdir -p "$dir"
 printf 'name: probe\non: push\njobs:\n  a:\n    steps:\n      - run: rustup default stable\n' > "$dir/probe.yml"
 run_gate "$t"
-if printf '%s\n' "$out" | grep -q 'workflow path with a newline in its name was not scanned'; then
+if grep -q 'workflow path with a newline in its name was not scanned' <<<"$out"; then
   ok 'newline dir: the workflow is refused by name'
 else
   bad 'newline dir: no refusal naming the workflow'
 fi
-if printf '%s\n' "$out" | grep -q 'toolchain:.*input(s)'; then
+if grep -q 'toolchain:.*input(s)' <<<"$out"; then
   bad 'newline dir: a forged toolchain: hit was parsed from the split line'
 else
   ok 'newline dir: no forged hit from the split path'
 fi
-if printf '%s\n' "$out" | grep -q 'toolchain input scan not evaluated'; then
+if grep -q 'toolchain input scan not evaluated' <<<"$out"; then
   ok 'newline dir: the scan reports itself not evaluated (fail-closed)'
 else
   bad 'newline dir: the scan did not report itself not evaluated'
@@ -1165,7 +1165,7 @@ if [ "$n" -eq 4 ]; then
 else
   bad "unreadable src: expected 4 scan-error lines, got $n"
 fi
-if printf '%s\n' "$out" | grep -qF 'partial tree: frp-core/src/zz_broken.rs is missing'; then
+if grep -qF 'partial tree: frp-core/src/zz_broken.rs is missing' <<<"$out"; then
   ok 'unreadable src: the doc-figures block reports it as a partial tree (site 4)'
 else
   bad 'unreadable src: unsafe_counts dropped the broken path (site 4)'
@@ -1191,7 +1191,7 @@ for site in 1 2 3 4; do
   if [ "$site" -eq 4 ]; then
     # Site 4 emits no `scan error:` line (it raises out of the whole block), so
     # its revert is pinned by the partial-tree row instead of the count.
-    if printf '%s\n' "$out" | grep -qF 'partial tree: frp-core/src/zz_broken.rs is missing'; then
+    if grep -qF 'partial tree: frp-core/src/zz_broken.rs is missing' <<<"$out"; then
       bad "unreadable src: site $site reverted but the partial-tree row survived"
     else
       ok "unreadable src: site $site revert drops the partial-tree row (check has teeth)"
@@ -1220,7 +1220,7 @@ printf '%s\n' 'scenario 5: the archive exit-3 row is absent when the scan succee
 tree clean-archive
 t=$TREE
 run_gate "$t"
-if printf '%s\n' "$out" | grep -qF '  FAIL  archive path scan failed'; then
+if grep -qF '  FAIL  archive path scan failed' <<<"$out"; then
   bad 'clean archive scan: the archive exit-3 row was printed anyway'
 else
   ok 'clean archive scan: no archive exit-3 row'
@@ -1248,7 +1248,7 @@ printf '#!/bin/sh\n:\n' > "$t/scripts/tests/not-rust.sh"
 printf 'fn t() {}\n' > "$t/frp-core/tests/it.rs"
 printf 'fn u() {}\n' > "$t/frp-vnet/tests/deep/nested.rs"
 run_gate "$t"
-if printf '%s\n' "$out" | grep -qF 'integration test dirs: 2'; then
+if grep -qF 'integration test dirs: 2' <<<"$out"; then
   ok 'integration test dirs: 2 (scripts/tests dropped; nested .rs counted)'
 else
   bad "integration test dirs: expected 2, got $(printf '%s\n' "$out" | grep -F 'integration test dirs' || echo none)"
@@ -1273,14 +1273,14 @@ t=$TREE
 rm -f "$t/frp-vnet/src/lib.rs"
 ln "$t/frp-core/src/lib.rs" "$t/frp-vnet/src/alias.rs" || bad 'aliased root: cannot hard-link the alias'
 run_gate "$t"
-if printf '%s\n' "$out" | grep -qF 'frp-vnet/src has no .rs files'; then
+if grep -qF 'frp-vnet/src has no .rs files' <<<"$out"; then
   bad 'aliased root: the crate-root row fired although the directory holds a .rs alias'
 else
   ok 'aliased root: the crate-root row is suppressed (the increment precedes the dedupe continue)'
 fi
 if mut_npresent "$t"; then
   run_gate "$t"
-  if printf '%s\n' "$out" | grep -qF 'frp-vnet/src has no .rs files'; then
+  if grep -qF 'frp-vnet/src has no .rs files' <<<"$out"; then
     ok 'aliased root: moving the increment past the dedupe re-raises the row (check has teeth)'
   else
     bad 'aliased root: the increment-after-dedupe mutation did not re-raise the row'
@@ -1319,7 +1319,7 @@ else
   # Enter at the **tail** of the chain: `l0` points straight at this harness, so
   # running it would re-run the whole suite instead of traversing 41 links.
   out=$(bash "$entry" 2>&1); rc=$?
-  if [ "$rc" -eq 126 ] && printf '%s\n' "$out" | grep -qF 'Too many levels of symbolic links'; then
+  if [ "$rc" -eq 126 ] && grep -qF 'Too many levels of symbolic links' <<<"$out"; then
     ok 'symlink chain: 41 hops is refused by the kernel (rc 126, ELOOP) — the in-script bound is unreachable'
   else
     bad "symlink chain: expected the kernel refusal (rc 126 + ELOOP), got rc=$rc, first line: $(printf '%s' "$out" | head -1)"
@@ -1353,7 +1353,7 @@ if [ "$rc" -eq 1 ]; then
 else
   bad "unreadable script under test: expected rc 1, got $rc"
 fi
-if printf '%s\n' "$out" | grep -qF 'fixture setup: new_tree'; then
+if grep -qF 'fixture setup: new_tree' <<<"$out"; then
   ok 'unreadable script under test: the failure names the setup step'
 else
   bad "unreadable script under test: no setup FAIL row — the checks below it would go vacuous-green: $(printf '%s' "$out" | head -3)"
@@ -1395,17 +1395,17 @@ unreadable_dir_tree walkerr
 t=$TREE
 run_gate "$t"
 chmod 700 "$t/frp-vnet/src/hidden"
-if printf '%s\n' "$out" | grep -qF 'has no .rs files'; then
+if grep -qF 'has no .rs files' <<<"$out"; then
   bad 'walk error: the crate is accused of holding no .rs files although the walk reported an unreadable directory'
 else
   ok 'walk error: no "no .rs files" accusation while the crate walk reported an error'
 fi
-if printf '%s\n' "$out" | grep -qF 'walk error: '; then
+if grep -qF 'walk error: ' <<<"$out"; then
   ok 'walk error: the unreadable directory is named in a walk error row'
 else
   bad 'walk error: no "walk error:" row for the unreadable directory'
 fi
-if printf '%s\n' "$out" | grep -qF 'doc figures not evaluated — the walk reported errors (exit 2)'; then
+if grep -qF 'doc figures not evaluated — the walk reported errors (exit 2)' <<<"$out"; then
   ok 'walk error: the doc-figures row reports the walk error (exit 2)'
 else
   bad 'walk error: the doc-figures row does not report the walk error'
@@ -1416,7 +1416,7 @@ for shape in b c; do
   if mut_walkerr "$t" "$shape"; then
     run_gate "$t"
     chmod 700 "$t/frp-vnet/src/hidden"
-    if printf '%s\n' "$out" | grep -qF 'has no .rs files'; then
+    if grep -qF 'has no .rs files' <<<"$out"; then
       ok "walk error ($shape): the guard mutant re-raises the false accusation (check has teeth)"
     else
       bad "walk error ($shape): the mutant did not re-raise the accusation — the check would be vacuous"
@@ -1475,6 +1475,305 @@ if mut_prefix "$t"; then
   fi
 else
   bad 'containment: mut_prefix failed to apply — anchor missing, the check would be vacuous'
+fi
+
+# mut_backstop <tree> <anchored|embedded> — force the internal FAIL backstop at
+# the end of the run to be reached with a capture larger than a pipe buffer
+# whose first line either is the anchored `  FAIL  ` prefix (`anchored`) or only
+# contains the same marker text mid-line (`embedded`). The mutation resets
+# `fail` and replaces the four captured inputs, so the backstop's anchor alone
+# decides the exit status — which is what makes the two cases a pair: an anchor
+# weakened to `.` would trip on `embedded` and turn that check red. The anchor
+# count is asserted: a refactor that moves the backstop fails the mutation
+# loudly instead of leaving the check vacuous. The payload is built by
+# `python3 -c` inside the tree's script so the fixture does not need a 70 KB
+# literal in this file.
+mut_backstop() {
+  python3 -B - "$1" "$2" <<'PY'
+import sys
+
+path = sys.argv[1] + "/scripts/repo-health.sh"
+kind = sys.argv[2]
+with open(path, "r", encoding="utf8") as f:
+    text = f.read()
+anchor = ('if [ "$fail" -eq 0 ]; then\n'
+          '  for captured in "${unsafe_misses:-}" "${index_misses:-}" '
+          '"${path_report:-}" "${doc_claims:-}"; do\n')
+if kind == "anchored":
+    payload = ('print("  FAIL  synthetic: a gate printed FAIL but the run '
+               'would exit 0"); print("x" * 70000)')
+elif kind == "embedded":
+    payload = ('print("x  FAIL  inside a witness line"); '
+               'print("y" * 70000)')
+else:
+    sys.exit(2)
+replace = (
+    'fail=0\n'
+    "payload=$(python3 -B -c '" + payload + "')\n"
+    'if [ "$fail" -eq 0 ]; then\n'
+    '  for captured in "$payload"; do\n'
+)
+if text.count(anchor) != 1:
+    sys.exit(1)
+with open(path, "w", encoding="utf8") as f:
+    f.write(text.replace(anchor, replace))
+PY
+}
+
+# mut_lint_only <tree> — make the pipefail-grep lint the only thing that can set
+# `fail` in the copy. A fixture tree is red for unrelated reasons (missing
+# Cargo.toml, README, vendor stubs), so its exit status says nothing about this
+# section; the mutation resets the flag immediately before the lint's heading
+# and empties the captured inputs the internal-FAIL backstop reads, since a
+# red gate's own output would otherwise trip the backstop after the reset. Both
+# anchors are asserted: a moved section fails the mutation loudly instead of
+# leaving the check vacuous.
+mut_lint_only() {
+  python3 -B - "$1" <<'PY'
+import sys
+
+path = sys.argv[1] + "/scripts/repo-health.sh"
+with open(path, "r", encoding="utf8") as f:
+    text = f.read()
+head = 'hdr "Pipefail-safe grep pipelines"\n'
+captures = ('for captured in "${unsafe_misses:-}" "${index_misses:-}" '
+            '"${path_report:-}" "${doc_claims:-}"; do')
+if text.count(head) != 1 or text.count(captures) != 1:
+    sys.exit(1)
+text = text.replace(head, 'fail=0\n' + head)
+text = text.replace(captures, 'for captured in ""; do')
+with open(path, "w", encoding="utf8") as f:
+    f.write(text)
+PY
+}
+
+# mut_lint_drop_verdict <tree> — delete the `fail=1` the lint's hit branch sets,
+# leaving its FAIL line in the output. This is the counterfactual half of
+# scenario 13: the same planted violation must then exit 0, which pins the
+# exit status to that one assignment instead of to the rest of the tree.
+mut_lint_drop_verdict() {
+  python3 -B - "$1" <<'PY'
+import sys
+
+path = sys.argv[1] + "/scripts/repo-health.sh"
+with open(path, "r", encoding="utf8") as f:
+    text = f.read()
+branch = '    elif [ -n "$pipe_hits" ]; then\n'
+if text.count(branch) != 1:
+    sys.exit(1)
+at = text.index(branch)
+hit = '\n      fail=1\n'
+rest = text[at:]
+if rest.count(hit) < 1:
+    sys.exit(1)
+with open(path, "w", encoding="utf8") as f:
+    f.write(text[:at] + rest.replace(hit, '\n', 1))
+PY
+}
+
+# --- scenario 12: the internal FAIL backstop survives a >pipe-buffer capture ---
+# `if [ "$fail" -eq 0 ]` at the end of the run is the last line of defence: it
+# refuses to exit 0 while a captured gate output still contains a `  FAIL  ` row.
+# The old spelling `printf '%s\n' "$captured" | grep -q '^  FAIL  '` is itself a
+# SIGPIPE race — on a match in the first pipe buffer grep exits at once, printf
+# dies of SIGPIPE (141), and under `pipefail` the `if` reads false, so a run that
+# printed a FAIL row still ends `RESULT: invariants hold` at rc 0. The mutation
+# replaces the four captured inputs with a 70000-byte payload whose first line is
+# the anchored FAIL prefix and forces `fail=0`, so the plumbing alone decides the
+# verdict. On the base script this fixture measured rc 0 with the failure line in
+# plain sight; on the fixed one the here-string delivers the whole capture and the
+# backstop trips. The second tree is the negative half of that anchor: the same
+# marker text inside a line (`x  FAIL  inside a witness line`) must not trip, so
+# weakening `^  FAIL  ` to `.` reds there while the first tree stays green.
+hdr
+printf '%s\n' 'scenario 12: the internal FAIL backstop survives a >pipe-buffer capture'
+tree backstop
+t=$TREE
+if mut_backstop "$t" anchored; then
+  run_gate "$t"
+  if [ "$rc" -eq 1 ]; then
+    ok 'backstop: a 70000-byte capture starting `  FAIL  ` cannot be lost (rc 1)'
+  else
+    bad "backstop: rc $rc — the match was lost and the run would exit 0 (want 1)"
+  fi
+  if [ "$(out_count '  FAIL  internal: a gate printed FAIL but the run would exit 0')" -eq 1 ]; then
+    ok 'backstop: the internal FAIL row is printed exactly once'
+  else
+    bad 'backstop: the internal FAIL row is missing or duplicated'
+  fi
+  if grep -qF 'RESULT: FAILURES above' <<<"$out"; then
+    ok 'backstop: the run ends with the failure summary, not `invariants hold`'
+  else
+    bad 'backstop: the run ended without the failure summary'
+  fi
+else
+  bad 'backstop: mut_backstop failed to apply — anchor missing, the check would be vacuous'
+fi
+
+# The pair's other half: the same marker text *inside* a line is not a failure
+# line. A capture that merely quotes witness text (`x  FAIL  inside a witness
+# line`) must pass, so weakening the anchor from `^  FAIL  ` to `.` reds here
+# while the positive case above stays green.
+tree backstop-neg
+t=$TREE
+if mut_backstop "$t" embedded; then
+  run_gate "$t"
+  if [ "$rc" -eq 0 ]; then
+    ok 'backstop: a FAIL marker that does not start a line is not a failure (rc 0)'
+  else
+    bad "backstop: rc $rc — the anchor matched text inside a line (want 0)"
+  fi
+  if [ "$(out_count '  FAIL  internal')" -eq 0 ]; then
+    ok 'backstop: an embedded marker produces no internal FAIL row'
+  else
+    bad 'backstop: an embedded marker produced the internal FAIL row'
+  fi
+else
+  bad 'backstop: mut_backstop (embedded) failed to apply — anchor missing'
+fi
+
+# --- scenario 13: the pipefail-grep lint has teeth ----------------------------
+# The lint must refuse a script that sends captured output into `grep -q` under
+# `set -o pipefail` — the shape that produced the false green this round fixes.
+# The fixture script carries two live pipelines (quiet and non-quiet) and a
+# comment that quotes the shape. Only the live quiet pipeline may be reported,
+# at its own line; the comment is not code and the non-quiet grep has no early
+# exit. The workflow covers both step spellings: a plain `run:` key under
+# `- name:` and the compact list item (`- run: |`, `- run: echo …`), plus the
+# two controls that keep the step boundary honest — a compact item without
+# `shell: bash` that follows a bash step must not inherit it, and a `- uses:`
+# item whose text quotes the shape is not a run line. The `gr''ep` split below
+# keeps this harness's own source from carrying the shape the lint looks for.
+hdr
+printf '%s\n' 'scenario 13: a script writing into grep -q under pipefail is refused'
+tree pipefail-grep
+t=$TREE
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'set -uo pipefail\n'
+  printf 'out=x\n'
+  printf 'printf %%s\\n "$out" | gr''ep -q x\n'
+  printf 'printf %%s\\n "$out" | gr''ep -v x\n'
+  printf '# printf %%s\\n "$out" | gr''ep -q x\n'
+  printf 'printf %%s\\n "$out" | /usr/bin/gr''ep -q x\n'
+  printf 'printf %%s\\n "$out" | command gr''ep -q x\n'
+  printf 'printf %%s\\n "$out" | \\gr''ep -q x\n'
+  printf 'printf %%s\\n "$out" | "gr''ep" -q x\n'
+  printf 'printf %%s\\n "$out" | gr''ep "$out" -q\n'
+} > "$t/scripts/bad-pipe.sh" || bad 'pipefail-grep: cannot write the fixture script'
+{
+  printf 'name: shell-bash\n'
+  printf 'on: push\n'
+  printf 'jobs:\n'
+  printf '  t:\n'
+  printf '    runs-on: ubuntu-latest\n'
+  printf '    steps:\n'
+  printf '      - name: bash step\n'
+  printf '        shell: bash\n'
+  printf '        run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '      - name: sh step\n'
+  printf '        shell: sh\n'
+  printf '        run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '      - uses: actions/checkout@v4  # run: echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+  printf '      - run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+  printf '      - run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '      - run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '        shell: sh\n'
+  printf '      - run: echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+  printf '      - run: >\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+} > "$t/.github/workflows/shell-bash.yml" || bad 'pipefail-grep: cannot write the workflow'
+# A fixture tree cannot be green, so its exit status alone says nothing about
+# this lint (round-19 F4: the assertion used to be `rc == 1`, which every tree
+# satisfies). `mut_lint_only` isolates the section, and the counterfactual below
+# proves the status follows the lint's own `fail=1`.
+if mut_lint_only "$t"; then
+  run_gate "$t"
+  if [ "$rc" -eq 1 ]; then
+    ok 'pipefail-grep: the lint decides the exit status (rc 1)'
+  else
+    bad "pipefail-grep: rc $rc — the lint did not set the verdict (want 1)"
+  fi
+  if [ "$(out_count '  FAIL  internal')" -eq 0 ]; then
+    ok 'pipefail-grep: the verdict comes from the lint, not the internal-FAIL backstop'
+  else
+    bad 'pipefail-grep: the run red for some other gate, so the verdict above proves nothing'
+  fi
+  for pair in 4:plain 7:path-prefix 8:command-prefix 9:backslash 10:quoted 11:flag-after-pattern; do
+    lineno=${pair%%:*}
+    spelling=${pair#*:}
+    if [ "$(out_count "scripts/bad-pipe.sh:$lineno")" -eq 1 ]; then
+      ok "pipefail-grep: the lint names the $spelling spelling at file:line"
+    else
+      bad "pipefail-grep: the lint did not name scripts/bad-pipe.sh:$lineno ($spelling)"
+    fi
+  done
+  if [ "$(out_count 'scripts/bad-pipe.sh:5')" -eq 0 ] &&
+     [ "$(out_count 'scripts/bad-pipe.sh:6')" -eq 0 ]; then
+    ok 'pipefail-grep: non-quiet grep and comment lines are not flagged'
+  else
+    bad 'pipefail-grep: a non-quiet or comment line was flagged'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:10')" -eq 1 ]; then
+    ok 'pipefail-grep: a `shell: bash` run block is scanned (the runner adds -eo pipefail)'
+  else
+    bad 'pipefail-grep: the lint did not name the `shell: bash` step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:14')" -eq 0 ]; then
+    ok 'pipefail-grep: a `shell: sh` step does not set pipefail and is not flagged'
+  else
+    bad 'pipefail-grep: the lint flagged a `shell: sh` step'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:18')" -eq 1 ]; then
+    ok 'pipefail-grep: a compact `- run: |` step with shell: bash is scanned'
+  else
+    bad 'pipefail-grep: the lint did not name the compact `- run: |` step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:25')" -eq 1 ]; then
+    ok 'pipefail-grep: a compact single-line `- run: cmd` step with shell: bash is scanned'
+  else
+    bad 'pipefail-grep: the lint did not name the compact single-line run step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:28')" -eq 1 ]; then
+    ok 'pipefail-grep: a compact folded `- run: >` step with shell: bash is scanned'
+  else
+    bad 'pipefail-grep: the lint did not name the compact folded run step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:15')" -eq 0 ] &&
+     [ "$(out_count '.github/workflows/shell-bash.yml:21')" -eq 0 ] &&
+     [ "$(out_count '.github/workflows/shell-bash.yml:23')" -eq 0 ]; then
+    ok 'pipefail-grep: a uses: item and compact steps without shell: bash are not flagged'
+  else
+    bad 'pipefail-grep: a control line was flagged (uses item, no-shell compact step, or compact sh step)'
+  fi
+  rm -rf "$tmp/pipefail-grep-mut"
+  cp -R "$t" "$tmp/pipefail-grep-mut"
+  if mut_lint_drop_verdict "$tmp/pipefail-grep-mut"; then
+    run_gate "$tmp/pipefail-grep-mut"
+    if [ "$rc" -eq 0 ]; then
+      ok 'pipefail-grep: mutation — without the verdict the same plant exits 0'
+    else
+      bad "pipefail-grep: mutation — rc $rc; the status does not come from the lint's fail=1"
+    fi
+    if [ "$(out_count 'scripts/bad-pipe.sh:4')" -eq 1 ]; then
+      ok 'pipefail-grep: mutation — the hit is still printed, only the verdict was removed'
+    else
+      bad 'pipefail-grep: mutation — the hit line vanished, so the counterfactual proves nothing'
+    fi
+  else
+    bad 'pipefail-grep: mut_lint_drop_verdict failed to apply — anchor missing'
+  fi
+else
+  bad 'pipefail-grep: mut_lint_only failed to apply — anchor missing, the check would be vacuous'
 fi
 
 # ---------------------------------------------------------------- summary

@@ -220,12 +220,14 @@ fails=0
 # alone were *not* sufficient either (R3-1): a floor above `9223372036854775807`
 # is unparseable as an integer, so the below-floor test is an ordered comparison
 # of digit strings and such a floor is a below-floor failure, not a status-2 skip.
-MIN_CHECKS=40
+MIN_CHECKS=42
 # The ordered assertion anchors, one per `ok`/`bad` call in scenario order.
 # Dynamic parts (pids, elapsed seconds) are matched as substrings, so each entry
 # is the stable prefix/skeleton of the assertion it pins.
 SHAPE=(
   'pgrep -x frps sees synthetic server pid'
+  'an empty pid is never "seen"'
+  'a pid the census lists still counts as "seen"'
   'clean run: assert_no_strays returned 0'
   'baseline server survived'
   'out-of-tree peer survived'
@@ -371,7 +373,7 @@ enforce_shape() {
 SCEN2_REGION_SHA='672f7e60063731363e7b1583a7f415cee46b5c2fc2710f82792df75f9cb18886'
 SCEN10_REGION_SHA='ea91a0e4130e297ac9a43d0ab72b3dbf6257fb3e4fb739f1ec813680e72fd421'
 SCEN12_REGION_SHA='6742cb4ea68f2ecb9baa13910fd0ba250507e44368935085711b4cd68d8fa159'
-SCEN13_REGION_SHA='071ade36c23aa45df0908f633a3e2f9686574fd672c9d83796526bdf0db24a67'
+SCEN13_REGION_SHA='a9003284ef29748d27d6b76e0134d9616c25c256192f16b8763498fef5840838'
 PINNED_REGIONS='scenario-2 scenario-10 scenario-12 scenario-13'
 PINNED_REGION_COUNT=4
 # Known vectors the hashing tool must reproduce, and the path the read-path
@@ -1028,6 +1030,23 @@ spawn_fake() {
   printf '%s' "$!"
 }
 
+# pid_matches <pid> <census-output> — does that census list exactly that pid?
+# An empty pid must never read as "seen": `grep -qx "" <<<"$census"` matches the
+# empty line a here-string always carries, so a spawn that failed (or a `pgrep`
+# that printed nothing) would satisfy a bare `grep -qx "$pid"` and the wait loop
+# would fall through at once. `printf '%s' "$!"` from `spawn_fake` is not
+# validated, so the refusal lives here, where both wait sites route through it.
+pid_matches() {
+  local pid=$1 census=$2
+  [ -n "$pid" ] || return 1
+  grep -qx "$pid" <<<"$census"
+}
+
+# pid_seen <pid> — is that pid visible to `pgrep -x frps` yet?
+pid_seen() {
+  pid_matches "$1" "$(pgrep -x frps 2>/dev/null)"
+}
+
 # wait_exec <pid> — synchronise on the child's own image before signalling it: a
 # child signalled before it has exec'd may not have taken the signal yet, so
 # scenario 5 waits here before `cleanup_pids` sends SIGTERM. The pre-fix shape
@@ -1111,7 +1130,7 @@ selfpid=$(spawn_fake "$selfdir")
 LIVE="$LIVE $selfpid"
 seen=false
 for _ in $(seq 1 50); do
-  if pgrep -x frps 2>/dev/null | grep -qx "$selfpid"; then seen=true; break; fi
+  if pid_seen "$selfpid"; then seen=true; break; fi
   sleep 0.1
 done
 hdr 'fixture setup: a symlink named `frps` is visible to `pgrep -x frps`'
@@ -1119,6 +1138,22 @@ if $seen; then
   ok "pgrep -x frps sees synthetic server pid $selfpid"
 else
   bad "pgrep -x frps does not see synthetic server pid $selfpid — the fixture would be vacuous"
+fi
+# The predicate both waits above and the scenario-13 wait below call: an empty
+# pid must not count as seen, or a spawn failure would satisfy the wait and the
+# fixture would proceed against a process that does not exist. The second check
+# keeps the refusal from degenerating into "never seen". These call the pure
+# predicate directly: the live synthetic is still up here, so `pid_seen ""`
+# would be testing against a non-empty pgrep listing rather than the empty case.
+if pid_matches "" ""; then
+  bad 'an empty pid counts as "seen" — a failed spawn would satisfy a wait'
+else
+  ok 'an empty pid is never "seen"'
+fi
+if pid_matches 123 $'123\n456'; then
+  ok 'a pid the census lists still counts as "seen"'
+else
+  bad 'a listed pid is not "seen" — the empty-pid refusal broke the predicate'
 fi
 kill -9 "$selfpid" 2>/dev/null || true
 
@@ -1513,7 +1548,7 @@ victim13=$(spawn_fake "$td13/scenario")
 LIVE="$LIVE $victim13"
 # The fake `ps` is only observable if `pgrep` really lists the victim first.
 for _ in $(seq 1 50); do
-  pgrep -x frps 2>/dev/null | grep -qx "$victim13" && break
+  pid_seen "$victim13" && break
   sleep 0.1
 done
 fakebin13="$WORK/fakebin13"

@@ -118,7 +118,7 @@ jobs:
           # The harness colors the ` RESULTS:` line even when redirected, so the
           # escapes are stripped before the summary is matched.
           plain=$(sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$out")
-          if ! printf '%s\n' "$plain" | grep -q ' RESULTS: 1 passed, 0 failed'; then
+          if ! grep -q ' RESULTS: 1 passed, 0 failed' <<<"$plain"; then
             echo "::error::a matching --test must run exactly the one selected scenario"
             exit 1
           fi
@@ -136,11 +136,11 @@ jobs:
             exit 1
           fi
           plain=$(sed $'s/\033\\[[0-9;]*[A-Za-z]//g' "$out")
-          if printf '%s\n' "$plain" | grep -q 'matched no scenario'; then
+          if grep -q 'matched no scenario' <<<"$plain"; then
             echo "::error::--debug reported an unmatched selector for a name that ran"
             exit 1
           fi
-          if ! printf '%s\n' "$plain" | grep -q ' RESULTS: 1 passed, 0 failed'; then
+          if ! grep -q ' RESULTS: 1 passed, 0 failed' <<<"$plain"; then
             echo "::error::--debug did not report the one selected scenario as passed"
             exit 1
           fi

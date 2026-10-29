@@ -12179,7 +12179,8 @@ section; ledger now **24 open / 104 closed**.**
   launched after it (generation G) was meant to take this port`), and `echo_port="$proxy_port"` — a spurious PASS before
   — now fails closed. The Done-when's "green after" half is the ordinary scenario, not the forced edit: the forced line bypasses the picker, so that run stays red by design (fail-closed in about 1 s, naming the holder), and the green half holds because no unmodified scenario can be handed a port the ledger already gave out. The new suite `scripts/tests/compat-port-ownership.sh` scores ownership, both collisions, the
   foreign listener and the matrix `wait_for_listen` cases (51 checks in round 1 → **61** at this head, `MIN_CHECKS=61`,
-  sha256 `b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9`), gated by the `Port ownership — fixture
+  sha256 `b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9` at this head; PR #554's
+  sweep rewrote matcher lines inside the suite and re-pinned it to `c207a9c1988e894aff57efd8407d7bc46aa05713a63e39460fe18bd71b575a7f`), gated by the `Port ownership — fixture
   checks (compat harness readiness)` step (`.github/workflows/ci.yml:587`, `guard_exact`/`guard_floor=61` at
   `:631-636`); `scripts/lib/compat-stray-guard.sh` and its 40-check suite are unweakened (pinned regions 4/4, canary
   live). The first CI run caught a real defect in the fix — the harness's `GO_FRP_DIR` recalculation overwrote the
@@ -12671,7 +12672,7 @@ other.
   Done-when: the spawn-based processor leaves the experimental gate, or the wiring moves to
   a stable API and the feature reference is removed.
 
-- [ ] **Guard suites still match captured output through a pipe, so `pipefail` can fake a miss — or a green run.**
+- [x] **Guard suites still match captured output through a pipe, so `pipefail` can fake a miss — or a green run.**
   Evidence: the `expect_red()` form `printf '%s\n' "$out" | grep -Fq "$needle"` under
   `set -o pipefail` reports 141 when the reader closes the pipe before the writer finishes,
   so a match can read as a miss. PR #553 fixed that one site (`scripts/tests/docs-go-column.sh`,
@@ -12684,6 +12685,9 @@ other.
   `scripts/tests/rss-soak-run-dir.sh:228`, and three in `.github/workflows/compat.yml` (`:139`).
   `scripts/tests/rss-soak-run-dir.sh:44-51` already documents this hazard and uses the
   here-string remedy, so the fix per site is known; what is missing is the sweep and a pin.
+  Closed by PR #554: 52 live pipelines in 14 files now use a here-string, `repo-health.sh`
+  lints the shape on every run (workflow `run:` blocks included), and a 70,000-byte fixture
+  proves the old form would have reported green.
   Done-when: every writer-then-match in a `pipefail` script uses a here-string (or a temp
   file), starting with `scripts/repo-health.sh:2591`, and a fixture feeds one of them a
   payload large enough to have failed before.

@@ -7919,7 +7919,7 @@ finally:
     s.close()
 " 2>/dev/null || echo "BANNER_ERROR")
 
-    if echo "$banner" | grep -q "^SSH-"; then
+    if grep -q "^SSH-" <<<"$banner"; then
         log "SSH banner: $(echo "$banner" | head -1)"
         pass_test "$name"
     else
@@ -8047,7 +8047,7 @@ finally:
     s.close()
 " 2>/dev/null || echo "BANNER_ERROR")
 
-    if echo "$banner" | grep -q "^SSH-"; then
+    if grep -q "^SSH-" <<<"$banner"; then
         log "Go frps SSH banner: $(echo "$banner" | head -1)"
         pass_test "$name"
     else

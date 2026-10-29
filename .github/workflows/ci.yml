@@ -164,7 +164,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.$$.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=a0e0d18d50a670680c682c34b469add850cc6438269b118c13e14ca22dab8f39
+          guard_pin=70f7329c18be220cf6541ce7853d8d4aadea9bd070818cd5565ccf433e9b7cf3
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -172,8 +172,8 @@ jobs:
           # independently anchored literal has to move too. The floor is
           # asserted on `guard_exact` (a floor on `guard_ok` would be
           # dead once the two are equal).
-          guard_exact=32
-          guard_floor=32
+          guard_exact=54
+          guard_floor=54
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -245,7 +245,7 @@ jobs:
           # F3/F4 (adversarial round 5): the suite must *say* it verified the
           # substance pins, and name the regions in order. The in-file checks
           # were previously CI-invisible — `trap - EXIT` or `elif false` printed
-          # the 32 `ok` lines and the RESULT line and exited 0 — and pinning only
+          # the 50 `ok` lines and the RESULT line and exited 0 — and pinning only
           # the total let a coordinated marker+hash+list edit drop a region
           # silently. These two literals are the only record of the expected set
           # outside the guarded file, so any of those leaves one of them absent
@@ -314,11 +314,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::repo-health fixture checks did not report 32 checks, verified pins and a live enforcer canary"
-            echo "::error::scripts/tests/repo-health-fixtures.sh must print 32 '  ok' lines, end with 'RESULT: 32 fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            echo "::error::repo-health fixture checks did not report $guard_exact checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/repo-health-fixtures.sh must print $guard_exact '  ok' lines, end with 'RESULT: '$guard_exact' fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "repo-health fixture checks ok: 32 checks hold, pins verified 2/2, enforcer canary live"
+          echo "repo-health fixture checks ok: $guard_exact checks hold, pins verified 2/2, enforcer canary live"
       # The compat harness's stray-process guard, driven against synthetic
       # `frps`/`frpc` peers (no Go toolchain, no compat run): it pins that the
       # guard's match is the scratch directory *and* the process name — a
@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.$$.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=cda2c283d4e2b30fa839acfaaa7778d5f9f284159d8358e75abb15a00762589b
+          guard_pin=200e8a514663226022d79917e65cf81630acc8825326b44a10d5068dc44eca03
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -424,8 +424,8 @@ jobs:
           # independently anchored literal has to move too. The floor is
           # asserted on `guard_exact` (a floor on `guard_ok` would be
           # dead once the two are equal).
-          guard_exact=40
-          guard_floor=40
+          guard_exact=42
+          guard_floor=42
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -556,11 +556,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::compat stray-guard fixture checks did not report 40 checks, verified pins and a live enforcer canary"
-            echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            echo "::error::compat stray-guard fixture checks did not report $guard_exact checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/compat-stray-guard.sh must print $guard_exact '  ok' lines, end with 'RESULT: '$guard_exact' fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
+          echo "compat stray-guard fixture checks ok: $guard_exact checks hold, pins verified 4/4, enforcer canary live"
       # The compat harness's port ledger and LISTEN-socket ownership checks,
       # driven against real python3 listeners, a stripped `PATH` and a fake `ss`,
       # plus the harness's own `--test` handling driven with four stub binaries
@@ -629,11 +629,11 @@ jobs:
           log="${TMPDIR:-/tmp}/frp-port-ownership-fixtures.$$.log"
           status=0
           guard_file=scripts/tests/compat-port-ownership.sh
-          guard_pin=b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9
+          guard_pin=c207a9c1988e894aff57efd8407d7bc46aa05713a63e39460fe18bd71b575a7f
           guard_exact=61
           guard_floor=61
           guard_lib=scripts/lib/compat-port-ownership.sh
-          guard_lib_pin=f431135d9ea9744249767404fb8969f24f44e87f2f4454b6541edb086be808f9
+          guard_lib_pin=5958ef64b4a1f158e55e75fa86dabbbcb8690f28cfe1143889bc766970cfa751
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -852,7 +852,7 @@ jobs:
           log=/tmp/frp-rss-soak-run-dir.$$.log
           status=0
           guard_file=scripts/tests/rss-soak-run-dir.sh
-          guard_pin=b3f59320f8242e1430f12e9dc464db90c09efe265da5e0b5edffa010c1c86210
+          guard_pin=339cefa2720a04583287110d0923ec97066e9b6ca5e1dfa284ad8b2e3ebc221c
           guard_exact=269
           guard_floor=269
           # Absolute, vector-proven hasher: `command -v sha256sum` honours a
@@ -962,7 +962,7 @@ jobs:
           log=/tmp/frp-large-functions-classifier.$$.log
           status=0
           guard_file=scripts/tests/large-functions-classifier.sh
-          guard_pin=d1c2b49d5afa18a0330a2dd5bfaf0567754a7e37c6bf8cd2950c4c73ecef8e6f
+          guard_pin=34dc87ad5da6b600817c7d41d2ede3149e702ab25f65cc680f4d7efaa5d98d04
           guard_lf_file=scripts/large-functions.sh
           guard_lf_pin=5ed5b05d08b5177844951f1ea2b1a546c87f5abf59c605bbfc0e601279467d48
           guard_exact=166
@@ -1564,7 +1564,7 @@ jobs:
           # run (review round 3, F3).
           unset AB_MD_CLASSIFIER AB_MD_MATRIX AB_MD_REMOTE AB_MD_SABOTAGE_CHILD
           guard_file=scripts/tests/ab-measurable-delta.sh
-          guard_pin=fe9828df381d8da90f3cb6437aa8f80b4dce0c2d4765753f484461a82166d9e4
+          guard_pin=a670793d7b28459a4a7f62d036cedab3554ca00fb89f3fb3426b9280f61d1f73
           guard_exact=53
           guard_floor=53
           guard_cls=scripts/ab-measurable-delta.sh
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=40adfc605b5a08b1fe3ba10a67abe0ac2c43c92f7ba7a04e0c4b1afa5ab10d68
+          guard_data_pin=eadf3c3cffd8c21f8d6ec6758aaa9234f50aefd6c02e7373acd26bfb5ae262cf
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
