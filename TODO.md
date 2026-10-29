@@ -12639,7 +12639,34 @@ other.
   21 diffs in a 102-case differential. Go frp v0.71.1 parses configs with
   `github.com/pelletier/go-toml/v2` v2.2.0, which rejects all four (probed against the
   release binary; `frpc verify -c` returns 0 on the Rust side and non-zero on the Go
-  side for such a file). No document that was valid under 0.8 changes meaning, and
-  multi-line CRLF is now preserved, which matches Go.
+  side for such a file). One 0.8-valid document does change value: a multi-line
+  string now keeps its `\r` (0.8 stripped it), which matches Go's parser. The
+  other diffs are acceptance-only: nothing valid under 0.8 is rejected.
   Done-when: either the loader rejects the four forms with a Go-style error, or the
   divergence is recorded as intentional leniency in `docs/go-frp-compat-audit.md`.
+
+- [ ] **The OTLP endpoint is used verbatim, so a documented base URL exports nothing.**
+  Evidence: `observability.otlp_endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT` reaches
+  `with_endpoint` unchanged, and opentelemetry-otlp 0.33 appends the `/v1/traces` signal
+  path only to its own env/default endpoints. A user who sets the documented base URL
+  (`http://collector:4318`) therefore POSTs to `/`, the collector answers 404, and — the
+  SDK's `internal-logs` feature being off — nothing is logged: spans vanish silently.
+  Measured during the PR #552 delta review (`POST / HTTP/1.1`, zero spans, no error).
+  Done-when: frp-rs appends the per-signal path when the configured value has no path, or
+  the trailing-path requirement is documented next to the config option and pinned by a test.
+
+- [ ] **The OTel provider is leaked and never flushed at shutdown.**
+  Evidence: `frp-core/src/logging.rs` `Box::leak`s the tracer provider on both wiring
+  branches and nothing calls `force_flush`/`shutdown`, so up to one batch interval
+  (5 s default) of spans is lost when the daemon exits; `frp-core/tests/otel_export.rs`
+  only observes its span because the test flushes explicitly.
+  Done-when: frps/frpc call `shutdown()` on the provider in their shutdown path and a test
+  shows a span recorded shortly before exit still reaches the endpoint.
+
+- [ ] **The `otel` fix rests on an `experimental_*` opentelemetry_sdk feature.**
+  Evidence: PR #552 builds `span_processor_with_async_runtime::BatchSpanProcessor` behind
+  `experimental_trace_batch_span_processor_with_async_runtime`. That feature is explicitly
+  semver-exempt upstream, so a lock bump inside 0.33.x may rename or drop it and break the
+  build (compile time, not runtime).
+  Done-when: the spawn-based processor leaves the experimental gate, or the wiring moves to
+  a stable API and the feature reference is removed.

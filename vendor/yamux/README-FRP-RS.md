@@ -388,10 +388,10 @@ difference, by file:
 
 | File | Changed lines | What |
 |------|---------------|------|
-| `Cargo.toml` | 19 | `crossbeam-queue = "0.3"` (body-pool patch); restored `[dev-dependencies.quickcheck]` + empty `[workspace]` (vendoring repair) |
+| `Cargo.toml` | 20 | `crossbeam-queue = "0.3"` (body-pool patch); restored `[dev-dependencies.quickcheck]` + empty `[workspace]` (vendoring repair) — 20 non-blank changed lines, 23 with blanks |
 | `src/connection.rs` | 245 | per-stream RST on inbound cap; exact outbound-ACK counter; threads the body pool into `Active`/`frame::Io` |
 | `src/connection/stream/flow_control.rs` | 210 | receive-window cap clamp; seed-RTT growth gate (`window_growth_gate_open`) |
-| `src/lib.rs` | 101 | `max_stream_receive_window` + setter; `window_growth_seed_rtt` + accessors, `WINDOW_GROWTH_SEED_RTT`, `Config::default()` seed; `web_time::Duration` import; `#[cfg(test)] impl Arbitrary for Config` (frp-rs addition, repair #3 above) |
+| `src/lib.rs` | 101 | `max_stream_receive_window` + setter; `window_growth_seed_rtt` + accessors, `WINDOW_GROWTH_SEED_RTT`, `Config::default()` seed; `web_time::Duration` import; clause additions inside upstream's `#[cfg(test)] impl Arbitrary for Config` (repair #3 above) |
 | `src/frame/io.rs` | 67 | pooled read/write bodies, `split_send_size` field, body return at `WriteState::Body` completion, pooled `ReadState::Body` init |
 | `src/connection/stream.rs` | 39 | body-pool field + `poll_write` reuse + `poll_read` return; test call site gains the pool (repair #2 above) |
 | `src/connection/closing.rs` | 8 | `#[cfg(test)]` only: its `frame::Io::new(...)` call gains the body-pool argument forced by the `Io::new` signature change — no behaviour change, not a separate patch |
