@@ -12179,7 +12179,8 @@ section; ledger now **24 open / 104 closed**.**
   launched after it (generation G) was meant to take this port`), and `echo_port="$proxy_port"` — a spurious PASS before
   — now fails closed. The Done-when's "green after" half is the ordinary scenario, not the forced edit: the forced line bypasses the picker, so that run stays red by design (fail-closed in about 1 s, naming the holder), and the green half holds because no unmodified scenario can be handed a port the ledger already gave out. The new suite `scripts/tests/compat-port-ownership.sh` scores ownership, both collisions, the
   foreign listener and the matrix `wait_for_listen` cases (51 checks in round 1 → **61** at this head, `MIN_CHECKS=61`,
-  sha256 `b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9`), gated by the `Port ownership — fixture
+  sha256 `b76f5188175a3c86f80804193ad5d33935bdd8874bf4928b807251b1b173c8b9` at this head; PR #554's
+  sweep rewrote matcher lines inside the suite and re-pinned it to `c207a9c1988e894aff57efd8407d7bc46aa05713a63e39460fe18bd71b575a7f`), gated by the `Port ownership — fixture
   checks (compat harness readiness)` step (`.github/workflows/ci.yml:587`, `guard_exact`/`guard_floor=61` at
   `:631-636`); `scripts/lib/compat-stray-guard.sh` and its 40-check suite are unweakened (pinned regions 4/4, canary
   live). The first CI run caught a real defect in the fix — the harness's `GO_FRP_DIR` recalculation overwrote the
