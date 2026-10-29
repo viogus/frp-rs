@@ -238,7 +238,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 |--------|-------|-------|
 | Async runtime | `tokio` | net, io-util, time, sync, macros, rt-multi-thread, signal |
 | Serialization | `serde` + `serde_json` | derive feature |
-| Config | `toml` | 0.8 (TOML); `.yaml`/`.yml`/`.json`/`.ini` via `yaml-rust2` 0.13 (`default-features = false`, Go-compatible YAML 1.1 scalar resolution) / `serde_json` — auto-detected by extension |
+| Config | `toml` | 1.1 (`toml` 1.1.8+spec-1.1.0); `.yaml`/`.yml`/`.json`/`.ini` via `yaml-rust2` 0.13 (`default-features = false`, Go-compatible YAML 1.1 scalar resolution) / `serde_json` — auto-detected by extension |
 | Test certs (dev) | `rcgen` | optional under `tls` feature, dev/tests only (LTO-GC'd out of shipped binaries) |
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
@@ -255,7 +255,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | OIDC/JWT | `jsonwebtoken` | |
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` | env-filter |
 | Error handling | `anyhow` + `thiserror` | |
-| Random | `rand` | 0.10 (0.8.7 remains in the lock only via the opt-in `otel` chain: opentelemetry_sdk → … → tonic → tower — third-party pins, latest releases) |
+| Random | `rand` | 0.10.3 direct; 0.9.5 remains in the lock via the opt-in `otel` chain (`opentelemetry_sdk` 0.33) and via `axum` 0.8 → `tokio-tungstenite` 0.29 → `tungstenite` — third-party pins, latest releases |
 | Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` | |
 
 **Removed and banned as direct dependencies** (do not reintroduce without approval):

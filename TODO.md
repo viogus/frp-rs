@@ -12620,3 +12620,14 @@ other.
   miss and (c) a vhost with `custom_404_page` decides whether the difference is the header set or
   only the layer that writes it; then either pin the observed Go bytes per path or record the
   divergence in `docs/go-frp-compat-audit.md`.
+
+- [ ] **`jsonwebtoken` is pinned below 11 until a `ring` backend exists.**
+  Evidence: 11.1.0 dropped the `ring` feature; its remaining backends are `aws-lc-rs`
+  (banned by the dependency policy) or `rust_crypto`, which re-imports `hmac`/`sha2`
+  and a second `rsa` (0.9.x) next to russh's `rsa 0.10.0-rc.18`. OIDC JWT verification
+  in `frp-core/src/auth.rs` therefore stays on 9.3.1, refreshed with the rest of the
+  workspace only within the 9.x line.
+  Done-when: one of (a) upstream restores a `ring` backend,
+  (b) the `aws-lc-rs` ban is revisited with a measured size/security argument, or
+  (c) OIDC verification is reimplemented directly on `ring` + the existing `rsa` crate
+  and `jsonwebtoken` is dropped.
