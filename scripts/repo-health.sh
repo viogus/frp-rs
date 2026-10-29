@@ -2591,10 +2591,14 @@ fi
 # pipefail **or** whose owning step declares `shell: bash`: GitHub runs that
 # predefined shell as `bash --noprofile --norc -eo pipefail` (a runner invocation
 # quoted in a comment in `.github/workflows/ci.yml` records the argv), so the
-# block has pipefail even without its own `set -o pipefail`. The step is read by
-# indentation: every `shell:` key between the step's list item and the next
-# dedent, at exactly the `run:` key's indent, so key order does not matter. A tree with no `.git` falls
-# back to walking `scripts/`.
+# block has pipefail even without its own `set -o pipefail`. Both step spellings
+# are read: the plain key under `- name:` and the compact list item (`- run: |`,
+# `- run: >-`, `- run: cmd`), whose other keys align with the `run` key after the
+# dash. The step is read by indentation: every `shell:` key between the step's
+# list item and the next dedent, at exactly the `run:` key's indent, so key order
+# does not matter; a compact item's own line is the step boundary, so a preceding
+# step's `shell: bash` cannot be inherited. A tree with no `.git` falls back to
+# walking `scripts/`.
 #
 # Non-goals, stated rather than silently skipped:
 #  * a wrapper or an assignment prefix — `xargs grep -q`, `env grep -q`,
@@ -2742,14 +2746,17 @@ def report(path, lineno, line):
 def step_declares_bash_shell(lines, at, base):
     # True if the step owning at declares shell: bash. A step is one YAML list
     # item; its keys sit at the indentation of the run: key (base) or deeper.
-    # Walk back to the line that starts the step (the list item, dedented past
-    # base) and forward to the line that dedents past it, then read every
-    # shell: key in that span. Key order inside the step therefore does not
-    # matter, and a line of shell text that happens to read shell: bash deeper
-    # inside the block scalar does not count: only a key at exactly base spaces
-    # is a key of the step.
+    # A compact `- run: ...` item puts the run key on the item line itself, so
+    # the step starts there: walking back would cross into the previous item and
+    # read its `shell: bash` as this step's. Otherwise walk back to the line that
+    # starts the step (the list item, dedented past base) and forward to the line
+    # that dedents past it, then read every shell: key in that span. Key order
+    # inside the step therefore does not matter, and a line of shell text that
+    # happens to read shell: bash deeper inside the block scalar does not count:
+    # only a key at exactly base spaces is a key of the step.
     start = at
-    while start > 0:
+    compact = re.match(r"^[ ]*-[ ]", lines[at]) is not None
+    while start > 0 and not compact:
         prev = lines[start - 1]
         ind = len(prev) - len(prev.lstrip(" "))
         if prev.strip() and ind < base:
@@ -2799,20 +2806,24 @@ for name in names:
         continue
     i = 0
     while i < len(lines):
-        key = re.match(r"^(\s*)run:[ \t]*[|>][-+]?[0-9]?[ \t]*(#.*)?$", lines[i])
+        # The run key may sit on the step's list-item line (`- run: |`,
+        # `- run: >-`, `- run: cmd`); base is then the run key's own column, so
+        # the step's other keys line up with it, not with the dash.
+        key = re.match(
+            r"^([ ]*)((?:-[ ]+)?)run:[ \t]*[|>][-+]?[0-9]?[ \t]*(#.*)?$", lines[i])
         if not key:
             # A single-line run: ... is scanned when it sets pipefail itself or
             # when its step declares shell: bash.
-            one = re.match(r"^(\s*)run:[ \t]*(.+)$", lines[i])
+            one = re.match(r"^([ ]*)((?:-[ ]+)?)run:[ \t]*(.+)$", lines[i])
             if one:
-                base = len(one.group(1))
-                if ("pipefail" in one.group(2)
+                base = len(one.group(1)) + len(one.group(2))
+                if ("pipefail" in one.group(3)
                         or step_declares_bash_shell(lines, i, base)) \
                         and violation(lines[i]):
                     report(path, i + 1, lines[i])
             i += 1
             continue
-        base = len(key.group(1))
+        base = len(key.group(1)) + len(key.group(2))
         block = [(i, lines[i])]
         j = i + 1
         while j < len(lines):

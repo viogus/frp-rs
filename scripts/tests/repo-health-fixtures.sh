@@ -88,7 +88,7 @@ set -uo pipefail
 # Pinning an ordered assertion list would need a second instrumented counter per
 # scenario, which this suite does not keep; the count is what can be pinned, and
 # that residual gap is recorded in the batch-E report.
-MIN_CHECKS=50
+MIN_CHECKS=54
 checks=0
 fail=0
 tmp=""
@@ -1638,8 +1638,12 @@ fi
 # The fixture script carries two live pipelines (quiet and non-quiet) and a
 # comment that quotes the shape. Only the live quiet pipeline may be reported,
 # at its own line; the comment is not code and the non-quiet grep has no early
-# exit. The `gr''ep` split below keeps this harness's own source from carrying
-# the shape the lint looks for.
+# exit. The workflow covers both step spellings: a plain `run:` key under
+# `- name:` and the compact list item (`- run: |`, `- run: echo …`), plus the
+# two controls that keep the step boundary honest — a compact item without
+# `shell: bash` that follows a bash step must not inherit it, and a `- uses:`
+# item whose text quotes the shape is not a run line. The `gr''ep` split below
+# keeps this harness's own source from carrying the shape the lint looks for.
 hdr
 printf '%s\n' 'scenario 13: a script writing into grep -q under pipefail is refused'
 tree pipefail-grep
@@ -1672,6 +1676,21 @@ t=$TREE
   printf '        shell: sh\n'
   printf '        run: |\n'
   printf '          echo x | gr''ep -q x\n'
+  printf '      - uses: actions/checkout@v4  # run: echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+  printf '      - run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+  printf '      - run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '      - run: |\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '        shell: sh\n'
+  printf '      - run: echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
+  printf '      - run: >\n'
+  printf '          echo x | gr''ep -q x\n'
+  printf '        shell: bash\n'
 } > "$t/.github/workflows/shell-bash.yml" || bad 'pipefail-grep: cannot write the workflow'
 # A fixture tree cannot be green, so its exit status alone says nothing about
 # this lint (round-19 F4: the assertion used to be `rc == 1`, which every tree
@@ -1713,6 +1732,28 @@ if mut_lint_only "$t"; then
     ok 'pipefail-grep: a `shell: sh` step does not set pipefail and is not flagged'
   else
     bad 'pipefail-grep: the lint flagged a `shell: sh` step'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:18')" -eq 1 ]; then
+    ok 'pipefail-grep: a compact `- run: |` step with shell: bash is scanned'
+  else
+    bad 'pipefail-grep: the lint did not name the compact `- run: |` step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:25')" -eq 1 ]; then
+    ok 'pipefail-grep: a compact single-line `- run: cmd` step with shell: bash is scanned'
+  else
+    bad 'pipefail-grep: the lint did not name the compact single-line run step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:28')" -eq 1 ]; then
+    ok 'pipefail-grep: a compact folded `- run: >` step with shell: bash is scanned'
+  else
+    bad 'pipefail-grep: the lint did not name the compact folded run step at file:line'
+  fi
+  if [ "$(out_count '.github/workflows/shell-bash.yml:15')" -eq 0 ] &&
+     [ "$(out_count '.github/workflows/shell-bash.yml:21')" -eq 0 ] &&
+     [ "$(out_count '.github/workflows/shell-bash.yml:23')" -eq 0 ]; then
+    ok 'pipefail-grep: a uses: item and compact steps without shell: bash are not flagged'
+  else
+    bad 'pipefail-grep: a control line was flagged (uses item, no-shell compact step, or compact sh step)'
   fi
   rm -rf "$tmp/pipefail-grep-mut"
   cp -R "$t" "$tmp/pipefail-grep-mut"
