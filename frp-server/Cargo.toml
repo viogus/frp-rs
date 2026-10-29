@@ -80,13 +80,13 @@ libc.workspace = true
 # dev-only, never compiled into the frps release binary.
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tempfile = "3"
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 axum = { workspace = true }
 jsonwebtoken = { workspace = true }
 bytes = { workspace = true }
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "nathole"

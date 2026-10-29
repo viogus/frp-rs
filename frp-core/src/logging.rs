@@ -644,6 +644,57 @@ pub fn init_tracing_otel(
     }
 }
 
+/// Build the OTLP/HTTP exporter, the batch span processor that drains it, and
+/// the [`opentelemetry_sdk::trace::SdkTracerProvider`] tying them together.
+///
+/// This is the whole outbound half of the `otel` feature; [`build_otel_layer`]
+/// only adds the `tracing` layer on top. It is `pub` + `#[doc(hidden)]` rather
+/// than `pub(crate)` so that `frp-core/tests/otel_export.rs` can drive the
+/// *production* wiring: an integration test is a separate crate, so a
+/// `pub(crate)` helper would be invisible to it and the test would have to
+/// rebuild the provider itself — exactly the copy that lets a wiring bug hide.
+#[cfg(feature = "otel")]
+#[doc(hidden)]
+pub fn build_otel_provider(
+    endpoint: &str,
+    service_name: &str,
+) -> Result<opentelemetry_sdk::trace::SdkTracerProvider, Box<dyn std::error::Error>> {
+    use opentelemetry::KeyValue;
+    use opentelemetry_otlp::WithExportConfig as _;
+    use opentelemetry_sdk::Resource;
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_http()
+        .with_endpoint(endpoint.to_string())
+        .build()?;
+    let resource = Resource::builder_empty()
+        .with_attributes(vec![KeyValue::new(
+            "service.name",
+            service_name.to_string(),
+        )])
+        .build();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        // The async-runtime batch processor, *not* `with_batch_exporter`: in
+        // 0.33 the latter picks the thread-based processor, which drives the
+        // exporter with `futures_executor::block_on` on a plain OS thread.
+        // The `hyper-client` OTLP exporter needs a tokio reactor, so that
+        // worker panics on its first export —
+        //   panicked at opentelemetry-http-0.33.1/src/lib.rs:330:13:
+        //   there is no reactor running, must be called from the context of a Tokio 1.x runtime
+        // — the thread dies and every span is silently dropped. This variant
+        // spawns the batch task on the ambient tokio runtime; both daemons call
+        // `init_tracing_otel` from inside `#[tokio::main]`.
+        .with_span_processor(
+            opentelemetry_sdk::trace::span_processor_with_async_runtime::BatchSpanProcessor::builder(
+                exporter,
+                opentelemetry_sdk::runtime::Tokio,
+            )
+            .build(),
+        )
+        .with_resource(resource)
+        .build();
+    Ok(provider)
+}
+
 #[cfg(feature = "otel")]
 pub fn build_otel_layer(
     endpoint: &str,
@@ -654,25 +705,12 @@ pub fn build_otel_layer(
             tracing_subscriber::Registry,
             opentelemetry_sdk::trace::Tracer,
         >,
-        opentelemetry_sdk::trace::TracerProvider,
+        opentelemetry_sdk::trace::SdkTracerProvider,
     ),
     Box<dyn std::error::Error>,
 > {
     use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry::KeyValue;
-    use opentelemetry_otlp::WithExportConfig as _;
-    use opentelemetry_sdk::Resource;
-    let exporter = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_endpoint(endpoint.to_string())
-        .build()?;
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-        .with_resource(Resource::new(vec![KeyValue::new(
-            "service.name",
-            service_name.to_string(),
-        )]))
-        .build();
+    let provider = build_otel_provider(endpoint, service_name)?;
     let tracer = provider.tracer("frp-rs");
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }

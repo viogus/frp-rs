@@ -12,7 +12,7 @@
 [package]
 edition = "2021"
 name = "yamux"
-version = "0.14.0"
+version = "0.14.1"
 authors = ["Parity Technologies <admin@parity.io>"]
 build = false
 autolib = false
@@ -60,11 +60,22 @@ version = "1"
 [dependencies.web-time]
 version = "1"
 
-# frp-rs patch (send-side body-buffer pool): lock-free bounded queue for
-# reusing data-frame body buffers. Already in the workspace dependency tree
+# frp-rs patch (body-buffer pool, send + read side): lock-free bounded queue
+# for reusing data-frame body buffers. Already in the workspace dependency tree
 # (frp-core's KCP chunk pool), so no new crates are added to the build.
 [dependencies.crossbeam-queue]
 version = "0.3"
+
+# frp-rs: upstream's Cargo.toml.orig declares
+# `quickcheck = { package = "quickcheck-ext", path = "../quickcheck-ext" }`.
+# A crates.io tarball cannot carry a path dependency, so cargo's manifest
+# normalization dropped it — which left `src/lib.rs`'s `impl quickcheck::Arbitrary`
+# and the quickcheck-based flow-control property test with no `quickcheck` crate
+# at all, i.e. the published test targets do not build anywhere on their own.
+# Restored against the copy vendored beside this manifest; see README-FRP-RS.md.
+[dev-dependencies.quickcheck]
+package = "quickcheck-ext"
+path = "quickcheck-ext"
 
 [dev-dependencies.futures]
 version = "0.3"
@@ -79,3 +90,9 @@ features = [
     "thread_rng",
 ]
 default-features = false
+
+# frp-rs: this vendored crate is not a workspace member (it is wired in via
+# `[patch.crates-io]`), so it declares its own empty workspace. Without this,
+# `cargo check --manifest-path vendor/yamux/Cargo.toml` refuses to run at all
+# ("current package believes it is in a workspace when it is not").
+[workspace]

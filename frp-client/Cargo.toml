@@ -13,7 +13,7 @@ frp-server = { path = "../frp-server" }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 md-5.workspace = true
 tower = "0.5"
-rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 tempfile = "3"
 # test-util enables `#[tokio::test(start_paused = true)]` + time::pause for
 # the socks5 handshake-deadline audit test — same pattern as frp-server's

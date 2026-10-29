@@ -1,8 +1,22 @@
-# Vendored yamux 0.14.0 (frp-rs)
+# Vendored yamux 0.14.1 (frp-rs)
 
-This directory vendors `yamux` 0.14.0 (crates.io, Parity Technologies)
-with five patches, wired in via `[patch.crates-io]` in the workspace
-root `Cargo.toml` (`yamux = { path = "vendor/yamux" }`).
+This directory vendors `yamux` 0.14.1 (crates.io, Parity Technologies)
+with five frp-rs patches, wired in via `[patch.crates-io]` in the
+workspace root `Cargo.toml` (`yamux = { path = "vendor/yamux" }`). On top
+of the five patches it carries a small **vendoring repair** that makes the
+crate's own test targets buildable at all — see
+[Vendoring hygiene](#vendoring-hygiene-tests-and-standalone-checks). The
+crate is a `[patch.crates-io]` path dependency, **not** a workspace
+member, so nothing in CI compiles its test targets; the repair is only
+exercised by the standalone check documented there.
+
+Re-vendored from 0.14.0 on 2026-10-29. The previous fork's separate
+`Sender` for window updates is **not** carried as a patch any more:
+upstream 0.14.1 fixes the same lost-wakeup bug itself (same design,
+field named `window_update_sender`), so that section below is kept only
+as a record of what the fork used to carry. The remaining five patches
+are unchanged in intent and semantics; each was re-applied on top of the
+pristine 0.14.1 sources.
 
 ## License
 
@@ -83,10 +97,26 @@ When bumping yamux upstream: re-apply the `Action::Reset` machinery
 above to the new `src/connection.rs` (the `Action` enum variant, the two
 cap sites, the `pending_reset_frames` bounded queue + send-loop +
 `close()` wiring, and the read-gate exception), or — better — carry the
-patch upstream. The other deviations from crates.io yamux 0.14.0 are
-listed below.
+patch upstream. The other deviations from crates.io yamux are listed
+below.
 
-## Patch: separate mpsc `Sender` for window updates (read-side lost-wakeup deadlock)
+## Upstream in 0.14.1: separate mpsc `Sender` for window updates (read-side lost-wakeup deadlock)
+
+**No local patch needed any more.** Upstream 0.14.1 ships exactly this
+fix: PR **[libp2p/rust-yamux#233](https://github.com/libp2p/rust-yamux/pull/233)**
+("Fix deadlock when a stream is split", merged 2026-09-21 as merge commit
+[`a9ea49e484`](https://github.com/libp2p/rust-yamux/commit/a9ea49e484eeba894e04c0b3cc5718adb26305f9)),
+which closes
+[issue #232](https://github.com/libp2p/rust-yamux/issues/232). (The
+`paritytech/yamux` repository URL redirects to `libp2p/rust-yamux`; there
+is no PR #279 upstream — an earlier revision of this README cited one, and
+that citation was wrong.) `Stream` gains
+`window_update_sender: mpsc::Sender<StreamCommand>` (a clone of the same
+channel) and `send_window_update` polls/sends through it, with the same
+one-poller-per-`Sender` rationale documented on the field. The frp-rs
+fork carried the same change as `sender_wu` in the previous vendored
+copy; the two implementations are semantically identical, and the vendor
+tree now uses the upstream one.
 
 `futures::channel::mpsc` assumes a single task polls each `Sender` for
 readiness. While a `Sender` is parked (queue full), `poll_ready` stores
@@ -109,24 +139,11 @@ with both directions idle. Reproduced intermittently (~7.5% of runs) by
 way over a 1 MiB duplex, 4 tasks, `tokio::io::split`), in either
 direction, and in the `poll_close` park as well.
 
-### What changed (src/connection/stream.rs only)
-
-- `Stream` gains `sender_wu: mpsc::Sender<StreamCommand>` — a clone of
-  the same channel, constructed in `new_inbound`/`new_outbound`.
-- `send_window_update` polls/start_sends via `sender_wu` instead of
-  `sender`. Data frames and `CloseStream` keep using `sender`.
-
-The write and read task domains each own their `Sender`, so a parked
-writer's stored waker is never overwritten by the reader's polls. The
-channel's guaranteed-slot accounting (capacity = buffer + senders)
-covers both handles; `parked_queue` wakes whichever sender is parked,
-FIFO.
-
-### Upgrade note
-
-When bumping yamux upstream: re-apply the `sender_wu` field, the two
-constructor clones, and the `send_window_update` sender swap. Carry
-both of these patches upstream if possible.
+The upstream fix is the same shape the fork had (`sender_wu`: one
+dedicated `Sender` handle for the read path, data frames and
+`CloseStream` on the write path), so the fork's fix is retired here.
+`frp-core/tests/mux.rs::mux_2mib_bidirectional_byte_exact` still pins
+the behaviour through the data plane.
 
 ## Patch: per-stream receive-window cap (Go `MaxStreamWindowSize` parity)
 
@@ -214,11 +231,10 @@ option (b).
 - Tests: `mod window_growth_tests` in `flow_control.rs` (gate matrix
   including the `None`/upstream row, no-sample doubling, slow-consumption
   no-growth, and "a sample wins over the seed"), plus the frp-core wiring
-  pin above. Note that this vendored crate is not a workspace member, so
-  its unit tests are not part of `cargo test --workspace`; run them with a
-  standalone checkout of the crate (`mod tests` there is quickcheck-based
-  and needs a `quickcheck` dev-dependency added, which the normalized
-  `Cargo.toml` does not carry).
+  pin above. These live in the vendored crate's `#[cfg(test)]` modules,
+  which the workspace does not build — see
+  [Vendoring hygiene](#vendoring-hygiene-tests-and-standalone-checks) for
+  the standalone commands that do.
 
 ### Upgrade note
 
@@ -248,22 +264,30 @@ was the last per-chunk allocation in the frp-rs bridge data path.
   written — `WriteState::Body` completion in `poll_ready`
   (`src/frame/io.rs`), the point where the body `Vec` becomes
   exclusively owned and would otherwise be dropped. Buffers with
-  capacity above `DEFAULT_SPLIT_SEND_SIZE` (custom `split_send_size`),
-  and any lost to WriteZero / Poisoned / teardown, are simply dropped —
-  the pool dies with the connection.
+  capacity above the configured `split_send_size`, and any lost to
+  WriteZero / Poisoned / teardown, are simply dropped — the pool dies
+  with the connection.
+- The read side is pooled too (round-17 follow-up): `frame::Io` draws
+  read bodies from the same queue at `ReadState::Body` init instead of
+  `vec![0; body_len]` (which zero-filled every byte `poll_read` then
+  overwrote), and `Stream::poll_read` returns a chunk's buffer to the
+  pool once the chunk is fully consumed (`src/connection/stream.rs`).
+  Safety is unchanged: the buffer moves into `Shared::buffer` only after
+  the frame has released it, and comes back to the pool only after the
+  chunk is empty and exclusively owned again.
 - New dependency: `crossbeam-queue = "0.3"` (`Cargo.toml`), already in
   the workspace dependency tree (frp-core's KCP chunk pool uses the
   same queue), so no new crates enter the build.
 
-### Red line: send-side only
+### Red line: never return a body while it is still referenced
 
-The pool must NOT extend to the read side: read bodies are allocated
-per-frame (`vec![0; body_len]` in `ReadState::Body`,
-`src/frame/io.rs` — Go-parity per-frame make, out of scope) and move
-into `Shared::buffer` (`Chunks`), where `Stream::poll_read` consumes
-them lazily, long after the frame object is dropped. Returning a read
-body to the pool at driver time would be a use-after-free. The return
-point above is exclusively on the write path.
+A read body moves into `Shared::buffer` (`Chunks`) and `Stream::poll_read`
+consumes it lazily, long after the frame object is dropped. The read
+side therefore only returns a buffer once the chunk is empty (fully
+consumed and popped) and exclusively owned; returning it at driver time
+would be a use-after-free. The write-side return happens only at
+`WriteState::Body` completion, where the same ownership argument
+holds.
 
 ### Why this is not the round-4 batched write path
 
@@ -275,9 +299,27 @@ are unchanged, so throughput behavior is preserved.
 ### Upgrade note
 
 When bumping yamux upstream: re-apply the `body_pool` field threading
-(`Connection::new`/`Active`/`Io`/`Stream`) and the two hunk sites
-(`poll_write`, `WriteState::Body` completion), or carry the patch
-upstream.
+(`Connection::new`/`Active`/`Io`/`Stream`) and the hunk sites
+(`poll_write`, `WriteState::Body` completion, `ReadState::Body` init,
+`poll_read` consumed-chunk return), or carry the patch upstream.
+
+## Patch: exact outbound-ACK backlog counter (O(1) instead of O(N) scan)
+
+Upstream's `ack_backlog()` scans the whole stream map on every
+`poll_new_outbound`, locking every stream, to see how many outbound
+streams are still awaiting an ACK. frp-rs keeps an exact
+`outbound_unacked: usize` counter in `Active`
+(`src/connection.rs`): incremented on outbound creation and
+decremented on every transition out of `Open { acknowledged: false }`
+(remote ACK, RST, FIN on either frame type, or removal).
+
+Documented divergence: `Stream::poll_close` on an *unacked* outbound
+stream moves it to `SendClosed` without decrementing (the counter lives
+in `Active`, the transition in `Stream`), so a `poll_close`-happy
+caller would see the gate fire 256 streams early. frp never calls
+`poll_close` on mux streams — they are dropped, which goes through
+`on_drop_stream` and does decrement — so the counter is exact for every
+reachable transition. `drop_active` resets it to 0.
 
 ## Minor deviations (not patches)
 
@@ -287,8 +329,88 @@ upstream.
   arm in `src/connection.rs` — now sends a per-stream Reset. Kept for
   upstream parity; benign, remove when upstream drops them.
 
-## Diff from crates.io yamux 0.14.0
+## Vendoring hygiene: tests and standalone checks
 
-Everything else in this tree is byte-identical to crates.io yamux
-0.14.0; the full delta is the five patches above plus the two
-`#[allow(dead_code)]` annotations.
+This crate is wired in through `[patch.crates-io]`, so it is **not a
+workspace member**: `cargo test --workspace` never compiles its
+`#[cfg(test)]` modules, and CI has no gate that would notice if they
+stopped building. They had in fact stopped building:
+
+1. The published 0.14.1 tarball cannot carry a path dependency, so cargo's
+   manifest normalization silently dropped upstream's
+   `quickcheck = { package = "quickcheck-ext", path = "../quickcheck-ext" }`
+   dev-dependency (`Cargo.toml.orig`, kept for provenance, still has it).
+   Every `quickcheck` use in the test modules was therefore an unresolved
+   crate name — which masked the next defect behind ten name-resolution
+   errors.
+2. `src/connection/stream.rs`'s `read_half_does_not_steal_the_write_half_wakeup`
+   test still called `Stream::new_outbound` with six arguments after the
+   body-pool patch gave it a seventh (`body_pool`), so the test target
+   failed with `E0061: this function takes 7 arguments but 6 were supplied`.
+3. The frp-rs-added `#[cfg(test)] impl quickcheck::Arbitrary for Config`
+   (`src/lib.rs`) called `g.gen_range(DEFAULT_CREDIT..=u32::MAX)`; upstream
+   `GenRange::gen_range` only accepts an exclusive `Range`, so this never
+   compiled either.
+
+All three are repaired here: a `quickcheck-ext` copy is vendored beside the
+manifest (upstream source, `Unlicense/MIT` as upstream declares it, `publish = false`) and wired
+up as the `quickcheck` dev-dependency, the call site passes a one-slot
+`ArrayQueue` body pool, and the range is exclusive. They are **test-only**
+repairs — no non-test code changed for them.
+
+Because the crate has no workspace membership, it also needs its own empty
+`[workspace]` table to be checkable standalone (without it cargo refuses:
+"current package believes it is in a workspace when it is not"). The
+standalone commands, which are the only way to compile or run the test
+targets:
+
+```bash
+cargo check --manifest-path vendor/yamux/Cargo.toml --all-targets
+cargo test  --manifest-path vendor/yamux/Cargo.toml --lib
+```
+
+Set `CARGO_TARGET_DIR` to a scratch path if you do not want a `target/`
+inside the vendor tree; the check also generates a lock file in the vendored
+crate's directory (the tarball's lock is not vendored), which `.gitignore`
+ignores — so it is deliberately not a tracked path.
+Nothing about this crate's own resolution enters the workspace
+`Cargo.lock` — verified: adding the dev-dependency leaves `git diff
+Cargo.lock` empty.
+
+**When bumping yamux, re-run both commands.** A green workspace build says
+nothing about this crate's test targets.
+
+## Diff from crates.io yamux 0.14.1
+
+0.14.1; the full delta from the crates.io tarball against the normalized
+`Cargo.toml` is the table below. Re-diffed against the unpacked
+`yamux-0.14.1.crate` (30 018 bytes from crates.io) on 2026-10-29. Every
+difference, by file:
+
+| File | Changed lines | What |
+|------|---------------|------|
+| `Cargo.toml` | 20 | `crossbeam-queue = "0.3"` (body-pool patch); restored `[dev-dependencies.quickcheck]` + empty `[workspace]` (vendoring repair) — 20 non-blank changed lines, 23 with blanks |
+| `src/connection.rs` | 245 | per-stream RST on inbound cap; exact outbound-ACK counter; threads the body pool into `Active`/`frame::Io` |
+| `src/connection/stream/flow_control.rs` | 210 | receive-window cap clamp; seed-RTT growth gate (`window_growth_gate_open`) |
+| `src/lib.rs` | 101 | `max_stream_receive_window` + setter; `window_growth_seed_rtt` + accessors, `WINDOW_GROWTH_SEED_RTT`, `Config::default()` seed; `web_time::Duration` import; clause additions inside upstream's `#[cfg(test)] impl Arbitrary for Config` (repair #3 above) |
+| `src/frame/io.rs` | 67 | pooled read/write bodies, `split_send_size` field, body return at `WriteState::Body` completion, pooled `ReadState::Body` init |
+| `src/connection/stream.rs` | 39 | body-pool field + `poll_write` reuse + `poll_read` return; test call site gains the pool (repair #2 above) |
+| `src/connection/closing.rs` | 8 | `#[cfg(test)]` only: its `frame::Io::new(...)` call gains the body-pool argument forced by the `Io::new` signature change — no behaviour change, not a separate patch |
+| `src/frame/header.rs` | 4 | `#[allow(dead_code)]` on `internal_error()` |
+| `src/frame.rs` | 4 | same, on `Frame::internal_error()` |
+| `Cargo.lock` | — | present in the tarball, not vendored (regenerated by the standalone check) |
+| `LICENSE-APACHE`, `LICENSE-MIT` | added | license files, copied verbatim from upstream |
+| `README-FRP-RS.md` | added | this file |
+| `quickcheck-ext/` | added | vendored upstream test helper (repair #1 above) |
+
+Everything else — `Cargo.toml.orig`, `.cargo_vcs_info.json`, and every
+other file under `src/**` — is byte-identical to the tarball. Note the
+earlier revision of this section claimed the delta was exactly the five
+patches plus the two `#[allow(dead_code)]` annotations; that was wrong. It
+missed the test-only `closing.rs` constructor delta, and
+`src/connection/stream.rs` additionally carried two gratuitous rewrites of
+upstream idioms (`ready!(…?)` rewritten into explicit `match` arms in
+`poll_write`/`poll_flush`). Those rewrites were **dropped** — the upstream
+form compiles unchanged on the pinned toolchain — so `stream.rs` now
+differs only by the body-pool patch and the test call-site repair.
+

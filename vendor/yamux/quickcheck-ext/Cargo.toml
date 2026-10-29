@@ -1,0 +1,20 @@
+# frp-rs: locally restored copy of upstream `paritytech/yamux`'s
+# `quickcheck-ext` crate (repo path `quickcheck-ext/`, ~40 lines, Apache-2.0 OR
+# MIT, same as yamux). Upstream declares it as a *path* dev-dependency of the
+# yamux crate; the crates.io tarball cannot carry a path dependency, so cargo's
+# manifest normalization dropped it and the published 0.14.1 test targets do not
+# build anywhere on their own. The vendored copy keeps the yamux test suite
+# buildable — see ../README-FRP-RS.md.
+[package]
+edition = "2021"
+name = "quickcheck-ext"
+version = "0.1.0"
+description = "QuickCheck extensions used by yamux's tests"
+license = "Unlicense/MIT"
+publish = false
+
+[dependencies.quickcheck]
+version = "1"
+
+[dependencies.num-traits]
+version = "0.2"
