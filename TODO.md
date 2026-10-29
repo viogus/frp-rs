@@ -12672,7 +12672,7 @@ other.
   Done-when: the spawn-based processor leaves the experimental gate, or the wiring moves to
   a stable API and the feature reference is removed.
 
-- [ ] **Guard suites still match captured output through a pipe, so `pipefail` can fake a miss — or a green run.**
+- [x] **Guard suites still match captured output through a pipe, so `pipefail` can fake a miss — or a green run.**
   Evidence: the `expect_red()` form `printf '%s\n' "$out" | grep -Fq "$needle"` under
   `set -o pipefail` reports 141 when the reader closes the pipe before the writer finishes,
   so a match can read as a miss. PR #553 fixed that one site (`scripts/tests/docs-go-column.sh`,
@@ -12685,6 +12685,9 @@ other.
   `scripts/tests/rss-soak-run-dir.sh:228`, and three in `.github/workflows/compat.yml` (`:139`).
   `scripts/tests/rss-soak-run-dir.sh:44-51` already documents this hazard and uses the
   here-string remedy, so the fix per site is known; what is missing is the sweep and a pin.
+  Closed by PR #554: 52 live pipelines in 14 files now use a here-string, `repo-health.sh`
+  lints the shape on every run (workflow `run:` blocks included), and a 70,000-byte fixture
+  proves the old form would have reported green.
   Done-when: every writer-then-match in a `pipefail` script uses a here-string (or a temp
   file), starting with `scripts/repo-health.sh:2591`, and a fixture feeds one of them a
   payload large enough to have failed before.
