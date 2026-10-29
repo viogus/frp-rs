@@ -12670,3 +12670,20 @@ other.
   build (compile time, not runtime).
   Done-when: the spawn-based processor leaves the experimental gate, or the wiring moves to
   a stable API and the feature reference is removed.
+
+- [ ] **Guard suites still match captured output through a pipe, so `pipefail` can fake a miss — or a green run.**
+  Evidence: the `expect_red()` form `printf '%s\n' "$out" | grep -Fq "$needle"` under
+  `set -o pipefail` reports 141 when the reader closes the pipe before the writer finishes,
+  so a match can read as a miss. PR #553 fixed that one site (`scripts/tests/docs-go-column.sh`,
+  where CI's Health job reported M7 vacuous on a tree that was green locally and on the PR run),
+  but the class survives in ~39 places, one of them worse than the bug it resembles:
+  `scripts/repo-health.sh:2591` gates the run on `printf '%s\n' "$captured" | grep -q '^  FAIL  '`,
+  and there 141 would mean **false green** — the gate printed `  FAIL  ` and the script exits 0.
+  Also: 19 sites in `scripts/tests/repo-health-fixtures.sh` (Health-gated negative assertions),
+  10 in `scripts/tests/ab-measurable-delta.sh`, `scripts/tests/large-functions-classifier.sh:1474`,
+  `scripts/tests/rss-soak-run-dir.sh:228`, and three in `.github/workflows/compat.yml` (`:139`).
+  `scripts/tests/rss-soak-run-dir.sh:44-51` already documents this hazard and uses the
+  here-string remedy, so the fix per site is known; what is missing is the sweep and a pin.
+  Done-when: every writer-then-match in a `pipefail` script uses a here-string (or a temp
+  file), starting with `scripts/repo-health.sh:2591`, and a fixture feeds one of them a
+  payload large enough to have failed before.

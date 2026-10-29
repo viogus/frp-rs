@@ -1093,7 +1093,7 @@ jobs:
           log=/tmp/frp-docs-go-column.$$.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=f3158f1d3a49db0dd89e12b5bedc448358e46a78146c01845f735a56d7cfcf22
+          guard_pin=1d4c2780f8c437432f47815acdbff29644fde5022caa6c05c2ed2d822f54db22
           guard_exact=257
           guard_floor=257
           guard_canary='M1 (websocket_port reworded'

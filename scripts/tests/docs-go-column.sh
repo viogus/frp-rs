@@ -1010,10 +1010,20 @@ open(dst, 'w', encoding='utf-8').write('\n'.join(lines))
 PY
 }
 
+# `grep -Fq` exits at the first match, so the writer of a pipe gets SIGPIPE if it
+# still has output queued when the reader closes. Under this script's
+# `set -o pipefail` that made a *match* look like a miss (the pipeline reports
+# 141). Whether it bit depended on the payload and on scheduling: CI's Health job
+# once failed M7 with `printf: write error: Broken pipe` ahead of a payload that
+# did red (its scan output is ~19.6 kB, and the same tree was green locally and
+# on the PR run), while a paused run reproduces it from ~70 kB up. Match through
+# a here-string so there is no writer to lose the race.
+contains() { grep -Fq "$1" <<<"$2"; }
+
 expect_red() { # <name> <doc> <needle> <needle>
   local name=$1 doc=$2 first=$3 second=$4 out
   out="$(scan "$doc")"
-  if printf '%s\n' "$out" | grep -Fq "$first" && printf '%s\n' "$out" | grep -Fq "$second"; then
+  if contains "$first" "$out" && contains "$second" "$out"; then
     ok "$name"
   else
     bad "$name — the mutant did not red as expected (want '$first' + '$second'); the check would be vacuous"
