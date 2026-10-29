@@ -314,11 +314,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::repo-health fixture checks did not report 50 checks, verified pins and a live enforcer canary"
-            echo "::error::scripts/tests/repo-health-fixtures.sh must print 50 '  ok' lines, end with 'RESULT: 50 fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            echo "::error::repo-health fixture checks did not report $guard_exact checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/repo-health-fixtures.sh must print $guard_exact '  ok' lines, end with 'RESULT: '$guard_exact' fixture check(s) hold', print 'pinned regions verified 2/2: scenario-6 scenario-7' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "repo-health fixture checks ok: 50 checks hold, pins verified 2/2, enforcer canary live"
+          echo "repo-health fixture checks ok: $guard_exact checks hold, pins verified 2/2, enforcer canary live"
       # The compat harness's stray-process guard, driven against synthetic
       # `frps`/`frpc` peers (no Go toolchain, no compat run): it pins that the
       # guard's match is the scratch directory *and* the process name — a
@@ -556,11 +556,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::compat stray-guard fixture checks did not report 40 checks, verified pins and a live enforcer canary"
-            echo "::error::scripts/tests/compat-stray-guard.sh must print 40 '  ok' lines, end with 'RESULT: 40 fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
+            echo "::error::compat stray-guard fixture checks did not report $guard_exact checks, verified pins and a live enforcer canary"
+            echo "::error::scripts/tests/compat-stray-guard.sh must print $guard_exact '  ok' lines, end with 'RESULT: '$guard_exact' fixture check(s) hold', print 'pinned regions verified 4/4: scenario-2 scenario-10 scenario-12 scenario-13' and print 'enforcer canary: injected mismatch detected, injected count mismatch detected'; a smaller total, a failure line, no output (an \`exec\`), a disabled EXIT trap, a skipped substance check or a neutered comparison means scenarios were skipped, neutered or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "compat stray-guard fixture checks ok: 40 checks hold, pins verified 4/4, enforcer canary live"
+          echo "compat stray-guard fixture checks ok: $guard_exact checks hold, pins verified 4/4, enforcer canary live"
       # The compat harness's port ledger and LISTEN-socket ownership checks,
       # driven against real python3 listeners, a stripped `PATH` and a fake `ss`,
       # plus the harness's own `--test` handling driven with four stub binaries
