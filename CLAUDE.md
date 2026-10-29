@@ -239,7 +239,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Async runtime | `tokio` | net, io-util, time, sync, macros, rt-multi-thread, signal |
 | Serialization | `serde` + `serde_json` | derive feature |
 | Config | `toml` | 1.1 (`toml` 1.1.8+spec-1.1.0); `.yaml`/`.yml`/`.json`/`.ini` via `yaml-rust2` 0.13 (`default-features = false`, Go-compatible YAML 1.1 scalar resolution) / `serde_json` — auto-detected by extension |
-| Test certs (dev) | `rcgen` | optional under `tls` feature, dev/tests only (LTO-GC'd out of shipped binaries) |
+| Cert generation | `rcgen` | optional under the default `tls` feature — not dev-only: `frp-core/src/transport/tls.rs` generates the frps certificate at runtime when no cert files are configured |
 | Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
 | Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |

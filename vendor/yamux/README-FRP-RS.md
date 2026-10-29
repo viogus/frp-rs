@@ -381,8 +381,10 @@ nothing about this crate's test targets.
 
 ## Diff from crates.io yamux 0.14.1
 
-Re-diffed against the unpacked `yamux-0.14.1.crate` (30 018 bytes from
-crates.io) on 2026-10-29. Every difference, by file:
+0.14.1; the full delta from the crates.io tarball against the normalized
+`Cargo.toml` is the table below. Re-diffed against the unpacked
+`yamux-0.14.1.crate` (30 018 bytes from crates.io) on 2026-10-29. Every
+difference, by file:
 
 | File | Changed lines | What |
 |------|---------------|------|

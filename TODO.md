@@ -12622,12 +12622,24 @@ other.
   divergence in `docs/go-frp-compat-audit.md`.
 
 - [ ] **`jsonwebtoken` is pinned below 11 until a `ring` backend exists.**
-  Evidence: 11.1.0 dropped the `ring` feature; its remaining backends are `aws-lc-rs`
-  (banned by the dependency policy) or `rust_crypto`, which re-imports `hmac`/`sha2`
-  and a second `rsa` (0.9.x) next to russh's `rsa 0.10.0-rc.18`. OIDC JWT verification
+  Evidence: 11.1.0 has no `ring` backend at all — 9.3.1's `ring` is a plain
+  dependency, not a feature — so the alternatives are `aws-lc-rs` (banned by the
+  dependency policy) or `rust_crypto`, which re-imports `hmac`/`sha2` and a second
+  `rsa` (0.9.x) next to russh's `rsa 0.10.0-rc.18`. OIDC JWT verification
   in `frp-core/src/auth.rs` therefore stays on 9.3.1, refreshed with the rest of the
   workspace only within the 9.x line.
   Done-when: one of (a) upstream restores a `ring` backend,
   (b) the `aws-lc-rs` ban is revisited with a measured size/security argument, or
   (c) OIDC verification is reimplemented directly on `ring` + the existing `rsa` crate
   and `jsonwebtoken` is dropped.
+
+- [ ] **`toml` 1.1 accepts config documents that the Go binary rejects.**
+  Evidence: the 0.8 → 1.1 bump (PR #552) newly accepts `\xNN` escapes, seconds-less
+  local times (`07:32`), inline tables spanning lines and inline-table trailing commas —
+  21 diffs in a 102-case differential. Go frp v0.71.1 parses configs with
+  `github.com/pelletier/go-toml/v2` v2.2.0, which rejects all four (probed against the
+  release binary; `frpc verify -c` returns 0 on the Rust side and non-zero on the Go
+  side for such a file). No document that was valid under 0.8 changes meaning, and
+  multi-line CRLF is now preserved, which matches Go.
+  Done-when: either the loader rejects the four forms with a Go-style error, or the
+  divergence is recorded as intentional leniency in `docs/go-frp-compat-audit.md`.
