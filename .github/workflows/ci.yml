@@ -164,7 +164,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.$$.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=2ba857a6e1a66b61037fef0560f38227a5f2dcc88544e0466f45eee7eee6f28b
+          guard_pin=70f7329c18be220cf6541ce7853d8d4aadea9bd070818cd5565ccf433e9b7cf3
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -172,8 +172,8 @@ jobs:
           # independently anchored literal has to move too. The floor is
           # asserted on `guard_exact` (a floor on `guard_ok` would be
           # dead once the two are equal).
-          guard_exact=50
-          guard_floor=50
+          guard_exact=54
+          guard_floor=54
           # R12-2 (adversarial round 13): resolve the hasher to an absolute path
           # and prove it with a known vector — the same candidate order and the
           # same fail-closed mode as the guard's own `find_hash_tool()`.
@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.$$.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=8ebda46d74f9cbaf0afc2246a59cbee72476bea3a8f8b46af597d6b862452105
+          guard_pin=200e8a514663226022d79917e65cf81630acc8825326b44a10d5068dc44eca03
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -424,8 +424,8 @@ jobs:
           # independently anchored literal has to move too. The floor is
           # asserted on `guard_exact` (a floor on `guard_ok` would be
           # dead once the two are equal).
-          guard_exact=40
-          guard_floor=40
+          guard_exact=42
+          guard_floor=42
           # R12-1 (adversarial round 13): the enforcer's *implementation* lives in
           # the library the scenarios `source` (the `LIB=` assignment at :96 only
           # names it), so pinning only the suite left the "two-file change" claim
@@ -633,7 +633,7 @@ jobs:
           guard_exact=61
           guard_floor=61
           guard_lib=scripts/lib/compat-port-ownership.sh
-          guard_lib_pin=09e0be60599a8487bcb697515eef9b4efa83a0ef2c6104bc9959f93f2e94d9e2
+          guard_lib_pin=5958ef64b4a1f158e55e75fa86dabbbcb8690f28cfe1143889bc766970cfa751
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=40adfc605b5a08b1fe3ba10a67abe0ac2c43c92f7ba7a04e0c4b1afa5ab10d68
+          guard_data_pin=eadf3c3cffd8c21f8d6ec6758aaa9234f50aefd6c02e7373acd26bfb5ae262cf
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

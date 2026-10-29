@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=581 weak=99 ambiguous=2 excluded=101 foreign_reported=1104 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=e105cef4e2c292e7 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=581 weak=101 ambiguous=2 excluded=101 foreign_reported=1115 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=5da10046c83d3459 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2310	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2310	1517
@@ -40,18 +40,18 @@
 .github/workflows/release.yml	162	-	7114fd8d158867fe	-	continuation	frp-core/src/config/loader.rs	162	618
 .github/workflows/release.yml	210	-	f1db6bc806bab9cb	-	continuation	frp-core/src/config/loader.rs	210	618
 .github/workflows/release.yml	213	-	7114fd8d158867fe	-	continuation	frp-core/src/config/loader.rs	213	618
-docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1051
-docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1052
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1072
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1073
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1080
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1081
-docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1035
-docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1036
-docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1065
+docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1061
+docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1062
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1082
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1083
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1090
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1091
+docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1045
+docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1046
+docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1075
 docs/config.md	22	-	b5ab33e4e36c157f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	62
-docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1043
-docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1044
+docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1053
+docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1054
 docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	62
 docs/config.md	668	-	97410f5562191f30	-	absolute	docs/developing.md	docs/config.md:668	4082
 docs/deployment.md	900	-	4459a65e565615ca	-	absolute	frp-core/src/config/tests.rs	docs/deployment.md:900	12638
@@ -573,7 +573,7 @@ scripts/compat-test.sh	1169	-	2874a3ae84a43612	-	shorthand	docs/developing.md	:1
 scripts/compat-test.sh	1197	-	0564b0370037e213	-	shorthand	docs/developing.md	:1197	680
 scripts/compat-test.sh	168	-	50fa4c4746e4f6fd	-	absolute	docs/developing.md	scripts/compat-test.sh:168	816
 scripts/compat-test.sh	185	-	d7c28a7b57682063	-	absolute	scripts/lib/compat-stray-guard.sh	scripts/compat-test.sh:185	51
-scripts/compat-test.sh	185	-	d7c28a7b57682063	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/compat-test.sh:185	1470
+scripts/compat-test.sh	185	-	d7c28a7b57682063	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/compat-test.sh:185	1505
 scripts/compat-test.sh	298	-	ff3d8db2d3997b06	-	absolute	scripts/compat-test.sh	scripts/compat-test.sh:298	4693
 scripts/compat-test.sh	327	-	be518b6bbe48f83e	-	shorthand	docs/developing.md	:327	794
 scripts/compat-test.sh	484	-	f9ff311b1300f889	-	absolute	docs/developing.md	scripts/compat-test.sh:484	793
@@ -588,12 +588,12 @@ scripts/compat-test.sh	906	-	0cba1b6b6e222dd9	-	shorthand	docs/developing.md	:90
 scripts/compat-test.sh	94	95	25bc8ce0ed2a1a90	18a30e396ec8d2cc	absolute	docs/developing.md	scripts/compat-test.sh:94-95	693
 scripts/compat-test.sh	96	-	4b761a3a14c5f0a5	-	shorthand	docs/developing.md	:96	690
 scripts/lib/compat-stray-guard.sh	75	-	90c658af0607de4a	-	absolute	scripts/compat-test.sh	scripts/lib/compat-stray-guard.sh:75	4703
-scripts/tests/compat-stray-guard.sh	842	-	eaa8791726c717ec	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:842	402
-scripts/tests/compat-stray-guard.sh	842	-	eaa8791726c717ec	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:842	193
-scripts/tests/compat-stray-guard.sh	847	-	1e58f25476556ce5	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:847	403
-scripts/tests/compat-stray-guard.sh	847	-	1e58f25476556ce5	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:847	196
-scripts/tests/compat-stray-guard.sh	885	-	ea3a01e306ae784f	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:885	517
-scripts/tests/compat-stray-guard.sh	885	-	ea3a01e306ae784f	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:885	202
+scripts/tests/compat-stray-guard.sh	842	-	a826e07e3f6b32e5	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:842	402
+scripts/tests/compat-stray-guard.sh	842	-	a826e07e3f6b32e5	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:842	193
+scripts/tests/compat-stray-guard.sh	847	-	b4bdc848109722a3	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:847	403
+scripts/tests/compat-stray-guard.sh	847	-	b4bdc848109722a3	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:847	196
+scripts/tests/compat-stray-guard.sh	885	-	312be6217c6d2c32	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:885	517
+scripts/tests/compat-stray-guard.sh	885	-	312be6217c6d2c32	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:885	202
 scripts/tests/repo-health-fixtures.sh	623	-	eaa8791726c717ec	-	absolute	scripts/tests/repo-health-fixtures.sh	scripts/tests/repo-health-fixtures.sh:623	165
 scripts/tests/repo-health-fixtures.sh	628	-	6018ad7271207f2f	-	absolute	scripts/tests/repo-health-fixtures.sh	scripts/tests/repo-health-fixtures.sh:628	168
 scripts/tests/repo-health-fixtures.sh	666	-	ea3a01e306ae784f	-	absolute	.github/workflows/ci.yml	scripts/tests/repo-health-fixtures.sh:666	270
