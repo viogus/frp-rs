@@ -10,7 +10,7 @@ edition = "2021"
 name = "quickcheck-ext"
 version = "0.1.0"
 description = "QuickCheck extensions used by yamux's tests"
-license = "Apache-2.0 OR MIT"
+license = "Unlicense/MIT"
 publish = false
 
 [dependencies.quickcheck]

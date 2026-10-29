@@ -5290,7 +5290,7 @@ agent commits), which matters because the *reason* for two reviewers is that no 
 - [x] **The `3`-vs-`4` exit code is chosen by a substring match on the formatted error, so the
   *same* failure exits differently depending on a path or URL inside it.** `is_token_error`
   (in `frp-core/src/logging.rs` until #418 deleted it; the tombstone comment is now at
-  `frp-core/src/logging.rs:647`) is `msg.contains("token") || msg.contains("auth")`, and the
+  `frp-core/src/logging.rs:718`) is `msg.contains("token") || msg.contains("auth")`, and the
   daemons call it on `e.to_string()` of a service-construction error
   (`frpc/src/main.rs:583`, `frps/src/main.rs`'s init-error arm). The error text embeds the config
   path and any URL from the config, so an unrelated substring decides the code. Measured with the

@@ -353,7 +353,7 @@ stopped building. They had in fact stopped building:
    compiled either.
 
 All three are repaired here: a `quickcheck-ext` copy is vendored beside the
-manifest (upstream source, Apache-2.0 OR MIT, `publish = false`) and wired
+manifest (upstream source, `Unlicense/MIT` as upstream declares it, `publish = false`) and wired
 up as the `quickcheck` dev-dependency, the call site passes a one-slot
 `ArrayQueue` body pool, and the range is exclusive. They are **test-only**
 repairs — no non-test code changed for them.
