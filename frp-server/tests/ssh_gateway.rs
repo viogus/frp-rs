@@ -781,6 +781,161 @@ async fn test_ssh_gateway_password_throttle_cuts_off_fresh_connection() {
     );
 }
 
+/// R2-F2 e2e pin: rejected PUBLICKEY attempts never consume per-IP
+/// login-throttle slots, while rejected PASSWORD attempts do.
+///
+/// The russh `Handler::auth_publickey` method delegates to
+/// `authorize_pubkey`, which returns `Auth::Reject` without calling
+/// `check_login_throttle`; only `auth_password`'s mismatch branch consumes a
+/// slot (5 per 60s window, `AppState::check_login_throttle`). The D5 unit
+/// test drives `authorize_pubkey` directly (a `VerifiedPublicKey` cannot be
+/// built out-of-tree), so it cannot see a throttle call added to the trait
+/// method — R2 proved that mutation leaves the unit test and this whole file
+/// green. This test drives the real handshake instead:
+///
+/// 1. N rejected pubkey attempts with an unlisted key from 127.0.0.1, then
+///    the correct password from the same source must still authenticate.
+/// 2. Five rejected password attempts from the same source, then the correct
+///    password must be denied — the converse, so step 1 cannot pass just
+///    because nothing ever arms the throttle.
+///
+/// Attempts run on one fresh connection each and in parallel: russh paces
+/// every auth rejection by `auth_rejection_time` (3s, `SshListener::run`), so
+/// serializing them would cost ~18s + ~15s, while concurrent attempts hold at
+/// most 6 of the 8 per-IP pre-auth permits. The asserts are on the observed
+/// auth outcome (success / denial), never on wall time.
+#[tokio::test]
+async fn test_ssh_gateway_pubkey_rejections_do_not_consume_password_throttle() {
+    use russh::keys::PublicKeyBase64;
+
+    // The throttle budget is 5 failures per 60s window, so N must exceed 5.
+    const PUBKEY_REJECTIONS: usize = 6;
+    const PASSWORD_REJECTIONS: usize = 5;
+
+    let started = std::time::Instant::now();
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+
+    // The allow-list exists and contains a DIFFERENT key, so the attempts
+    // below are rejected by membership, not by an empty allow-list.
+    let dir = tempfile::TempDir::new().unwrap();
+    let keys_path = dir.path().join("authorized_keys");
+    let allowed =
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+            .expect("allowed key");
+    let unlisted =
+        russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+            .expect("unlisted key");
+    std::fs::write(
+        &keys_path,
+        format!(
+            "ssh-ed25519 {} allowed\n",
+            allowed.public_key().public_key_base64()
+        ),
+    )
+    .unwrap();
+
+    let mut cfg = ssh_test_config(ssh_port, bind_port);
+    cfg.ssh_tunnel_gateway.authorized_keys_file = keys_path.to_str().unwrap().into();
+    cfg.auth.token = common::TEST_TOKEN.into();
+
+    let (_handle, _port) = start_test_server(cfg).await;
+    let addr: SocketAddr = format!("127.0.0.1:{}", ssh_port).parse().unwrap();
+
+    // Phase 1: N rejected publickey attempts, each on its own connection so
+    // the 3s rejection pacing overlaps. This is a real signed USERAUTH
+    // request that reaches `Handler::auth_publickey`: the default
+    // `auth_publickey_offered` accepts the offer, the client signs, and the
+    // server verifies before calling the handler.
+    let attempts = (0..PUBKEY_REJECTIONS).map(|_| {
+        let key = unlisted.clone();
+        async move {
+            let mut client = connect_ssh_ready(addr, None).await;
+            let outcome = client
+                .authenticate_publickey(
+                    "v0",
+                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), None),
+                )
+                .await;
+            let _ = client
+                .disconnect(russh::Disconnect::ByApplication, "pubkey probe done", "")
+                .await;
+            outcome
+        }
+    });
+    for (i, outcome) in futures_util::future::join_all(attempts)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        let auth = outcome.unwrap_or_else(|e| panic!("publickey attempt {i} must complete: {e}"));
+        assert!(
+            !auth.success(),
+            "publickey attempt {i} with an unlisted key must be rejected, got: {auth:?}"
+        );
+    }
+
+    // The correct password from the SAME source must still authenticate:
+    // the pubkey rejections must not have consumed any of the 5 slots.
+    let mut after_pubkey = connect_ssh_ready(addr, None).await;
+    let outcome = timeout(
+        Duration::from_secs(10),
+        after_pubkey.authenticate_password("v0", common::TEST_TOKEN),
+    )
+    .await;
+    assert!(
+        matches!(outcome, Ok(Ok(ref auth)) if auth.success()),
+        "per-IP login-throttle accounting: {PUBKEY_REJECTIONS} rejected PUBLICKEY attempts from \
+         127.0.0.1 must not consume password throttle slots, so the correct password from the \
+         same source must authenticate; got {outcome:?}"
+    );
+    after_pubkey
+        .disconnect(russh::Disconnect::ByApplication, "auth ok", "")
+        .await
+        .ok();
+
+    // Phase 2 (converse): 5 rejected PASSWORD attempts arm the 60s window
+    // (each reserves its slot at handler entry, before the rejection's 3s
+    // pacing), so the correct password from the same source must be denied.
+    let attempts = (0..PASSWORD_REJECTIONS).map(|_| async move {
+        let mut client = connect_ssh_ready(addr, None).await;
+        let outcome = client.authenticate_password("v0", "wrong-password").await;
+        let _ = client
+            .disconnect(russh::Disconnect::ByApplication, "password probe done", "")
+            .await;
+        outcome
+    });
+    for (i, outcome) in futures_util::future::join_all(attempts)
+        .await
+        .into_iter()
+        .enumerate()
+    {
+        let auth = outcome.unwrap_or_else(|e| panic!("password attempt {i} must complete: {e}"));
+        assert!(
+            !auth.success(),
+            "wrong-password attempt {i} must be rejected, got: {auth:?}"
+        );
+    }
+
+    let mut throttled = connect_ssh_ready(addr, None).await;
+    let outcome = timeout(
+        Duration::from_secs(10),
+        throttled.authenticate_password("v0", common::TEST_TOKEN),
+    )
+    .await;
+    assert!(
+        !matches!(outcome, Ok(Ok(ref auth)) if auth.success()),
+        "per-IP login-throttle accounting (converse): {PASSWORD_REJECTIONS} rejected PASSWORD \
+         attempts from 127.0.0.1 must arm the 60s window, so the correct password from the same \
+         source must be denied; got {outcome:?}"
+    );
+
+    eprintln!(
+        "pubkey-vs-password throttle e2e wall time: {:?}",
+        started.elapsed()
+    );
+}
+
 /// Round-13 (S RISK): the per-IP pre-auth cap — a single source cannot
 /// fill the global SSH conn semaphore with unauthenticated conns and hold
 /// them to the auth deadline (8 slots/IP bounds one source to ~0.5

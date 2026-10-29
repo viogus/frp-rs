@@ -244,8 +244,11 @@ async fn test_pubkey_and_none_rejections_do_not_consume_throttle_slots() {
     // cannot be constructed out-of-tree (and adding a test-only constructor
     // to the vendored crate is out of scope). The helper is exactly the
     // decision the trait method delegates to, so the D5 pin still covers
-    // the pubkey-rejection path; trait wiring + real pubkey acceptance are
-    // covered end-to-end by `frp-server/tests/ssh_gateway.rs`.
+    // the pubkey-rejection path. Trait wiring + real pubkey acceptance are
+    // covered end-to-end by `frp-server/tests/ssh_gateway.rs`; the R2-F2
+    // property that trait-level pubkey rejections consume no throttle slot
+    // is pinned there by
+    // `test_ssh_gateway_pubkey_rejections_do_not_consume_password_throttle`.
     let key =
         russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap();
     let pubkey = key.public_key().clone();
