@@ -8,7 +8,7 @@ impl russh::client::Handler for TestSshClient {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -232,16 +232,28 @@ async fn test_pubkey_and_none_rejections_do_not_consume_throttle_slots() {
     // "none" methods cannot arm the window against the password path
     // (or the shared frpc-login table) — and 5 pubkey/none rejections
     // from one IP leave a subsequent password attempt fully allowed.
-    let (mut session, _auth_rx, _run_id) = pre_auth_session();
+    let (session, _auth_rx, _run_id) = pre_auth_session();
     let addr = session.peer_addr;
     let state = session.state.clone();
 
     // 5 publickey rejections (key not in the empty authorized_keys).
+    //
+    // Calls the inherent `authorize_pubkey` helper instead of the trait's
+    // `auth_publickey`: russh 0.63+ passes that method a
+    // `russh::server::VerifiedPublicKey`, which is `#[non_exhaustive]` and
+    // cannot be constructed out-of-tree (and adding a test-only constructor
+    // to the vendored crate is out of scope). The helper is exactly the
+    // decision the trait method delegates to, so the D5 pin still covers
+    // the pubkey-rejection path. Trait wiring + real pubkey acceptance are
+    // covered end-to-end by `frp-server/tests/ssh_gateway.rs`; the R2-F2
+    // property that trait-level pubkey rejections consume no throttle slot
+    // is pinned there by
+    // `test_ssh_gateway_pubkey_rejections_do_not_consume_password_throttle`.
     let key =
         russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519).unwrap();
     let pubkey = key.public_key().clone();
     for i in 0..5 {
-        let result = session.auth_publickey("v0", &pubkey).await.unwrap();
+        let result = session.authorize_pubkey(&pubkey);
         assert!(
             matches!(result, Auth::Reject { .. }),
             "pubkey rejection {i} must reject (key not authorized)"
@@ -250,6 +262,25 @@ async fn test_pubkey_and_none_rejections_do_not_consume_throttle_slots() {
     assert!(
         state.check_login_throttle(addr).await,
         "5 pubkey rejections must not arm the password throttle window"
+    );
+
+    // The helper's accept branch: a key that IS in the allow-list accepts,
+    // and (like the reject branch) consumes no throttle slot. Without this
+    // the bypass above would only pin the reject path.
+    let (auth_tx, _auth_rx) = tokio::sync::watch::channel(false);
+    let keyed = SshSession::new(
+        "test-token".into(),
+        vec![pubkey.clone()],
+        test_state(1),
+        "127.0.0.1:2200".parse().unwrap(),
+        auth_tx,
+        Arc::new(std::sync::Mutex::new(None)),
+        tokio::time::Instant::now() + SSH_AUTH_DEADLINE,
+        tokio_util::sync::CancellationToken::new(),
+    );
+    assert!(
+        matches!(keyed.authorize_pubkey(&pubkey), Auth::Accept),
+        "an authorized key must be accepted by authorize_pubkey"
     );
 
     // 5 "none" rejections (token configured → auth_none rejects).

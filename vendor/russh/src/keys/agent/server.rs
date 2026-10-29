@@ -8,16 +8,17 @@ use bytes::Bytes;
 use futures::future::Future;
 use futures::stream::{Stream, StreamExt};
 use ssh_encoding::{Decode, Encode, Reader};
-use ssh_key::PrivateKey;
+use ssh_key::{HashAlg, PrivateKey};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::sleep;
 use {std, tokio};
 
-use super::{msg, Constraint};
-use crate::helpers::{sign_with_hash_alg, EncodedExt};
-use crate::keys::key::PrivateKeyWithHashAlg;
-use crate::keys::Error;
+use super::{Constraint, msg};
 use crate::CryptoVec;
+use crate::helpers::{EncodedExt, sign_with_hash_alg};
+use crate::keys::Error;
+use crate::keys::key::PrivateKeyWithHashAlg;
 
 const MAX_AGENT_FRAME_LEN: usize = 256 * 1024;
 
@@ -45,7 +46,6 @@ pub enum MessageType {
     Unlock,
 }
 
-#[cfg_attr(feature = "async-trait", async_trait::async_trait)]
 pub trait Agent: Clone + Send + 'static {
     fn confirm(
         self,
@@ -247,7 +247,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
     fn unlock<R: Reader>(&self, r: &mut R) -> Result<bool, Error> {
         let password = Bytes::decode(r)?;
         let mut lock = self.lock.0.write().or(Err(Error::AgentFailure))?;
-        if lock[..] == password {
+        if bool::from(lock[..].ct_eq(&password)) {
             lock.clear();
             Ok(true)
         } else {
@@ -280,40 +280,50 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
 
             (private_key.public_key().key_data().encoded()?, private_key)
         };
-        writebuf.push(msg::SUCCESS);
-        let mut w = self.keys.0.write().or(Err(Error::AgentFailure))?;
-        let now = SystemTime::now();
+
+        let mut c = Vec::new();
+        let mut lifetime = None;
         if constrained {
-            let mut c = Vec::new();
             while let Ok(t) = u8::decode(r) {
                 if t == msg::CONSTRAIN_LIFETIME {
+                    if lifetime.is_some() {
+                        return Ok(false);
+                    }
                     let seconds = u32::decode(r)?;
+                    lifetime = Some(seconds);
                     c.push(Constraint::KeyLifetime { seconds });
-                    let blob = blob.clone();
-                    let keys = self.keys.clone();
-                    russh_util::runtime::spawn(async move {
-                        sleep(Duration::from_secs(seconds as u64)).await;
-                        if let Ok(mut keys) = keys.0.write() {
-                            let delete = if let Some(&(_, time, _)) = keys.get(&blob) {
-                                time == now
-                            } else {
-                                false
-                            };
-                            if delete {
-                                keys.remove(&blob);
-                            }
-                        }
-                    });
                 } else if t == msg::CONSTRAIN_CONFIRM {
-                    c.push(Constraint::Confirm)
+                    if !c.contains(&Constraint::Confirm) {
+                        c.push(Constraint::Confirm)
+                    }
                 } else {
                     return Ok(false);
                 }
             }
-            w.insert(blob, (Arc::new(key_pair), now, c));
-        } else {
-            w.insert(blob, (Arc::new(key_pair), now, Vec::new()));
         }
+        let now = SystemTime::now();
+        self.keys
+            .0
+            .write()
+            .or(Err(Error::AgentFailure))?
+            .insert(blob.clone(), (Arc::new(key_pair), now, c));
+        if let Some(seconds) = lifetime {
+            let keys = self.keys.clone();
+            russh_util::runtime::spawn(async move {
+                sleep(Duration::from_secs(seconds as u64)).await;
+                if let Ok(mut keys) = keys.0.write() {
+                    let delete = if let Some(&(_, time, _)) = keys.get(&blob) {
+                        time == now
+                    } else {
+                        false
+                    };
+                    if delete {
+                        keys.remove(&blob);
+                    }
+                }
+            });
+        }
+        writebuf.push(msg::SUCCESS);
         Ok(true)
     }
 
@@ -337,11 +347,7 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
             }
         };
         let agent = if needs_confirm {
-            let (agent, ok) = {
-                let _pk = key.clone();
-                Box::new(futures::future::ready((agent, true)))
-            }
-            .await;
+            let (agent, ok) = agent.confirm(key.clone()).await;
             if !ok {
                 return Ok((agent, false));
             }
@@ -351,8 +357,17 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin + 'static, A: Agent + Send + Sync 
         };
         writebuf.push(msg::SIGN_RESPONSE);
         let data = Bytes::decode(r)?;
+        let flags = u32::decode(r)?;
 
-        sign_with_hash_alg(&PrivateKeyWithHashAlg::new(key, None), &data)?.encode(writebuf)?;
+        let hash_alg = if flags & msg::SSH_AGENT_RSA_SHA2_256 != 0 {
+            Some(HashAlg::Sha256)
+        } else if flags & msg::SSH_AGENT_RSA_SHA2_512 != 0 {
+            Some(HashAlg::Sha512)
+        } else {
+            None
+        };
+
+        sign_with_hash_alg(&PrivateKeyWithHashAlg::new(key, hash_alg), &data)?.encode(writebuf)?;
 
         let len = writebuf.len();
         BigEndian::write_u32(writebuf, (len - 4) as u32);
@@ -378,7 +393,9 @@ mod tests {
         runtime.block_on(async {
             let (server, mut client) = tokio::io::duplex(64);
             let connection = Connection {
-                lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(crate::CryptoVec::new()))),
+                lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(
+                    crate::CryptoVec::new(),
+                ))),
                 keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(
                     std::collections::HashMap::new(),
                 ))),
@@ -399,5 +416,39 @@ mod tests {
         })?;
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_confirm_constraints_are_stored_once() {
+        use ssh_encoding::Encode;
+
+        let (server, _client) = tokio::io::duplex(64);
+        let connection = Connection {
+            lock: Lock(std::sync::Arc::new(std::sync::RwLock::new(
+                crate::CryptoVec::new(),
+            ))),
+            keys: KeyStore(std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            ))),
+            agent: Some(()),
+            s: server,
+            buf: Vec::new(),
+        };
+
+        let keypair = ssh_key::private::KeypairData::Ed25519(
+            ssh_key::private::Ed25519Keypair::from_seed(&[7u8; 32]),
+        );
+        let mut payload = Vec::new();
+        keypair.encode(&mut payload).unwrap();
+        String::new().encode(&mut payload).unwrap();
+        payload.resize(payload.len() + 10_000, super::msg::CONSTRAIN_CONFIRM);
+
+        let mut writebuf = Vec::new();
+        let mut r = &payload[..];
+        assert!(connection.add_key(&mut r, true, &mut writebuf).await.unwrap());
+
+        let keys = connection.keys.0.read().unwrap();
+        let (_, _, constraints) = keys.values().next().unwrap();
+        assert_eq!(constraints, &[super::Constraint::Confirm]);
     }
 }

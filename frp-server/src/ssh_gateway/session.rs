@@ -127,6 +127,32 @@ impl SshSession {
         let _ = self.auth_complete_tx.send(true);
         true
     }
+
+    /// Authorized-keys membership check behind [`Handler::auth_publickey`].
+    ///
+    /// Kept as an inherent method (rather than inlined into the trait impl)
+    /// because russh 0.63+ passes the handler a [`russh::server::VerifiedPublicKey`],
+    /// which is `#[non_exhaustive]` with no public constructor — an
+    /// out-of-tree test cannot build one, so
+    /// `tests::test_pubkey_and_none_rejections_do_not_consume_throttle_slots`
+    /// (the D5 pin: pubkey rejections must not consume password throttle
+    /// slots) drives this decision directly. The trait wiring and the accept
+    /// path stay covered end-to-end by `frp-server/tests/ssh_gateway.rs`.
+    ///
+    /// Returns `Auth::Reject` offering the password method for an unknown
+    /// key; the caller never consumes a login-throttle slot here.
+    pub(super) fn authorize_pubkey(&self, public_key: &russh::keys::PublicKey) -> Auth {
+        if self.authorized_keys.iter().any(|k| k == public_key) {
+            tracing::debug!("SSH public key auth accepted");
+            Auth::Accept
+        } else {
+            tracing::debug!("SSH public key auth rejected, fall through to password");
+            Auth::Reject {
+                proceed_with_methods: Some(MethodSet::from(&[MethodKind::Password][..])),
+                partial_success: false,
+            }
+        }
+    }
 }
 
 impl Handler for SshSession {
@@ -217,18 +243,13 @@ impl Handler for SshSession {
     async fn auth_publickey(
         &mut self,
         _user: &str,
-        public_key: &russh::keys::PublicKey,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
-        if self.authorized_keys.iter().any(|k| k == public_key) {
-            tracing::debug!("SSH public key auth accepted");
-            Ok(Auth::Accept)
-        } else {
-            tracing::debug!("SSH public key auth rejected, fall through to password");
-            Ok(Auth::Reject {
-                proceed_with_methods: Some(MethodSet::from(&[MethodKind::Password][..])),
-                partial_success: false,
-            })
-        }
+        // russh 0.63+ hands the handler the *verified* key (the client already
+        // proved possession of the private half) instead of the raw offer;
+        // the allow-list decision itself is unchanged and lives in
+        // `authorize_pubkey`, which the D5 unit test can call directly.
+        Ok(self.authorize_pubkey(key.public_key))
     }
 
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
