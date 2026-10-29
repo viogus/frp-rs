@@ -713,7 +713,8 @@ case "$stub_out" in
     bad 'selector: no RESULTS summary is printed' ;;
   *) ok 'selector: no RESULTS summary is printed' ;;
 esac
-if grep -qx 'test_g2r_tcp_plain' <<<"$(bash "$COMPAT" --list 2>/dev/null)"; then
+list=$(bash "$COMPAT" --list 2>/dev/null) || list=""
+if [ -n "$list" ] && grep -qx 'test_g2r_tcp_plain' <<<"$list"; then
   ok 'selector: --list still prints function names'
 else
   bad 'selector: --list still prints function names'

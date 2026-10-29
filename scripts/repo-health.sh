@@ -2574,31 +2574,52 @@ fi
 # coming back; the toolchain-channel test above and the internal-FAIL backstop
 # below are the two sites in this file that motivated it.
 #
-# Detection: a `|` (not `||`) followed by `grep` whose own option words carry the
-# quiet flag in any spelling (`-q`, `-Fq`, `-qx`, `-Eqi`, `--quiet`, `--silent`);
-# options stop at the first non-option word (the pattern) or at `--`. A full-line
-# comment is skipped: a comment quoting the shape is documentation, not code.
+# Detection: a `|` (not `||`) followed by a quiet `grep`. The command word may
+# carry a path prefix (`/usr/bin/grep`), a leading backslash (`\grep`), quotes
+# (`"grep"`) or the `command` prefix; the quiet flag (`-q`, `-Fq`, `-qx`, `-Eqi`,
+# `--quiet`, `--silent`) may sit anywhere among that command's own words, before
+# or after the pattern (`grep PAT -q`). Words after an argument-taking option are
+# skipped so `grep -e -q` stays a pattern, not a flag; `--` ends the options. A
+# full-line comment is skipped: a comment quoting the shape is documentation, not
+# code.
 # Scope: every tracked `scripts/**/*.sh` that enables pipefail itself (its own
 # `set … pipefail`, including `set -euo pipefail`), every `scripts/lib/*.sh`
 # whether or not it sets the option (libraries are sourced into callers that do,
 # so the caller's pipefail applies to their pipelines — `compat-port-ownership.sh`
 # was exactly this case), plus every `.github/workflows/*.yml` `run:` block scalar
 # (`run: |` / `run: >`, with the optional chomping/indent indicator) that sets
-# pipefail; a tree with no `.git` falls back to walking `scripts/`.
+# pipefail **or** whose owning step declares `shell: bash`: GitHub runs that
+# predefined shell as `bash --noprofile --norc -eo pipefail` (a runner invocation
+# quoted in a comment in `.github/workflows/ci.yml` records the argv), so the
+# block has pipefail even without its own `set -o pipefail`. The step is read by
+# indentation: every `shell:` key between the step's list item and the next
+# dedent, at exactly the `run:` key's indent, so key order does not matter. A tree with no `.git` falls
+# back to walking `scripts/`.
 #
-# Non-goals, stated rather than silently skipped: `grep -l`/`-L`/`-m` exit early
-# for the same reason. The only such pipelines here are three
-# `printf '%s' "$text" | grep -m1 …` version reads (`extract_ver` and the two
-# inline reads after it): both ends are a few hundred bytes, far under the pipe
-# buffer, so the writer's single write completes before grep can exit and the
-# SIGPIPE race cannot fire. They are left alone; a `-m1` read of anything large
-# enough to block would be a real instance and would have to be rewritten too.
-# A pipeline whose left side is not captured output (`git log | grep -q`,
-# `pgrep … | grep -q`) is equally affected, but whether the writer blocks or
-# dies is not decidable by a mechanical text rule, so this gate matches the
-# shape rather than proving the race. It also does not see `egrep`/`fgrep`,
-# variable-borne flags (`grep $flags`), `|&`, or a pipeline whose `grep` starts
-# on the next line of a line continuation; none of those occur here.
+# Non-goals, stated rather than silently skipped:
+#  * a wrapper or an assignment prefix — `xargs grep -q`, `env grep -q`,
+#    `LC_ALL=C grep -q` — is a different command word, and `time`/`sudo`/`exec`
+#    wrappers likewise. Not matched.
+#  * `|&`, `egrep`/`fgrep`, variable-borne flags (`grep $flags`), a `grep` that
+#    starts on the next line of a line continuation, and `defaults: run: shell:
+#    bash` at job/workflow level (no workflow here sets it). Not matched.
+#  * early-exit greps that are not quiet: `grep -l`/`-L`/`-m`, and `… | head -1`.
+#    Four remain, all version reads above: `extract_ver`, the `pub const VERSION`
+#    read, the download-script default, and `grep -oE … | head -1` over README.md.
+#    Payload size is *not* what makes them safe — a write can be split across the
+#    pipe buffer and a 330 KB capture has been measured dying with 141 — they are
+#    safe today because each consumes the pipeline inside a command substitution,
+#    where the 141 status is discarded and cannot flip a predicate. A `-m1`/`-l`
+#    read whose status reaches a test would be a real instance and must be
+#    rewritten.
+#  * quoted text and here-document bodies are not parsed: a line that carries the
+#    shape inside a here-doc or a multi-line string is reported at that line. That
+#    is why the fixture suite writes the shape as `gr''ep` (two adjacent shell
+#    words) instead of as a literal it would then have to suppress.
+#  * the gate matches the shape; it does not prove that a particular writer would
+#    block. A pipeline whose left side is not captured output (`git log | grep
+#    -q`, `pgrep … | grep -q`) is equally affected in principle and is left to
+#    the review.
 hdr "Pipefail-safe grep pipelines"
 if [ "$have_python" = 1 ]; then
   if [ "$git_state" = ok ]; then
@@ -2612,31 +2633,75 @@ if [ "$have_python" = 1 ]; then
     fail=1
   else
     pipe_hits=$(PIPE_SCAN_FILES="$pipe_scripts" python3 -B - <<'PY'
-import os, re, sys
+import os, re
 
 # The shape is assembled from pieces so this file — itself one of the scripts the
 # scan reads — does not carry the literal it looks for.
 PIPE = "|"
 GREP = "gr" + "ep"
+QUOTE_CHARS = "\x22\x27"
 QUIET_SHORT = re.compile(r"-[A-Za-z]*q[A-Za-z]*$")
 SET_PIPEFAIL = re.compile(r"\b(set|shopt)\b[^#]*\bpipefail\b")
+# The command word in every spelling a pipeline can carry: grep, behind
+# command, with a path prefix (/usr/bin/grep), a leading backslash (\grep),
+# or quotes, single or double. The lookahead keeps greps/grep-file out.
+GREP_WORD = "(?:[\"']" + GREP + "[\"']|" + GREP + ")"
+GREP_CMD = re.compile(
+    r"[ \t]*(?:command[ \t]+)?(?:[^\s|;&()<>\x22\x27]*/)?\\?" + GREP_WORD
+    + r"(?=[\s|;&()<>]|$)")
+# Options that consume the next word. Without this, the pattern of grep -e -q
+# would read as the quiet flag. Residual over-match: an argument-taking option
+# not listed here, and the attached forms -ePAT/--regexp=PAT; declared with
+# the other non-goals in the comment above this block.
+ARG_OPT = {"-e", "-f", "-A", "-B", "-C", "-m", "-d", "-D"}
+LONG_ARG_OPT = {"--regexp", "--file", "--after-context", "--before-context",
+                "--context", "--max-count", "--devices", "--directories"}
+SHELL_BASH = re.compile(r"shell:[ \t]*[\"']?bash[\"']?[ \t]*(#.*)?$")
 
 
-def quiet_grep(line, at):
-    """True if grep's option words starting at `at` include the quiet flag."""
-    for tok in line[at:].split():
-        if tok == "--":
-            break
-        if tok.startswith("-") and tok != "-":
-            if tok in ("--quiet", "--silent") or QUIET_SHORT.match(tok):
-                return True
+def quiet_flag(tok):
+    return tok in ("--quiet", "--silent") or bool(QUIET_SHORT.match(tok))
+
+
+def command_tokens(line, at):
+    # The words of the command starting at at, up to shell syntax or a comment.
+    # Quotes are tracked so a pipe or hash inside them does not end the command;
+    # an unquoted hash at a word boundary starts a comment and ends it.
+    toks, cur = [], []
+    i, n = at, len(line)
+    quote = None
+    while i < n:
+        c = line[i]
+        if quote:
+            if c == quote:
+                quote = None
+            else:
+                cur.append(c)
+            i += 1
             continue
-        break
-    return False
+        if c in QUOTE_CHARS:
+            quote = c
+            i += 1
+            continue
+        if c in "|;&()<>" + chr(96):
+            break
+        if c == "#" and not cur:
+            break
+        if c in " \t":
+            if cur:
+                toks.append("".join(cur))
+                cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    if cur:
+        toks.append("".join(cur))
+    return toks
 
 
 def violation(line):
-    """True if the line is a pipeline whose right half is a quiet grep."""
+    """True if the line pipes into a quiet grep, whatever its spelling."""
     if line.lstrip().startswith("#"):
         return False
     i = 0
@@ -2648,9 +2713,22 @@ def violation(line):
         if line[p + 1:p + 2] == PIPE:
             i = p + 2
             continue
-        m = re.compile(r"\s*" + GREP + r"(?=\s|$)").match(line, p + 1)
-        if m and quiet_grep(line, m.end()):
-            return True
+        m = GREP_CMD.match(line, p + 1)
+        if not m:
+            continue
+        skip = False
+        for tok in command_tokens(line, m.end()):
+            if skip:
+                skip = False
+                continue
+            if tok == "--":
+                break
+            if tok in ARG_OPT or tok in LONG_ARG_OPT:
+                skip = True
+                continue
+            if quiet_flag(tok):
+                return True
+    return False
 
 
 def sets_pipefail(line):
@@ -2661,6 +2739,33 @@ def report(path, lineno, line):
     print("%s:%d: %s" % (path, lineno, line.strip()))
 
 
+def step_declares_bash_shell(lines, at, base):
+    # True if the step owning at declares shell: bash. A step is one YAML list
+    # item; its keys sit at the indentation of the run: key (base) or deeper.
+    # Walk back to the line that starts the step (the list item, dedented past
+    # base) and forward to the line that dedents past it, then read every
+    # shell: key in that span. Key order inside the step therefore does not
+    # matter, and a line of shell text that happens to read shell: bash deeper
+    # inside the block scalar does not count: only a key at exactly base spaces
+    # is a key of the step.
+    start = at
+    while start > 0:
+        prev = lines[start - 1]
+        ind = len(prev) - len(prev.lstrip(" "))
+        if prev.strip() and ind < base:
+            break
+        start -= 1
+    end = at + 1
+    while end < len(lines):
+        ln = lines[end]
+        ind = len(ln) - len(ln.lstrip(" "))
+        if ln.strip() and ind < base:
+            break
+        end += 1
+    key = re.compile(r"^ {%d}shell:" % base)
+    return any(key.match(ln) and SHELL_BASH.search(ln) for ln in lines[start:end])
+
+
 for path in os.environ.get("PIPE_SCAN_FILES", "").splitlines():
     if not path:
         continue
@@ -2669,7 +2774,7 @@ for path in os.environ.get("PIPE_SCAN_FILES", "").splitlines():
             text = f.read()
     except OSError:
         continue
-    # A library is scanned even without its own `set … pipefail`: it is sourced
+    # A library is scanned even without its own set ... pipefail: it is sourced
     # into callers that enable the option, so it inherits their pipeline status.
     if not path.startswith("scripts/lib/") and not any(
             sets_pipefail(ln) for ln in text.splitlines()):
@@ -2696,10 +2801,15 @@ for name in names:
     while i < len(lines):
         key = re.match(r"^(\s*)run:[ \t]*[|>][-+]?[0-9]?[ \t]*(#.*)?$", lines[i])
         if not key:
-            # A single-line `run: …` that sets pipefail itself is scanned too.
+            # A single-line run: ... is scanned when it sets pipefail itself or
+            # when its step declares shell: bash.
             one = re.match(r"^(\s*)run:[ \t]*(.+)$", lines[i])
-            if one and "pipefail" in one.group(2) and violation(lines[i]):
-                report(path, i + 1, lines[i])
+            if one:
+                base = len(one.group(1))
+                if ("pipefail" in one.group(2)
+                        or step_declares_bash_shell(lines, i, base)) \
+                        and violation(lines[i]):
+                    report(path, i + 1, lines[i])
             i += 1
             continue
         base = len(key.group(1))
@@ -2712,7 +2822,11 @@ for name in names:
                 break
             block.append((j, ln))
             j += 1
-        if any(sets_pipefail(ln) for _, ln in block):
+        # shell: bash is the predefined template: the runner invokes
+        # bash --noprofile --norc -eo pipefail, so the block runs under
+        # pipefail even without its own set -o pipefail.
+        if any(sets_pipefail(ln) for _, ln in block) \
+                or step_declares_bash_shell(lines, i, base):
             for k, ln in block:
                 if violation(ln):
                     report(path, k + 1, ln)

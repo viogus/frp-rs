@@ -98,7 +98,7 @@ PORTS_RANGE="${PORTS_START}:${PORTS_END}"
 if command -v ufw &>/dev/null && grep -q "Status: active" <<<"$(ufw status)"; then
     ufw allow ${PORTS_START}:${PORTS_END}/tcp
     log "UFW: opened tcp ${PORTS_START}-${PORTS_END}"
-elif command -v firewall-cmd &>/dev/null && grep -q "running" <<<"$(firewall-cmd --state 2>/dev/null)"; then
+elif command -v firewall-cmd &>/dev/null && [ "$(firewall-cmd --state 2>/dev/null)" = "running" ]; then
     firewall-cmd --permanent --add-port=${PORTS_START}-${PORTS_END}/tcp
     firewall-cmd --reload
     log "firewalld: opened tcp ${PORTS_START}-${PORTS_END}"
