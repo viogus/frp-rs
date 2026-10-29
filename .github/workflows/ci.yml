@@ -4106,7 +4106,13 @@ jobs:
   verify:
     name: Verify (bench + feature sets)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 15 minutes only fits with a warm `target/` cache. The cache key includes
+    # `Cargo.lock`, so every dependency PR starts cold, and this job recompiles
+    # the workspace under several different `RUSTFLAGS`/feature sets
+    # (`cargo bench --workspace --no-run` alone takes 10-12 min cold) — it was
+    # cancelled mid-run on a cold cache. 25 minutes keeps headroom for a cold
+    # dependency bump while still bounding a hung job.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
