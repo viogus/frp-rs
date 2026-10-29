@@ -1,8 +1,31 @@
-# Vendored russh 0.62.7 (frp-rs)
+# Vendored russh 0.65.0 (frp-rs)
 
-This directory vendors `russh` 0.62.7 (crates.io, warp-tech) with two
+This directory vendors `russh` 0.65.0 (crates.io, warp-tech) with two
 patches, wired in via `[patch.crates-io]` in the workspace root
 `Cargo.toml` (`russh = { path = "vendor/russh" }`).
+
+## Provenance
+
+Re-vendored from the crates.io `russh` 0.65.0 tarball
+(`sha256 3bb77a4b259312b2abbc541bca1c13cb4e9b61c560a7fd894068c3b92e0c9dc3`,
+matching the `cksum` of the 0.65.0 row in the crates.io sparse index).
+The vendored tree is the tarball's `Cargo.toml`, `Cargo.toml.orig`,
+`README.md` and `src/`; the package's `benches/`, `examples/`, `tests/`,
+`Cargo.lock` and `.cargo_vcs_info.json` are not vendored, same as in the
+previous (0.62.7) copy. `diff -r` against the pristine tarball reports
+exactly five modified files — `Cargo.toml`, `src/cipher/mod.rs`,
+`src/keys/format/mod.rs`, `src/keys/format/openssh.rs` and
+`src/keys/format/pkcs8.rs` — i.e. the two patches below and the one
+`#[allow(dead_code)]`; everything else is byte-identical to crates.io.
+
+The re-vendor commit was 0.62.7 → 0.65.0 in one step. The patch hunks
+re-applied to the 0.65.0 text with zero fuzz (`patch -p1 --fuzz=0`, no
+offsets, no rejects), so the frp-rs edit set is unchanged across the bump.
+Upstream's exit condition for these patches is still unmet at 0.65.0:
+`Cargo.toml` still hardcodes ssh-key's `encryption` + `ppk` features and
+pkcs8's `encryption` feature, and the crate still calls
+`PrivateKey::from_ppk`, `PrivateKey::decrypt` and
+`EncryptedPrivateKeyInfoRef::decrypt` unconditionally.
 
 ## License
 
@@ -57,15 +80,19 @@ so no reachable behavior changes.
 
 ### Upgrade note
 
-When bumping russh upstream: re-apply the source edits from Patch 1 and
-Patch 2 (the `format/mod.rs` PuTTY branch removal, the
-`format/openssh.rs` decrypt replacement, the `format/pkcs8.rs`
-encrypted-key rejection + `encode_pkcs8_encrypted` removal, and the
-`format/mod.rs` `encode_pkcs8_pem_encrypted` removal) and the two
-`Cargo.toml` trims (ssh-key features; pkcs8 features + the
-pkcs5/salsa20/scrypt/sha3 direct deps), or carry the patch upstream
-(preferred: feature knobs in russh so `ppk`, ssh-key `encryption`, and
-pkcs8 `encryption` can be disabled from the crate root).
+This has been replayed through the 0.62.7 → 0.65.0 bump: the two patches
+above applied to the pristine 0.65.0 sources with `patch -p1 --fuzz=0`
+(zero fuzz, zero offsets, no rejects), and `diff -r` against the pristine
+tarball shows only the five files listed at the end of this file. When
+bumping russh again: re-apply the source edits from Patch 1 and Patch 2
+(the `format/mod.rs` PuTTY branch removal, the `format/openssh.rs` decrypt
+replacement, the `format/pkcs8.rs` encrypted-key rejection +
+`encode_pkcs8_encrypted` removal, and the `format/mod.rs`
+`encode_pkcs8_pem_encrypted` removal) and the two `Cargo.toml` trims
+(ssh-key features; pkcs8 features + the pkcs5/salsa20/scrypt/sha3 direct
+deps), or carry the patch upstream (preferred: feature knobs in russh so
+`ppk`, ssh-key `encryption`, and pkcs8 `encryption` can be disabled from
+the crate root).
 
 ## Patch 2: drop pkcs8 `encryption` (encrypted-PKCS8 decryption chain)
 
@@ -77,8 +104,9 @@ and (transitively) aes-gcm 0.11. Russh uses it in exactly one place:
 `keys/format/pkcs8.rs` decrypts `-----BEGIN ENCRYPTED PRIVATE KEY-----`
 files via `EncryptedPrivateKeyInfoRef::decrypt`.
 
-frp-rs's SSH gateway never loads private-key files at all: the host key
-is generated in-memory (`PrivateKey::random`), auth is password + public
+frp-rs's SSH gateway never loads an encrypted private key: host keys are
+read with `russh::keys::load_secret_key(path, None)` (no passphrase) or
+generated in-memory (`PrivateKey::random`), auth is password + public
 keys (`authorized_keys`), and no config path reads an encrypted PKCS#8
 key. So the entire encrypted-PKCS8/PKCS5 path is dead, and its dependency
 chain is pure compile-time + audit-surface cost (LTO already strips the
@@ -102,9 +130,11 @@ Five crates leave `Cargo.lock`: `pkcs5`, `salsa20`, `scrypt`, `sha3`
 `aes`, `cbc`, `keccak`, `pbkdf2`) stay because russh's own direct deps
 still use them. `sha3` 0.11 also stays — it is a hard dependency of
 `ml-kem` (post-quantum Kyber KEX), not of the removed PKCS5 chain.
-`aes-gcm` 0.11 was already unreachable after Patch 1 (its only puller,
-`ssh-cipher` via ssh-key's `encryption` feature, is gone); its lock entry
-lingers as an orphan. The SSH key algorithms (rsa/ed25519/p256/p384/p521)
+`aes-gcm` 0.11 is no longer compiled into the russh tree after Patch 1
+(`cargo tree -i aes-gcm` prints nothing, so the `ssh-cipher` path that
+used it is off); its lock entry lingers as an orphan. (`ssh-cipher` 0.3
+itself stays: ssh-key 0.7 depends on it independently of the
+`encryption` feature.) The SSH key algorithms (rsa/ed25519/p256/p384/p521)
 are unaffected: they use pkcs8's core (`alloc`), never the `encryption`
 path. russh's internal `keys/format/pkcs5` module (legacy OpenSSL
 `DEK-Info: AES-128-CBC` PEM, on the `aes`/`cbc`/`md5` direct deps) is
@@ -129,9 +159,20 @@ never had a code path that fed one in, so no reachable behavior changes.
   vendored build warning-free — upstream is silent only because registry
   dependencies suppress warnings.
 
-## Diff from crates.io russh 0.62.7
+## Diff from crates.io russh 0.65.0
 
-Everything else in this tree is byte-identical to crates.io russh
-0.62.7 (the normalized `Cargo.toml`); the full delta is the source edits
-from Patch 1 and Patch 2, the two `Cargo.toml` trims, and the one
-`#[allow(dead_code)]`.
+0.65.0 (the normalized `Cargo.toml`) with the five-file delta below is
+the whole difference: `Cargo.toml.orig`, `README.md` and every `src/`
+file not listed here are byte-identical to crates.io. The full delta is:
+
+| File | Change |
+|------|--------|
+| `Cargo.toml` | ssh-key features trimmed; pkcs8 features trimmed; `pkcs5`/`salsa20`/`scrypt`/`sha3` direct deps dropped |
+| `src/cipher/mod.rs` | `#[allow(dead_code)]` on `MAXIMUM_DECOMPRESSED_PACKET_LEN` |
+| `src/keys/format/mod.rs` | PuTTY branch removed; `encode_pkcs8_pem_encrypted` removed |
+| `src/keys/format/openssh.rs` | decrypt branch replaced with `Err(Error::KeyIsEncrypted)` |
+| `src/keys/format/pkcs8.rs` | encrypted-key rejection; `encode_pkcs8_encrypted` removed |
+
+The vendored tree also omits the package's `benches/`, `examples/`,
+`tests/`, `Cargo.lock` and `.cargo_vcs_info.json` (as the 0.62.7 copy
+did), and carries this file.

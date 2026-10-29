@@ -85,7 +85,7 @@ webpki-roots = "1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "tracing"] }
 prometheus = { version = "0.14", default-features = false }
 yamux = "0.14"
-russh = { version = "0.62.5", default-features = false, features = ["ring", "rsa"] }
+russh = { version = "0.65.0", default-features = false, features = ["ring", "rsa"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 h2 = "0.4"
 http = "1"
@@ -126,7 +126,7 @@ rustls = { path = "vendor/rustls" }
 # yamux 0.14.0 with a per-stream RST on inbound stream-cap hits (instead
 # of a session-killing GoAway) — see vendor/yamux/README-FRP-RS.md.
 yamux = { path = "vendor/yamux" }
-# russh 0.62.7 with ssh-key's `encryption` + `ppk` features dropped (dead
+# russh 0.65.0 with ssh-key's `encryption` + `ppk` features dropped (dead
 # code in the frp-rs SSH gateway) — see vendor/russh/README-FRP-RS.md.
 russh = { path = "vendor/russh" }
 
