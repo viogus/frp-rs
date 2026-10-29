@@ -390,11 +390,10 @@ impl AsyncWrite for Stream {
         cx: &mut Context,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        match self.sender.poll_ready(cx) {
-            Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(_)) => return Poll::Ready(Err(self.write_zero_err())),
-            Poll::Pending => return Poll::Pending,
-        }
+        ready!(self
+            .sender
+            .poll_ready(cx)
+            .map_err(|_| self.write_zero_err())?);
         let body = {
             let mut shared = self.shared();
             if !shared.state().can_write() {
@@ -445,10 +444,9 @@ impl AsyncWrite for Stream {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
-        match self.sender.poll_flush_unpin(cx) {
-            Poll::Ready(r) => Poll::Ready(r.map_err(|_| self.write_zero_err())),
-            Poll::Pending => Poll::Pending,
-        }
+        self.sender
+            .poll_flush_unpin(cx)
+            .map_err(|_| self.write_zero_err())
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
@@ -621,6 +619,10 @@ mod tests {
             sender,
             Rtt::new(),
             Default::default(),
+            // frp-rs: `new_outbound` also takes the body-buffer pool added by
+            // the send/read buffer-reuse patch. This test never reads or writes
+            // a data-frame body, so a one-slot pool is enough.
+            Arc::new(ArrayQueue::new(1)),
         );
 
         let write_waker = Arc::new(FlagWaker::default());

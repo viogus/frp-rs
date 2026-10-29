@@ -284,7 +284,11 @@ impl quickcheck::Arbitrary for Config {
             read_after_close: bool::arbitrary(g),
             split_send_size: g.gen_range(DEFAULT_SPLIT_SEND_SIZE..usize::MAX),
             max_stream_receive_window: if bool::arbitrary(g) {
-                Some(g.gen_range(DEFAULT_CREDIT..=u32::MAX))
+                // frp-rs: exclusive range — upstream `quickcheck-ext`'s
+                // `GenRange::gen_range` only accepts `Range<T>`, not
+                // `RangeInclusive<T>` (this `Arbitrary` impl is an frp-rs
+                // addition and had never been compiled).
+                Some(g.gen_range(DEFAULT_CREDIT..u32::MAX))
             } else {
                 None
             },

@@ -13,6 +13,15 @@
 # scripts/frp-stress/ is a separate throwaway workspace; its lock is not tracked.
 scripts/frp-stress/Cargo.lock
 
+# Vendored crates are `[patch.crates-io]` path deps, not workspace members. The
+# ones that carry their own empty `[workspace]` (vendor/yamux) can be checked
+# standalone — `cargo check --manifest-path vendor/yamux/Cargo.toml --all-targets`
+# — which resolves its own lock and (without CARGO_TARGET_DIR) builds a target
+# dir inside the vendor tree. That is local verification state, not repo content.
+# See vendor/yamux/README-FRP-RS.md § Vendoring hygiene.
+/vendor/*/Cargo.lock
+/vendor/*/target/
+
 # Local tool state and scratch dirs — never part of the repo.
 .worktrees/
 .claude/
