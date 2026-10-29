@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=0aa8cae1db6e33bb53c02de876c30704e123ff387b38240d6099189b0cb9ef37
+          guard_data_pin=40adfc605b5a08b1fe3ba10a67abe0ac2c43c92f7ba7a04e0c4b1afa5ab10d68
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2279,17 +2279,25 @@ jobs:
         # target prints `running 0 tests` and exits 0.
         run: |
           set -o pipefail
+          # `CARGO_TERM_COLOR: always` is set for the whole workflow, and an
+          # escape sequence between `test` and the name would make every grep
+          # below miss (the frps bin guard above strips them for the same
+          # reason), so assert on a scrubbed copy and keep the raw log for the
+          # failure message.
           log=$(mktemp)
           cargo test -p frp-core --features otel --test otel_export 2>&1 | tee "$log"
-          if ! grep -qE '^running 1 test$' "$log"; then
-            echo "::error::the otel exporter regression test listed $(grep -cE '^running [0-9]+ tests?$' "$log") run(s): frp-core/tests/otel_export.rs was emptied, renamed or cfg'd out"
+          sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
+          if ! grep -qE '^running 1 test$' "$log.plain"; then
+            echo "::error::the otel exporter regression test listed $(grep -cE '^running [0-9]+ tests?$' "$log.plain") run(s): frp-core/tests/otel_export.rs was emptied, renamed or cfg'd out"
+            cat "$log.plain"
             exit 1
           fi
-          if ! grep -qE '^test span_is_exported_over_http_to_the_otlp_endpoint \.\.\. ok$' "$log"; then
+          if ! grep -qE '^test span_is_exported_over_http_to_the_otlp_endpoint \.\.\. ok$' "$log.plain"; then
             echo "::error::span_is_exported_over_http_to_the_otlp_endpoint did not pass — spans are not leaving the process"
+            cat "$log.plain"
             exit 1
           fi
-          grep -qE '^test result: ok\. 1 passed; 0 failed' "$log"
+          grep -qE '^test result: ok\. 1 passed; 0 failed' "$log.plain"
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
