@@ -170,8 +170,9 @@ pub async fn pump_tcp_bridge(
 /// frps writes on a vhost/tcpmux route miss (and control-gone) when no
 /// `custom_404_page` is configured, here behind frp's own raw 92-byte header
 /// block (no `Date`/charset/`Connection`: the raw-writer shape this fixture
-/// pins, not the stdlib `http.Server`-layer shape a Go *GET* route miss can
-/// show — see the backlog item on the 404 head shape): 92 + 489 = 581 bytes.
+/// pins, not the stdlib `http.Server`-layer shape a Go *GET* route miss shows —
+/// probed at 632 B; recorded in `docs/go-frp-compat-audit.md`
+/// § Deliberate divergences): 92 + 489 = 581 bytes.
 /// Probe-verified byte-exact against the Go binary at the compat target
 /// (v0.71.0; re-checked for v0.71.1). The `Server:` line carries this crate's
 /// version, as the Go binary carries its own, so it is interpolated here and

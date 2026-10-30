@@ -201,6 +201,85 @@ specifics that are not already tabulated:
 
 ---
 
+## Deliberate divergences (probed)
+
+These differences from Go frp v0.71.1 are known, measured and kept on purpose.
+Each was probed against the real binaries rather than inferred from source: Go frp
+v0.71.1 (darwin/arm64 release build) and an frp-rs `target/debug` build of the
+tree that recorded them, on 2026-10-30. The leftovers are listed in [`TODO.md`](../TODO.md)
+where they are large enough to be worth tracking; the rest are settled here.
+
+### 404 head shape on the vhost HTTP GET path
+
+Three routes were probed with a raw socket so the head bytes are exact:
+
+| Route | Go v0.71.1 | frp-rs |
+|---|---|---|
+| (a) tcpmux `CONNECT` route miss | **581 B** = 92-byte head + 489-byte body | identical, byte-for-byte (`GO_404_NOT_FOUND_RESPONSE`) |
+| (b) plain-HTTP vhost `GET` route miss | **632 B** = 143-byte head + 489-byte body | **581 B** = 92-byte head + 489-byte body |
+| (c) vhost `GET` miss with `custom404Page` | **186 B** = 142-byte head + the custom file's 44 bytes | **135 B** = 91-byte head + the same 44 bytes |
+
+Go's (b)/(c) head is written by `net/http`, not by frp's `NotFoundResponse`:
+`HTTPReverseProxy`'s reverse-proxy `ErrorHandler` calls `rw.WriteHeader(404)` then
+`rw.Write(getNotFoundPageContent())` (`pkg/util/vhost/http.go:128-138`), so the
+server layer adds `Date`, sniffs `Content-Type: text/html; charset=utf-8`, and adds
+`Connection: close` for the probed close-requesting client — and no `Server` header
+is present. Go's (a) and every frp-rs arm write `NotFoundResponse`
+(`pkg/util/vhost/resource.go:70-85`): fixed head order, `Server: frp/<version>`,
+no `Date`. The **status, body bytes and `Content-Length` agree on every row**
+(the builtin body is 489 B in both, and the configured custom page is served by
+both on both routes); only the head layer differs, and only on the plain-HTTP GET
+path.
+
+frp-rs keeps the raw `NotFoundResponse` head there instead of re-implementing
+`net/http`'s response writer. A faithful copy would have to model date formatting,
+keep-alive vs `Connection: close`, header ordering and content sniffing — and the
+`Date` value changes every second — for a header set no client routes on. The
+difference is pinned as the raw shape in
+`frp-server/tests/common/mod.rs` (`GO_404_NOT_FOUND_RESPONSE`) and documented in
+`frp-server/src/vhost.rs`; the tcpmux row remains byte-exact.
+
+### TOML 1.1 leniency in the config loader
+
+The loader uses `toml` 1.1, which parses TOML 1.1. Go frp v0.71.1 parses configs
+with `github.com/pelletier/go-toml/v2` v2.2.0, which is TOML 1.0. Four 1.1-only
+forms are therefore **accepted by frp-rs and rejected by Go**, measured with
+`verify -c` on both binaries:
+
+| Document | Go v0.71.1 | frp-rs |
+|---|---|---|
+| `serverAddr = "\x41"` (`\xNN` escape) | exit 1, `invalid escaped character U+0078 'x'` | exit 0, value `A` |
+| `metadatas.ts = 07:32` (seconds-less local time) | exit 1, `times are expected to have the format HH:MM:SS[.NNNNNN]` | exit 0 |
+| inline table spanning lines | exit 1, `invalid character at start of key` | exit 0 |
+| `auth = { method = "token", token = "t", }` (inline-table trailing comma) | exit 1, `invalid character at start of key: }` | exit 0 |
+
+This is **acceptance-only leniency**, not a value divergence: every document the
+0.8 parser accepted is still accepted, and re-parsing one of them (a multi-line
+string containing `\r`) now keeps the `\r`, which is also what Go does. Rejecting
+the four forms would require a TOML 1.0 validator in front of the parser (the
+shapes sit inside strings, dates and table syntax, so a pre-scan would have to
+reimplement the grammar); the loader therefore stays on the maintained parser and
+warns nothing, which is the deliberate choice recorded here. A config that is
+valid for Go is valid for frp-rs, so a shared config directory still works.
+
+### Dashboard daily traffic buckets are UTC days
+
+Go's `DateCounter` rotates on the **server's local calendar date**
+(`time.Now()` in `pkg/util/metric/date_counter.go`). frp-core's daily buffer
+rotates on UTC epoch days (`days_since_epoch` in `frp-core/src/metrics.rs`), and
+the dates in `/api/v2/proxies/{name}/traffic` are formatted from the same UTC
+clock, so a deployment west of Greenwich counts the last hours of its local day
+into the next bucket (and east of it into the previous one). Totals agree; only
+the day boundary differs, and the bucket dates are UTC dates.
+
+A local-date fix needs a timezone source on every shipped target: a tz database
+is a new dependency, and `libc`'s `localtime_r` is not available on all of them
+(frp-core links `libc` only on Linux, for `splice(2)`). The dashboard therefore
+labels its buckets as UTC on purpose, documented here and next to
+`days_since_epoch`.
+
+---
+
 ## Known Limitations
 
 Current limitations as of frp-rs 0.71.1:

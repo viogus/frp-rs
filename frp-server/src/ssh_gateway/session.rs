@@ -310,6 +310,19 @@ pub struct SshSession {
     /// client → bridge task read half, plus the teardown bookkeeping — see
     /// [`ReverseChannels`]).
     reverse_channels: ReverseChannels,
+    /// Channels this peer opened with `CHANNEL_OPEN` type `session`. Only these
+    /// may carry `exec`/`env` requests: a `forwarded-tcpip` channel is a work
+    /// connection (the server opens it, the peer accepts it, bytes flow), and
+    /// answering `exec` on it would let the local service side of `-R` also
+    /// register a proxy through that channel. Client-initiated
+    /// `forwarded-tcpip`/`direct-tcpip` opens are rejected outright (see the
+    /// `channel_open_*` callbacks), so membership here is the whole
+    /// authorization test.
+    ///
+    /// Tracked per channel rather than per session because SSH allows several
+    /// session channels on one connection; entries are removed on
+    /// `CHANNEL_CLOSE` so a long-lived peer cannot grow the set without bound.
+    session_channels: std::collections::HashSet<ChannelId>,
     /// Cancelled when the virtual control handler exits (e.g. the server's
     /// heartbeat-timeout cleanup kills it — the SSH virtual client never
     /// sends Ping). The listener task and the work-conn bridge race on it so
@@ -352,6 +365,7 @@ impl SshSession {
             auth_deadline,
             reverse_forward: Arc::new(std::sync::Mutex::new(None)),
             reverse_channels: ReverseChannels::default(),
+            session_channels: std::collections::HashSet::new(),
             control_exit,
         }
     }
@@ -618,6 +632,20 @@ impl Handler for SshSession {
         let handle = session.handle();
         let run_id = self.run_id.clone();
 
+        if !self.session_channels.contains(&channel) {
+            // Not a session channel: a forwarded-tcpip work channel (or an id
+            // this session never opened). A command run here would register a
+            // proxy through a channel whose other end is the local service
+            // behind `-R` — see the `session_channels` field docs.
+            tracing::warn!(
+                run_id = %run_id,
+                channel = ?channel,
+                "SSH gateway: refusing exec on a channel that was not opened as a session channel"
+            );
+            let _ = handle.channel_failure(channel).await;
+            return Ok(());
+        }
+
         let cmd = match std::str::from_utf8(data) {
             Ok(cmd) => cmd.trim().to_string(),
             Err(e) => {
@@ -876,6 +904,15 @@ impl Handler for SshSession {
         _variable_value: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        if !self.session_channels.contains(&channel) {
+            tracing::warn!(
+                run_id = %self.run_id,
+                channel = ?channel,
+                "SSH gateway: refusing env on a channel that was not opened as a session channel"
+            );
+            let _ = session.handle().channel_failure(channel).await;
+            return Ok(());
+        }
         session.handle().channel_success(channel).await.ok();
         Ok(())
     }
@@ -884,11 +921,15 @@ impl Handler for SshSession {
 
     async fn channel_open_session(
         &mut self,
-        _channel: Channel<Msg>,
+        channel: Channel<Msg>,
         reply: ChannelOpenHandle,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // Accept session channels (needed for exec_request/shell_request)
+        // Accept session channels (needed for exec_request/shell_request) and
+        // remember that this id is allowed to carry exec/env requests. The
+        // insert happens before the accept reply, so no request on this
+        // channel can be dispatched ahead of the record.
+        self.session_channels.insert(channel.id());
         reply.accept().await;
         Ok(())
     }
@@ -968,6 +1009,7 @@ impl Handler for SshSession {
                 "SSH gateway: channel closed, its reverse data sender is ended; a bridge task on it, if any, exits"
             );
         }
+        self.session_channels.remove(&channel);
         Ok(())
     }
 

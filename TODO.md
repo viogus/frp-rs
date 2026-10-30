@@ -12612,7 +12612,7 @@ other.
   compat suite against Go 0.71.1, `protocol-matrix`, both cite guards, `repo-health`)
   before merging to `main`.
 
-- [ ] **HTTP 404 head shape may diverge from Go on some vhost paths.**
+- [x] **HTTP 404 head shape may diverge from Go on some vhost paths.**
   Evidence: the v0.71.1 release review probed a Go frp 0.71.1 **GET** route miss on a vhost and got
   a stdlib `http.Server`-shaped 404 (143-byte head: `Date`, `Content-Type: text/html; charset=utf-8`,
   `Connection: close`, no `Server` header; 632 bytes total), while frp-rs writes frp's own raw 404
@@ -12624,6 +12624,14 @@ other.
   miss and (c) a vhost with `custom_404_page` decides whether the difference is the header set or
   only the layer that writes it; then either pin the observed Go bytes per path or record the
   divergence in `docs/go-frp-compat-audit.md`.
+  Done (2026-10-30): probed with raw sockets against Go v0.71.1 and this tree's `target/debug/frps`.
+  (a) tcpmux CONNECT miss is byte-identical (581 B). (b) the plain-HTTP GET miss is **632 B** on Go
+  (143-byte head rendered by `net/http` with `Date`, sniffed `Content-Type`, `Connection: close`, no
+  `Server`) vs **581 B** here. (c) with `custom404Page` the GET miss is 186 B vs 135 B; tcpmux is
+  135 B on both. Status, body bytes and `Content-Length` agree on every row. Recorded in
+  `docs/go-frp-compat-audit.md` § Deliberate divergences; `frp-server/src/vhost.rs`'s two route-miss
+  comments no longer claim Go answers `NotFoundResponse` on the GET path, and the tcpmux pin in
+  `frp-server/tests/common/mod.rs` points at the record.
 
 - [ ] **`jsonwebtoken` is pinned below 11 until a `ring` backend exists.**
   Evidence: 11.1.0 has no `ring` backend at all — 9.3.1's `ring` is a plain
@@ -12637,7 +12645,7 @@ other.
   (c) OIDC verification is reimplemented directly on `ring` + the existing `rsa` crate
   and `jsonwebtoken` is dropped.
 
-- [ ] **`toml` 1.1 accepts config documents that the Go binary rejects.**
+- [x] **`toml` 1.1 accepts config documents that the Go binary rejects.**
   Evidence: the 0.8 → 1.1 bump (PR #552) newly accepts `\xNN` escapes, seconds-less
   local times (`07:32`), inline tables spanning lines and inline-table trailing commas —
   21 diffs in a 102-case differential. Go frp v0.71.1 parses configs with
@@ -12648,6 +12656,13 @@ other.
   other diffs are acceptance-only: nothing valid under 0.8 is rejected.
   Done-when: either the loader rejects the four forms with a Go-style error, or the
   divergence is recorded as intentional leniency in `docs/go-frp-compat-audit.md`.
+  Done (2026-10-30): recorded as intentional leniency. Re-measured all four forms with
+  `verify -c` on Go v0.71.1 and the debug frpc: `serverAddr = "\x41"` (Go: invalid escaped
+  character), `metadatas.ts = 07:32` (Go: times are expected to have the format HH:MM:SS),
+  an inline table spanning lines, and `auth = { …, }` (both: invalid character at start of
+  key) — Go exits 1, frp-rs exits 0 on each. The audit's new § Deliberate divergences table
+  carries the commands and both sides' text. Acceptance-only: every 0.8-valid document still
+  loads, and rejecting these would require a TOML 1.0 validator in front of the parser.
 
 - [x] **The OTLP endpoint is used verbatim, so a documented base URL exports nothing.**
   Evidence: `observability.otlp_endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT` reaches
@@ -12712,7 +12727,7 @@ other.
   file), starting with `scripts/repo-health.sh:2591`, and a fixture feeds one of them a
   payload large enough to have failed before.
 
-- [ ] **Dashboard daily counters roll over on the UTC day boundary, where Go uses the server's local calendar date.**
+- [x] **Dashboard daily counters roll over on the UTC day boundary, where Go uses the server's local calendar date.**
   Evidence: `frp-core/src/metrics.rs:148-153` derives the day index from UTC epoch days and
   `:118-131` rotates on it, so a deployment west of Greenwich counts the last hours of its
   local day into the next day's bucket (and east of it into the previous one) — the numbers
@@ -12724,7 +12739,13 @@ other.
   Done-when: the day index is computed from a documented local-date source (with the DST and
   half-hour-offset cases covered by a test), or the dashboard labels its buckets as UTC on
   purpose and the compatibility audit records that deviation.
-- [ ] **The SSH gateway has no channel-type registry: `exec`/`env` on an established `forwarded-tcpip` channel are dispatched.**
+  Done (2026-10-30): took the second branch. The buckets are **UTC days by design**:
+  `TrafficHistory`'s docs and `days_since_epoch` (`frp-core/src/metrics.rs`) now state that
+  explicitly, and `docs/go-frp-compat-audit.md` § Deliberate divergences records the deviation
+  from Go's local calendar date plus why a portable local-date source is out of scope (a tz
+  database is a new dependency; `libc`'s `localtime_r` is linked only on Linux, and frp-core
+  has no per-platform calendar source). Totals agree; only the boundary differs.
+- [x] **The SSH gateway has no channel-type registry: `exec`/`env` on an established `forwarded-tcpip` channel are dispatched.**
   Evidence: `frp-server/src/ssh_gateway/session.rs` answers `exec_request` and `env_request`
   for any open channel and keeps no record of which channel was opened for which purpose, so
   a client that opened `forwarded-tcpip` (a work connection) can also ask that channel to run
@@ -12736,7 +12757,14 @@ other.
   Done-when: `channel_open_*` records the channel's purpose, and `exec_request`/`env_request`
   (and any future type-specific request) are answered with a failure on a channel that was
   not opened for that purpose, with a test that a work connection cannot run a command.
-- [ ] **The `otel` build keeps a stdout `fmt` layer when `[log] to=<file>` is set.**
+  Done (2026-10-30): `SshSession::session_channels` records every channel the peer opened with
+  `channel_open_session` and drops it on `channel_close`; `exec_request` and `env_request`
+  answer `CHANNEL_FAILURE` and return before parsing/registration on any other channel id,
+  which is exactly the server-opened `forwarded-tcpip` work channel. Pinned by
+  `exec_on_a_forwarded_tcpip_channel_is_refused` (`frp-server/tests/ssh_gateway.rs`), which
+  opens a real `-R` work channel and sends `exec` on it: it passes with the guard and times
+  out on the pre-fix tree (re-measured by reverting `session.rs`).
+- [x] **The `otel` build keeps a stdout `fmt` layer when `[log] to=<file>` is set.**
   Evidence: `frp-core/src/logging.rs`'s otel branch installs the console layer *and* the file
   layer, while the non-otel branch suppresses the console layer once a file destination is
   configured. So in an otel build `[log] to=…` still mirrors every record to stdout, and
@@ -12749,3 +12777,9 @@ other.
   `observability.otlp_endpoint` and relax/pin the `log_completion` expectation for the otel
   lane) or the file branch should suppress the console layer as the non-otel path does, and
   pin the chosen behaviour in `log_completion`.
+  Done (2026-10-30): took the second branch. `init_tracing_otel`'s file arm now installs only
+  the file `fmt` layer, matching the non-otel `init_tracing` (Go's file destination likewise
+  replaces stdout); the OTel layer still exports spans. The existing expectation needed no
+  change: `cargo test -p frps --all-features --test log_completion
+  cli_empty_log_file_keeps_the_files_destination` passes on the fixed tree and was failing on
+  base.

@@ -68,6 +68,14 @@ pub struct MetricsSnapshot {
 
 /// Per-day traffic ring buffer. Index 0 = today, 6 = 6 days ago.
 /// Rotates automatically on day change. Go frp v0.70.0 compat.
+///
+/// **The day boundary is UTC, deliberately diverging from Go.** Go's
+/// `DateCounter` rotates on the server's local calendar date
+/// (`pkg/util/metric/date_counter.go`); this buffer uses UTC epoch days because
+/// a portable local-date source would need a timezone database (or a
+/// per-platform `localtime_r`, unavailable on every shipped target). Totals
+/// agree; only traffic in the hours around local midnight lands in a different
+/// bucket. Recorded in `docs/go-frp-compat-audit.md` § Deliberate divergences.
 pub struct TrafficHistory {
     state: Mutex<TrafficState>,
 }
@@ -145,6 +153,8 @@ impl TrafficHistory {
     }
 }
 
+/// UTC days since the Unix epoch — the bucket index for [`TrafficHistory`].
+/// See the type docs for the deliberate UTC-vs-local-date divergence.
 fn days_since_epoch() -> u32 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
