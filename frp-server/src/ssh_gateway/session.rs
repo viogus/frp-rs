@@ -5,7 +5,8 @@
 //! `SshSession` for its listener loop, and the sibling `tests` module drives
 //! the auth methods and reads a handful of fields directly.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::anyhow;
 use dashmap::DashMap;
@@ -21,6 +22,243 @@ use super::{
     build_v1_frame_from_args, handle_work_conn_requests, log_exec_request, parse_ssh_args,
     ssh_gateway_usage, VirtualControl, PROXY_REGISTER_WAIT,
 };
+
+// ==============================================================
+// ReverseChannels — forwarded-tcpip routing table
+// ==============================================================
+
+/// Reverse-tunnel routing table for one SSH session: `forwarded-tcpip`
+/// channel → bridge read-half sender, shared by the russh handler callbacks
+/// (`data`, `channel_eof`, `channel_close`) and the work-connection task that
+/// opens the channels (see `bridge::handle_work_conn_requests`).
+///
+/// Dropping a channel's sender is the one teardown signal: the bridge's
+/// `data_rx.recv()` loop ends, the bridge shuts the work connection's write
+/// half, and frps propagates EOF to the user connection. Two callbacks drop
+/// it — the peer's `CHANNEL_EOF` (the local service sent FIN; channel and
+/// session stay open) and `CHANNEL_CLOSE` — and both go through
+/// [`end`](Self::end).
+///
+/// Registration is asynchronous: the server only learns the [`ChannelId`] when
+/// `channel_open_forwarded_tcpip` returns, so a peer that half-closes (or
+/// closes) right after accepting the channel — a local service that FINs
+/// immediately, or a refused `ssh -R` target — delivers `CHANNEL_EOF` /
+/// `CHANNEL_CLOSE` *before* its sender exists. A bare "remove the sender" is
+/// then a no-op, and the sender registered a moment later is never dropped:
+/// the bridge waits forever and the user connection never sees EOF.
+/// [`begin_open`](Self::begin_open) marks that window, and [`end`](Self::end)
+/// leaves a tombstone (a sender whose receiver is already gone) inside it;
+/// [`register`](Self::register) then drops the fresh sender at once, so an end
+/// that overtakes registration is not lost.
+///
+/// The invariant that makes that work: **a peer end never interleaves with the
+/// register/finish sequence it can overtake**. Every transition below runs
+/// under `gate`, so `end` cannot read `open_in_flight` after another thread has
+/// already cleared it for the open its tombstone belongs to: the flag read is
+/// part of the same critical section as the map update. The sections are tiny
+/// and hold no `await`, and opens are serial, so the mutex is uncontended.
+///
+/// Bounded: tombstones exist only while an open is in flight, are swept by
+/// [`finish_open`](Self::finish_open), and are capped at
+/// [`MAX_IN_FLIGHT_TOMBSTONES`]. The window is client-controlled (the peer
+/// decides how long to leave one open unanswered, and how many other channels
+/// it closes meanwhile), so without the cap a single unanswered open plus a
+/// channel-close loop could grow the table without limit. At the cap the newest
+/// end is *recorded*: one existing closed entry is evicted to make room — the
+/// first in iteration order, never a live sender — and the evicted channel's
+/// own end is lost until `CHANNEL_CLOSE`. Iteration order is not age, so the
+/// victim can even be the in-flight channel's own tombstone; the only property
+/// the eviction guarantees is that the end arriving now is kept rather than
+/// dropped. A live sender is never evicted.
+#[derive(Clone, Default)]
+pub(super) struct ReverseChannels {
+    /// Registered channels: live senders plus in-flight tombstones (senders
+    /// whose receiver is already gone). Sharded by `ChannelId` (DashMap), so
+    /// the per-chunk `data` callback lock for one reverse channel never
+    /// serializes against the other reverse channels of this session.
+    data_tx: Arc<DashMap<ChannelId, mpsc::Sender<Vec<u8>>>>,
+    /// One `forwarded-tcpip` open is in flight. The work-connection task opens
+    /// channels serially, so a peer end that arrives while this is set may
+    /// belong to the channel that is about to be registered.
+    open_in_flight: Arc<AtomicBool>,
+    /// Serializes the compound transitions ([`begin_open`](Self::begin_open),
+    /// [`register`](Self::register), [`finish_open`](Self::finish_open),
+    /// [`end`](Self::end), [`discard`](Self::discard)); see the invariant above.
+    gate: Arc<Mutex<()>>,
+}
+
+/// How many tombstones one in-flight open may leave behind. A single open owns
+/// at most one, but the window is client-controlled, so the leftover set is
+/// capped rather than assumed small.
+pub(super) const MAX_IN_FLIGHT_TOMBSTONES: usize = 64;
+
+impl ReverseChannels {
+    /// Enter one table transition. Poisoning is unrecoverable in general but
+    /// impossible here — no code inside a section panics — and taking the inner
+    /// value keeps a panicking test from wedging the table for the session.
+    fn lock_gate(&self) -> MutexGuard<'_, ()> {
+        self.gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Route one `data` callback chunk to the bridge's read half, cloned under
+    /// the shard lock so the send is awaited outside it. A failed send means the
+    /// receiver is gone: a tombstone left by the peer's end (the pending
+    /// half-close [`register`](Self::register) has yet to observe) or a bridge
+    /// that already exited. The entry is deliberately kept — a tombstone is
+    /// pending state, and [`finish_open`](Self::finish_open) sweeps dead senders —
+    /// so data that arrives after a peer EOF (a protocol violation, RFC 4254
+    /// §5.3) cannot erase the end that is waiting to be consumed.
+    pub(super) async fn deliver(&self, channel: ChannelId, data: &[u8]) {
+        if let Some(tx) = self.sender(channel) {
+            let _ = tx.send(data.to_vec()).await;
+        }
+    }
+
+    /// Sender for a registered channel, cloned under the shard lock so the
+    /// caller can await the send outside it. `None` once the peer has ended the
+    /// channel; a pending tombstone is returned as a sender whose receiver is
+    /// already gone, so a send to it fails immediately.
+    pub(super) fn sender(&self, channel: ChannelId) -> Option<mpsc::Sender<Vec<u8>>> {
+        self.data_tx.get(&channel).map(|e| e.value().clone())
+    }
+
+    /// The work-connection task is about to open a `forwarded-tcpip` channel.
+    /// Until [`finish_open`](Self::finish_open), a peer end with no registered
+    /// sender is remembered instead of dropped.
+    pub(super) fn begin_open(&self) {
+        let _gate = self.lock_gate();
+        self.open_in_flight.store(true, Ordering::SeqCst);
+    }
+
+    /// The open finished — registered, or failed before registration. Clears
+    /// tombstones left by channels the peer ended inside the window (a tombstone
+    /// belonging to the channel just registered was already consumed).
+    pub(super) fn finish_open(&self) {
+        let _gate = self.lock_gate();
+        self.open_in_flight.store(false, Ordering::SeqCst);
+        self.data_tx.retain(|_, tx| !tx.is_closed());
+    }
+
+    /// Register the channel's sender. If the peer already ended the channel
+    /// while the open was in flight, the tombstone left by [`end`](Self::end)
+    /// is closed and the fresh sender is dropped immediately: the bridge's
+    /// `data_rx` ends at once, so the work connection is half-closed even
+    /// though no further callback will ever run for this channel.
+    pub(super) fn register(&self, channel: ChannelId, tx: mpsc::Sender<Vec<u8>>) {
+        let _gate = self.lock_gate();
+        if let Some(previous) = self.data_tx.insert(channel, tx) {
+            if previous.is_closed() {
+                self.data_tx.remove(&channel);
+            }
+        }
+    }
+
+    /// The peer ended the channel — `CHANNEL_EOF`, or `CHANNEL_CLOSE` (after an
+    /// EOF too): drop the data sender so the bridge half-closes the work
+    /// connection.
+    ///
+    /// Returns `true` when the end was recorded for this channel: a live sender
+    /// was dropped, or a tombstone now represents the end until
+    /// [`register`](Self::register) consumes it. Returns `false` only for an end
+    /// that has nothing to end — no sender and no open in flight (session/exec
+    /// channels, or an end after the window closed) — so `CHANNEL_CLOSE` after
+    /// `CHANNEL_EOF` stays a quiet no-op there. Inside one window a repeat
+    /// re-inserts the same tombstone and returns `true` again.
+    pub(super) fn end(&self, channel: ChannelId) -> bool {
+        let _gate = self.lock_gate();
+        if self
+            .data_tx
+            .remove(&channel)
+            .is_some_and(|(_, tx)| !tx.is_closed())
+        {
+            return true;
+        }
+        if self.open_in_flight.load(Ordering::SeqCst) {
+            let (tx, rx) = mpsc::channel(1);
+            drop(rx);
+            // The end arriving now is the one a completing `register` can
+            // still consume, so at the cap evict an existing tombstone instead
+            // of dropping this end — otherwise the channel that is about to
+            // register waits for CHANNEL_CLOSE, which is the hang this table
+            // exists to prevent. Eviction picks the first closed entry in
+            // iteration order (not age), so the evicted channel loses its own
+            // end until CHANNEL_CLOSE. `tombstone_count` counts only closed
+            // senders, so a tombstone to evict exists here and a live channel
+            // is never chosen.
+            if self.tombstone_count() >= MAX_IN_FLIGHT_TOMBSTONES {
+                if let Some(evicted) = self.evict_tombstone() {
+                    tracing::debug!(
+                        channel = ?channel,
+                        evicted = ?evicted,
+                        cap = MAX_IN_FLIGHT_TOMBSTONES,
+                        "SSH gateway: forwarded-tcpip tombstone evicted to record a newer end"
+                    );
+                }
+            }
+            // Under `gate` no entry can exist for this channel here: the
+            // `remove` above took it and no registration interleaves. The
+            // previous value is therefore always `None`; it is bound and
+            // asserted rather than matched so a future ungated caller still
+            // overwrites (and drops) a stale sender instead of leaking it.
+            let previous = self.data_tx.insert(channel, tx);
+            debug_assert!(previous.is_none(), "the gate makes this insert a plain add");
+            let _ = previous;
+            return true;
+        }
+        false
+    }
+
+    /// Evict one existing tombstone to keep the table bounded while still
+    /// recording the newest end. The filter is `is_closed`, so a live sender is
+    /// never chosen and a table of live senders only yields `None`; the victim
+    /// is the first closed entry in iteration order, not the oldest.
+    /// Called under `gate` when [`tombstone_count`](Self::tombstone_count) has
+    /// reached the cap; the unit tests also call it directly to pin the filter.
+    pub(super) fn evict_tombstone(&self) -> Option<ChannelId> {
+        let evicted = self
+            .data_tx
+            .iter()
+            .find(|e| e.value().is_closed())
+            .map(|e| *e.key())?;
+        self.data_tx.remove(&evicted);
+        Some(evicted)
+    }
+
+    /// Tombstones in the table: closed senders only, both the in-flight ones
+    /// (receiver already dropped) and registered channels whose bridge has
+    /// exited. The scan walks every registered entry but counts only closed
+    /// ones, so live channels neither count against [`MAX_IN_FLIGHT_TOMBSTONES`]
+    /// nor get evicted. Callers holding `gate` see a stable count (every mutator
+    /// takes the gate); the unit tests read it without the gate, where it is a
+    /// point-in-time count of the table.
+    pub(super) fn tombstone_count(&self) -> usize {
+        self.data_tx
+            .iter()
+            .filter(|e| e.value().is_closed())
+            .count()
+    }
+
+    /// Number of tracked entries (live senders + tombstones). Unit tests use it
+    /// to pin that the table stays bounded: a peer ending channels *outside* an
+    /// open window (every session/exec channel does) puts nothing in the table,
+    /// and inside a window the tombstones are capped.
+    #[cfg(test)]
+    pub(super) fn tracked(&self) -> usize {
+        self.data_tx.len()
+    }
+
+    /// Drop a registered sender although the peer never ended the channel: the
+    /// work connection is being abandoned before its bridge starts (control
+    /// handler gone, or delivering it failed). The bridge for this channel will
+    /// never run, so a later peer end is an ordinary no-op. Not used for a peer
+    /// end — that must leave a tombstone when no sender exists yet.
+    pub(super) fn discard(&self, channel: ChannelId) {
+        let _gate = self.lock_gate();
+        self.data_tx.remove(&channel);
+    }
+}
 
 // ==============================================================
 // SshSession — russh server::Handler impl
@@ -68,11 +306,10 @@ pub struct SshSession {
     /// address is recorded, not actually bound; it becomes the
     /// forwarded-tcpip channel payload.
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
-    /// Data routing table for forwarded-tcpip channels: SSH client → bridge
-    /// task read half. Sharded by ChannelId (DashMap), so the per-chunk
-    /// `data` callback lock for one reverse channel never serializes against
-    /// the other reverse channels of this session.
-    reverse_data_tx: Arc<DashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
+    /// Data routing table for this session's forwarded-tcpip channels (SSH
+    /// client → bridge task read half, plus the teardown bookkeeping — see
+    /// [`ReverseChannels`]).
+    reverse_channels: ReverseChannels,
     /// Cancelled when the virtual control handler exits (e.g. the server's
     /// heartbeat-timeout cleanup kills it — the SSH virtual client never
     /// sends Ping). The listener task and the work-conn bridge race on it so
@@ -114,7 +351,7 @@ impl SshSession {
             authenticated_run_id,
             auth_deadline,
             reverse_forward: Arc::new(std::sync::Mutex::new(None)),
-            reverse_data_tx: Arc::new(DashMap::new()),
+            reverse_channels: ReverseChannels::default(),
             control_exit,
         }
     }
@@ -352,7 +589,7 @@ impl Handler for SshSession {
         let ssh_handle = self.ssh_handle.clone().expect("ssh handle set after auth");
         let state = self.state.clone();
         let reverse_forward = self.reverse_forward.clone();
-        let reverse_data_tx = self.reverse_data_tx.clone();
+        let reverse_channels = self.reverse_channels.clone();
         let control_exit = self.control_exit.clone();
         tokio::spawn(async move {
             handle_work_conn_requests(
@@ -361,7 +598,7 @@ impl Handler for SshSession {
                 ssh_handle,
                 state,
                 reverse_forward,
-                reverse_data_tx,
+                reverse_channels,
                 control_exit,
             )
             .await;
@@ -708,21 +945,9 @@ impl Handler for SshSession {
         // Forwarded-tcpip channel data is routed to the bridge task's read
         // half (data from the SSH client = local service response). The
         // bounded channel provides backpressure when the frps side reads
-        // slower than the SSH client sends (Go net.Pipe is blocking too).
-        // Clone the sender under the shard lock, then await the send outside
-        // it so the future stays Send. The map is sharded per ChannelId
-        // (DashMap), so concurrent reverse channels do not serialize their
-        // data callback on a single mutex.
-        let tx = self
-            .reverse_data_tx
-            .get(&channel)
-            .map(|e| e.value().clone());
-        if let Some(tx) = tx {
-            if tx.send(data.to_vec()).await.is_err() {
-                // Bridge task exited (channel closed) — drop the entry.
-                self.reverse_data_tx.remove(&channel);
-            }
-        }
+        // slower than the SSH client sends (Go net.Pipe is blocking too);
+        // `ReverseChannels::deliver` owns the send and the EOF/tombstone rules.
+        self.reverse_channels.deliver(channel, data).await;
         Ok(())
     }
 
@@ -731,15 +956,44 @@ impl Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // The peer closed the forwarded-tcpip channel (local service exited).
-        // Drop the data sender so the bridge task's `data_rx.recv()` returns
-        // and the task (plus its duplex) exits — otherwise the bridge hangs
-        // forever holding the channel entry in the map.
-        if self.reverse_data_tx.remove(&channel).is_some() {
+        // The peer closed a channel — normally the forwarded-tcpip one (local
+        // service exited), but session/exec channels land here too. Drop any
+        // data sender so a bridge task's `data_rx.recv()` returns and the task
+        // (plus its duplex) exits — otherwise the bridge hangs forever holding
+        // the channel entry in the map.
+        if self.reverse_channels.end(channel) {
             tracing::debug!(
                 run_id = %self.run_id,
                 channel = ?channel,
-                "SSH gateway: forwarded-tcpip channel closed, bridge task will exit"
+                "SSH gateway: channel closed, its reverse data sender is ended; a bridge task on it, if any, exits"
+            );
+        }
+        Ok(())
+    }
+
+    async fn channel_eof(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // The peer half-closed a channel — normally the forwarded-tcpip one: the
+        // local service behind `ssh -R` sent FIN, but the SSH session — and this
+        // channel — stay open, so no `CHANNEL_CLOSE` will follow. russh's default
+        // hook is a no-op, which left the bridge's `data_rx.recv()` waiting
+        // forever: the work connection's write half never shut, frps never
+        // propagated EOF to the user connection, and read-until-EOF protocols
+        // (file transfer, `nc -N`, an HTTP client that finished its request)
+        // hung until a timeout.
+        //
+        // Dropping the sender ends that loop exactly as `channel_close` does,
+        // so the bridge half-closes the work conn. The bridge's writer task is
+        // untouched — the frps → SSH direction stays alive — so the client can
+        // still receive data after its own EOF.
+        if self.reverse_channels.end(channel) {
+            tracing::debug!(
+                run_id = %self.run_id,
+                channel = ?channel,
+                "SSH gateway: channel EOF, its reverse data sender is ended; a bridge task on it, if any, half-closes the work connection"
             );
         }
         Ok(())

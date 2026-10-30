@@ -1807,3 +1807,388 @@ fn build_v1_frame_rejects_oversized_proxy_config() {
     assert!(declared <= frp_core::protocol::V1_MAX_MSG_LENGTH as usize);
     assert_eq!(frame.len(), 9 + declared);
 }
+
+// ── Reverse-tunnel channel teardown ─────────────────────────
+
+/// Fabricate a `ChannelId` for the routing-table tests: russh keeps its inner
+/// `u32` private and exposes no constructor, but implements ssh-encoding's
+/// `Decode` and `&[u8]` implements the matching `Reader`.
+fn test_channel_id(number: u32) -> russh::ChannelId {
+    use russh::keys::ssh_encoding::Decode;
+    let mut bytes: &[u8] = &number.to_be_bytes();
+    russh::ChannelId::decode(&mut bytes).expect("ChannelId decodes from a big-endian u32")
+}
+
+/// A peer `CHANNEL_EOF` drops the channel's data sender — the one signal that
+/// ends the bridge's `data_rx.recv()` loop and half-closes the work connection,
+/// so the user connection observes EOF. `CHANNEL_CLOSE` afterwards (russh sends
+/// both when the local service exits) is a quiet no-op.
+#[tokio::test]
+async fn reverse_channel_end_drops_sender_once() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    let channel = test_channel_id(7);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channels.begin_open();
+    channels.register(channel, tx);
+    channels.finish_open();
+    assert!(
+        channels.sender(channel).is_some(),
+        "a registered sender is routable by data()"
+    );
+
+    assert!(
+        channels.end(channel),
+        "peer EOF drops the registered sender"
+    );
+    assert!(
+        channels.sender(channel).is_none(),
+        "data() after EOF must find no sender and drop the bytes"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bridge data_rx must finish promptly once the sender is dropped");
+    assert!(
+        ended.is_none(),
+        "bridge read half must observe the channel end"
+    );
+
+    assert!(
+        !channels.end(channel),
+        "CHANNEL_CLOSE after CHANNEL_EOF must be a quiet no-op"
+    );
+}
+
+/// The peer can end the channel before `channel_open_forwarded_tcpip` has
+/// returned its id (the local service FINs straight away, or the `ssh -R`
+/// target refuses the connection). That end must not be lost: the sender
+/// registered a moment later is dropped at once, so the bridge still
+/// half-closes the work connection instead of waiting forever.
+#[tokio::test]
+async fn reverse_channel_end_before_register_is_not_lost() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    let channel = test_channel_id(8);
+
+    channels.begin_open();
+    assert!(
+        channels.end(channel),
+        "an end inside the open window is recorded as a tombstone"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channels.register(channel, tx);
+    channels.finish_open();
+
+    assert!(
+        channels.sender(channel).is_none(),
+        "a sender registering after the peer's end must be dropped immediately"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bridge data_rx must finish promptly when the peer ended before registration");
+    assert!(
+        ended.is_none(),
+        "bridge read half must observe the channel end"
+    );
+}
+
+/// Ends that arrive outside a `forwarded-tcpip` open window — every closed
+/// session/exec channel does this — must leave nothing behind: the table is
+/// per session and must not grow with the number of channels a client closes.
+#[test]
+fn reverse_channel_end_outside_open_window_leaves_no_tombstone() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    for n in 0..64 {
+        assert!(!channels.end(test_channel_id(100 + n)));
+    }
+    assert_eq!(
+        channels.tracked(),
+        0,
+        "peer-ended channels outside an open window must not be remembered"
+    );
+}
+
+/// `finish_open` clears the tombstones an open window left behind, and only
+/// those: a live sender registered for a channel that did not end survives the
+/// sweep. Without the sweep a single unanswered open would leave one tombstone
+/// behind for every channel the peer closes inside it.
+#[test]
+fn reverse_channel_finish_open_sweeps_tombstones_only() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+
+    channels.begin_open();
+    assert!(channels.end(test_channel_id(200)));
+    assert!(channels.end(test_channel_id(201)));
+    assert_eq!(
+        channels.tracked(),
+        2,
+        "ends inside the window are remembered"
+    );
+
+    channels.finish_open();
+    assert_eq!(
+        channels.tracked(),
+        0,
+        "closing the window must sweep its tombstones"
+    );
+
+    // A live sender (receiver kept alive) registered outside a window is not a
+    // tombstone and must survive a later sweep.
+    let live = test_channel_id(202);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    channels.register(live, tx);
+    channels.finish_open();
+    assert_eq!(
+        channels.tracked(),
+        1,
+        "a live sender must survive the sweep"
+    );
+    assert!(
+        channels.sender(live).is_some(),
+        "the live channel must still be routable"
+    );
+}
+
+/// The in-flight window is client-controlled (russh waits for a channel
+/// confirmation with no timeout), so tombstones are capped: an unanswered open
+/// plus a channel-close loop must not grow the table past
+/// [`MAX_IN_FLIGHT_TOMBSTONES`]. At the cap the newest end is kept by evicting
+/// one existing tombstone (see
+/// [`reverse_channel_cap_evicts_an_older_tombstone_not_the_newest_end`]), so the
+/// table stays bounded without dropping the end `register` can still consume.
+/// The window sweep clears whatever the window leaves.
+#[test]
+fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
+    use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
+    let channels = ReverseChannels::default();
+
+    channels.begin_open();
+    for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
+        assert!(
+            channels.end(test_channel_id(n as u32)),
+            "every end inside the window is recorded"
+        );
+    }
+    assert_eq!(
+        channels.tracked(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "the window fills up to the cap"
+    );
+
+    assert!(
+        channels.end(test_channel_id(9_999)),
+        "an end at the cap is recorded by evicting a tombstone"
+    );
+    assert_eq!(
+        channels.tracked(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "an end past the cap must not grow the table"
+    );
+
+    channels.finish_open();
+    assert_eq!(
+        channels.tracked(),
+        0,
+        "the sweep still clears the capped set"
+    );
+}
+
+/// At the cap the end that arrives now must not be the one dropped: it is the
+/// one a completing `register` can still consume. The table therefore evicts one
+/// existing closed entry to make room (first in iteration order — in this test
+/// those are all older ids — never a live sender) and records the newest end
+/// instead of dropping it and hanging that channel until CHANNEL_CLOSE.
+#[test]
+fn reverse_channel_cap_evicts_an_older_tombstone_not_the_newest_end() {
+    use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
+    let channels = ReverseChannels::default();
+
+    channels.begin_open();
+    for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
+        assert!(channels.end(test_channel_id(n as u32)));
+    }
+
+    let pending = test_channel_id(9_999);
+    assert!(
+        channels.end(pending),
+        "the end at the cap must be recorded, not dropped"
+    );
+    assert_eq!(
+        channels.tombstone_count(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "recording the newest end must not grow the tombstone set"
+    );
+
+    // Exactly one of the older tombstones was evicted — it is absent from the
+    // table, so a later register for it would be a plain new channel — while the
+    // newest end is still a tombstone whose sender will be dropped.
+    let evicted: Vec<u32> = (0..MAX_IN_FLIGHT_TOMBSTONES as u32)
+        .filter(|n| channels.sender(test_channel_id(*n)).is_none())
+        .collect();
+    assert_eq!(
+        evicted.len(),
+        1,
+        "exactly one older tombstone must be evicted to make room"
+    );
+    assert!(
+        channels.sender(test_channel_id(evicted[0])).is_none(),
+        "the evicted id must no longer be closed (it is gone)"
+    );
+    let pending_tx = channels
+        .sender(pending)
+        .expect("the newest end must be represented in the table");
+    assert!(
+        pending_tx.is_closed(),
+        "the newest end must be a tombstone whose receiver is gone"
+    );
+
+    // The pending channel's registration is dropped at once, so its bridge
+    // half-closes instead of waiting for CHANNEL_CLOSE.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    channels.register(pending, tx);
+    channels.finish_open();
+    assert!(channels.sender(pending).is_none());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+/// The cap counts tombstones, never live channels: with a live sender registered
+/// outside the window and the tombstone set at the cap, an incoming end must
+/// evict a tombstone and leave the live channel routable.
+#[test]
+fn reverse_channel_cap_never_evicts_a_live_sender() {
+    use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
+    let channels = ReverseChannels::default();
+
+    let live = test_channel_id(500);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(4);
+    channels.register(live, live_tx);
+
+    channels.begin_open();
+    for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
+        assert!(channels.end(test_channel_id(n as u32)));
+    }
+    assert_eq!(
+        channels.tombstone_count(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "live senders do not count against the cap"
+    );
+
+    assert!(
+        channels.end(test_channel_id(9_999)),
+        "the end at the cap must still be recorded"
+    );
+    assert_eq!(
+        channels.tombstone_count(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "the eviction must pick a tombstone, not the live sender"
+    );
+    assert!(
+        channels.sender(live).is_some_and(|tx| !tx.is_closed()),
+        "a live sender must never be evicted"
+    );
+    assert_eq!(
+        channels.tracked(),
+        MAX_IN_FLIGHT_TOMBSTONES + 1,
+        "the table holds the live sender plus the capped tombstone set"
+    );
+
+    // Pin the filter itself, not just the iteration order above: on a table of
+    // live senders only, an eviction must find nothing. A `find(|_e| true)`
+    // regression would evict a healthy channel here and hang it at the cap.
+    let live_only = ReverseChannels::default();
+    let (one_tx, _one_rx) = tokio::sync::mpsc::channel(1);
+    let (two_tx, _two_rx) = tokio::sync::mpsc::channel(1);
+    live_only.register(test_channel_id(601), one_tx);
+    live_only.register(test_channel_id(602), two_tx);
+    assert_eq!(live_only.tombstone_count(), 0, "no tombstones to evict");
+    assert_eq!(
+        live_only.evict_tombstone(),
+        None,
+        "evicting must never pick a live sender"
+    );
+    assert_eq!(
+        live_only.tracked(),
+        2,
+        "a failed eviction must leave the live channels in place"
+    );
+}
+
+#[tokio::test]
+async fn reverse_channel_data_after_end_keeps_the_tombstone() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    let channel = test_channel_id(300);
+
+    channels.begin_open();
+    assert!(channels.end(channel));
+    assert_eq!(channels.tracked(), 1, "the end left a tombstone");
+
+    channels.deliver(channel, b"late data").await;
+    assert_eq!(
+        channels.tracked(),
+        1,
+        "delivering into a tombstone must not remove it"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channels.register(channel, tx);
+    channels.finish_open();
+    assert!(
+        channels.sender(channel).is_none(),
+        "the tombstone must still drop the sender that registers after it"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bridge data_rx must finish promptly");
+    assert!(ended.is_none(), "the bridge read half must observe the end");
+}
+
+/// A peer end and the register/finish sequence it can overtake must never
+/// interleave: `end` decides to leave a tombstone and `finish_open` clears the
+/// window inside one critical section. Without that (the pre-fix code read
+/// `open_in_flight` after its `remove`), the schedule `end` (no sender) →
+/// `register` → `finish_open` (flag false) → `end` (reads false, no tombstone)
+/// keeps the live sender and loses the EOF — the bridge then waits forever.
+/// Either outcome is fine here as long as the end is never lost.
+#[test]
+fn reverse_channel_concurrent_end_and_register_never_lose_the_end() {
+    use super::session::ReverseChannels;
+    let channels = std::sync::Arc::new(ReverseChannels::default());
+
+    for round in 0..2_000u32 {
+        let channel = test_channel_id(1_000 + round);
+
+        channels.begin_open();
+        let peer_side = std::sync::Arc::clone(&channels);
+        let peer_end = std::thread::spawn(move || peer_side.end(channel));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        channels.register(channel, tx);
+        channels.finish_open();
+        let dropped_live = peer_end.join().expect("peer thread must not panic");
+
+        // Whichever way the race went, the peer's end must have ended the
+        // channel: either it removed the live sender (`true`, it got there
+        // first) or its tombstone made `register` drop the sender (the end won
+        // the window and `register` consumed it).
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "round {round}: the peer's end was lost (end() -> {dropped_live})"
+        );
+        assert_eq!(
+            channels.tracked(),
+            0,
+            "round {round}: the table must be empty once the end is consumed"
+        );
+    }
+}

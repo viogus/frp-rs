@@ -12,6 +12,85 @@ struct TestSshClient {
     /// `-R` local target address (e.g. "127.0.0.1:1234"). When set, server
     /// `forwarded-tcpip` channels are bridged to that TCP service.
     local_target: Option<String>,
+    /// When set, the first `forwarded-tcpip` channel is handed to the probe
+    /// instead of being bridged to `local_target` (see [`ChannelProbe`]).
+    probe: Option<ChannelProbe>,
+}
+
+/// What a [`ChannelProbe`] observed on a `forwarded-tcpip` channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClientEvent {
+    /// The probe shut down its write half — a real CHANNEL_EOF went on the
+    /// wire — and deliberately kept the channel open (no CHANNEL_CLOSE).
+    EofSent,
+    /// Data arrived from frps on the channel.
+    Data(Vec<u8>),
+    /// The channel's read side ended with an orderly EOF: frps sent
+    /// CHANNEL_EOF or closed the channel.
+    EofReceived,
+    /// Reading the channel failed (connection reset, channel torn down). Kept
+    /// distinct from [`ClientEvent::EofReceived`]: a reset must not satisfy an
+    /// assertion that the peer half-closed, or the test would pass on a
+    /// teardown instead of a half-close.
+    ReadError(String),
+}
+
+/// Client-side stand-in for the service behind `ssh -R`, with the two
+/// properties the EOF tests need and `copy_bidirectional` cannot express:
+///
+/// * it can **half-close**: `AsyncWriteExt::shutdown` on a `ChannelStream`
+///   sends CHANNEL_EOF while the read half stays usable — the wire shape of a
+///   local service that sent FIN but is still reading (`nc -N`, `cat`, a file
+///   transfer, an HTTP client after its request);
+/// * it **stays alive** after half-closing (`std::future::pending`), because
+///   dropping a `ChannelStream` sends CHANNEL_CLOSE, which would tear the
+///   bridge down and make an assertion on EOF vacuous.
+#[derive(Clone)]
+struct ChannelProbe {
+    /// Shut down the write half (CHANNEL_EOF) as soon as the channel is open.
+    half_close: bool,
+    events: tokio::sync::mpsc::UnboundedSender<ClientEvent>,
+}
+
+/// Drive one probed `forwarded-tcpip` channel and report what it sees.
+async fn run_channel_probe(
+    mut stream: std::pin::Pin<Box<russh::ChannelStream<russh::client::Msg>>>,
+    probe: ChannelProbe,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    if probe.half_close {
+        // CHANNEL_EOF — *not* CHANNEL_CLOSE: the session and the channel stay up.
+        stream
+            .shutdown()
+            .await
+            .expect("shutdown() must send CHANNEL_EOF on an accepted channel");
+        let _ = probe.events.send(ClientEvent::EofSent);
+    }
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => {
+                let _ = probe.events.send(ClientEvent::EofReceived);
+                break;
+            }
+            Ok(n) => {
+                if probe
+                    .events
+                    .send(ClientEvent::Data(buf[..n].to_vec()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(e) => {
+                // A reset is not the orderly EOF these tests assert on.
+                let _ = probe.events.send(ClientEvent::ReadError(e.to_string()));
+                break;
+            }
+        }
+    }
+    // Keep the channel open for the rest of the test: no CHANNEL_CLOSE.
+    std::future::pending::<()>().await;
 }
 
 impl russh::client::Handler for TestSshClient {
@@ -51,6 +130,10 @@ impl russh::client::Handler for TestSshClient {
         // ssh -R). ChannelStream is a full AsyncRead+AsyncWrite pair —
         // use copy_bidirectional.
         reply.accept().await;
+        if let Some(probe) = self.probe.take() {
+            tokio::spawn(run_channel_probe(Box::pin(channel.into_stream()), probe));
+            return Ok(());
+        }
         if let Some(target) = self.local_target.clone() {
             let mut stream = Box::pin(channel.into_stream());
             tokio::spawn(async move {
@@ -103,7 +186,19 @@ async fn connect_ssh_ready(
     addr: SocketAddr,
     local_target: Option<String>,
 ) -> russh::client::Handle<TestSshClient> {
-    connect_ssh_ready_within(addr, local_target, SSH_READY_TIMEOUT)
+    connect_ssh_ready_within(addr, local_target, None, SSH_READY_TIMEOUT)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// [`connect_ssh_ready`] with a [`ChannelProbe`] attached instead of a `-R`
+/// local target: the probe (not a TCP forward) drives the forwarded-tcpip
+/// channel, so a test can half-close it and observe what frps does.
+async fn connect_ssh_ready_with_probe(
+    addr: SocketAddr,
+    probe: ChannelProbe,
+) -> russh::client::Handle<TestSshClient> {
+    connect_ssh_ready_within(addr, None, Some(probe), SSH_READY_TIMEOUT)
         .await
         .unwrap_or_else(|e| panic!("{e}"))
 }
@@ -119,6 +214,7 @@ async fn connect_ssh_ready(
 async fn connect_ssh_ready_within(
     addr: SocketAddr,
     local_target: Option<String>,
+    probe: Option<ChannelProbe>,
     budget: Duration,
 ) -> Result<russh::client::Handle<TestSshClient>, String> {
     let deadline = tokio::time::Instant::now() + budget;
@@ -131,7 +227,7 @@ async fn connect_ssh_ready_within(
                 last_error.as_deref().unwrap_or("<none>")
             ));
         }
-        match try_connect_ssh(addr, local_target.clone(), remaining).await {
+        match try_connect_ssh(addr, local_target.clone(), probe.clone(), remaining).await {
             Some(Ok(c)) => return Ok(c),
             Some(Err(e)) => {
                 last_error = Some(format!("{e:?}"));
@@ -163,6 +259,7 @@ async fn connect_ssh_ready_within(
 async fn try_connect_ssh(
     addr: SocketAddr,
     local_target: Option<String>,
+    probe: Option<ChannelProbe>,
     budget: Duration,
 ) -> Option<Result<russh::client::Handle<TestSshClient>, russh::Error>> {
     timeout(
@@ -170,7 +267,10 @@ async fn try_connect_ssh(
         russh::client::connect(
             Arc::new(russh::client::Config::default()),
             addr,
-            TestSshClient { local_target },
+            TestSshClient {
+                local_target,
+                probe,
+            },
         ),
     )
     .await
@@ -208,7 +308,7 @@ async fn stalled_ssh_handshake_attempt_is_bounded() {
 
     const BUDGET: Duration = Duration::from_millis(500);
     let started = tokio::time::Instant::now();
-    let outcome = try_connect_ssh(addr, None, BUDGET).await;
+    let outcome = try_connect_ssh(addr, None, None, BUDGET).await;
     let elapsed = started.elapsed();
 
     assert!(
@@ -242,7 +342,7 @@ async fn connect_ssh_ready_bounds_a_stalled_peer_in_aggregate() {
 
     const BUDGET: Duration = Duration::from_millis(750);
     let started = tokio::time::Instant::now();
-    let outcome = connect_ssh_ready_within(addr, None, BUDGET).await;
+    let outcome = connect_ssh_ready_within(addr, None, None, BUDGET).await;
     let elapsed = started.elapsed();
 
     let err = match outcome {
@@ -281,7 +381,7 @@ async fn connect_ssh_ready_retries_within_budget_on_fast_failures() {
 
     const BUDGET: Duration = Duration::from_millis(350);
     let started = tokio::time::Instant::now();
-    let outcome = connect_ssh_ready_within(addr, None, BUDGET).await;
+    let outcome = connect_ssh_ready_within(addr, None, None, BUDGET).await;
     let elapsed = started.elapsed();
 
     let err = match outcome {
@@ -645,6 +745,228 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
         .await
         .ok();
     echo_task.abort();
+}
+
+/// Register `-R remote_port` plus a `tcp` proxy on an authenticated SSH
+/// client, then connect to the frps proxy port. Returns the exec session
+/// channel (the caller keeps it alive) and the user-side stream.
+///
+/// The connect retry mirrors
+/// [`test_ssh_gateway_reverse_forwarding_roundtrip`]: `exec` returns before
+/// frps has registered the proxy, so the listener may not exist yet.
+async fn connect_reverse_proxy(
+    client: &mut russh::client::Handle<TestSshClient>,
+    remote_port: u16,
+) -> (russh::Channel<russh::client::Msg>, tokio::net::TcpStream) {
+    // ssh -R :remote_port:127.0.0.1:<probe>
+    let fwd = client
+        .tcpip_forward("127.0.0.1", remote_port as u32)
+        .await
+        .expect("-R tcpip-forward must be accepted");
+    assert_eq!(
+        fwd, 0,
+        "-R request should be granted for the requested port"
+    );
+
+    let session = client
+        .channel_open_session()
+        .await
+        .expect("open session channel");
+    session
+        .exec(
+            true,
+            format!("tcp --proxy_name \"ssh-r-eof\" --remote_port {remote_port}"),
+        )
+        .await
+        .expect("exec accepted");
+
+    let mut last_connect_error = None;
+    for _ in 0..50 {
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{remote_port}")).await {
+            Ok(stream) => return (session, stream),
+            Err(e) => last_connect_error = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("frps proxy port should accept within 5s; last error: {last_connect_error:?}")
+}
+
+/// Half-close regression: a peer `CHANNEL_EOF` must reach the user connection.
+///
+/// The service behind `ssh -R` may half-close: it sends FIN and keeps reading
+/// (`nc -N`, `cat`, a file transfer, an HTTP client that finished its
+/// request). On the wire that is `CHANNEL_EOF` with the session — and the
+/// forwarded-tcpip channel — still open; no `CHANNEL_CLOSE` follows. Before
+/// the gateway implemented `Handler::channel_eof`, that EOF was ignored: the
+/// bridge's `data_rx.recv()` never returned `None`, so the work connection's
+/// write half stayed open, frps never propagated EOF to the user connection,
+/// and every read-until-EOF protocol hung until a timeout.
+///
+/// RED on base: the `user.read` below times out after 5 s — the user
+/// connection never observes EOF. GREEN: it returns `Ok(0)` promptly.
+///
+/// The test also pins that the EOF only *half*-closes: the channel stays
+/// alive, so bytes the user writes after the EOF must still reach the client.
+#[tokio::test]
+async fn test_ssh_gateway_client_half_close_closes_user_connection() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+    let remote_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{ssh_port}").parse().unwrap();
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let probe = ChannelProbe {
+        half_close: true,
+        events: events_tx,
+    };
+    let mut client = connect_ssh_ready_with_probe(addr, probe).await;
+
+    let auth = client
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "SSH password auth failed");
+
+    let (_session, mut user) = connect_reverse_proxy(&mut client, remote_port).await;
+
+    // The client accepted the forwarded-tcpip channel and half-closed it.
+    let first = timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("client must accept the forwarded-tcpip channel")
+        .expect("probe event channel closed");
+    assert_eq!(
+        first,
+        ClientEvent::EofSent,
+        "probe must half-close (CHANNEL_EOF), not close, the channel"
+    );
+
+    // frps must turn that CHANNEL_EOF into EOF on the user's TCP connection.
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(5), user.read(&mut buf))
+        .await
+        .expect(
+            "user connection must observe EOF after the SSH client half-closes \
+             (CHANNEL_EOF): the frps work connection never half-closed",
+        )
+        .expect("read on user connection");
+    assert_eq!(n, 0, "a peer half-close must surface as EOF, not as data");
+
+    // ... but a half-close is not a close: frps -> SSH must stay usable.
+    user.write_all(b"after-eof")
+        .await
+        .expect("write on user connection after the peer half-close");
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = timeout(remaining, events.recv())
+            .await
+            .expect("client must still receive frps -> SSH data after its own half-close")
+            .expect("probe event channel closed");
+        match event {
+            ClientEvent::Data(data) => {
+                seen.extend_from_slice(&data);
+                if seen == b"after-eof" {
+                    break;
+                }
+            }
+            ClientEvent::EofReceived => panic!(
+                "channel must stay open after a half-close, but frps ended the read direction"
+            ),
+            ClientEvent::ReadError(err) => {
+                panic!("channel must stay open after a half-close, but reading it failed: {err}")
+            }
+            ClientEvent::EofSent => {}
+        }
+    }
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+        .await
+        .ok();
+}
+
+/// Converse direction, and the reason `channel_eof` must not close the
+/// channel: when the *user* connection half-closes (frps reads EOF on the
+/// work connection), the forwarded-tcpip channel must reach the SSH client as
+/// EOF while the channel itself stays open. The gateway's work-connection
+/// writer task already does this (`handle.eof` after a zero-byte read) — this
+/// is the guard that the EOF hook added for the other direction did not
+/// change it.
+#[tokio::test]
+async fn test_ssh_gateway_frps_eof_reaches_client() {
+    use tokio::io::AsyncWriteExt;
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+    let remote_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{ssh_port}").parse().unwrap();
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let probe = ChannelProbe {
+        half_close: false,
+        events: events_tx,
+    };
+    let mut client = connect_ssh_ready_with_probe(addr, probe).await;
+
+    let auth = client
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "SSH password auth failed");
+
+    let (_session, mut user) = connect_reverse_proxy(&mut client, remote_port).await;
+
+    // Data must flow user -> SSH first, so the EOF below is not racing a
+    // channel that never got opened.
+    user.write_all(b"ping")
+        .await
+        .expect("write on user connection");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let event = timeout(remaining, events.recv())
+            .await
+            .expect("client must receive the user's bytes")
+            .expect("probe event channel closed");
+        match event {
+            ClientEvent::Data(data) => {
+                seen.extend_from_slice(&data);
+                if seen == b"ping" {
+                    break;
+                }
+            }
+            ClientEvent::EofReceived => panic!("channel ended before any data arrived"),
+            ClientEvent::ReadError(err) => panic!("channel failed before any data arrived: {err}"),
+            ClientEvent::EofSent => {}
+        }
+    }
+
+    // Half-close the user connection: frps reads EOF on the work connection.
+    user.shutdown().await.expect("shutdown user write half");
+
+    let event = timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("client must observe EOF after frps half-closes the work connection")
+        .expect("probe event channel closed");
+    assert_eq!(
+        event,
+        ClientEvent::EofReceived,
+        "frps must forward the user's EOF to the SSH client as an orderly EOF; a \
+         ReadError here means the channel was torn down instead"
+    );
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+        .await
+        .ok();
 }
 
 /// Round-11 audit GAP 1: the per-IP password throttle must DENY, not just
