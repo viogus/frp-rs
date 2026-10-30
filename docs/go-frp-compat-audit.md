@@ -219,7 +219,11 @@ Three routes were probed with a raw socket so the head bytes are exact:
 | (b) plain-HTTP vhost `GET` route miss | **632 B** = 143-byte head + 489-byte body | **581 B** = 92-byte head + 489-byte body |
 | (c) vhost `GET` miss with `custom404Page` | **186 B** = 142-byte head + the custom file's 44 bytes | **135 B** = 91-byte head + the same 44 bytes |
 
-Go's (b)/(c) head is written by `net/http`, not by frp's `NotFoundResponse`:
+All GET rows above are the **close-requesting** probe shape (`Connection: close`
+in the request). A keep-alive GET miss is 613 B on Go (124-byte head + 489) and
+167 B with the 44-byte custom page; the frp-rs raw writer always answers with
+its 581 B / 135 B shape and closes. Go's (b)/(c) head is written by `net/http`,
+not by frp's `NotFoundResponse`:
 `HTTPReverseProxy`'s reverse-proxy `ErrorHandler` calls `rw.WriteHeader(404)` then
 `rw.Write(getNotFoundPageContent())` (`pkg/util/vhost/http.go:128-138`), so the
 server layer adds `Date`, sniffs `Content-Type: text/html; charset=utf-8`, and adds

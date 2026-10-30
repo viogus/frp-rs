@@ -320,8 +320,9 @@ pub struct SshSession {
     /// authorization test.
     ///
     /// Tracked per channel rather than per session because SSH allows several
-    /// session channels on one connection; entries are removed on
-    /// `CHANNEL_CLOSE` so a long-lived peer cannot grow the set without bound.
+    /// session channels on one connection. Entries are removed on
+    /// `CHANNEL_CLOSE`; the set is therefore bounded by the channels the peer
+    /// keeps open, i.e. by the connection's lifetime, not by the close count.
     session_channels: std::collections::HashSet<ChannelId>,
     /// Cancelled when the virtual control handler exits (e.g. the server's
     /// heartbeat-timeout cleanup kills it — the SSH virtual client never

@@ -25,12 +25,27 @@ struct TestSshClient {
 /// [`exec_on_a_forwarded_tcpip_channel_is_refused`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ForwardedExecOutcome {
-    /// `CHANNEL_SUCCESS`: the request was dispatched (a regression).
-    Accepted,
-    /// `CHANNEL_FAILURE`: the gateway refused it (the fix).
+    /// `exec` was refused and so was the follow-up `env`.
     Refused,
+    /// `exec` got `CHANNEL_SUCCESS`: the request was dispatched (a regression).
+    ExecAccepted,
+    /// `exec` was refused but `env` got `CHANNEL_SUCCESS` (half a guard).
+    EnvAccepted,
     /// The channel or session ended without a reply.
     Closed(String),
+}
+
+/// Wait for the reply to one channel request: `Some(true)` = `CHANNEL_SUCCESS`,
+/// `Some(false)` = `CHANNEL_FAILURE`, `None` = the channel closed first.
+async fn next_request_reply(channel: &mut russh::Channel<russh::client::Msg>) -> Option<bool> {
+    loop {
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Success) => return Some(true),
+            Some(russh::ChannelMsg::Failure) => return Some(false),
+            Some(russh::ChannelMsg::Close) | None => return None,
+            Some(_) => {}
+        }
+    }
 }
 
 /// What a [`ChannelProbe`] observed on a `forwarded-tcpip` channel.
@@ -147,10 +162,11 @@ impl russh::client::Handler for TestSshClient {
         // use copy_bidirectional.
         reply.accept().await;
         if let Some(tx) = self.forwarded_exec_probe.take() {
-            // Send an `exec` request on this work channel and report how the
-            // server answers. A server without the channel-type registry
-            // dispatches it (and would register the proxy); the gateway must
-            // answer CHANNEL_FAILURE instead.
+            // Send an `exec` request on this work channel, then an `env`
+            // request on the same channel, and report how the server answers
+            // each. A server without the channel-type registry dispatches
+            // `exec` (and registers the proxy); the gateway must answer
+            // CHANNEL_FAILURE for both request types.
             let mut channel = channel;
             tokio::spawn(async move {
                 if let Err(e) = channel
@@ -160,26 +176,37 @@ impl russh::client::Handler for TestSshClient {
                     )
                     .await
                 {
-                    let _ = tx.send(ForwardedExecOutcome::Closed(format!("send: {e}")));
+                    let _ = tx.send(ForwardedExecOutcome::Closed(format!("exec send: {e}")));
                     return;
                 }
-                loop {
-                    match channel.wait().await {
-                        Some(russh::ChannelMsg::Success) => {
-                            let _ = tx.send(ForwardedExecOutcome::Accepted);
-                            return;
-                        }
-                        Some(russh::ChannelMsg::Failure) => {
-                            let _ = tx.send(ForwardedExecOutcome::Refused);
-                            return;
-                        }
-                        Some(russh::ChannelMsg::Close) | None => {
-                            let _ = tx.send(ForwardedExecOutcome::Closed(
-                                "channel closed before a reply".into(),
-                            ));
-                            return;
-                        }
-                        Some(_) => {}
+                match next_request_reply(&mut channel).await {
+                    Some(true) => {
+                        let _ = tx.send(ForwardedExecOutcome::ExecAccepted);
+                        return;
+                    }
+                    Some(false) => {}
+                    None => {
+                        let _ = tx.send(ForwardedExecOutcome::Closed(
+                            "channel closed before the exec reply".into(),
+                        ));
+                        return;
+                    }
+                }
+                if let Err(e) = channel.set_env(true, "FRP_GUARD", "1").await {
+                    let _ = tx.send(ForwardedExecOutcome::Closed(format!("env send: {e}")));
+                    return;
+                }
+                match next_request_reply(&mut channel).await {
+                    Some(true) => {
+                        let _ = tx.send(ForwardedExecOutcome::EnvAccepted);
+                    }
+                    Some(false) => {
+                        let _ = tx.send(ForwardedExecOutcome::Refused);
+                    }
+                    None => {
+                        let _ = tx.send(ForwardedExecOutcome::Closed(
+                            "channel closed before the env reply".into(),
+                        ));
                     }
                 }
             });
@@ -906,8 +933,8 @@ async fn exec_on_a_forwarded_tcpip_channel_is_refused() {
     assert_eq!(
         outcome,
         ForwardedExecOutcome::Refused,
-        "exec on a forwarded-tcpip work channel must be answered with \
-         CHANNEL_FAILURE, not dispatched"
+        "exec and env on a forwarded-tcpip work channel must both be answered \
+         with CHANNEL_FAILURE, not dispatched"
     );
 
     client
