@@ -1012,6 +1012,14 @@ async fn run(mut cli: FrpsArgs) {
                 }
             }
         }
+        // Flush the OTLP exporter before this lane leaves. Every `--config-dir`
+        // exit goes through here — the plain `return` below and the
+        // all-files-failed `process::exit` — so one call covers both. It is a
+        // no-op when no exporter was initialised (including the no-`otel`
+        // build), and it must run *before* the failure check so the spans from
+        // a directory that failed to start are not lost.
+        logging::shutdown_otel();
+
         if failures.len() == files.len() {
             failures.sort_by_key(|(file_index, _)| *file_index);
             if let Some((_, code)) = failures.first() {
@@ -1193,6 +1201,11 @@ async fn run(mut cli: FrpsArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frps error: {}", e);
+        // The record above is the one an operator will go looking for in OTel;
+        // flush it before the runtime is torn down. Bounded by the exporter's
+        // own request timeout (10 s by default), a no-op when no exporter was
+        // initialised, and it leaves this exit's code untouched.
+        logging::shutdown_otel();
         process::exit(frp_core::EXIT_RUNTIME);
     }
 
@@ -1201,6 +1214,13 @@ async fn run(mut cli: FrpsArgs) {
 
     #[cfg(all(unix, feature = "profiling"))]
     profile_handle.abort();
+
+    // Graceful tail: the provider used to be leaked, so `service.run()`
+    // returning normally still dropped up to one batch interval (5 s) of
+    // spans — exactly the spans around a shutdown, which are the ones an
+    // operator wants. Idempotent, so an earlier call (the error branch above)
+    // makes this a no-op.
+    logging::shutdown_otel();
 }
 
 /// `lock_dir_registry` must never turn a poisoned registry into a second panic.

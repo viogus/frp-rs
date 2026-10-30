@@ -359,6 +359,15 @@ async fn main() {
         FrpcCmd::Status(args) => run_status(args).await,
         FrpcCmd::Stop(args) => run_stop(args).await,
     }
+
+    // Flush the OTLP exporter before `main` returns. One call covers every
+    // subcommand lane that returns here — `Run` (the daemon, whose graceful
+    // `SIGTERM` tail is `run_normal`) as well as the one-shot lanes. The
+    // provider used to be `Box::leak`ed, so up to one batch interval (5 s) of
+    // spans was lost on every clean exit. No-op without the `otel` feature and
+    // without a configured exporter; idempotent, so the error branch inside
+    // `run_normal` that already flushed makes this a second no-op.
+    logging::shutdown_otel();
 }
 
 // ── Logging / tracing init ────────────────────────────────────────────────────
@@ -787,6 +796,11 @@ async fn run_normal(mut args: FrpcRunArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
+        // Flush before the runtime is torn down: this error record is the
+        // reason someone will open the trace backend. Bounded by the
+        // exporter's own request timeout (10 s by default), a no-op when no
+        // exporter was initialised, and the exit code is unchanged.
+        logging::shutdown_otel();
         process::exit(EXIT_RUNTIME);
     }
 

@@ -557,10 +557,9 @@ pub fn init_tracing_otel(
             .into_owned();
         let fa = tracing_appender::rolling::daily(dir, &log_name);
         let reg = tracing_subscriber::registry();
-        // Leak the OTel provider so it lives for the process lifetime.
-        if let Some(p) = _provider {
-            let _ = Box::leak(Box::new(p));
-        }
+        // Keep the provider for the process lifetime, where `shutdown_otel`
+        // can find it on the exit path.
+        store_otel_provider(_provider);
         let json = format == "json";
         match (otel_layer, json) {
             (Some(layer), true) => {
@@ -616,10 +615,9 @@ pub fn init_tracing_otel(
         }
     } else {
         let reg = tracing_subscriber::registry();
-        // Leak the OTel provider so it lives for the process lifetime.
-        if let Some(p) = _provider {
-            let _ = Box::leak(Box::new(p));
-        }
+        // Keep the provider for the process lifetime, where `shutdown_otel`
+        // can find it on the exit path.
+        store_otel_provider(_provider);
         if let Some(layer) = otel_layer {
             if format == "json" {
                 reg.with(layer)
@@ -644,6 +642,65 @@ pub fn init_tracing_otel(
     }
 }
 
+/// Append the OTLP/HTTP per-signal path to a **base** endpoint, the way
+/// `WithEndpoint` does on Go (`otlptracehttp`) and the OTLP/HTTP spec requires.
+///
+/// `opentelemetry-otlp` 0.33 appends `/v1/traces` only to the endpoints it
+/// resolves itself (the `OTEL_EXPORTER_OTLP_*` environment variables and its
+/// defaults); a string handed to `with_endpoint` is used as the request URI
+/// verbatim. So a user following the documented base-URL form
+/// (`http://collector:4318`) got `POST /`, a collector 404, and — the SDK's
+/// `internal-logs` feature being off — no error anywhere: every span vanished
+/// silently. This is the missing half of that contract.
+///
+/// Rules, in the order they are applied:
+///
+/// * anything without a `scheme://authority` shape is returned **verbatim** —
+///   the old code raised no error for it and this must not invent one;
+/// * a path that is absent (`http://host:4318`) or exactly `/`
+///   (`http://host:4318/`) is a base URL: `/v1/traces` is appended;
+/// * any other path is the user's own choice and is left alone — including an
+///   endpoint that already carries `/v1/traces`, so this is a no-op for every
+///   endpoint that worked before the fix;
+/// * a query string (and/or fragment) is carried across:
+///   `http://host:4318?x=1` ⇒ `http://host:4318/v1/traces?x=1`.
+#[cfg(feature = "otel")]
+fn normalize_otlp_endpoint(endpoint: &str) -> String {
+    // `scheme://` must be present and the scheme must look like one. A value
+    // that misses either test is not a URL this function can reason about.
+    let Some(scheme_end) = endpoint.find("://") else {
+        return endpoint.to_string();
+    };
+    let scheme = &endpoint[..scheme_end];
+    let mut scheme_chars = scheme.chars();
+    let scheme_ok = scheme_chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme_chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    if !scheme_ok {
+        return endpoint.to_string();
+    }
+
+    // Authority ends at the first `/`, `?` or `#`; an empty one (`http://`)
+    // names no host, so it is not a base URL either.
+    let after_scheme = &endpoint[scheme_end + 3..];
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let (authority, tail) = after_scheme.split_at(authority_end);
+    if authority.is_empty() {
+        return endpoint.to_string();
+    }
+
+    let (path, suffix) = match tail.find(['?', '#']) {
+        Some(i) => tail.split_at(i),
+        None => (tail, ""),
+    };
+    if !path.is_empty() && path != "/" {
+        return endpoint.to_string();
+    }
+
+    format!("{scheme}://{authority}/v1/traces{suffix}")
+}
+
 /// Build the OTLP/HTTP exporter, the batch span processor that drains it, and
 /// the [`opentelemetry_sdk::trace::SdkTracerProvider`] tying them together.
 ///
@@ -664,7 +721,7 @@ pub fn build_otel_provider(
     use opentelemetry_sdk::Resource;
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
-        .with_endpoint(endpoint.to_string())
+        .with_endpoint(normalize_otlp_endpoint(endpoint))
         .build()?;
     let resource = Resource::builder_empty()
         .with_attributes(vec![KeyValue::new(
@@ -714,6 +771,99 @@ pub fn build_otel_layer(
     let tracer = provider.tracer("frp-rs");
     Ok((tracing_opentelemetry::layer().with_tracer(tracer), provider))
 }
+
+/// The provider [`init_tracing_otel`] built, held for the process lifetime so
+/// the exit path can flush it.
+///
+/// The provider used to be `Box::leak`ed on both wiring branches: nothing owned
+/// it, so nothing could call `shutdown()` and up to one batch interval (5 s by
+/// default) of spans was dropped when the daemon exited. It lives in a `Mutex`
+/// rather than behind a `OnceLock` because [`shutdown_otel`] has to *move* it
+/// out — that is what makes a second call a no-op instead of a second
+/// `shutdown()` on an already-shut-down provider.
+#[cfg(feature = "otel")]
+static OTEL_PROVIDER: std::sync::Mutex<Option<opentelemetry_sdk::trace::SdkTracerProvider>> =
+    std::sync::Mutex::new(None);
+
+/// Lock [`OTEL_PROVIDER`], treating a poisoned lock as "the previous holder
+/// panicked" rather than a second panic.
+///
+/// The exit path is the last place that may abort: a panic while the slot was
+/// held (nothing holds it across a yield, but the cost of assuming so is a
+/// process that panics *instead of* flushing) must not turn the flush into
+/// another panic. The same reasoning as `lock_dir_registry` in `frps`.
+#[cfg(feature = "otel")]
+fn lock_otel_provider(
+) -> std::sync::MutexGuard<'static, Option<opentelemetry_sdk::trace::SdkTracerProvider>> {
+    OTEL_PROVIDER.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Hand the provider from [`build_otel_layer`] to the process-wide holder.
+#[cfg(feature = "otel")]
+fn store_otel_provider(provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>) {
+    let Some(provider) = provider else { return };
+    *lock_otel_provider() = Some(provider);
+}
+
+/// Flush and shut down the OTLP exporter, if one was initialised.
+///
+/// Call this once on the daemon's exit path: `SdkTracerProvider::shutdown()`
+/// waits for the batch span processor to drain — that is what gets the last
+/// batch of spans onto the wire — and then stops its task. Without it the
+/// process exits with up to one batch interval of spans still queued.
+///
+/// Idempotent: the provider is *taken* out of [`OTEL_PROVIDER`], so the second
+/// call finds `None` and returns immediately. Safe to call unconditionally —
+/// with the `otel` feature off this is the empty function below, so `frps` and
+/// `frpc` need no `#[cfg]` at the call site.
+///
+/// Blocking: the SDK's `shutdown()` waits on a oneshot channel for the batch
+/// task, which runs on the ambient tokio runtime. Called from inside
+/// `#[tokio::main]` (both daemons do), a direct wait would starve that task on
+/// a runtime that has no other free worker, so a multi-thread runtime hands the
+/// worker's tasks off with [`tokio::task::block_in_place`] first. A
+/// `current_thread` runtime has no such hand-off, so there the provider is
+/// moved to its own thread and this function returns without waiting — a
+/// blocking wait (including the one `Drop` would do) would deadlock that
+/// runtime.
+#[cfg(feature = "otel")]
+pub fn shutdown_otel() {
+    let Some(provider) = lock_otel_provider().take() else {
+        return;
+    };
+    match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
+        // `block_in_place` moves the current worker's tasks to another worker
+        // (spawning one when this is the only worker), so the batch task keeps
+        // being polled while this thread waits for its answer.
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| shutdown_provider(&provider));
+        }
+        // Not a tokio thread: no runtime to starve.
+        Err(_) => shutdown_provider(&provider),
+        // `current_thread`: every wait below would block the one thread that
+        // can poll the batch task. Give the provider to a thread that can
+        // finish after this function returns; if the runtime is torn down
+        // first, the SDK's answer channel closes and that thread exits without
+        // exporting rather than hanging the process.
+        Ok(_) => {
+            std::thread::spawn(move || shutdown_provider(&provider));
+        }
+    }
+}
+
+/// Flush and shut down `provider`, ignoring the verdict.
+#[cfg(feature = "otel")]
+fn shutdown_provider(provider: &opentelemetry_sdk::trace::SdkTracerProvider) {
+    // The exit path has nowhere to report a failed export to, and the SDK
+    // already logs at debug level; panicking here would replace the process's
+    // own exit code with a panic.
+    let _ = provider.shutdown();
+}
+
+/// No-op when this build has no OTLP exporter, so the daemons can call
+/// [`shutdown_otel`] unconditionally.
+#[cfg(not(feature = "otel"))]
+pub fn shutdown_otel() {}
 
 // `is_token_error(msg) = msg.contains("token") || msg.contains("auth")` used to
 // live here; the daemons called it on `e.to_string()` to pick between
@@ -1041,5 +1191,119 @@ mod tests {
         let t: Targets = "frp_core=4".parse().unwrap();
         assert!(t.would_enable("frp_core", &Level::DEBUG));
         assert!(!t.would_enable("frp_core", &Level::TRACE));
+    }
+}
+
+/// The `current_thread` half of [`shutdown_otel`]'s blocking contract: such a
+/// runtime has no spare worker to poll the batch task that
+/// `SdkTracerProvider::shutdown()` waits on, so a direct wait there is a
+/// self-deadlock.
+#[cfg(all(test, feature = "otel"))]
+mod otel_shutdown_tests {
+    use super::{build_otel_provider, shutdown_otel, store_otel_provider};
+    use std::time::{Duration, Instant};
+
+    /// The endpoint is a socket that accepts the connection and never answers,
+    /// so a *direct* wait would block for the exporter's request timeout (10 s
+    /// by default) and blow the bound below. Passing therefore means
+    /// `shutdown_otel()` handed the provider off instead of waiting.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_otel_returns_immediately_on_a_current_thread_runtime() {
+        let black_hole = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole sink");
+        let endpoint = format!(
+            "http://{}/v1/traces",
+            black_hole.local_addr().expect("black-hole local_addr")
+        );
+        let provider =
+            build_otel_provider(&endpoint, "frp-rs-current-thread-test").expect("build provider");
+        store_otel_provider(Some(provider));
+
+        let started = Instant::now();
+        shutdown_otel();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "shutdown_otel() blocked for {elapsed:?} on a current_thread runtime: the batch task \
+             it waits for is spawned on the very runtime this call is blocking, so the daemon's \
+             exit path would hang instead of flushing"
+        );
+        drop(black_hole);
+    }
+}
+
+/// The endpoint rules from [`normalize_otlp_endpoint`]'s doc block, one test
+/// per rule. The integration test in `tests/otel_export_path.rs` proves rule 1
+/// on the wire; these pin the shapes it cannot cheaply stand up a sink for.
+#[cfg(all(test, feature = "otel"))]
+mod otel_endpoint_tests {
+    use super::normalize_otlp_endpoint;
+
+    #[test]
+    fn bare_base_url_gets_the_signal_path() {
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("https://collector:4318"),
+            "https://collector:4318/v1/traces"
+        );
+    }
+
+    #[test]
+    fn lone_slash_counts_as_no_path() {
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318/"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+    }
+
+    #[test]
+    fn an_explicit_path_is_left_alone() {
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318/custom"),
+            "http://127.0.0.1:4318/custom"
+        );
+        // Including one that already carries the signal path: every endpoint
+        // that worked before the fix must keep working byte for byte.
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318/v1/traces"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("http://127.0.0.1:4318/v1/traces/"),
+            "http://127.0.0.1:4318/v1/traces/"
+        );
+    }
+
+    #[test]
+    fn query_string_is_carried_across() {
+        assert_eq!(
+            normalize_otlp_endpoint("http://host:4318?x=1"),
+            "http://host:4318/v1/traces?x=1"
+        );
+        assert_eq!(
+            normalize_otlp_endpoint("http://host:4318/?x=1"),
+            "http://host:4318/v1/traces?x=1"
+        );
+    }
+
+    #[test]
+    fn unparseable_values_stay_verbatim() {
+        // The old code passed anything through; it raised no error for a value
+        // it could not parse, and this must not start doing so.
+        for value in [
+            "",
+            "   ",
+            "collector:4318",
+            "127.0.0.1:4318",
+            "http://",
+            "http:///v1/traces",
+            "://collector:4318",
+            "1http://collector:4318",
+            "not a url at all",
+        ] {
+            assert_eq!(normalize_otlp_endpoint(value), value, "value {value:?}");
+        }
     }
 }
