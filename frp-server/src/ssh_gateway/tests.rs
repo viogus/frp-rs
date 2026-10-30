@@ -1957,9 +1957,9 @@ fn reverse_channel_finish_open_sweeps_tombstones_only() {
 /// confirmation with no timeout), so tombstones are capped: an unanswered open
 /// plus a channel-close loop must not grow the table past
 /// [`MAX_IN_FLIGHT_TOMBSTONES`]. At the cap the newest end is kept by evicting
-/// one older tombstone (see
+/// one existing tombstone (see
 /// [`reverse_channel_cap_evicts_an_older_tombstone_not_the_newest_end`]), so the
-/// table stays bounded without losing the end that `register` can still consume.
+/// table stays bounded without dropping the end `register` can still consume.
 /// The window sweep clears whatever the window leaves.
 #[test]
 fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
@@ -1997,10 +1997,11 @@ fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
     );
 }
 
-/// At the cap, the end that arrives now is the one a completing `register` can
-/// still consume; every existing tombstone's channel has already lost that race.
-/// So the table evicts an older tombstone and records the newest end, instead
-/// of dropping it and hanging that channel until CHANNEL_CLOSE.
+/// At the cap the end that arrives now must not be the one dropped: it is the
+/// one a completing `register` can still consume. The table therefore evicts one
+/// existing closed entry to make room (first in iteration order — in this test
+/// those are all older ids — never a live sender) and records the newest end
+/// instead of dropping it and hanging that channel until CHANNEL_CLOSE.
 #[test]
 fn reverse_channel_cap_evicts_an_older_tombstone_not_the_newest_end() {
     use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
@@ -2096,6 +2097,26 @@ fn reverse_channel_cap_never_evicts_a_live_sender() {
         channels.tracked(),
         MAX_IN_FLIGHT_TOMBSTONES + 1,
         "the table holds the live sender plus the capped tombstone set"
+    );
+
+    // Pin the filter itself, not just the iteration order above: on a table of
+    // live senders only, an eviction must find nothing. A `find(|_e| true)`
+    // regression would evict a healthy channel here and hang it at the cap.
+    let live_only = ReverseChannels::default();
+    let (one_tx, _one_rx) = tokio::sync::mpsc::channel(1);
+    let (two_tx, _two_rx) = tokio::sync::mpsc::channel(1);
+    live_only.register(test_channel_id(601), one_tx);
+    live_only.register(test_channel_id(602), two_tx);
+    assert_eq!(live_only.tombstone_count(), 0, "no tombstones to evict");
+    assert_eq!(
+        live_only.evict_tombstone(),
+        None,
+        "evicting must never pick a live sender"
+    );
+    assert_eq!(
+        live_only.tracked(),
+        2,
+        "a failed eviction must leave the live channels in place"
     );
 }
 

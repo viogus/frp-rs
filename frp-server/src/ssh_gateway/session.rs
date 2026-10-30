@@ -64,10 +64,12 @@ use super::{
 /// decides how long to leave one open unanswered, and how many other channels
 /// it closes meanwhile), so without the cap a single unanswered open plus a
 /// channel-close loop could grow the table without limit. At the cap the newest
-/// end still wins: one existing tombstone is evicted to record it, because the
-/// newest end is the only one a completing [`register`](Self::register) can
-/// still consume, while an older tombstone's channel has already lost that
-/// race. A live sender is never evicted.
+/// end is *recorded*: one existing closed entry is evicted to make room — the
+/// first in iteration order, never a live sender — and the evicted channel's
+/// own end is lost until `CHANNEL_CLOSE`. Iteration order is not age, so the
+/// victim can even be the in-flight channel's own tombstone; the only property
+/// the eviction guarantees is that the end arriving now is kept rather than
+/// dropped. A live sender is never evicted.
 #[derive(Clone, Default)]
 pub(super) struct ReverseChannels {
     /// Registered channels: live senders plus in-flight tombstones (senders
@@ -176,13 +178,15 @@ impl ReverseChannels {
         if self.open_in_flight.load(Ordering::SeqCst) {
             let (tx, rx) = mpsc::channel(1);
             drop(rx);
-            // The newest end is the one a completing `register` can still
-            // consume, so at the cap evict an older tombstone instead of
-            // dropping this end — otherwise the channel that is about to
+            // The end arriving now is the one a completing `register` can
+            // still consume, so at the cap evict an existing tombstone instead
+            // of dropping this end — otherwise the channel that is about to
             // register waits for CHANNEL_CLOSE, which is the hang this table
-            // exists to prevent. `tombstone_count` counts only closed senders,
-            // so a tombstone to evict always exists here and a live channel is
-            // never chosen.
+            // exists to prevent. Eviction picks the first closed entry in
+            // iteration order (not age), so the evicted channel loses its own
+            // end until CHANNEL_CLOSE. `tombstone_count` counts only closed
+            // senders, so a tombstone to evict exists here and a live channel
+            // is never chosen.
             if self.tombstone_count() >= MAX_IN_FLIGHT_TOMBSTONES {
                 if let Some(evicted) = self.evict_tombstone() {
                     tracing::debug!(
@@ -206,10 +210,13 @@ impl ReverseChannels {
         false
     }
 
-    /// Evict one tombstone (never a live sender) to keep the table bounded
-    /// while still recording the newest end. Called under `gate`, only when
-    /// [`tombstone_count`](Self::tombstone_count) has reached the cap.
-    fn evict_tombstone(&self) -> Option<ChannelId> {
+    /// Evict one existing tombstone to keep the table bounded while still
+    /// recording the newest end. The filter is `is_closed`, so a live sender is
+    /// never chosen and a table of live senders only yields `None`; the victim
+    /// is the first closed entry in iteration order, not the oldest.
+    /// Called under `gate` when [`tombstone_count`](Self::tombstone_count) has
+    /// reached the cap; the unit tests also call it directly to pin the filter.
+    pub(super) fn evict_tombstone(&self) -> Option<ChannelId> {
         let evicted = self
             .data_tx
             .iter()
@@ -223,8 +230,9 @@ impl ReverseChannels {
     /// (receiver already dropped) and registered channels whose bridge has
     /// exited. The scan walks every registered entry but counts only closed
     /// ones, so live channels neither count against [`MAX_IN_FLIGHT_TOMBSTONES`]
-    /// nor get evicted. Only called under `gate`, so the count cannot move while
-    /// the cap is being checked.
+    /// nor get evicted. Callers holding `gate` see a stable count (every mutator
+    /// takes the gate); the unit tests read it without the gate, where it is a
+    /// point-in-time count of the table.
     pub(super) fn tombstone_count(&self) -> usize {
         self.data_tx
             .iter()
@@ -948,15 +956,16 @@ impl Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // The peer closed the forwarded-tcpip channel (local service exited).
-        // Drop the data sender so the bridge task's `data_rx.recv()` returns
-        // and the task (plus its duplex) exits — otherwise the bridge hangs
-        // forever holding the channel entry in the map.
+        // The peer closed a channel — normally the forwarded-tcpip one (local
+        // service exited), but session/exec channels land here too. Drop any
+        // data sender so a bridge task's `data_rx.recv()` returns and the task
+        // (plus its duplex) exits — otherwise the bridge hangs forever holding
+        // the channel entry in the map.
         if self.reverse_channels.end(channel) {
             tracing::debug!(
                 run_id = %self.run_id,
                 channel = ?channel,
-                "SSH gateway: forwarded-tcpip channel closed, bridge task will exit"
+                "SSH gateway: channel closed, its reverse data sender is ended; a bridge task on it, if any, exits"
             );
         }
         Ok(())
@@ -967,14 +976,14 @@ impl Handler for SshSession {
         channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        // The peer half-closed the forwarded-tcpip channel: the local service
-        // behind `ssh -R` sent FIN, but the SSH session — and this channel —
-        // stay open, so no `CHANNEL_CLOSE` will follow. russh's default hook is
-        // a no-op, which left the bridge's `data_rx.recv()` waiting forever:
-        // the work connection's write half never shut, frps never propagated
-        // EOF to the user connection, and read-until-EOF protocols (file
-        // transfer, `nc -N`, an HTTP client that finished its request) hung
-        // until a timeout.
+        // The peer half-closed a channel — normally the forwarded-tcpip one: the
+        // local service behind `ssh -R` sent FIN, but the SSH session — and this
+        // channel — stay open, so no `CHANNEL_CLOSE` will follow. russh's default
+        // hook is a no-op, which left the bridge's `data_rx.recv()` waiting
+        // forever: the work connection's write half never shut, frps never
+        // propagated EOF to the user connection, and read-until-EOF protocols
+        // (file transfer, `nc -N`, an HTTP client that finished its request)
+        // hung until a timeout.
         //
         // Dropping the sender ends that loop exactly as `channel_close` does,
         // so the bridge half-closes the work conn. The bridge's writer task is
@@ -984,7 +993,7 @@ impl Handler for SshSession {
             tracing::debug!(
                 run_id = %self.run_id,
                 channel = ?channel,
-                "SSH gateway: forwarded-tcpip channel EOF, bridge task half-closes the work connection"
+                "SSH gateway: channel EOF, its reverse data sender is ended; a bridge task on it, if any, half-closes the work connection"
             );
         }
         Ok(())
