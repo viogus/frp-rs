@@ -103,15 +103,18 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Drop the ambient OTel configuration before spawning the daemon.
+/// Drop the ambient tracing configuration before spawning the daemon.
 ///
-/// These variables are read by the SDK itself, so a developer's exported
+/// The `OTEL_*` names are read by the SDK itself, so a developer's exported
 /// `OTEL_SDK_DISABLED=true`, `OTEL_TRACES_EXPORTER=none`, or a per-signal
 /// endpoint override would silently change the run this test exists to observe
-/// (and could turn a real regression into a pass). `env_clear()` is deliberately
-/// not used: the daemon legitimately needs `HOME`, `PATH` and the temp-dir
-/// variables.
-fn scrub_otel_env(cmd: &mut Command) {
+/// (and could turn a real regression into a pass). `RUST_LOG` is here for the
+/// same reason from the other side: the daemon only prints `STARTUP_LINE` at
+/// `info`, and the `run` span is only recorded under a filter that admits it,
+/// so `RUST_LOG=error` or `RUST_LOG=off` in a developer's shell used to turn
+/// this pin red with no product change. `env_clear()` is deliberately not used:
+/// the daemon legitimately needs `HOME`, `PATH` and the temp-dir variables.
+fn scrub_inherited_env(cmd: &mut Command) {
     for var in [
         "OTEL_SDK_DISABLED",
         "OTEL_TRACES_EXPORTER",
@@ -130,6 +133,8 @@ fn scrub_otel_env(cmd: &mut Command) {
         "OTEL_SERVICE_NAME",
         "OTEL_RESOURCE_ATTRIBUTES",
         "OTEL_TRACES_SAMPLER",
+        // The daemon's own log filter (see the doc above).
+        "RUST_LOG",
     ] {
         cmd.env_remove(var);
     }
@@ -151,7 +156,7 @@ fn sigterm_flushes_the_run_span_to_the_otlp_endpoint() {
 
     let log = std::fs::File::create(&log_path).expect("create diagnostic log");
     let mut cmd = Command::new(bin());
-    scrub_otel_env(&mut cmd);
+    scrub_inherited_env(&mut cmd);
     let mut child = cmd
         .args(["-c", &config])
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)
@@ -256,4 +261,7 @@ fn sigterm_flushes_the_run_span_to_the_otlp_endpoint() {
          flush exported something, but not the span `Service::run` closed; body_len={}",
         request.body.len()
     );
+    // Completion marker for the CI step (`--nocapture`): a test body that
+    // returns early or loses its assertions must not look green.
+    println!("otel-flush-pin: run span exported");
 }

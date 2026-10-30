@@ -88,15 +88,17 @@ fn client_config(dead_port: u16) -> String {
     )
 }
 
-/// Drop the ambient OTel configuration before spawning the daemon.
+/// Drop the ambient tracing configuration before spawning the daemon.
 ///
-/// These variables are read by the SDK itself, so a developer's exported
+/// The `OTEL_*` names are read by the SDK itself, so a developer's exported
 /// `OTEL_SDK_DISABLED=true`, `OTEL_TRACES_EXPORTER=none`, or a per-signal
 /// endpoint override would silently change the run this test exists to observe
-/// (and could turn a real regression into a pass). `env_clear()` is deliberately
-/// not used: the daemon legitimately needs `HOME`, `PATH` and the temp-dir
-/// variables.
-fn scrub_otel_env(cmd: &mut Command) {
+/// (and could turn a real regression into a pass). `RUST_LOG` is here for the
+/// same reason from the other side: the `run` span is only recorded under a
+/// filter that admits it, so `RUST_LOG=off` in a developer's shell used to turn
+/// this pin red with no product change. `env_clear()` is deliberately not used:
+/// the daemon legitimately needs `HOME`, `PATH` and the temp-dir variables.
+fn scrub_inherited_env(cmd: &mut Command) {
     for var in [
         "OTEL_SDK_DISABLED",
         "OTEL_TRACES_EXPORTER",
@@ -115,6 +117,8 @@ fn scrub_otel_env(cmd: &mut Command) {
         "OTEL_SERVICE_NAME",
         "OTEL_RESOURCE_ATTRIBUTES",
         "OTEL_TRACES_SAMPLER",
+        // The daemon's own log filter (see the doc above).
+        "RUST_LOG",
     ] {
         cmd.env_remove(var);
     }
@@ -125,7 +129,7 @@ fn spawn_frpc(dir: &TempDir, args: &[&str], endpoint: &str) -> (Child, String) {
     let log = std::fs::File::create(&log_path).expect("create diagnostic log");
     let stderr = log.try_clone().expect("clone the log handle");
     let mut cmd = Command::new(bin());
-    scrub_otel_env(&mut cmd);
+    scrub_inherited_env(&mut cmd);
     let child = cmd
         .args(args)
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint)
@@ -209,6 +213,9 @@ fn single_config_run_failure_flushes_the_run_span() {
         "a refused login must exit 1 (EXIT_RUNTIME), got {status:?}; log={log:?}"
     );
     assert_run_span_flushed(&requests_rx, &log);
+    // Completion marker for the CI step (`--nocapture`): a test body that
+    // returns early or loses its assertions must not look green.
+    println!("otel-flush-pin: run span exported");
 }
 
 #[test]
@@ -230,4 +237,7 @@ fn config_dir_all_failed_flushes_the_run_spans() {
          rather than report success; log={log:?}"
     );
     assert_run_span_flushed(&requests_rx, &log);
+    // Completion marker for the CI step (`--nocapture`): a test body that
+    // returns early or loses its assertions must not look green.
+    println!("otel-flush-pin: all-failed exit exported");
 }
