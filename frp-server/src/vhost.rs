@@ -752,7 +752,7 @@ async fn handle_http1_request<S>(
                 // (pkg/util/vhost/http.go:262), which writes the raw
                 // NotFoundResponse — byte-identical here (581B + close). A
                 // GET whose control died goes through the reverse-proxy
-                // ErrorHandler instead (http.go:128-137), i.e. Go's net/http
+                // ErrorHandler instead (http.go:128-138), i.e. Go's net/http
                 // server layer renders it (`Date`, sniffed
                 // `Content-Type: text/html; charset=utf-8`, `Connection:
                 // close`, no `Server` header) while frp-rs writes the raw
