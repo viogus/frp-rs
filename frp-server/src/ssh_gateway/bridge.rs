@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::service::AppState;
-use dashmap::DashMap;
+
+use super::session::ReverseChannels;
 
 use super::WorkConnRequest;
 
@@ -25,7 +26,7 @@ pub(super) async fn handle_work_conn_requests(
     handle: russh::server::Handle,
     state: Arc<AppState>,
     reverse_forward: Arc<std::sync::Mutex<Option<(String, u32)>>>,
-    reverse_data_tx: Arc<DashMap<russh::ChannelId, mpsc::Sender<Vec<u8>>>>,
+    reverse: ReverseChannels,
     control_exit: tokio_util::sync::CancellationToken,
 ) {
     loop {
@@ -61,13 +62,18 @@ pub(super) async fn handle_work_conn_requests(
         };
 
         // Open the forwarded-tcpip channel (server-initiated). The payload
-        // carries the recorded -R address (Go server.go semantics).
+        // carries the recorded -R address (Go server.go semantics). The peer
+        // can end the channel as soon as it accepts it — before the id below
+        // exists — so bracket the open: `ReverseChannels::end` remembers an
+        // end that overtakes `register` instead of losing it.
+        reverse.begin_open();
         let channel = match handle
             .channel_open_forwarded_tcpip(&addr, port, &addr, port)
             .await
         {
             Ok(ch) => ch,
             Err(e) => {
+                reverse.finish_open();
                 tracing::warn!(
                     run_id = %run_id,
                     error = %e,
@@ -84,7 +90,8 @@ pub(super) async fn handle_work_conn_requests(
         // Register the data route (SSH client → bridge read half).
         // Bounded: backpressure via the SSH data callback above.
         let (data_tx, data_rx) = mpsc::channel::<Vec<u8>>(64);
-        reverse_data_tx.insert(channel_id, data_tx);
+        reverse.register(channel_id, data_tx);
+        reverse.finish_open();
 
         // In-memory pipe: one end is the work conn, the other is bridged
         // with the SSH channel (Go virtual client net.Pipe).
@@ -94,7 +101,7 @@ pub(super) async fn handle_work_conn_requests(
         let Some(tx) = ctl_tx else {
             tracing::warn!(run_id = %run_id, "SSH: control handler gone; dropping work conn");
             let _ = handle.close(channel_id).await;
-            reverse_data_tx.remove(&channel_id);
+            reverse.discard(channel_id);
             continue;
         };
         let work_io = frp_core::transport::IoStream::SshChannel(Box::new(work_side));
@@ -105,16 +112,16 @@ pub(super) async fn handle_work_conn_requests(
         {
             tracing::debug!(run_id = %run_id, "SSH: control gone while delivering work conn");
             let _ = handle.close(channel_id).await;
-            reverse_data_tx.remove(&channel_id);
+            reverse.discard(channel_id);
             continue;
         }
 
-        let reg = reverse_data_tx.clone();
+        let reg = reverse.clone();
         let handle2 = handle.clone();
         tokio::spawn(async move {
             bridge_ssh_side(ssh_side, data_rx, handle2.clone(), channel_id).await;
             let _ = handle2.close(channel_id).await;
-            reg.remove(&channel_id);
+            reg.discard(channel_id);
         });
     }
 

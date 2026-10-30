@@ -1807,3 +1807,106 @@ fn build_v1_frame_rejects_oversized_proxy_config() {
     assert!(declared <= frp_core::protocol::V1_MAX_MSG_LENGTH as usize);
     assert_eq!(frame.len(), 9 + declared);
 }
+
+// ── Reverse-tunnel channel teardown ─────────────────────────
+
+/// Fabricate a `ChannelId` for the routing-table tests: russh keeps its inner
+/// `u32` private and exposes no constructor, but implements ssh-encoding's
+/// `Decode` and `&[u8]` implements the matching `Reader`.
+fn test_channel_id(number: u32) -> russh::ChannelId {
+    use russh::keys::ssh_encoding::Decode;
+    let mut bytes: &[u8] = &number.to_be_bytes();
+    russh::ChannelId::decode(&mut bytes).expect("ChannelId decodes from a big-endian u32")
+}
+
+/// A peer `CHANNEL_EOF` drops the channel's data sender — the one signal that
+/// ends the bridge's `data_rx.recv()` loop and half-closes the work connection,
+/// so the user connection observes EOF. `CHANNEL_CLOSE` afterwards (russh sends
+/// both when the local service exits) is a quiet no-op.
+#[tokio::test]
+async fn reverse_channel_end_drops_sender_once() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    let channel = test_channel_id(7);
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channels.begin_open();
+    channels.register(channel, tx);
+    channels.finish_open();
+    assert!(
+        channels.sender(channel).is_some(),
+        "a registered sender is routable by data()"
+    );
+
+    assert!(
+        channels.end(channel),
+        "peer EOF drops the registered sender"
+    );
+    assert!(
+        channels.sender(channel).is_none(),
+        "data() after EOF must find no sender and drop the bytes"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bridge data_rx must finish promptly once the sender is dropped");
+    assert!(
+        ended.is_none(),
+        "bridge read half must observe the channel end"
+    );
+
+    assert!(
+        !channels.end(channel),
+        "CHANNEL_CLOSE after CHANNEL_EOF must be a quiet no-op"
+    );
+}
+
+/// The peer can end the channel before `channel_open_forwarded_tcpip` has
+/// returned its id (the local service FINs straight away, or the `ssh -R`
+/// target refuses the connection). That end must not be lost: the sender
+/// registered a moment later is dropped at once, so the bridge still
+/// half-closes the work connection instead of waiting forever.
+#[tokio::test]
+async fn reverse_channel_end_before_register_is_not_lost() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    let channel = test_channel_id(8);
+
+    channels.begin_open();
+    assert!(
+        !channels.end(channel),
+        "no sender yet — the open is still in flight"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channels.register(channel, tx);
+    channels.finish_open();
+
+    assert!(
+        channels.sender(channel).is_none(),
+        "a sender registering after the peer's end must be dropped immediately"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bridge data_rx must finish promptly when the peer ended before registration");
+    assert!(
+        ended.is_none(),
+        "bridge read half must observe the channel end"
+    );
+}
+
+/// Ends that arrive outside a `forwarded-tcpip` open window — every closed
+/// session/exec channel does this — must leave nothing behind: the table is
+/// per session and must not grow with the number of channels a client closes.
+#[test]
+fn reverse_channel_end_outside_open_window_leaves_no_tombstone() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    for n in 0..64 {
+        assert!(!channels.end(test_channel_id(100 + n)));
+    }
+    assert_eq!(
+        channels.tracked(),
+        0,
+        "peer-ended channels outside an open window must not be remembered"
+    );
+}
