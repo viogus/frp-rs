@@ -507,8 +507,8 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // `[web_server.tls] enable = true`: the inert-key warning is a `WARN` record
 // emitted on every build right after `init_logging`
 // (`presence.warn_inert_web_server_tls_enable`, called at
-// `frps/src/main.rs:1093`), while the startup marker is an `INFO` record
-// (`frps/src/main.rs:1115`). So
+// `frps/src/main.rs:1107`), while the startup marker is an `INFO` record
+// (`frps/src/main.rs:1129`). So
 // "`web_server.tls.enable has no effect` present **and** `frps (Rust) v` absent"
 // pins the effective level at *exactly* `warn`: `info` would add the marker,
 // `error` would drop the warning.
@@ -657,8 +657,8 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
 // `cmd/frps/root.go:112` inits the logger from the *file's* `cfg.Log` — and
 // `frps -c frps.toml --log-level info` over a file with `[log] level = "warn"`
 // therefore prints **0** records. Pre-fix, frp-rs gated only
-// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1068-1070`)
-// while `init_logging` (`frps/src/main.rs:1080`) still read the raw CLI value:
+// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1082-1084`)
+// while `init_logging` (`frps/src/main.rs:1094`) still read the raw CLI value:
 // measured on that binary the same argv printed **11** `INFO` records (2434 B)
 // and `--log-level debug` printed 11 `INFO` + 3 `DEBUG` (2860 B), while the
 // no-flag control printed 231 B / 0 `INFO` / 1 `WARN` — `level_config` always
@@ -825,7 +825,7 @@ fn fresh_rotation_file(dir: &TempDir) -> Option<PathBuf> {
 }
 
 /// True when the fresh rotation file already carries the record `frps` writes
-/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1115`).
+/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1129`).
 ///
 /// Mere existence is not evidence that anything ran: `tracing_appender::rolling::daily`
 /// creates `logs/frps.log.<date>` eagerly when it is constructed
