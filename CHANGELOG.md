@@ -9,6 +9,21 @@ User-facing release notes for frp-rs.
 > write the same detail in both; see the
 > [docs conventions](docs/README.md#conventions-for-these-docs).
 
+## Unreleased
+
+### Fixes
+
+- **The SSH gateway no longer runs `exec`/`env` on a work connection.** A
+  `forwarded-tcpip` channel is a data path for one `ssh -R` work connection,
+  but the gateway answered `exec` and `env` requests on any channel id, so the
+  local service side of the tunnel could also register a proxy through the very
+  channel it was serving. Channels the peer opened as SSH `session` channels are
+  now the only ones allowed to run a command; anything else is answered with
+  `CHANNEL_FAILURE`.
+- **`[log] to = "<file>"` no longer also writes to stdout in `otel` builds.**
+  The file destination installs only the file layer, exactly as a non-otel
+  build does; spans still export through OTLP.
+
 ## v0.71.1 — 2026-10-24
 
 Tracks Go frp v0.71.1 (`0.71.1` released 2026-10-14; our compat target moves with
