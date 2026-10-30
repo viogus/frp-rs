@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=6d74b0acd0ccad0f848e8d21ce880b3924f20d4b3eedf58cab097785e250d605
+          guard_data_pin=1cb689fd9ec81d45a301974285bef9be17dbefeeefe88a9f55a21844a5598db0
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2330,20 +2330,39 @@ jobs:
               exit 1
             fi
           }
+          # Each test prints a completion marker after its last assertion, and the
+          # step reads it because the exit status alone is not enough: a body that
+          # returns early - or loses its assertions - still reports `... ok` and
+          # `1 passed`. `--nocapture` is what makes libtest show the marker.
+          # The cargo status is captured rather than left to `bash -e` so a real
+          # failure prints the log and a curated message instead of dying silently.
           f=$(mktemp)
-          cargo test -p frps --all-features --test otel_flush 2>&1 | tee "$f"
+          status=0
+          cargo test -p frps --all-features --test otel_flush -- --nocapture 2>&1 | tee "$f" || status=$?
           strip "$f" > "$f.plain"
-          expect "$f.plain" 'running 1 test'             'frps otel_flush did not run exactly one test: the target was emptied, renamed or compiled out'
-          expect "$f.plain" 'test sigterm_flushes_the_run_span_to_the_otlp_endpoint \.\.\. ok'             'sigterm_flushes_the_run_span_to_the_otlp_endpoint did not pass - the SIGTERM tail is not exporting the queued span'
-          expect_prefix "$f.plain" '^test result: ok\. 1 passed; 0 failed'             'frps otel_flush did not report a clean one-test pass'
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the frps otel_flush target failed (exit $status): the SIGTERM tail is not exporting the queued \`run\` span - see the log above"
+            exit 1
+          fi
+          expect "$f.plain" 'running 1 test'            'frps otel_flush did not run exactly one test: the target was emptied, renamed or compiled out'
+          expect "$f.plain" 'test sigterm_flushes_the_run_span_to_the_otlp_endpoint \.\.\. ok'            'sigterm_flushes_the_run_span_to_the_otlp_endpoint did not pass - the SIGTERM tail is not exporting the queued span'
+          expect "$f.plain" 'otel-flush-pin: run span exported'            'the frps flush test did not reach its last assertion: the completion marker is missing, so the body may return early'
+          expect_prefix "$f.plain" '^test result: ok\. 1 passed; 0 failed'            'frps otel_flush did not report a clean one-test pass'
           g=$(mktemp)
-          cargo test -p frpc --all-features --test otel_flush 2>&1 | tee "$g"
+          status=0
+          cargo test -p frpc --all-features --test otel_flush -- --nocapture 2>&1 | tee "$g" || status=$?
           strip "$g" > "$g.plain"
-          expect "$g.plain" 'running 2 tests'             'frpc otel_flush did not run exactly two tests: the target was emptied, renamed or compiled out'
-          expect "$g.plain" 'test single_config_run_failure_flushes_the_run_span \.\.\. ok'             'single_config_run_failure_flushes_the_run_span did not pass - the single-config failure exit is not flushing'
-          expect "$g.plain" 'test config_dir_all_failed_flushes_the_run_spans \.\.\. ok'             'config_dir_all_failed_flushes_the_run_spans did not pass - the all-failed config-dir exit is not flushing'
-          expect_prefix "$g.plain" '^test result: ok\. 2 passed; 0 failed' \
-            'frpc otel_flush did not report a clean two-test pass'
+          if [ "$status" -ne 0 ]; then
+            echo "::error::the frpc otel_flush target failed (exit $status): an exit path is not flushing - see the log above"
+            exit 1
+          fi
+          expect "$g.plain" 'running 2 tests'            'frpc otel_flush did not run exactly two tests: the target was emptied, renamed or compiled out'
+          expect "$g.plain" 'test single_config_run_failure_flushes_the_run_span \.\.\. ok'            'single_config_run_failure_flushes_the_run_span did not pass - the single-config failure exit is not flushing'
+          expect "$g.plain" 'test config_dir_all_failed_flushes_the_run_spans \.\.\. ok'            'config_dir_all_failed_flushes_the_run_spans did not pass - the all-failed config-dir exit is not flushing'
+          expect "$g.plain" 'otel-flush-pin: run span exported'            'the frpc single-config test did not reach its last assertion: the completion marker is missing'
+          expect "$g.plain" 'otel-flush-pin: all-failed exit exported'            'the frpc all-failed test did not reach its last assertion: the completion marker is missing'
+          expect_prefix "$g.plain" '^test result: ok\. 2 passed; 0 failed'            'frpc otel_flush did not report a clean two-test pass'
+
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
