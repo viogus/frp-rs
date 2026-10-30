@@ -213,8 +213,10 @@ fn single_config_run_failure_flushes_the_run_span() {
         "a refused login must exit 1 (EXIT_RUNTIME), got {status:?}; log={log:?}"
     );
     assert_run_span_flushed(&requests_rx, &log);
-    // Completion marker for the CI step (`--nocapture`): a test body that
-    // returns early or loses its assertions must not look green.
+    // Completion marker for the CI step (`--nocapture`). It proves the body
+    // reached this line: an early return, a panic before the assertions or a
+    // cfg'd-out test leaves no marker. It cannot prove the assertions above are
+    // still there - deleting one while keeping this line would still pass.
     println!("otel-flush-pin: run span exported");
 }
 
@@ -237,7 +239,9 @@ fn config_dir_all_failed_flushes_the_run_spans() {
          rather than report success; log={log:?}"
     );
     assert_run_span_flushed(&requests_rx, &log);
-    // Completion marker for the CI step (`--nocapture`): a test body that
-    // returns early or loses its assertions must not look green.
+    // Completion marker for the CI step (`--nocapture`). It proves the body
+    // reached this line: an early return, a panic before the assertions or a
+    // cfg'd-out test leaves no marker. It cannot prove the assertions above are
+    // still there - deleting one while keeping this line would still pass.
     println!("otel-flush-pin: all-failed exit exported");
 }

@@ -261,7 +261,9 @@ fn sigterm_flushes_the_run_span_to_the_otlp_endpoint() {
          flush exported something, but not the span `Service::run` closed; body_len={}",
         request.body.len()
     );
-    // Completion marker for the CI step (`--nocapture`): a test body that
-    // returns early or loses its assertions must not look green.
+    // Completion marker for the CI step (`--nocapture`). It proves the body
+    // reached this line: an early return, a panic before the assertions or a
+    // cfg'd-out test leaves no marker. It cannot prove the assertions above are
+    // still there - deleting one while keeping this line would still pass.
     println!("otel-flush-pin: run span exported");
 }
