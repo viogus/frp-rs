@@ -63,9 +63,11 @@ use super::{
 /// [`MAX_IN_FLIGHT_TOMBSTONES`]. The window is client-controlled (the peer
 /// decides how long to leave one open unanswered, and how many other channels
 /// it closes meanwhile), so without the cap a single unanswered open plus a
-/// channel-close loop could grow the table without limit. Past the cap an end
-/// is dropped and logged: that one channel's EOF is not propagated, and its
-/// bridge ends when the channel closes instead.
+/// channel-close loop could grow the table without limit. At the cap the newest
+/// end still wins: one existing tombstone is evicted to record it, because the
+/// newest end is the only one a completing [`register`](Self::register) can
+/// still consume, while an older tombstone's channel has already lost that
+/// race. A live sender is never evicted.
 #[derive(Clone, Default)]
 pub(super) struct ReverseChannels {
     /// Registered channels: live senders plus in-flight tombstones (senders
@@ -155,11 +157,13 @@ impl ReverseChannels {
     /// EOF too): drop the data sender so the bridge half-closes the work
     /// connection.
     ///
-    /// Returns `true` when a live sender was dropped. With no live sender it
-    /// returns `false` and, only while an open is in flight, leaves a tombstone
-    /// (unless the tombstone cap is exhausted), so `CHANNEL_CLOSE` after
-    /// `CHANNEL_EOF`, an end for an already-ended channel, and a repeat inside
-    /// one window are all harmless — the last one re-inserts the same tombstone.
+    /// Returns `true` when the end was recorded for this channel: a live sender
+    /// was dropped, or a tombstone now represents the end until
+    /// [`register`](Self::register) consumes it. Returns `false` only for an end
+    /// that has nothing to end — no sender and no open in flight (session/exec
+    /// channels, or an end after the window closed) — so `CHANNEL_CLOSE` after
+    /// `CHANNEL_EOF` stays a quiet no-op there. Inside one window a repeat
+    /// re-inserts the same tombstone and returns `true` again.
     pub(super) fn end(&self, channel: ChannelId) -> bool {
         let _gate = self.lock_gate();
         if self
@@ -170,42 +174,68 @@ impl ReverseChannels {
             return true;
         }
         if self.open_in_flight.load(Ordering::SeqCst) {
-            if self.tombstone_count() >= MAX_IN_FLIGHT_TOMBSTONES {
-                // One unanswered open plus a channel-close loop can outrun the
-                // window's budget. Keeping the table bounded costs this end: the
-                // channel's EOF is not propagated, and its bridge ends when the
-                // channel is closed instead.
-                tracing::debug!(
-                    channel = ?channel,
-                    cap = MAX_IN_FLIGHT_TOMBSTONES,
-                    "SSH gateway: forwarded-tcpip end dropped, in-flight tombstone cap reached"
-                );
-                return false;
-            }
             let (tx, rx) = mpsc::channel(1);
             drop(rx);
-            // `insert` also drops a sender registered between the `remove`
-            // above and this line — the same half-close signal, from the race
-            // the other way round. Both steps are inside `gate`, so
-            // `register`/`finish_open` cannot slip in between.
-            self.data_tx.insert(channel, tx);
+            // The newest end is the one a completing `register` can still
+            // consume, so at the cap evict an older tombstone instead of
+            // dropping this end — otherwise the channel that is about to
+            // register waits for CHANNEL_CLOSE, which is the hang this table
+            // exists to prevent. `tombstone_count` counts only closed senders,
+            // so a tombstone to evict always exists here and a live channel is
+            // never chosen.
+            if self.tombstone_count() >= MAX_IN_FLIGHT_TOMBSTONES {
+                if let Some(evicted) = self.evict_tombstone() {
+                    tracing::debug!(
+                        channel = ?channel,
+                        evicted = ?evicted,
+                        cap = MAX_IN_FLIGHT_TOMBSTONES,
+                        "SSH gateway: forwarded-tcpip tombstone evicted to record a newer end"
+                    );
+                }
+            }
+            // Under `gate` no entry can exist for this channel here: the
+            // `remove` above took it and no registration interleaves. The
+            // previous value is therefore always `None`; it is bound and
+            // asserted rather than matched so a future ungated caller still
+            // overwrites (and drops) a stale sender instead of leaking it.
+            let previous = self.data_tx.insert(channel, tx);
+            debug_assert!(previous.is_none(), "the gate makes this insert a plain add");
+            let _ = previous;
+            return true;
         }
         false
     }
 
-    /// Tombstones in the table. Only called under `gate`, so the count cannot
-    /// move while the cap is being checked.
-    fn tombstone_count(&self) -> usize {
+    /// Evict one tombstone (never a live sender) to keep the table bounded
+    /// while still recording the newest end. Called under `gate`, only when
+    /// [`tombstone_count`](Self::tombstone_count) has reached the cap.
+    fn evict_tombstone(&self) -> Option<ChannelId> {
+        let evicted = self
+            .data_tx
+            .iter()
+            .find(|e| e.value().is_closed())
+            .map(|e| *e.key())?;
+        self.data_tx.remove(&evicted);
+        Some(evicted)
+    }
+
+    /// Tombstones in the table: closed senders only, both the in-flight ones
+    /// (receiver already dropped) and registered channels whose bridge has
+    /// exited. The scan walks every registered entry but counts only closed
+    /// ones, so live channels neither count against [`MAX_IN_FLIGHT_TOMBSTONES`]
+    /// nor get evicted. Only called under `gate`, so the count cannot move while
+    /// the cap is being checked.
+    pub(super) fn tombstone_count(&self) -> usize {
         self.data_tx
             .iter()
             .filter(|e| e.value().is_closed())
             .count()
     }
 
-    /// Number of tracked channels. Unit tests use it to pin that the table
-    /// stays bounded: a peer ending channels *outside* an open window (every
-    /// session/exec channel does) puts nothing in the table, and inside a
-    /// window the tombstones are capped.
+    /// Number of tracked entries (live senders + tombstones). Unit tests use it
+    /// to pin that the table stays bounded: a peer ending channels *outside* an
+    /// open window (every session/exec channel does) puts nothing in the table,
+    /// and inside a window the tombstones are capped.
     #[cfg(test)]
     pub(super) fn tracked(&self) -> usize {
         self.data_tx.len()

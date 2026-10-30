@@ -1873,8 +1873,8 @@ async fn reverse_channel_end_before_register_is_not_lost() {
 
     channels.begin_open();
     assert!(
-        !channels.end(channel),
-        "no sender yet — the open is still in flight"
+        channels.end(channel),
+        "an end inside the open window is recorded as a tombstone"
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
@@ -1921,8 +1921,8 @@ fn reverse_channel_finish_open_sweeps_tombstones_only() {
     let channels = ReverseChannels::default();
 
     channels.begin_open();
-    assert!(!channels.end(test_channel_id(200)));
-    assert!(!channels.end(test_channel_id(201)));
+    assert!(channels.end(test_channel_id(200)));
+    assert!(channels.end(test_channel_id(201)));
     assert_eq!(
         channels.tracked(),
         2,
@@ -1956,9 +1956,11 @@ fn reverse_channel_finish_open_sweeps_tombstones_only() {
 /// The in-flight window is client-controlled (russh waits for a channel
 /// confirmation with no timeout), so tombstones are capped: an unanswered open
 /// plus a channel-close loop must not grow the table past
-/// [`MAX_IN_FLIGHT_TOMBSTONES`]. Past the cap the end is dropped — bounded memory
-/// over propagating that one channel's EOF — and the window sweep clears what
-/// the window did leave.
+/// [`MAX_IN_FLIGHT_TOMBSTONES`]. At the cap the newest end is kept by evicting
+/// one older tombstone (see
+/// [`reverse_channel_cap_evicts_an_older_tombstone_not_the_newest_end`]), so the
+/// table stays bounded without losing the end that `register` can still consume.
+/// The window sweep clears whatever the window leaves.
 #[test]
 fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
     use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
@@ -1966,7 +1968,10 @@ fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
 
     channels.begin_open();
     for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
-        assert!(!channels.end(test_channel_id(n as u32)));
+        assert!(
+            channels.end(test_channel_id(n as u32)),
+            "every end inside the window is recorded"
+        );
     }
     assert_eq!(
         channels.tracked(),
@@ -1975,8 +1980,8 @@ fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
     );
 
     assert!(
-        !channels.end(test_channel_id(9_999)),
-        "an end past the cap drops without a live sender"
+        channels.end(test_channel_id(9_999)),
+        "an end at the cap is recorded by evicting a tombstone"
     );
     assert_eq!(
         channels.tracked(),
@@ -1992,9 +1997,108 @@ fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
     );
 }
 
-/// A `data` callback that arrives after the peer's EOF (a protocol violation,
-/// but russh dispatches it) must not erase the tombstone: the pending end is
-/// what `register` has yet to observe, so dropping it would lose the half-close.
+/// At the cap, the end that arrives now is the one a completing `register` can
+/// still consume; every existing tombstone's channel has already lost that race.
+/// So the table evicts an older tombstone and records the newest end, instead
+/// of dropping it and hanging that channel until CHANNEL_CLOSE.
+#[test]
+fn reverse_channel_cap_evicts_an_older_tombstone_not_the_newest_end() {
+    use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
+    let channels = ReverseChannels::default();
+
+    channels.begin_open();
+    for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
+        assert!(channels.end(test_channel_id(n as u32)));
+    }
+
+    let pending = test_channel_id(9_999);
+    assert!(
+        channels.end(pending),
+        "the end at the cap must be recorded, not dropped"
+    );
+    assert_eq!(
+        channels.tombstone_count(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "recording the newest end must not grow the tombstone set"
+    );
+
+    // Exactly one of the older tombstones was evicted — it is absent from the
+    // table, so a later register for it would be a plain new channel — while the
+    // newest end is still a tombstone whose sender will be dropped.
+    let evicted: Vec<u32> = (0..MAX_IN_FLIGHT_TOMBSTONES as u32)
+        .filter(|n| channels.sender(test_channel_id(*n)).is_none())
+        .collect();
+    assert_eq!(
+        evicted.len(),
+        1,
+        "exactly one older tombstone must be evicted to make room"
+    );
+    assert!(
+        channels.sender(test_channel_id(evicted[0])).is_none(),
+        "the evicted id must no longer be closed (it is gone)"
+    );
+    let pending_tx = channels
+        .sender(pending)
+        .expect("the newest end must be represented in the table");
+    assert!(
+        pending_tx.is_closed(),
+        "the newest end must be a tombstone whose receiver is gone"
+    );
+
+    // The pending channel's registration is dropped at once, so its bridge
+    // half-closes instead of waiting for CHANNEL_CLOSE.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    channels.register(pending, tx);
+    channels.finish_open();
+    assert!(channels.sender(pending).is_none());
+    assert!(matches!(
+        rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+    ));
+}
+
+/// The cap counts tombstones, never live channels: with a live sender registered
+/// outside the window and the tombstone set at the cap, an incoming end must
+/// evict a tombstone and leave the live channel routable.
+#[test]
+fn reverse_channel_cap_never_evicts_a_live_sender() {
+    use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
+    let channels = ReverseChannels::default();
+
+    let live = test_channel_id(500);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(4);
+    channels.register(live, live_tx);
+
+    channels.begin_open();
+    for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
+        assert!(channels.end(test_channel_id(n as u32)));
+    }
+    assert_eq!(
+        channels.tombstone_count(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "live senders do not count against the cap"
+    );
+
+    assert!(
+        channels.end(test_channel_id(9_999)),
+        "the end at the cap must still be recorded"
+    );
+    assert_eq!(
+        channels.tombstone_count(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "the eviction must pick a tombstone, not the live sender"
+    );
+    assert!(
+        channels.sender(live).is_some_and(|tx| !tx.is_closed()),
+        "a live sender must never be evicted"
+    );
+    assert_eq!(
+        channels.tracked(),
+        MAX_IN_FLIGHT_TOMBSTONES + 1,
+        "the table holds the live sender plus the capped tombstone set"
+    );
+}
+
 #[tokio::test]
 async fn reverse_channel_data_after_end_keeps_the_tombstone() {
     use super::session::ReverseChannels;
@@ -2002,7 +2106,7 @@ async fn reverse_channel_data_after_end_keeps_the_tombstone() {
     let channel = test_channel_id(300);
 
     channels.begin_open();
-    assert!(!channels.end(channel));
+    assert!(channels.end(channel));
     assert_eq!(channels.tracked(), 1, "the end left a tombstone");
 
     channels.deliver(channel, b"late data").await;
@@ -2050,8 +2154,9 @@ fn reverse_channel_concurrent_end_and_register_never_lose_the_end() {
         let dropped_live = peer_end.join().expect("peer thread must not panic");
 
         // Whichever way the race went, the peer's end must have ended the
-        // channel: either it removed the live sender (`true`) or its tombstone
-        // made `register` drop the sender (`false`, and the receiver is gone).
+        // channel: either it removed the live sender (`true`, it got there
+        // first) or its tombstone made `register` drop the sender (the end won
+        // the window and `register` consumed it).
         assert!(
             matches!(
                 rx.try_recv(),
