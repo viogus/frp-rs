@@ -640,28 +640,45 @@ pub fn init_tracing_otel(
                 .init();
         }
     }
+
+    // `build_otel_layer` ran before this subscriber existed, so the `https://`
+    // record it emitted reached no sink. Repeat it now that one is installed:
+    // otherwise a daemon with an endpoint the exporter cannot reach still
+    // starts with no trace at all and no explanation.
+    if let Some(endpoint) = otlp_endpoint.as_deref().filter(|ep| endpoint_is_https(ep)) {
+        tracing::error!(endpoint = endpoint, "{}", OTLP_PLAIN_HTTP_ONLY);
+    }
 }
 
-/// Append the OTLP/HTTP per-signal path to a **base** endpoint, the way
-/// `WithEndpoint` does on Go (`otlptracehttp`) and the OTLP/HTTP spec requires.
+/// Append the OTLP/HTTP per-signal path (`/v1/traces`) to a **base** endpoint.
 ///
-/// `opentelemetry-otlp` 0.33 appends `/v1/traces` only to the endpoints it
+/// `opentelemetry-otlp` 0.33 appends the signal path only to the endpoints it
 /// resolves itself (the `OTEL_EXPORTER_OTLP_*` environment variables and its
 /// defaults); a string handed to `with_endpoint` is used as the request URI
-/// verbatim. So a user following the documented base-URL form
+/// verbatim. So a base-URL value passed to `init_tracing_otel`
 /// (`http://collector:4318`) got `POST /`, a collector 404, and — the SDK's
 /// `internal-logs` feature being off — no error anywhere: every span vanished
-/// silently. This is the missing half of that contract.
+/// silently. This is the missing half of that contract for the programmatic
+/// path.
+///
+/// The OTLP/HTTP spec's own rule is generic: *any* base URL gains the signal
+/// path appended, so `http://host:4318/mycollector` would become
+/// `.../mycollector/v1/traces`. This function deliberately does **not** extend
+/// a non-root path: rewriting an endpoint that carries a path is the riskier
+/// half of the change, and the only broken shape the bug report covered was
+/// pathless. Non-root paths are therefore the caller's own choice.
 ///
 /// Rules, in the order they are applied:
 ///
 /// * anything without a `scheme://authority` shape is returned **verbatim** —
 ///   the old code raised no error for it and this must not invent one;
 /// * a path that is absent (`http://host:4318`) or exactly `/`
-///   (`http://host:4318/`) is a base URL: `/v1/traces` is appended;
-/// * any other path is the user's own choice and is left alone — including an
-///   endpoint that already carries `/v1/traces`, so this is a no-op for every
-///   endpoint that worked before the fix;
+///   (`http://host:4318/`) is a base URL: `/v1/traces` is appended. This is the
+///   one behaviour change: both shapes previously went to the collector as
+///   `POST /`, which an OTLP/HTTP receiver does not serve, so the request now
+///   addresses the signal path the protocol defines;
+/// * any other path is left alone — including an endpoint that already carries
+///   `/v1/traces`, so an endpoint with a non-root path is byte-identical;
 /// * a query string (and/or fragment) is carried across:
 ///   `http://host:4318?x=1` ⇒ `http://host:4318/v1/traces?x=1`.
 #[cfg(feature = "otel")]
@@ -701,6 +718,22 @@ fn normalize_otlp_endpoint(endpoint: &str) -> String {
     format!("{scheme}://{authority}/v1/traces{suffix}")
 }
 
+/// The OTLP exporter this build ships has no TLS connector, so an `https://`
+/// endpoint would be accepted and then export nothing.
+#[cfg(feature = "otel")]
+const OTLP_PLAIN_HTTP_ONLY: &str =
+    "the OTLP/HTTP exporter only supports http:// endpoints; spans will not be exported";
+
+/// Whether `endpoint` asks for the scheme the bundled exporter cannot reach.
+///
+/// Scheme comparison is ASCII-case-insensitive, the way a URL's scheme is.
+#[cfg(feature = "otel")]
+fn endpoint_is_https(endpoint: &str) -> bool {
+    endpoint
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
 /// Build the OTLP/HTTP exporter, the batch span processor that drains it, and
 /// the [`opentelemetry_sdk::trace::SdkTracerProvider`] tying them together.
 ///
@@ -710,6 +743,15 @@ fn normalize_otlp_endpoint(endpoint: &str) -> String {
 /// *production* wiring: an integration test is a separate crate, so a
 /// `pub(crate)` helper would be invisible to it and the test would have to
 /// rebuild the provider itself — exactly the copy that lets a wiring bug hide.
+///
+/// **Only `http://` is supported.** The `hyper-client` OTLP transport builds a
+/// plain `HttpConnector`, so an `https://` endpoint is accepted here and then
+/// never connects — measured: zero TCP connects, no span exported. That must
+/// not be silent, so this function emits a `tracing::error!` for such an
+/// endpoint, but it still returns a working provider: a daemon that is healthy
+/// apart from tracing must not refuse to start. Callers that install their
+/// subscriber *after* this call (the daemons do) repeat the record at init so
+/// it lands in the log.
 #[cfg(feature = "otel")]
 #[doc(hidden)]
 pub fn build_otel_provider(
@@ -719,6 +761,9 @@ pub fn build_otel_provider(
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig as _;
     use opentelemetry_sdk::Resource;
+    if endpoint_is_https(endpoint) {
+        tracing::error!(endpoint = endpoint, "{}", OTLP_PLAIN_HTTP_ONLY);
+    }
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_http()
         .with_endpoint(normalize_otlp_endpoint(endpoint))
@@ -776,10 +821,11 @@ pub fn build_otel_layer(
 /// the exit path can flush it.
 ///
 /// The provider used to be `Box::leak`ed on both wiring branches: nothing owned
-/// it, so nothing could call `shutdown()` and up to one batch interval (5 s by
-/// default) of spans was dropped when the daemon exited. It lives in a `Mutex`
-/// rather than behind a `OnceLock` because [`shutdown_otel`] has to *move* it
-/// out — that is what makes a second call a no-op instead of a second
+/// it, so nothing could call `shutdown()` and the batch still queued when the
+/// daemon exited waited for the batch processor's first periodic export —
+/// measured at 10.006 s on the SDK defaults — and was lost. It lives in a
+/// `Mutex` rather than behind a `OnceLock` because [`shutdown_otel`] has to
+/// *move* it out — that is what makes a second call a no-op instead of a second
 /// `shutdown()` on an already-shut-down provider.
 #[cfg(feature = "otel")]
 static OTEL_PROVIDER: std::sync::Mutex<Option<opentelemetry_sdk::trace::SdkTracerProvider>> =
@@ -809,23 +855,32 @@ fn store_otel_provider(provider: Option<opentelemetry_sdk::trace::SdkTracerProvi
 ///
 /// Call this once on the daemon's exit path: `SdkTracerProvider::shutdown()`
 /// waits for the batch span processor to drain — that is what gets the last
-/// batch of spans onto the wire — and then stops its task. Without it the
-/// process exits with up to one batch interval of spans still queued.
+/// batch of spans onto the wire — and then stops its task. Without it, spans
+/// still queued when the process exits wait for the batch processor's first
+/// periodic export (measured at 10.006 s on the SDK defaults) and are lost.
 ///
 /// Idempotent: the provider is *taken* out of [`OTEL_PROVIDER`], so the second
 /// call finds `None` and returns immediately. Safe to call unconditionally —
 /// with the `otel` feature off this is the empty function below, so `frps` and
 /// `frpc` need no `#[cfg]` at the call site.
 ///
+/// **Supported contexts: a multi-thread tokio runtime, or no runtime at all.**
 /// Blocking: the SDK's `shutdown()` waits on a oneshot channel for the batch
-/// task, which runs on the ambient tokio runtime. Called from inside
-/// `#[tokio::main]` (both daemons do), a direct wait would starve that task on
-/// a runtime that has no other free worker, so a multi-thread runtime hands the
-/// worker's tasks off with [`tokio::task::block_in_place`] first. A
-/// `current_thread` runtime has no such hand-off, so there the provider is
-/// moved to its own thread and this function returns without waiting — a
-/// blocking wait (including the one `Drop` would do) would deadlock that
-/// runtime.
+/// task. Called from inside `#[tokio::main]` (both daemons do, and both are
+/// multi-thread), a direct wait would starve that task on a runtime that has no
+/// other free worker, so a multi-thread runtime hands the worker's tasks off
+/// with [`tokio::task::block_in_place`] first. With no runtime there is nothing
+/// to starve and the wait is direct.
+///
+/// On a `current_thread` runtime queued spans are **not guaranteed** to be
+/// exported. The batch task lives on that one runtime thread, so it cannot run
+/// while the thread waits, and a blocking wait (including the one `Drop` would
+/// do) would deadlock the runtime. That arm therefore spawns a detached thread
+/// and returns without waiting; it can still flush when the runtime outlives
+/// this call (a mid-run callback), but when the process exits immediately after
+/// the call the batch is dropped — measured 0 of 3 runs, and giving the process
+/// an extra 800 ms of life did not help. A `tracing::warn!` records the
+/// condition. Neither daemon takes this path; do not add a daemon that does.
 #[cfg(feature = "otel")]
 pub fn shutdown_otel() {
     let Some(provider) = lock_otel_provider().take() else {
@@ -840,12 +895,16 @@ pub fn shutdown_otel() {
         }
         // Not a tokio thread: no runtime to starve.
         Err(_) => shutdown_provider(&provider),
-        // `current_thread`: every wait below would block the one thread that
-        // can poll the batch task. Give the provider to a thread that can
-        // finish after this function returns; if the runtime is torn down
-        // first, the SDK's answer channel closes and that thread exits without
-        // exporting rather than hanging the process.
+        // `current_thread`: any wait here blocks the one thread that can poll
+        // the batch task, so this call must not wait. The detached thread is
+        // best-effort only — see the doc above: if the process exits right
+        // after this returns, the batch is not exported.
         Ok(_) => {
+            tracing::warn!(
+                "shutdown_otel() on a current_thread runtime: queued OTLP spans are not \
+                 guaranteed to be exported (the batch task shares the single runtime thread); \
+                 run on a multi-thread runtime for a flush on exit"
+            );
             std::thread::spawn(move || shutdown_provider(&provider));
         }
     }
@@ -1194,40 +1253,193 @@ mod tests {
     }
 }
 
-/// The `current_thread` half of [`shutdown_otel`]'s blocking contract: such a
-/// runtime has no spare worker to poll the batch task that
-/// `SdkTracerProvider::shutdown()` waits on, so a direct wait there is a
-/// self-deadlock.
+/// The observable half of [`shutdown_otel`]'s contract, on both supported
+/// runtime shapes.
+///
+/// These tests assert *state and wire output*, not elapsed time. The first cut
+/// asserted only "returned in under 2 s", which a `store_otel_provider` that
+/// dropped its argument would have satisfied; and because the SDK's `Drop`
+/// blocks on the batch task, a regression to a direct wait on a
+/// `current_thread` runtime hung the suite (>120 s) instead of failing it. The
+/// receive timeouts below are hang guards, not the claim.
 #[cfg(all(test, feature = "otel"))]
 mod otel_shutdown_tests {
-    use super::{build_otel_provider, shutdown_otel, store_otel_provider};
+    use super::{build_otel_provider, lock_otel_provider, shutdown_otel, store_otel_provider};
+    use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+    use std::io::{Read as _, Write as _};
+    use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// The endpoint is a socket that accepts the connection and never answers,
-    /// so a *direct* wait would block for the exporter's request timeout (10 s
-    /// by default) and blow the bound below. Passing therefore means
-    /// `shutdown_otel()` handed the provider off instead of waiting.
-    #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_otel_returns_immediately_on_a_current_thread_runtime() {
-        let black_hole = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole sink");
+    /// `OTEL_PROVIDER` is process-wide and libtest runs these on separate
+    /// threads, so the tests must not interleave.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A socket that accepts the connection and never answers. A *direct*
+    /// wait blocks for the exporter's request timeout (10 s by default), so
+    /// this is the shape that used to hang instead of fail.
+    fn black_hole_endpoint() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind black-hole sink");
         let endpoint = format!(
             "http://{}/v1/traces",
-            black_hole.local_addr().expect("black-hole local_addr")
+            listener.local_addr().expect("black-hole local_addr")
         );
-        let provider =
-            build_otel_provider(&endpoint, "frp-rs-current-thread-test").expect("build provider");
-        store_otel_provider(Some(provider));
+        (listener, endpoint)
+    }
 
-        let started = Instant::now();
-        shutdown_otel();
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(2),
-            "shutdown_otel() blocked for {elapsed:?} on a current_thread runtime: the batch task \
-             it waits for is spawned on the very runtime this call is blocking, so the daemon's \
-             exit path would hang instead of flushing"
+    /// One-shot OTLP/HTTP sink: accept one connection, read one request, answer
+    /// `200`, and report `(head, body)`. Returns the base endpoint (no signal
+    /// path) so the normaliser is exercised too.
+    fn one_shot_sink() -> (String, mpsc::Receiver<(String, Vec<u8>)>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the sink");
+        listener
+            .set_nonblocking(true)
+            .expect("non-blocking accept on the sink");
+        let endpoint = format!("http://{}", listener.local_addr().expect("sink local_addr"));
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("sink accept failed: {e}"),
+                }
+            };
+            // The listener is non-blocking only so the accept loop can time
+            // out; the accepted socket must block again or `read` returns
+            // `WouldBlock` before the exporter's request arrives.
+            stream
+                .set_nonblocking(false)
+                .expect("blocking reads on the accepted sink connection");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("sink read timeout");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let head_end = loop {
+                if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+                let n = stream.read(&mut chunk).expect("read the request head");
+                assert!(n > 0, "connection closed before the request head ended");
+                buf.extend_from_slice(&chunk[..n]);
+                assert!(buf.len() < 64 * 1024, "request head too large");
+            };
+            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content-length"))
+                })
+                .expect("the OTLP/HTTP POST must carry content-length");
+            while buf.len() < head_end + content_length {
+                let n = stream.read(&mut chunk).expect("read the request body");
+                assert!(n > 0, "connection closed before the request body ended");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            let body = buf[head_end..head_end + content_length].to_vec();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .expect("answer the OTLP request");
+            tx.send((head, body)).ok();
+        });
+        (endpoint, rx)
+    }
+
+    #[test]
+    fn shutdown_otel_empties_the_slot_and_is_idempotent_on_a_current_thread_runtime() {
+        let _serial = serial();
+        let (_black_hole, endpoint) = black_hole_endpoint();
+
+        // The runtime is entered on a worker thread so the test thread can
+        // stop waiting if this regresses into a blocking wait.
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current_thread runtime");
+            let observed = runtime.block_on(async {
+                let provider =
+                    build_otel_provider(&endpoint, "frp-rs-current-thread-test").expect("build");
+                store_otel_provider(Some(provider));
+                let stored = lock_otel_provider().is_some();
+                shutdown_otel();
+                let emptied = lock_otel_provider().is_none();
+                // Must not panic: the provider is gone, so this is a no-op.
+                shutdown_otel();
+                (stored, emptied, lock_otel_provider().is_none())
+            });
+            tx.send(observed).expect("report the observation");
+        });
+        let (stored, emptied, stayed_empty) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "shutdown_otel() returned nothing within 10 s on a current_thread runtime: it \
+                 must take the provider out and hand it to a detached thread, never wait on the \
+                 batch task this runtime owns (that wait deadlocks; the worker's own panic, if \
+                 any, is printed above)",
         );
-        drop(black_hole);
+        worker.join().expect("the current_thread worker panicked");
+        assert!(stored, "store_otel_provider() must fill OTEL_PROVIDER");
+        assert!(
+            emptied,
+            "shutdown_otel() must take the provider out of OTEL_PROVIDER"
+        );
+        assert!(
+            stayed_empty,
+            "a second shutdown_otel() must not install a provider again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_otel_flushes_on_a_multi_thread_runtime() {
+        let _serial = serial();
+        let (endpoint, rx) = one_shot_sink();
+        let provider =
+            build_otel_provider(&endpoint, "frp-rs-multi-thread-test").expect("build provider");
+        let tracer = provider.tracer("frp-rs-unit-test");
+        store_otel_provider(Some(provider));
+        {
+            let mut span = tracer.start("otel_export_unit_span");
+            span.end();
+        }
+        shutdown_otel();
+        let (head, body) = rx.recv_timeout(Duration::from_secs(10)).expect(
+            "shutdown_otel() on a multi-thread runtime exported nothing: the process must own \
+             the provider and drain it on the exit path",
+        );
+        assert!(
+            head.starts_with("POST /v1/traces "),
+            "the base endpoint must be normalised to /v1/traces, got:\n{head}"
+        );
+        assert!(
+            !body.is_empty(),
+            "the exported request body must carry the queued span"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_https_endpoint_does_not_fail_the_provider_build() {
+        let _serial = serial();
+        // Decision pinned: an endpoint the bundled exporter cannot reach is a
+        // loud tracing error, not a startup failure — a daemon that is healthy
+        // apart from tracing must still boot. The provider is shut down here so
+        // this test leaves the process-wide slot as it found it.
+        let provider = build_otel_provider("https://collector.invalid:4318", "frp-rs-https-test")
+            .expect("an https endpoint must not turn into a startup failure");
+        store_otel_provider(Some(provider));
+        shutdown_otel();
+        assert!(lock_otel_provider().is_none());
     }
 }
 

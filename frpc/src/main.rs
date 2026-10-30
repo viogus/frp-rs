@@ -362,11 +362,16 @@ async fn main() {
 
     // Flush the OTLP exporter before `main` returns. One call covers every
     // subcommand lane that returns here — `Run` (the daemon, whose graceful
-    // `SIGTERM` tail is `run_normal`) as well as the one-shot lanes. The
-    // provider used to be `Box::leak`ed, so up to one batch interval (5 s) of
-    // spans was lost on every clean exit. No-op without the `otel` feature and
-    // without a configured exporter; idempotent, so the error branch inside
-    // `run_normal` that already flushed makes this a second no-op.
+    // `SIGTERM` tail is `run_normal`) as well as the one-shot lanes. Lanes that
+    // leave through `process::exit` inside the command (the `--config-dir`
+    // refusals, a construction error) bypass it; they close no `run` span, and
+    // tracing-opentelemetry drops records outside a span, so there is nothing
+    // exportable for them to lose. The provider used to be
+    // `Box::leak`ed, so the batch still queued at exit was lost (the first
+    // periodic export is measured at 10.006 s on the SDK defaults). No-op
+    // without the `otel` feature and without a configured exporter;
+    // idempotent, so the error branch inside `run_normal` that already flushed
+    // makes this a second no-op.
     logging::shutdown_otel();
 }
 
@@ -796,10 +801,13 @@ async fn run_normal(mut args: FrpcRunArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frpc error: {}", e);
-        // Flush before the runtime is torn down: this error record is the
-        // reason someone will open the trace backend. Bounded by the
-        // exporter's own request timeout (10 s by default), a no-op when no
-        // exporter was initialised, and the exit code is unchanged.
+        // The `run` span closed when `service.run()` returned; this record sits
+        // outside it, and tracing-opentelemetry drops records that belong to
+        // no span — the reviewers' probe found the `run` span in the exported
+        // body and none of this text. What the flush preserves is that span
+        // and its attributes, not the message above. Bounded by the exporter's
+        // own request timeout (10 s by default), a no-op when no exporter was
+        // initialised, and the exit code is unchanged.
         logging::shutdown_otel();
         process::exit(EXIT_RUNTIME);
     }

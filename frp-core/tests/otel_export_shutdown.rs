@@ -3,8 +3,9 @@
 //!
 //! Defect this pins: `init_tracing_otel` `Box::leak`ed the `SdkTracerProvider`
 //! on both wiring branches, so nothing owned it, nothing called
-//! `force_flush`/`shutdown`, and the process died with up to one batch interval
-//! (5 s by default) of spans still queued in the batch processor.
+//! `force_flush`/`shutdown`, and the process died with the last batch still
+//! queued in the batch processor (its first periodic export is measured at
+//! 10.006 s on the SDK defaults).
 //! `frp-core/tests/otel_export.rs` never noticed because it flushes by hand.
 //!
 //! This test drives the *production* entry point — `init_tracing_otel`, with
@@ -17,10 +18,10 @@
 //! "Eventually arrived" is not the claim. Because this test process keeps
 //! running after the call, a leaked provider would still get the span out on
 //! the batch processor's next periodic export tick — so the assertion is on
-//! *how long* it took: a flush reaches the endpoint in milliseconds, the timer
-//! only after its 5 s delay, which is longer than a real daemon lives after
-//! `Service::run` returns. See `FLAKE_ENVELOPE` for the one way this bound can
-//! be fooled.
+//! *how long* it took: a flush reaches the endpoint in milliseconds, the first
+//! periodic export only after its measured 10.006 s (SDK defaults), which is
+//! longer than a real daemon lives after `Service::run` returns. See
+//! `FLAKE_ENVELOPE` for the one way this bound can be fooled.
 //!
 //! One init case per test binary: the global subscriber is once-per-process.
 //! The second `shutdown_otel()` at the end pins idempotence (a second call must
@@ -42,12 +43,13 @@ const SPAN_NAME: &str = "otel_export_shutdown_span";
 
 /// Upper bound on "record → span on the wire".
 ///
-/// The batch processor's periodic export tick is 5 s by default (it sleeps
-/// between batches; `SdkTracerProvider`'s default scheduled delay), so a flush
-/// and a tick are three orders of magnitude apart. `FLAKE_ENVELOPE`: this bound
-/// is only fooled if more than ~3 s elapse between provider construction (which
-/// starts the timer) and the span being recorded, which would let a timer tick
-/// land inside the window; nothing between the two does more than allocate.
+/// The batch processor's first periodic export is measured at 10.006 s on the
+/// SDK defaults (it is not the scheduled 5 s delay: the stream skips a tick),
+/// so a flush and a tick are three orders of magnitude apart. `FLAKE_ENVELOPE`:
+/// this bound is only fooled if more than ~8 s elapse between provider
+/// construction (which starts the timer) and the span being recorded, which
+/// would let a tick land inside the window; nothing between the two does more
+/// than allocate.
 const FLAKE_ENVELOPE: Duration = Duration::from_secs(2);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -112,10 +114,10 @@ async fn shutdown_otel_flushes_spans_recorded_just_before_exit() {
     assert!(
         exported_at < FLAKE_ENVELOPE,
         "the span took {exported_at:?} to reach the endpoint after `shutdown_otel()` was called, \
-         but a flush delivers in milliseconds and the batch processor's periodic tick — the only \
-         thing that could have exported it instead — fires after 5 s. A real daemon is long gone \
-         by then, so this span would have been lost: the provider must be owned by the process \
-         (not `Box::leak`ed) and flushed on the exit path"
+         but a flush delivers in milliseconds and the batch processor's first periodic export — \
+         the only thing that could have exported it instead — is measured at 10.006 s on the SDK \
+         defaults. A real daemon is long gone by then, so this span would have been lost: the \
+         provider must be owned by the process (not `Box::leak`ed) and flushed on the exit path"
     );
 
     assert!(

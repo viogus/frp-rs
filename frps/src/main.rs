@@ -1012,12 +1012,18 @@ async fn run(mut cli: FrpsArgs) {
                 }
             }
         }
-        // Flush the OTLP exporter before this lane leaves. Every `--config-dir`
-        // exit goes through here — the plain `return` below and the
-        // all-files-failed `process::exit` — so one call covers both. It is a
-        // no-op when no exporter was initialised (including the no-`otel`
-        // build), and it must run *before* the failure check so the spans from
-        // a directory that failed to start are not lost.
+        // Flush the OTLP exporter before the two exits below. This is **not**
+        // every `--config-dir` exit: the refusals above — directory read
+        // failure, empty directory, and "every file failed to load" — leave
+        // through `process::exit` without a service ever running. That loses
+        // nothing exportable today: only `Service::run` is instrumented
+        // (`frp-server/src/service.rs`), a startup failure closes no span, and
+        // tracing-opentelemetry drops records that are not inside a span. The
+        // reviewers' all-files-fail probe measured zero requests at the sink,
+        // which is that fact and not a missing flush. The call is a no-op when
+        // no exporter was initialised (including the no-`otel` build), and it
+        // runs before the all-failed `process::exit` so the spans from
+        // services that did run are not lost.
         logging::shutdown_otel();
 
         if failures.len() == files.len() {
@@ -1201,10 +1207,13 @@ async fn run(mut cli: FrpsArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frps error: {}", e);
-        // The record above is the one an operator will go looking for in OTel;
-        // flush it before the runtime is torn down. Bounded by the exporter's
-        // own request timeout (10 s by default), a no-op when no exporter was
-        // initialised, and it leaves this exit's code untouched.
+        // The `run` span closed when `service.run()` returned; this record
+        // sits outside it, and tracing-opentelemetry drops records that belong
+        // to no span — the reviewers' probe found the `run` span in the
+        // exported body and none of this text. What the flush preserves is
+        // that span and its attributes, not the message above. Bounded by the
+        // exporter's own request timeout (10 s by default), a no-op when no
+        // exporter was initialised, and it leaves this exit's code untouched.
         logging::shutdown_otel();
         process::exit(frp_core::EXIT_RUNTIME);
     }
@@ -1216,10 +1225,13 @@ async fn run(mut cli: FrpsArgs) {
     profile_handle.abort();
 
     // Graceful tail: the provider used to be leaked, so `service.run()`
-    // returning normally still dropped up to one batch interval (5 s) of
-    // spans — exactly the spans around a shutdown, which are the ones an
-    // operator wants. Idempotent, so an earlier call (the error branch above)
-    // makes this a no-op.
+    // returning normally still dropped the one batch of closed spans queued at
+    // shutdown — the `run` span plus anything recorded just before the signal,
+    // which are the ones an operator wants. Nothing waits for the batch
+    // processor's first periodic export (measured at 10.006 s on the SDK
+    // defaults). Idempotent, so an earlier call (the error branch above) makes
+    // this a no-op; the startup-failure exits above never reach it and close
+    // no span, so there is nothing for them to flush.
     logging::shutdown_otel();
 }
 
