@@ -422,7 +422,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Go frp parity (TODO.md:11129): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1068-1070`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1082-1084`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
@@ -831,7 +831,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:1115`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1194-1197`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1208-1219`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
@@ -1012,6 +1012,20 @@ async fn run(mut cli: FrpsArgs) {
                 }
             }
         }
+        // Flush the OTLP exporter before the two exits below. This is **not**
+        // every `--config-dir` exit: the refusals above — a directory that
+        // cannot be read, an empty directory, and "every file failed to load"
+        // — leave through `process::exit` before any instrumented unit runs
+        // (no service is constructed yet), so no span is open.
+        // tracing-opentelemetry drops records that are not inside a span, so
+        // those exits have nothing to export; the reviewers' all-files-fail
+        // probe measured zero requests at the sink, which is that fact and not
+        // a missing flush. The call is a no-op when no exporter was
+        // initialised (including the no-`otel` build), and it runs before the
+        // all-failed `process::exit` so the spans closed by services that did
+        // run are not lost.
+        logging::shutdown_otel();
+
         if failures.len() == files.len() {
             failures.sort_by_key(|(file_index, _)| *file_index);
             if let Some((_, code)) = failures.first() {
@@ -1193,6 +1207,14 @@ async fn run(mut cli: FrpsArgs) {
 
     if let Err(e) = service.run().await {
         tracing::error!(error = %e, "frps error: {}", e);
+        // The `run` span closed when `service.run()` returned; this record
+        // sits outside it, and tracing-opentelemetry drops records that belong
+        // to no span — the reviewers' probe found the `run` span in the
+        // exported body and none of this text. What the flush preserves is
+        // that span and its attributes, not the message above. Bounded by the
+        // exporter's own request timeout (10 s by default), a no-op when no
+        // exporter was initialised, and it leaves this exit's code untouched.
+        logging::shutdown_otel();
         process::exit(frp_core::EXIT_RUNTIME);
     }
 
@@ -1201,6 +1223,16 @@ async fn run(mut cli: FrpsArgs) {
 
     #[cfg(all(unix, feature = "profiling"))]
     profile_handle.abort();
+
+    // Graceful tail: the provider used to be leaked, so `service.run()`
+    // returning normally still dropped the one batch of closed spans queued at
+    // shutdown — the `run` span plus anything recorded just before the signal,
+    // which are the ones an operator wants. Nothing waits for the batch
+    // processor's first periodic export (measured at 10.006 s on the SDK
+    // defaults). Idempotent, so an earlier call (the error branch above) makes
+    // this a no-op; the startup-failure exits above never reach it and close
+    // no span, so there is nothing for them to flush.
+    logging::shutdown_otel();
 }
 
 /// `lock_dir_registry` must never turn a poisoned registry into a second panic.

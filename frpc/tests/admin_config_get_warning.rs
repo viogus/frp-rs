@@ -518,7 +518,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// forwards `frp-client/default`, which includes `tls`) and answers "a web server
 /// with a TLS acceptor exists", and a record that says otherwise means a call
 /// site answered wrongly. The call sites this file reaches are
-/// `frpc/src/main.rs:649-662` (the `-c` startup load in `run_normal`:
+/// `frpc/src/main.rs:675-688` (the `-c` startup load in `run_normal`:
 /// `init_logging` through the `warn_inert_web_server_tls_enable` call it opens
 /// the sink for; the range is anchored on the unique `init_logging` line because
 /// the call line itself repeats at the `verify` site) and
@@ -531,7 +531,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// measured before the three-way reader landed, hardcoding a reached site's
 /// answer to the no-dashboard one reds **2 of the 4** (`test result: FAILED. 2
 /// passed; 2 failed`) — the startup rows witness the `-c` load above
-/// (`frpc/src/main.rs:649-662`), the hand-edit rows witness the GET handler
+/// (`frpc/src/main.rs:675-688`), the hand-edit rows witness the GET handler
 /// (`frp-client/src/admin.rs:771`); the reload site is
 /// `service/reload_apply.rs:98`.
 fn assert_clause_is_the_dashboard_one(tag: &str, out: &str) {

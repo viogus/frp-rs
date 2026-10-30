@@ -12649,7 +12649,7 @@ other.
   Done-when: either the loader rejects the four forms with a Go-style error, or the
   divergence is recorded as intentional leniency in `docs/go-frp-compat-audit.md`.
 
-- [ ] **The OTLP endpoint is used verbatim, so a documented base URL exports nothing.**
+- [x] **The OTLP endpoint is used verbatim, so a documented base URL exports nothing.**
   Evidence: `observability.otlp_endpoint` / `OTEL_EXPORTER_OTLP_ENDPOINT` reaches
   `with_endpoint` unchanged, and opentelemetry-otlp 0.33 appends the `/v1/traces` signal
   path only to its own env/default endpoints. A user who sets the documented base URL
@@ -12658,14 +12658,31 @@ other.
   Measured during the PR #552 delta review (`POST / HTTP/1.1`, zero spans, no error).
   Done-when: frp-rs appends the per-signal path when the configured value has no path, or
   the trailing-path requirement is documented next to the config option and pinned by a test.
+  Resolved (PR #555, 2026-10-30): `normalize_otlp_endpoint` in `frp-core/src/logging.rs` appends
+  `/v1/traces` when the value has `scheme://authority` and no path (or a lone `/`), carrying any
+  query/fragment; an explicit path, including `/v1/traces/`, is left untouched, and an unparseable
+  value passes through verbatim so a broken endpoint still fails at the exporter instead of being
+  rewritten into a plausible-looking URL. Pinned by `frp-core/tests/otel_export_path.rs` (red on
+  base: it captured `POST / HTTP/1.1`). The reviewers' 18-shape wire table showed the only values
+  whose request path changes are the path-less ones.
 
-- [ ] **The OTel provider is leaked and never flushed at shutdown.**
+- [x] **The OTel provider is leaked and never flushed at shutdown.**
   Evidence: `frp-core/src/logging.rs` `Box::leak`s the tracer provider on both wiring
   branches and nothing calls `force_flush`/`shutdown`, so up to one batch interval
   (5 s default) of spans is lost when the daemon exits; `frp-core/tests/otel_export.rs`
   only observes its span because the test flushes explicitly.
   Done-when: frps/frpc call `shutdown()` on the provider in their shutdown path and a test
   shows a span recorded shortly before exit still reaches the endpoint.
+  Resolved (PR #555, 2026-10-30): the provider lives in a `static OTEL_PROVIDER` (no `Box::leak`
+  anywhere), and `logging::shutdown_otel()` takes it out — idempotent, a no-op without the feature or
+  an exporter — and flushes it on every exit path that can hold a queued span: `frps` before the
+  `--config-dir` all-failed exit and on both `service.run()` error/normal tails, `frpc` on its main
+  tail and on the single-config and all-failed `--config-dir` failures. The base's first periodic
+  export was measured at **10.006 s** (the SDK defaults, not the 5 s assumed above), so a shutdown
+  between batches lost the span. Pinned by `frp-core/tests/otel_export_shutdown.rs` (does not compile
+  on base), `frps/tests/otel_flush.rs` (`sigterm_flushes_the_run_span_to_the_otlp_endpoint`) and
+  `frpc/tests/otel_flush.rs` (both non-zero `-c`/`--config-dir` lanes); deleting either daemon's
+  flush call makes those tests fail after the exporter timeout rather than pass silently.
 
 - [ ] **The `otel` fix rests on an `experimental_*` opentelemetry_sdk feature.**
   Evidence: PR #552 builds `span_processor_with_async_runtime::BatchSpanProcessor` behind
@@ -12719,3 +12736,16 @@ other.
   Done-when: `channel_open_*` records the channel's purpose, and `exec_request`/`env_request`
   (and any future type-specific request) are answered with a failure on a channel that was
   not opened for that purpose, with a test that a work connection cannot run a command.
+- [ ] **The `otel` build keeps a stdout `fmt` layer when `[log] to=<file>` is set.**
+  Evidence: `frp-core/src/logging.rs`'s otel branch installs the console layer *and* the file
+  layer, while the non-otel branch suppresses the console layer once a file destination is
+  configured. So in an otel build `[log] to=…` still mirrors every record to stdout, and
+  `cargo test -p frps --all-features --test log_completion` fails
+  `cli_empty_log_file_keeps_the_files_destination` at `frps/tests/log_completion.rs:935`
+  (the same test passes with default features). Pre-existing on base `53582401`: both delta
+  reviewers of PR #555 reproduced it, and #555 changes neither the layer composition nor that
+  test.
+  Done-when: decide whether otel builds should keep mirroring to stdout (document it next to
+  `observability.otlp_endpoint` and relax/pin the `log_completion` expectation for the otel
+  lane) or the file branch should suppress the console layer as the non-otel path does, and
+  pin the chosen behaviour in `log_completion`.

@@ -548,8 +548,8 @@ fn assert_one_warning_on_stdout(tag: &str, spawned: &Spawned) {
 /// All three variants open with the same `web_server.tls.enable has no effect: …`,
 /// so the count assertions above pass either way: a call site that hardcodes
 /// another answer still compiles and still emits one `KEY` record. The call sites
-/// this file reaches are `frpc/src/main.rs:545` (`--config-dir`), `:662` (`-c`)
-/// and `:847` (`verify`). `frp-core`'s own dispatch test passes the caller's
+/// this file reaches are `frpc/src/main.rs:562` (`--config-dir`), `:688` (`-c`)
+/// and `:881` (`verify`). `frp-core`'s own dispatch test passes the caller's
 /// answer as an argument, so only this assertion on the captured output can see
 /// what the binary answered.
 ///
@@ -739,7 +739,7 @@ fn no_server_tls_enable_warning_in_frpc_where_the_field_is_live() {
 fn frpc_verify_says_nothing_about_the_server_tls_enable_key() {
     let dir = TempDir::new("srv-key-verify");
     // The nested key is what lets this row witness the `verify` call site
-    // (`frpc/src/main.rs:847`): with no `[web_server.tls] enable` the presence
+    // (`frpc/src/main.rs:881`): with no `[web_server.tls] enable` the presence
     // flag stays unset and the record never fires, so a hardcoded answer there
     // was invisible to every lane.
     let cfg = format!(
