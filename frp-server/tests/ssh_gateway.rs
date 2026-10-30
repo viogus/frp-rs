@@ -25,8 +25,14 @@ enum ClientEvent {
     EofSent,
     /// Data arrived from frps on the channel.
     Data(Vec<u8>),
-    /// The channel's read side ended: frps sent EOF or closed the channel.
+    /// The channel's read side ended with an orderly EOF: frps sent
+    /// CHANNEL_EOF or closed the channel.
     EofReceived,
+    /// Reading the channel failed (connection reset, channel torn down). Kept
+    /// distinct from [`ClientEvent::EofReceived`]: a reset must not satisfy an
+    /// assertion that the peer half-closed, or the test would pass on a
+    /// teardown instead of a half-close.
+    ReadError(String),
 }
 
 /// Client-side stand-in for the service behind `ssh -R`, with the two
@@ -76,8 +82,9 @@ async fn run_channel_probe(
                     break;
                 }
             }
-            Err(_) => {
-                let _ = probe.events.send(ClientEvent::EofReceived);
+            Err(e) => {
+                // A reset is not the orderly EOF these tests assert on.
+                let _ = probe.events.send(ClientEvent::ReadError(e.to_string()));
                 break;
             }
         }
@@ -870,6 +877,9 @@ async fn test_ssh_gateway_client_half_close_closes_user_connection() {
             ClientEvent::EofReceived => panic!(
                 "channel must stay open after a half-close, but frps ended the read direction"
             ),
+            ClientEvent::ReadError(err) => {
+                panic!("channel must stay open after a half-close, but reading it failed: {err}")
+            }
             ClientEvent::EofSent => {}
         }
     }
@@ -934,6 +944,7 @@ async fn test_ssh_gateway_frps_eof_reaches_client() {
                 }
             }
             ClientEvent::EofReceived => panic!("channel ended before any data arrived"),
+            ClientEvent::ReadError(err) => panic!("channel failed before any data arrived: {err}"),
             ClientEvent::EofSent => {}
         }
     }
@@ -948,7 +959,8 @@ async fn test_ssh_gateway_frps_eof_reaches_client() {
     assert_eq!(
         event,
         ClientEvent::EofReceived,
-        "frps must forward the user's EOF to the SSH client"
+        "frps must forward the user's EOF to the SSH client as an orderly EOF; a \
+         ReadError here means the channel was torn down instead"
     );
 
     client

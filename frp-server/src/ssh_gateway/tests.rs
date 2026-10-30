@@ -1910,3 +1910,159 @@ fn reverse_channel_end_outside_open_window_leaves_no_tombstone() {
         "peer-ended channels outside an open window must not be remembered"
     );
 }
+
+/// `finish_open` clears the tombstones an open window left behind, and only
+/// those: a live sender registered for a channel that did not end survives the
+/// sweep. Without the sweep a single unanswered open would leave one tombstone
+/// behind for every channel the peer closes inside it.
+#[test]
+fn reverse_channel_finish_open_sweeps_tombstones_only() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+
+    channels.begin_open();
+    assert!(!channels.end(test_channel_id(200)));
+    assert!(!channels.end(test_channel_id(201)));
+    assert_eq!(
+        channels.tracked(),
+        2,
+        "ends inside the window are remembered"
+    );
+
+    channels.finish_open();
+    assert_eq!(
+        channels.tracked(),
+        0,
+        "closing the window must sweep its tombstones"
+    );
+
+    // A live sender (receiver kept alive) registered outside a window is not a
+    // tombstone and must survive a later sweep.
+    let live = test_channel_id(202);
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    channels.register(live, tx);
+    channels.finish_open();
+    assert_eq!(
+        channels.tracked(),
+        1,
+        "a live sender must survive the sweep"
+    );
+    assert!(
+        channels.sender(live).is_some(),
+        "the live channel must still be routable"
+    );
+}
+
+/// The in-flight window is client-controlled (russh waits for a channel
+/// confirmation with no timeout), so tombstones are capped: an unanswered open
+/// plus a channel-close loop must not grow the table past
+/// [`MAX_IN_FLIGHT_TOMBSTONES`]. Past the cap the end is dropped — bounded memory
+/// over propagating that one channel's EOF — and the window sweep clears what
+/// the window did leave.
+#[test]
+fn reverse_channel_tombstones_are_capped_while_open_is_in_flight() {
+    use super::session::{ReverseChannels, MAX_IN_FLIGHT_TOMBSTONES};
+    let channels = ReverseChannels::default();
+
+    channels.begin_open();
+    for n in 0..MAX_IN_FLIGHT_TOMBSTONES {
+        assert!(!channels.end(test_channel_id(n as u32)));
+    }
+    assert_eq!(
+        channels.tracked(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "the window fills up to the cap"
+    );
+
+    assert!(
+        !channels.end(test_channel_id(9_999)),
+        "an end past the cap drops without a live sender"
+    );
+    assert_eq!(
+        channels.tracked(),
+        MAX_IN_FLIGHT_TOMBSTONES,
+        "an end past the cap must not grow the table"
+    );
+
+    channels.finish_open();
+    assert_eq!(
+        channels.tracked(),
+        0,
+        "the sweep still clears the capped set"
+    );
+}
+
+/// A `data` callback that arrives after the peer's EOF (a protocol violation,
+/// but russh dispatches it) must not erase the tombstone: the pending end is
+/// what `register` has yet to observe, so dropping it would lose the half-close.
+#[tokio::test]
+async fn reverse_channel_data_after_end_keeps_the_tombstone() {
+    use super::session::ReverseChannels;
+    let channels = ReverseChannels::default();
+    let channel = test_channel_id(300);
+
+    channels.begin_open();
+    assert!(!channels.end(channel));
+    assert_eq!(channels.tracked(), 1, "the end left a tombstone");
+
+    channels.deliver(channel, b"late data").await;
+    assert_eq!(
+        channels.tracked(),
+        1,
+        "delivering into a tombstone must not remove it"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    channels.register(channel, tx);
+    channels.finish_open();
+    assert!(
+        channels.sender(channel).is_none(),
+        "the tombstone must still drop the sender that registers after it"
+    );
+    let ended = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+        .await
+        .expect("bridge data_rx must finish promptly");
+    assert!(ended.is_none(), "the bridge read half must observe the end");
+}
+
+/// A peer end and the register/finish sequence it can overtake must never
+/// interleave: `end` decides to leave a tombstone and `finish_open` clears the
+/// window inside one critical section. Without that (the pre-fix code read
+/// `open_in_flight` after its `remove`), the schedule `end` (no sender) →
+/// `register` → `finish_open` (flag false) → `end` (reads false, no tombstone)
+/// keeps the live sender and loses the EOF — the bridge then waits forever.
+/// Either outcome is fine here as long as the end is never lost.
+#[test]
+fn reverse_channel_concurrent_end_and_register_never_lose_the_end() {
+    use super::session::ReverseChannels;
+    let channels = std::sync::Arc::new(ReverseChannels::default());
+
+    for round in 0..2_000u32 {
+        let channel = test_channel_id(1_000 + round);
+
+        channels.begin_open();
+        let peer_side = std::sync::Arc::clone(&channels);
+        let peer_end = std::thread::spawn(move || peer_side.end(channel));
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        channels.register(channel, tx);
+        channels.finish_open();
+        let dropped_live = peer_end.join().expect("peer thread must not panic");
+
+        // Whichever way the race went, the peer's end must have ended the
+        // channel: either it removed the live sender (`true`) or its tombstone
+        // made `register` drop the sender (`false`, and the receiver is gone).
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            ),
+            "round {round}: the peer's end was lost (end() -> {dropped_live})"
+        );
+        assert_eq!(
+            channels.tracked(),
+            0,
+            "round {round}: the table must be empty once the end is consumed"
+        );
+    }
+}
