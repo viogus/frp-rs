@@ -12593,8 +12593,11 @@ other.
   `.github/workflows/{compat,xtcp-compat}.yml`) default to 0.71.1.
   **Filed as backlog rather than this release:** dashboard daily counters use a UTC day
   boundary where Go uses the local calendar date (needs a cross-platform local-date
-  design); the SSH gateway does not propagate a peer `EOF` to the frps work connection
-  (read-until-EOF protocols hang; pre-existing, MEDIUM); the SSH gateway keeps no
+  design); ~~the SSH gateway does not propagate a peer `EOF` to the frps work connection
+  (read-until-EOF protocols hang; pre-existing, MEDIUM)~~ **fixed 2026-10-30**: PR #556
+  half-closes the frps work connection when the peer sends `CHANNEL_EOF`, with the
+  registration race pinned by `ReverseChannels` (see the two items filed at the end of this
+  file for what is still open on that path); the SSH gateway keeps no
   channel-type registry, so `exec`/`env` on an established `forwarded-tcpip` channel is
   dispatched (authenticated client, own session; LOW).
   **Done-when:** the v0.71.1 tag builds and publishes the 13-target × 3-tier release
@@ -12691,3 +12694,28 @@ other.
   Done-when: every writer-then-match in a `pipefail` script uses a here-string (or a temp
   file), starting with `scripts/repo-health.sh:2591`, and a fixture feeds one of them a
   payload large enough to have failed before.
+
+- [ ] **Dashboard daily counters roll over on the UTC day boundary, where Go uses the server's local calendar date.**
+  Evidence: `frp-core/src/metrics.rs:148-153` derives the day index from UTC epoch days and
+  `:118-131` rotates on it, so a deployment west of Greenwich counts the last hours of its
+  local day into the next day's bucket (and east of it into the previous one) — the numbers
+  in the dashboard's daily table then disagree with Go frps by up to one day's edge traffic.
+  Both sides agree on totals; only the bucket boundary differs. Filed as backlog during the
+  v0.71.1 alignment round, where it was judged too large for that release: a fix needs a
+  cross-platform local-date design (a timezone database is a new dependency, and `libc`
+  `localtime_r` is not available on every target we ship), not a one-line offset.
+  Done-when: the day index is computed from a documented local-date source (with the DST and
+  half-hour-offset cases covered by a test), or the dashboard labels its buckets as UTC on
+  purpose and the compatibility audit records that deviation.
+- [ ] **The SSH gateway has no channel-type registry: `exec`/`env` on an established `forwarded-tcpip` channel are dispatched.**
+  Evidence: `frp-server/src/ssh_gateway/session.rs` answers `exec_request` and `env_request`
+  for any open channel and keeps no record of which channel was opened for which purpose, so
+  a client that opened `forwarded-tcpip` (a work connection) can also ask that channel to run
+  a command. Impact is bounded — the requester is an authenticated allow-listed user acting on
+  its own session, and the command has no `pty-req` path to launch into — which is why it is
+  LOW. The v0.71.1 alignment round filed it rather than fixing it, because the fix changes
+  the handler surface (per-channel type + a rejection path) and no Go frp behaviour depends
+  on the answer.
+  Done-when: `channel_open_*` records the channel's purpose, and `exec_request`/`env_request`
+  (and any future type-specific request) are answered with a failure on a channel that was
+  not opened for that purpose, with a test that a work connection cannot run a command.
