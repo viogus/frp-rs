@@ -561,11 +561,17 @@ pub fn init_tracing_otel(
         // can find it on the exit path.
         store_otel_provider(_provider);
         let json = format == "json";
+        // A file destination means the records go to the file and nowhere
+        // else — the same rule the non-otel `init_tracing` applies above.
+        // The otel branch used to install a stdout fmt layer *as well*, so
+        // `[log] to = "..."` mirrored every record to stdout in an otel build
+        // (and `cli_empty_log_file_keeps_the_files_destination` failed in the
+        // all-features lane). The OTel layer is orthogonal: spans still export
+        // through the provider, only the console duplication is gone.
         match (otel_layer, json) {
             (Some(layer), true) => {
                 reg.with(layer)
                     .with(filter)
-                    .with(tracing_subscriber::fmt::layer().with_ansi(ansi).json())
                     .with(
                         tracing_subscriber::fmt::layer()
                             .with_ansi(false)
@@ -577,7 +583,6 @@ pub fn init_tracing_otel(
             (Some(layer), false) => {
                 reg.with(layer)
                     .with(filter)
-                    .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                     .with(
                         tracing_subscriber::fmt::layer()
                             .with_ansi(false)
@@ -587,7 +592,6 @@ pub fn init_tracing_otel(
             }
             (None, true) => {
                 reg.with(filter)
-                    .with(tracing_subscriber::fmt::layer().with_ansi(ansi).json())
                     .with(
                         tracing_subscriber::fmt::layer()
                             .with_ansi(false)
@@ -598,7 +602,6 @@ pub fn init_tracing_otel(
             }
             (None, false) => {
                 reg.with(filter)
-                    .with(tracing_subscriber::fmt::layer().with_ansi(ansi))
                     .with(
                         tracing_subscriber::fmt::layer()
                             .with_ansi(false)

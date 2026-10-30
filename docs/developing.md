@@ -618,7 +618,7 @@ For a server-side test that speaks the raw V1 protocol, the harness is
 `frp-server/tests/common/mod.rs`: `register_tcp_proxy`, `open_tcp_proxy_bridge`
 and `pump_tcp_bridge` (`frp-server/tests/common/mod.rs:22`, `:81`, `:135`) drive
 the control channel and the work connection directly, and `start_test_server`
-(`:393`) boots frps in-process. Use it when the interesting behaviour is in
+(`:394`) boots frps in-process. Use it when the interesting behaviour is in
 registration, not in the client.
 
 **What you must add, and what review will ask for.** The round-trip test proves

@@ -15,6 +15,37 @@ struct TestSshClient {
     /// When set, the first `forwarded-tcpip` channel is handed to the probe
     /// instead of being bridged to `local_target` (see [`ChannelProbe`]).
     probe: Option<ChannelProbe>,
+    /// When set, the first server-opened `forwarded-tcpip` channel is used to
+    /// send a peer-side `exec` request and the server's reply is reported.
+    forwarded_exec_probe: Option<tokio::sync::mpsc::UnboundedSender<ForwardedExecOutcome>>,
+}
+
+/// How the server answered an `exec` request sent on a *forwarded-tcpip* work
+/// channel — the channel-type guard pinned by
+/// [`exec_on_a_forwarded_tcpip_channel_is_refused`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForwardedExecOutcome {
+    /// `exec` was refused and so was the follow-up `env`.
+    Refused,
+    /// `exec` got `CHANNEL_SUCCESS`: the request was dispatched (a regression).
+    ExecAccepted,
+    /// `exec` was refused but `env` got `CHANNEL_SUCCESS` (half a guard).
+    EnvAccepted,
+    /// The channel or session ended without a reply.
+    Closed(String),
+}
+
+/// Wait for the reply to one channel request: `Some(true)` = `CHANNEL_SUCCESS`,
+/// `Some(false)` = `CHANNEL_FAILURE`, `None` = the channel closed first.
+async fn next_request_reply(channel: &mut russh::Channel<russh::client::Msg>) -> Option<bool> {
+    loop {
+        match channel.wait().await {
+            Some(russh::ChannelMsg::Success) => return Some(true),
+            Some(russh::ChannelMsg::Failure) => return Some(false),
+            Some(russh::ChannelMsg::Close) | None => return None,
+            Some(_) => {}
+        }
+    }
 }
 
 /// What a [`ChannelProbe`] observed on a `forwarded-tcpip` channel.
@@ -130,6 +161,57 @@ impl russh::client::Handler for TestSshClient {
         // ssh -R). ChannelStream is a full AsyncRead+AsyncWrite pair —
         // use copy_bidirectional.
         reply.accept().await;
+        if let Some(tx) = self.forwarded_exec_probe.take() {
+            // Send an `exec` request on this work channel, then an `env`
+            // request on the same channel, and report how the server answers
+            // each. A server without the channel-type registry dispatches
+            // `exec` (and registers the proxy); the gateway must answer
+            // CHANNEL_FAILURE for both request types.
+            let mut channel = channel;
+            tokio::spawn(async move {
+                if let Err(e) = channel
+                    .exec(
+                        true,
+                        "tcp --proxy_name forwarded-exec-guard --remote_port 0",
+                    )
+                    .await
+                {
+                    let _ = tx.send(ForwardedExecOutcome::Closed(format!("exec send: {e}")));
+                    return;
+                }
+                match next_request_reply(&mut channel).await {
+                    Some(true) => {
+                        let _ = tx.send(ForwardedExecOutcome::ExecAccepted);
+                        return;
+                    }
+                    Some(false) => {}
+                    None => {
+                        let _ = tx.send(ForwardedExecOutcome::Closed(
+                            "channel closed before the exec reply".into(),
+                        ));
+                        return;
+                    }
+                }
+                if let Err(e) = channel.set_env(true, "FRP_GUARD", "1").await {
+                    let _ = tx.send(ForwardedExecOutcome::Closed(format!("env send: {e}")));
+                    return;
+                }
+                match next_request_reply(&mut channel).await {
+                    Some(true) => {
+                        let _ = tx.send(ForwardedExecOutcome::EnvAccepted);
+                    }
+                    Some(false) => {
+                        let _ = tx.send(ForwardedExecOutcome::Refused);
+                    }
+                    None => {
+                        let _ = tx.send(ForwardedExecOutcome::Closed(
+                            "channel closed before the env reply".into(),
+                        ));
+                    }
+                }
+            });
+            return Ok(());
+        }
         if let Some(probe) = self.probe.take() {
             tokio::spawn(run_channel_probe(Box::pin(channel.into_stream()), probe));
             return Ok(());
@@ -270,6 +352,7 @@ async fn try_connect_ssh(
             TestSshClient {
                 local_target,
                 probe,
+                forwarded_exec_probe: None,
             },
         ),
     )
@@ -745,6 +828,119 @@ async fn test_ssh_gateway_reverse_forwarding_roundtrip() {
         .await
         .ok();
     echo_task.abort();
+}
+
+/// Connect and authenticate, attaching the peer-side `exec` probe that fires
+/// when the server opens a `forwarded-tcpip` work channel.
+async fn connect_ssh_with_forwarded_exec_probe(
+    addr: SocketAddr,
+) -> (
+    russh::client::Handle<TestSshClient>,
+    tokio::sync::mpsc::UnboundedReceiver<ForwardedExecOutcome>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut client = timeout(
+        SSH_READY_TIMEOUT,
+        russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            TestSshClient {
+                local_target: None,
+                probe: None,
+                forwarded_exec_probe: Some(tx),
+            },
+        ),
+    )
+    .await
+    .expect("SSH connect must finish within the ready budget")
+    .expect("SSH connect should succeed");
+    let auth = client
+        .authenticate_password("v0", common::TEST_TOKEN)
+        .await
+        .expect("password auth should succeed");
+    assert!(auth.success(), "SSH password auth failed");
+    (client, rx)
+}
+
+/// The channel-type guard: a peer that received a `forwarded-tcpip` work
+/// channel must not be able to run a command on it.
+///
+/// That channel is opened *by the server* for one work connection; its other
+/// end is the local service behind `ssh -R`. Before the registry,
+/// `exec_request` was answered on any channel id, so the service side could
+/// register an extra proxy through the very channel it is supposed to serve.
+/// The gateway now records which channels the peer opened as `session`
+/// channels and refuses `exec`/`env` everywhere else — visible here as
+/// `CHANNEL_FAILURE` instead of `CHANNEL_SUCCESS`/a registration banner.
+#[tokio::test]
+async fn exec_on_a_forwarded_tcpip_channel_is_refused() {
+    let ssh_port = allocate_port();
+    let bind_port = allocate_port();
+    let remote_port = allocate_port();
+
+    let cfg = ssh_test_config(ssh_port, bind_port);
+    let (_handle, _port) = start_test_server(cfg).await;
+
+    let addr: SocketAddr = format!("127.0.0.1:{ssh_port}").parse().unwrap();
+    let (client, mut outcomes) = connect_ssh_with_forwarded_exec_probe(addr).await;
+
+    // ssh -R :remote_port:127.0.0.1:<anything>
+    let fwd = client
+        .tcpip_forward("127.0.0.1", remote_port as u32)
+        .await
+        .expect("-R tcpip-forward must be accepted");
+    assert_eq!(
+        fwd, 0,
+        "-R request should be granted for the requested port"
+    );
+
+    // Register the proxy through a *session* channel (the allowed shape).
+    let session = client
+        .channel_open_session()
+        .await
+        .expect("open session channel");
+    session
+        .exec(
+            true,
+            format!("tcp --proxy_name \"ssh-r-exec-guard\" --remote_port {remote_port}"),
+        )
+        .await
+        .expect("exec accepted");
+
+    // A user connection makes frps request a work conn: the server opens the
+    // forwarded-tcpip channel and the probe sends `exec` on it. Keep the
+    // user-side stream alive until the outcome arrives.
+    let mut user_stream = None;
+    let mut last_connect_error = None;
+    for _ in 0..50 {
+        match tokio::net::TcpStream::connect(format!("127.0.0.1:{remote_port}")).await {
+            Ok(stream) => {
+                user_stream = Some(stream);
+                break;
+            }
+            Err(e) => last_connect_error = Some(e),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _user_stream = user_stream.unwrap_or_else(|| {
+        panic!("frps proxy port should accept within 5s; last error: {last_connect_error:?}")
+    });
+
+    let outcome = timeout(Duration::from_secs(5), outcomes.recv())
+        .await
+        .expect("the forwarded-tcpip channel must be opened within 5s")
+        .expect("the exec probe must report an outcome");
+    assert_eq!(
+        outcome,
+        ForwardedExecOutcome::Refused,
+        "exec and env on a forwarded-tcpip work channel must both be answered \
+         with CHANNEL_FAILURE, not dispatched"
+    );
+
+    client
+        .disconnect(russh::Disconnect::ByApplication, "test complete", "")
+        .await
+        .ok();
 }
 
 /// Register `-R remote_port` plus a `tcp` proxy on an authenticated SSH

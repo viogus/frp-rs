@@ -752,10 +752,13 @@ async fn handle_http1_request<S>(
                 // (pkg/util/vhost/http.go:262), which writes the raw
                 // NotFoundResponse — byte-identical here (581B + close). A
                 // GET whose control died goes through the reverse-proxy
-                // ErrorHandler instead (http.go:128-137, a net/http
-                // server-layer render with Date etc.); both arms serve the
-                // same 404 status/body in frp-rs, with the NotFound arm's
-                // documented fixed-shape scoping (no server-layer headers).
+                // ErrorHandler instead (http.go:128-138), i.e. Go's net/http
+                // server layer renders it (`Date`, sniffed
+                // `Content-Type: text/html; charset=utf-8`, `Connection:
+                // close`, no `Server` header) while frp-rs writes the raw
+                // NotFoundResponse head. Status/body agree; the head-layer
+                // difference is recorded in `docs/go-frp-compat-audit.md`
+                // § Deliberate divergences (probed, 632 B vs 581 B).
                 // NotFoundResponse() (pkg/util/vhost/resource.go) re-reads
                 // custom404Page on EVERY call, so this arm serves the
                 // configured page too — not just the builtin body.
@@ -796,13 +799,20 @@ async fn handle_http1_request<S>(
             .await;
         }
         Err(VhostResolveError::NotFound) => {
-            // Go parity: the vhost GET path answers Go's NotFoundResponse
-            // (the 489-byte builtin body below, or custom_404_page content).
-            // Go's copy additionally carries Date / Connection: close /
-            // charset headers — those are added by net/http's response
-            // writer (http.Server layer), not by Go frp, and frp-rs writes
-            // raw bytes instead. Shape parity with the fixed fields is the
-            // goal, not byte-exactness with a live Go server's dated copy.
+            // Status and body match Go: the 489-byte builtin page below, or
+            // custom_404_page content. The head does **not** match a live Go
+            // server on this path: Go reaches the reverse-proxy ErrorHandler
+            // (`pkg/util/vhost/http.go:128-138`), whose `WriteHeader(404)` +
+            // `Write(page)` is rendered by net/http with `Date`, a sniffed
+            // `Content-Type: text/html; charset=utf-8`, `Connection: close`
+            // and no `Server` header (632 B total on the probe), while this
+            // raw writer emits frp's own NotFoundResponse head (581 B).
+            // Reproducing that would mean modelling net/http's response
+            // writer for a header set no client routes on, so the divergence
+            // is kept and recorded in `docs/go-frp-compat-audit.md`
+            // § Deliberate divergences (probed). The tcpmux CONNECT miss is
+            // byte-exact (same 581 B), because Go writes NotFoundResponse
+            // there too.
             write_not_found_response(&mut stream, &state.custom_404_page).await;
         }
     }
