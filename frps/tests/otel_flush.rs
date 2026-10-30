@@ -15,27 +15,31 @@
 //!   treats the value as a base URL (`/v1/traces` is appended by
 //!   `normalize_otlp_endpoint`, not by this test);
 //! * SIGTERM reaches the graceful tail (exit status 0, not a signal death);
-//! * the exit path exported exactly one OTLP/HTTP request, with a non-empty
-//!   body — the `run` span closed at shutdown — rather than waiting for the
-//!   batch processor's first periodic export (measured at 10.006 s on the SDK
-//!   defaults, longer than this test's whole timeout).
+//! * the exit path exported exactly one OTLP/HTTP request whose body carries the
+//!   span name `run` framed as protobuf field 5 (`Span.name`) — the span that
+//!   closed at shutdown — rather than waiting for the batch processor's first
+//!   periodic export (measured at 10.006 s on the SDK defaults, longer than
+//!   this test's whole timeout).
 //!
 //! Hermetic: its own temporary config, a free `bindPort`, an ephemeral sink
 //! port, and a child process killed on every failure path.
 //!
-//! Gated on `full` for the same reason as the other `frps/tests/*.rs` files
-//! (`CARGO_BIN_EXE_frps` needs the bin's `required-features`) and on `unix`
+//! Gated on `full` because `CARGO_BIN_EXE_frps` is only provided when the
+//! package's `[[bin]] frps` — which declares `required-features = ["full"]` —
+//! is built; without `full` this test has no binary to spawn. Gated on `unix`
 //! because `SIGTERM` is the trigger.
 
 #![cfg(all(unix, feature = "full", feature = "otel"))]
 
-use std::io::{Read as _, Write as _};
-use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
+
+#[path = "../../frp-core/tests/support/otel_sink_std.rs"]
+mod otel_sink;
+
+use otel_sink::{find, free_port, length_delimited_field, otlp_sink};
 
 const BIN: &str = env!("CARGO_BIN_EXE_frps");
 
@@ -90,14 +94,6 @@ impl Drop for TempDir {
     }
 }
 
-/// An ephemeral port, released immediately: `bindPort = 0` is not "any port"
-/// here (frp-rs normalises 0 to the default 7000, which macOS's Control Center
-/// holds), so the daemon needs a concrete free port.
-fn free_port() -> u16 {
-    let probe = TcpListener::bind("127.0.0.1:0").expect("bind a probe port");
-    probe.local_addr().expect("probe local_addr").port()
-}
-
 fn try_wait(child: &mut Child) -> Option<ExitStatus> {
     child.try_wait().expect("try_wait")
 }
@@ -107,106 +103,35 @@ fn kill_and_reap(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// One OTLP/HTTP request as the sink saw it.
-struct Request {
-    head: String,
-    body: Vec<u8>,
-}
-
-/// A throwaway OTLP/HTTP sink on an ephemeral port.
+/// Drop the ambient OTel configuration before spawning the daemon.
 ///
-/// Accepts one connection, reads HTTP requests off it (answering each with
-/// `200`), and sends back everything it parsed once the connection closes. A
-/// connection that never arrives or a request that stalls reports an empty list
-/// after [`SINK_TIMEOUT`], so a missing flush fails the assertion below instead
-/// of hanging the suite.
-fn otlp_sink() -> (SocketAddr, mpsc::Receiver<Vec<Request>>) {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind the fake OTLP server");
-    let addr = listener.local_addr().expect("sink local_addr");
-    listener
-        .set_nonblocking(true)
-        .expect("non-blocking accept on the sink");
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let accept_deadline = Instant::now() + SINK_TIMEOUT;
-        let mut stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= accept_deadline {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => panic!("fake OTLP server failed to accept: {e}"),
-            }
-        };
-        // The listener is non-blocking only so the accept loop can time out;
-        // the accepted socket must be blocking again or `read` would return
-        // `WouldBlock` before the exporter's request lands.
-        stream
-            .set_nonblocking(false)
-            .expect("blocking reads on the accepted sink connection");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("sink read timeout");
-        let requests = read_requests(&mut stream);
-        // `ok()`: the receiver is gone only if the test already panicked.
-        tx.send(requests).ok();
-    });
-    (addr, rx)
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn content_length(head: &str) -> Option<usize> {
-    head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("content-length")
-            .then(|| value.trim().parse::<usize>().expect("content-length"))
-    })
-}
-
-/// Read requests until the peer closes (the daemon has exited) or a read times
-/// out, answering each with an empty `200` so the exporter's call resolves.
-fn read_requests(stream: &mut TcpStream) -> Vec<Request> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let mut requests = Vec::new();
-    loop {
-        if let Some(head_end) = find(&buf, b"\r\n\r\n").map(|i| i + 4) {
-            let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
-            match content_length(&head) {
-                Some(len) if buf.len() >= head_end + len => {
-                    let body = buf[head_end..head_end + len].to_vec();
-                    requests.push(Request { head, body });
-                    buf.drain(..head_end + len);
-                    stream
-                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                        .expect("answer the OTLP export");
-                    continue;
-                }
-                Some(_) => {}
-                None => {
-                    // Not an OTLP/HTTP request this parser understands; keep it
-                    // so the assertion's failure message shows the head.
-                    requests.push(Request {
-                        head,
-                        body: Vec::new(),
-                    });
-                    return requests;
-                }
-            }
-        }
-        match stream.read(&mut chunk) {
-            Ok(0) => return requests,
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
-            Err(_) => return requests,
-        }
+/// These variables are read by the SDK itself, so a developer's exported
+/// `OTEL_SDK_DISABLED=true`, `OTEL_TRACES_EXPORTER=none`, or a per-signal
+/// endpoint override would silently change the run this test exists to observe
+/// (and could turn a real regression into a pass). `env_clear()` is deliberately
+/// not used: the daemon legitimately needs `HOME`, `PATH` and the temp-dir
+/// variables.
+fn scrub_otel_env(cmd: &mut Command) {
+    for var in [
+        "OTEL_SDK_DISABLED",
+        "OTEL_TRACES_EXPORTER",
+        "OTEL_METRICS_EXPORTER",
+        "OTEL_LOGS_EXPORTER",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
+        "OTEL_EXPORTER_OTLP_COMPRESSION",
+        "OTEL_EXPORTER_OTLP_TRACES_COMPRESSION",
+        "OTEL_SERVICE_NAME",
+        "OTEL_RESOURCE_ATTRIBUTES",
+        "OTEL_TRACES_SAMPLER",
+    ] {
+        cmd.env_remove(var);
     }
 }
 
@@ -225,7 +150,9 @@ fn sigterm_flushes_the_run_span_to_the_otlp_endpoint() {
     let endpoint = format!("http://{sink_addr}");
 
     let log = std::fs::File::create(&log_path).expect("create diagnostic log");
-    let mut child = Command::new(bin())
+    let mut cmd = Command::new(bin());
+    scrub_otel_env(&mut cmd);
+    let mut child = cmd
         .args(["-c", &config])
         .env("OTEL_EXPORTER_OTLP_ENDPOINT", &endpoint)
         .stdout(Stdio::from(log.try_clone().expect("clone log")))
@@ -319,5 +246,14 @@ fn sigterm_flushes_the_run_span_to_the_otlp_endpoint() {
         "the export request carried no spans: the `run` span closed when `Service::run` \
          returned, so the flush has nothing to prove; head={:?}",
         request.head
+    );
+    // The body is protobuf, so a bare `find(body, b"run")` could match an
+    // attribute value; the field-5 framing (`Span.name`, tag 0x2a) is what
+    // makes this the span name rather than a coincidence.
+    assert!(
+        find(&request.body, &length_delimited_field(0x2a, b"run")).is_some(),
+        "the exported body does not carry `run` as protobuf field 5 (`Span.name`): the \
+         flush exported something, but not the span `Service::run` closed; body_len={}",
+        request.body.len()
     );
 }

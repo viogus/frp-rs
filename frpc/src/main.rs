@@ -360,18 +360,21 @@ async fn main() {
         FrpcCmd::Stop(args) => run_stop(args).await,
     }
 
-    // Flush the OTLP exporter before `main` returns. One call covers every
-    // subcommand lane that returns here — `Run` (the daemon, whose graceful
-    // `SIGTERM` tail is `run_normal`) as well as the one-shot lanes. Lanes that
-    // leave through `process::exit` inside the command (the `--config-dir`
-    // refusals, a construction error) bypass it; they close no `run` span, and
-    // tracing-opentelemetry drops records outside a span, so there is nothing
-    // exportable for them to lose. The provider used to be
-    // `Box::leak`ed, so the batch still queued at exit was lost (the first
-    // periodic export is measured at 10.006 s on the SDK defaults). No-op
-    // without the `otel` feature and without a configured exporter;
-    // idempotent, so the error branch inside `run_normal` that already flushed
-    // makes this a second no-op.
+    // Flush the OTLP exporter before `main` returns. This covers the lanes that
+    // return from `main`: `Run` (the daemon, whose graceful `SIGTERM` tail is
+    // `run_normal`) and the one-shot subcommands, plus a `--config-dir` where at
+    // least one file survived. The paths that leave through `process::exit`
+    // flush at their own call sites: `run_normal`'s error branch, and the
+    // `--config-dir` all-failed exit after the join loop. Only the startup
+    // refusals reach `process::exit` with no flush — a directory that cannot be
+    // read or is empty, every file failing to *load*, and the single-config load
+    // or construction error — and that is correct: none of them runs an
+    // instrumented unit, so no span was opened and tracing-opentelemetry, which
+    // drops records outside a span, has nothing to export for them. The provider
+    // used to be `Box::leak`ed, so the batch still queued at exit was lost (the
+    // first periodic export is measured at 10.006 s on the SDK defaults). No-op
+    // without the `otel` feature and without a configured exporter; idempotent,
+    // so an earlier call makes this a second no-op.
     logging::shutdown_otel();
 }
 
@@ -628,6 +631,15 @@ async fn run_normal(mut args: FrpcRunArgs) {
                 }
             }
         }
+        // Flush the OTLP exporter before the all-failed `process::exit` below:
+        // that exit skips the call at the end of `main`, and every service that
+        // ran and failed closed a `run` span whose batch is still queued.
+        // `frps` flushes at the same point for the same reason. No-op when no
+        // exporter was initialised (including the no-`otel` build); idempotent,
+        // so the partial-failure case that returns to the tail flush pays
+        // nothing extra.
+        logging::shutdown_otel();
+
         if failures.len() == files.len() {
             failures.sort_by_key(|(file_index, _)| *file_index);
             if let Some((_, code)) = failures.first() {

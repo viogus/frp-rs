@@ -1013,17 +1013,17 @@ async fn run(mut cli: FrpsArgs) {
             }
         }
         // Flush the OTLP exporter before the two exits below. This is **not**
-        // every `--config-dir` exit: the refusals above — directory read
-        // failure, empty directory, and "every file failed to load" — leave
-        // through `process::exit` without a service ever running. That loses
-        // nothing exportable today: only `Service::run` is instrumented
-        // (`frp-server/src/service.rs`), a startup failure closes no span, and
-        // tracing-opentelemetry drops records that are not inside a span. The
-        // reviewers' all-files-fail probe measured zero requests at the sink,
-        // which is that fact and not a missing flush. The call is a no-op when
-        // no exporter was initialised (including the no-`otel` build), and it
-        // runs before the all-failed `process::exit` so the spans from
-        // services that did run are not lost.
+        // every `--config-dir` exit: the refusals above — a directory that
+        // cannot be read, an empty directory, and "every file failed to load"
+        // — leave through `process::exit` before any instrumented unit runs
+        // (no service is constructed yet), so no span is open.
+        // tracing-opentelemetry drops records that are not inside a span, so
+        // those exits have nothing to export; the reviewers' all-files-fail
+        // probe measured zero requests at the sink, which is that fact and not
+        // a missing flush. The call is a no-op when no exporter was
+        // initialised (including the no-`otel` build), and it runs before the
+        // all-failed `process::exit` so the spans closed by services that did
+        // run are not lost.
         logging::shutdown_otel();
 
         if failures.len() == files.len() {
