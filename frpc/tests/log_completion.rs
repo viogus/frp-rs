@@ -11,7 +11,7 @@
 //!
 //! **This file is the client's control.** `frpc` has no overlay at all: it
 //! passes `cli.log_level` straight to `logging::resolve_log_level`
-//! (`frpc/src/main.rs:367-371`), whose existing empty-CLI filter already falls
+//! (`frpc/src/main.rs:384-388`), whose existing empty-CLI filter already falls
 //! through to `cfg.log.level`. So the correct outcome here is the one that was
 //! always observed, and the test exists to make it a *contract*: if a future
 //! change "aligns" the binaries by giving `frpc` the same overlay — writing `""`
@@ -21,7 +21,7 @@
 //! against a closed port: the client retries and logs `Login failed (attempt 1)`
 //! at `WARN` on the first try, so a `WARN` record is guaranteed inside
 //! [`RECORD_TIMEOUT`] with no server to run. The startup marker
-//! (`frpc (Rust) v`) is an `INFO` record (`frpc/src/main.rs:649` installs the
+//! (`frpc (Rust) v`) is an `INFO` record (`frpc/src/main.rs:675` installs the
 //! sink, the marker follows). So "one `WARN`, no `INFO`, marker absent, clean
 //! stderr" pins the effective level at exactly the file's `warn` — `info` would
 //! add the marker and the `run`-span `INFO` records, `error` would drop the

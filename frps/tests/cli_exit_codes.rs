@@ -51,7 +51,7 @@ fn bin() -> String {
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The child's own **progress witness**: the SIGUSR1 task logs this line after
 /// its `tokio::signal::unix::signal` call returns (`frps/src/main.rs:568`/`:921`
-/// in the `--config-dir` lane, `:1135`/`:1137` on `-c`),
+/// in the `--config-dir` lane, `:1149`/`:1151` on `-c`),
 /// which a `frps` that is still pre-init cannot have printed. It is *not* proof
 /// that SIGTERM's handler is installed — tokio registers signals per kind and
 /// lazily (`tokio-1.53.1/src/signal/unix.rs:283-300`), so the SIGTERM
@@ -586,7 +586,7 @@ fn oidc_without_an_issuer_is_refused_with_3_where_go_panics() {
 /// So the barrier is a **child-specific progress witness**: the SIGUSR1 task
 /// logs `SIGUSR1 reload ready` after its `tokio::signal::unix::signal` call
 /// returns (`frps/src/main.rs:568` installs the handler, `frps/src/main.rs:921`
-/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:1135`/`:1137`),
+/// logs the marker; the `-c` lane's twin is `frps/src/main.rs:1149`/`:1151`),
 /// i.e. only after that `frps` is past its
 /// own startup logging. A foreign listener cannot fake it — only the child under
 /// test writes to that log path. If the line never appears (a platform without

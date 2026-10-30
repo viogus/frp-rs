@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=eadf3c3cffd8c21f8d6ec6758aaa9234f50aefd6c02e7373acd26bfb5ae262cf
+          guard_data_pin=6d74b0acd0ccad0f848e8d21ce880b3924f20d4b3eedf58cab097785e250d605
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2298,6 +2298,52 @@ jobs:
             exit 1
           fi
           grep -qE '^test result: ok\. 1 passed; 0 failed' "$log.plain"
+      - name: Run the OTel shutdown-flush tests (the `--lib` sweep cannot see them)
+        # `frps/tests/otel_flush.rs` (SIGTERM during a live session) and
+        # `frpc/tests/otel_flush.rs` (single-config run failure, all-failed
+        # `--config-dir`) are gated on `feature = "otel"`, and the all-features
+        # step above is `--lib`-only, so without this step the two tests that pin
+        # "the span queued at exit still leaves the process" run in no CI lane:
+        # deleting `shutdown_otel()` from either daemon's exit path keeps every
+        # other lane green and silently drops the last batch — the exact defect
+        # the flush exists to prevent. The frpc half also pins the all-failed
+        # `--config-dir` exit, which used to `process::exit` without a flush even
+        # though both `run` spans had already closed.
+        # The count assertions are here for the usual reason: a cfg'd-out test
+        # target prints `running 0 tests` and exits 0.
+        run: |
+          set -o pipefail
+          # `CARGO_TERM_COLOR: always` is set for the whole workflow, so assert on
+          # a scrubbed copy and keep the raw log for the failure message.
+          strip() { sed -e 's/\x1b\[[0-9;]*m//g' "$1"; }
+          expect() {  # <plain-log> <whole-line regex> <message>
+            if ! grep -qxE "$2" "$1"; then
+              echo "::error::$3"
+              cat "$1"
+              exit 1
+            fi
+          }
+          expect_prefix() {  # <plain-log> <line-prefix regex> <message>
+            if ! grep -qE "$2" "$1"; then
+              echo "::error::$3"
+              cat "$1"
+              exit 1
+            fi
+          }
+          f=$(mktemp)
+          cargo test -p frps --all-features --test otel_flush 2>&1 | tee "$f"
+          strip "$f" > "$f.plain"
+          expect "$f.plain" 'running 1 test'             'frps otel_flush did not run exactly one test: the target was emptied, renamed or compiled out'
+          expect "$f.plain" 'test sigterm_flushes_the_run_span_to_the_otlp_endpoint \.\.\. ok'             'sigterm_flushes_the_run_span_to_the_otlp_endpoint did not pass - the SIGTERM tail is not exporting the queued span'
+          expect_prefix "$f.plain" '^test result: ok\. 1 passed; 0 failed'             'frps otel_flush did not report a clean one-test pass'
+          g=$(mktemp)
+          cargo test -p frpc --all-features --test otel_flush 2>&1 | tee "$g"
+          strip "$g" > "$g.plain"
+          expect "$g.plain" 'running 2 tests'             'frpc otel_flush did not run exactly two tests: the target was emptied, renamed or compiled out'
+          expect "$g.plain" 'test single_config_run_failure_flushes_the_run_span \.\.\. ok'             'single_config_run_failure_flushes_the_run_span did not pass - the single-config failure exit is not flushing'
+          expect "$g.plain" 'test config_dir_all_failed_flushes_the_run_spans \.\.\. ok'             'config_dir_all_failed_flushes_the_run_spans did not pass - the all-failed config-dir exit is not flushing'
+          expect_prefix "$g.plain" '^test result: ok\. 2 passed; 0 failed' \
+            'frpc otel_flush did not report a clean two-test pass'
       - name: Run vnet unit tests (nathole membership/cap guards)
         # frps/frpc default features exclude `vnet`, so the default-feature
         # `cargo test --workspace` steps never compile the nathole.rs vnet
@@ -2847,7 +2893,7 @@ jobs:
       - name: Run frpc's log-completion spawn test (the client control)
         # `frpc/tests/log_completion.rs` is the **control** for the empty-CLI-value
         # rule the `frps` log-completion step below pins. The client has never
-        # overlaid its flags onto the loaded config — `frpc/src/main.rs:367-371`
+        # overlaid its flags onto the loaded config — `frpc/src/main.rs:384-388`
         # passes `cli.log_level` straight to `resolve_log_level` — so "an empty
         # `--log-level` leaves the file's `[log] level` alone" is the outcome it
         # has always had, on both the `-c` and the `--config-dir` lane. The file
@@ -3340,11 +3386,11 @@ jobs:
           echo "frpc admin config-GET guard ok: $n tests listed (expected $want, floor $want_floor), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
-        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:544`)
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:561`)
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
-        # `:545` survived every lane in CI. Same three-check guard shape as its
+        # `:562` survived every lane in CI. Same three-check guard shape as its
         # siblings, with the admin build already warm from the step above.
         shell: bash
         run: |

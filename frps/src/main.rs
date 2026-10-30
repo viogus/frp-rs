@@ -422,7 +422,7 @@ fn init_logging(cli: &FrpsArgs, cfg: Option<&ServerConfig>) {
     // Go frp parity (TODO.md:11129): with an explicit `-c` the config file is
     // authoritative for the whole `[log]` section, exactly as it is for the
     // config flags — the `-c` branch of `main` skips `override_server_config`
-    // (`frps/src/main.rs:1068-1070`), so consulting the CLI log flags here would
+    // (`frps/src/main.rs:1082-1084`), so consulting the CLI log flags here would
     // silently re-honour the very flags that gate exists to discard. Measured
     // on Go v0.71.0: `frps -c frps.toml --log-level info` over a file with
     // `[log] level = "warn"` emits 0 `INFO` records; before this gate frp-rs
@@ -831,7 +831,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:1115`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1194-1197`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1208-1219`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
