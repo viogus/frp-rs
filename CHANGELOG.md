@@ -42,9 +42,12 @@ User-facing release notes for frp-rs.
   a datagram to a dead address is dropped rather than refused — so they dial the
   one address Go's `net.ResolveUDPAddr` returns: IPv4 preferred, unless
   `serverAddr` is a bracketed IPv6 literal. Proxied connections are unchanged
-  (the proxy makes the connection), and the fallback is sequential rather than
-  Go's 300 ms Happy-Eyeballs race, so a blackholed first address costs the dial
-  timeout before the next family is tried.
+  (the proxy makes the connection). Each attempt gets Go's own sub-deadline — the
+  remaining time divided by the addresses left, with a two-second floor — so a
+  first address that silently blackholes packets cannot consume the whole
+  `dialTimeout` and starve the rest; the fallback is still sequential rather than
+  Go's 300 ms Happy-Eyeballs race, so the second family starts after the first
+  attempt's share rather than 300 ms in.
 
 ## v0.71.1 — 2026-10-24
 

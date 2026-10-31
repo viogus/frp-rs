@@ -951,24 +951,33 @@ async fn connect_direct(
 ///
 /// `net.Dial` tries every resolved address (`net/dial.go:552-560`, `:659-745`)
 /// and reports "the error from the first address" as most relevant
-/// (`net/dial.go:740-741`); the attempts share one deadline
-/// (`partialDeadline`, `net/dial.go:745-754`) rather than one timeout each, so
-/// a blackholed first address cannot multiply the configured
-/// `dial_timeout_secs` by the number of addresses.
+/// (`net/dial.go:734`, `:764-765`). The budget per attempt is Go's
+/// `partialDeadline` (`net/dial.go:273-293`): the remaining time divided by the
+/// addresses left, with a two-second floor — *not* the whole remaining budget
+/// for the first attempt, which would let a blackholed first address consume the
+/// entire `dial_timeout_secs` and never reach the rest (`resolve::partial_deadline`).
+///
+/// One deliberate divergence: Go races a fallback group after `fallbackDelay`
+/// (300 ms, `net/dial.go:295-297`) instead of waiting for the first group's
+/// share, so on a dual-stack name Go may reach the second family sooner. The
+/// addresses tried and the order within each group are the same.
 async fn connect_direct_any(
     addr: &str,
     peers: &[SocketAddr],
     opts: &DialOptions,
 ) -> Result<(tokio::net::TcpStream, SocketAddr), crate::Error> {
+    let ordered = resolve::dial_order(peers);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(opts.dial_timeout_secs);
     let mut first_error: Option<crate::Error> = None;
-    for peer in resolve::dial_order(peers) {
-        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if budget.is_zero() {
+    for (index, peer) in ordered.iter().enumerate() {
+        let now = tokio::time::Instant::now();
+        let Some(attempt_deadline) =
+            resolve::partial_deadline(now, deadline, ordered.len() - index)
+        else {
             break;
-        }
-        match connect_direct(addr, peer, opts, budget).await {
-            Ok(stream) => return Ok((stream, peer)),
+        };
+        match connect_direct(addr, *peer, opts, attempt_deadline - now).await {
+            Ok(stream) => return Ok((stream, *peer)),
             Err(error) => {
                 first_error.get_or_insert(error);
             }
