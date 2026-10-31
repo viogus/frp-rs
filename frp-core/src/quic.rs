@@ -508,16 +508,18 @@ pub async fn dial_quic_connection_with_params(
     dial_timeout_secs: Option<u64>,
 ) -> io::Result<QuicConnection> {
     // Go frp compat: server_addr may be a hostname, not just an IP
-    // (Go transport/quic.go resolves via net.ResolveUDPAddr).
+    // (Go transport/quic.go resolves via net.ResolveUDPAddr). QUIC is UDP, so
+    // like KCP it gets no second attempt: the address is the one
+    // `addrList.forResolve` returns — IPv4 preferred unless the string is a
+    // bracketed IPv6 literal (`net/ipsock.go:79-107`) — not the resolver's
+    // first entry.
     let remote: SocketAddr = match addr.parse() {
         Ok(a) => a,
         Err(_) => {
-            let mut addrs = tokio::net::lookup_host(addr)
+            let peers = crate::transport::resolve::resolve_peers(addr)
                 .await
                 .map_err(|e| io::Error::other(format!("QUIC resolve {addr}: {e}")))?;
-            addrs.next().ok_or_else(|| {
-                io::Error::other(format!("QUIC resolve {addr}: no addresses found"))
-            })?
+            crate::transport::resolve::pick_for_resolve(&peers, addr.contains('['))
         }
     };
 

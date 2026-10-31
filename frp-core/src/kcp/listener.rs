@@ -113,19 +113,26 @@ pub async fn dial_kcp_with_driver(
     // Go parity: kcp-go's `Dial(raddr string)` resolves its argument with
     // `net.ResolveUDPAddr`, so a hostname is a valid dial target here too —
     // rejecting it with a bare parse error was an frp-rs-only restriction that
-    // surfaced as `KCP dial: invalid socket address syntax` one layer up. As in
-    // `dial_server`, the *first* resolved address is used; the other family is
-    // not tried, and no fallback is possible at this layer anyway: a datagram
-    // to a dead or unreachable address fails silently (see the socket-family
+    // surfaced as `KCP dial: invalid socket address syntax` one layer up.
+    //
+    // The address is chosen the way `ResolveUDPAddr` chooses it — not as the
+    // resolver's first entry: `addrList.forResolve` (`net/ipsock.go:79-107`)
+    // prefers IPv4 unless the dialled string is a bracketed IPv6 literal, and
+    // falls back to the first entry when the name has no IPv4 address. That
+    // differs from the resolver's own order on this platform (`localhost`
+    // resolves `[::1]` first), so `.next()` picked the address Go does not
+    // return. No fallback is possible at this layer either way: a datagram to a
+    // dead or unreachable address is dropped silently (see the socket-family
     // note below), so a failure appears later as a retransmission timeout
     // rather than as an error here.
     let remote: SocketAddr = match addr.parse() {
         Ok(remote) => remote,
-        Err(_) => tokio::net::lookup_host(addr)
-            .await
-            .map_err(|e| io::Error::other(format!("resolve '{addr}': {e}")))?
-            .next()
-            .ok_or_else(|| io::Error::other(format!("resolve '{addr}': no records found")))?,
+        Err(_) => {
+            let peers = crate::transport::resolve::resolve_peers(addr)
+                .await
+                .map_err(|e| io::Error::other(format!("resolve '{addr}': {e}")))?;
+            crate::transport::resolve::pick_for_resolve(&peers, addr.contains('['))
+        }
     };
     let conv: u32 = loop {
         let c = rand::random();
