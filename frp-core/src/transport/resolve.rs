@@ -67,11 +67,12 @@ fn is_ipv4(peer: &SocketAddr) -> bool {
 /// entry first (`addrList.partition`, `net/ipsock.go:115-127`), then the other
 /// group, each in resolver order.
 ///
-/// frp-rs walks the two groups sequentially instead of racing them, so a
-/// blackholed first group costs its whole dial timeout before the fallback
-/// starts, where Go starts the fallback after `fallbackDelay` (300 ms) or on
-/// the primary group's first error (`net/dial.go:698`, `:725-732`). The set of
-/// addresses tried, and the order within each group, are identical.
+/// frp-rs walks the two groups sequentially instead of racing them: each
+/// attempt gets its `partialDeadline` share ([`partial_deadline`]), so the
+/// second group starts after the first group's share of the remaining budget
+/// has been spent, where Go starts the fallback after `fallbackDelay` (300 ms)
+/// or on the primary group's first error (`net/dial.go:698`, `:725-732`). The
+/// set of addresses tried, and the order within each group, are identical.
 ///
 /// # Panics
 ///
