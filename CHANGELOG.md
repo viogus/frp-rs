@@ -33,6 +33,21 @@ User-facing release notes for frp-rs.
   `jsonwebtoken` required), and a non-string `aud`/`iss` with a configured
   expectation is rejected instead of silently skipping the check; integer-valued
   float `exp`/`nbf` still round as before.
+- **A `serverAddr` that names several addresses now connects on any of them, and
+  KCP/QUIC dial the same address Go dials.** `dial_server` resolved the name and
+  kept only the resolver's *first* answer, so `serverAddr = "localhost"` on macOS
+  (which answers `::1` first) was refused by an IPv4-only `frps` on every stream
+  transport, while Go's `net.Dial` tries the rest of the list. TCP/TLS/WS now try
+  each resolved address in Go's order before failing. KCP and QUIC cannot retry —
+  a datagram to a dead address is dropped rather than refused — so they dial the
+  one address Go's `net.ResolveUDPAddr` returns: IPv4 preferred, unless
+  `serverAddr` is a bracketed IPv6 literal. Proxied connections are unchanged
+  (the proxy makes the connection). Each attempt gets Go's own sub-deadline — the
+  remaining time divided by the addresses left, with a two-second floor — so a
+  first address that silently blackholes packets cannot consume the whole
+  `dialTimeout` and starve the rest; the fallback is still sequential rather than
+  Go's 300 ms Happy-Eyeballs race, so the second family starts after the first
+  attempt's share rather than 300 ms in.
 
 ## v0.71.1 — 2026-10-24
 
