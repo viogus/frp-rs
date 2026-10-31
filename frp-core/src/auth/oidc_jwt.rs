@@ -262,10 +262,22 @@ pub(crate) fn is_key_related_error(err: &Error) -> bool {
 /// Decode the JOSE header segment alone. Mirrors `jsonwebtoken::decode_header`:
 /// an unknown `alg` string fails here, before any key or payload is touched.
 pub(crate) fn decode_header(token: &str) -> Result<Header, Error> {
-    let header_b64 = token
-        .split('.')
+    let mut parts = token.split('.');
+    let header_b64 = parts
         .next()
         .ok_or_else(|| Error::new(ErrorKind::InvalidToken))?;
+    // `jsonwebtoken::decode_header` requires the compact-JWS three-part shape
+    // even though it only reads the first part; a truncated token must not
+    // reach the JWKS path before failing as `InvalidToken`.
+    parts
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidToken))?;
+    parts
+        .next()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidToken))?;
+    if parts.next().is_some() {
+        return Err(Error::new(ErrorKind::InvalidToken));
+    }
     let bytes = base64url_decode(header_b64).map_err(ErrorKind::Base64)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
@@ -394,19 +406,22 @@ fn ecdsa_point(point: &[u8], coordinate_len: usize) -> Result<&[u8], Error> {
 }
 
 fn validate_claims(claims: &serde_json::Value, validation: &Validation) -> Result<(), Error> {
-    let exp = claims.get("exp").and_then(serde_json::Value::as_u64);
-    let nbf = claims.get("nbf").and_then(serde_json::Value::as_u64);
+    let exp = claims.get("exp").and_then(numeric_date);
+    let nbf = claims.get("nbf").and_then(numeric_date);
     let sub = claims.get("sub").and_then(serde_json::Value::as_str);
-    let iss = claims.get("iss").and_then(string_or_string_array);
-    let aud = claims.get("aud").and_then(string_or_string_array);
+    // `Some(Err(()))` is a *present but malformed* claim: unlike the old
+    // `jsonwebtoken` path (which fell through and silently skipped the check),
+    // a malformed iss/aud with a configured expectation is rejected below.
+    let iss = claims.get("iss").map(parse_string_or_array);
+    let aud = claims.get("aud").map(parse_string_or_array);
 
     for required in &validation.required_spec_claims {
         let present = match required.as_str() {
             "exp" => exp.is_some(),
             "nbf" => nbf.is_some(),
             "sub" => sub.is_some(),
-            "iss" => iss.is_some(),
-            "aud" => aud.is_some(),
+            "iss" => matches!(iss, Some(Ok(_))),
+            "aud" => matches!(aud, Some(Ok(_))),
             // jsonwebtoken ignores anything outside the five registered names.
             _ => continue,
         };
@@ -436,9 +451,19 @@ fn validate_claims(claims: &serde_json::Value, validation: &Validation) -> Resul
         }
     }
 
-    if let (Some(iss), Some(expected)) = (iss, validation.iss.as_ref()) {
-        if !iss.iter().any(|candidate| expected.contains(*candidate)) {
-            return Err(Error::new(ErrorKind::InvalidIssuer));
+    if let Some(expected) = validation.iss.as_ref() {
+        match iss {
+            Some(Ok(iss)) => {
+                if !iss.iter().any(|candidate| expected.contains(*candidate)) {
+                    return Err(Error::new(ErrorKind::InvalidIssuer));
+                }
+            }
+            // Present but not a string/array-of-strings: fail closed instead
+            // of accepting a token the issuer check cannot read.
+            Some(Err(())) => return Err(Error::new(ErrorKind::InvalidIssuer)),
+            // No `iss` claim: jsonwebtoken only enforces presence via
+            // `required_spec_claims`, which this verifier does not set.
+            None => {}
         }
     }
 
@@ -448,26 +473,43 @@ fn validate_claims(claims: &serde_json::Value, validation: &Validation) -> Resul
     match (aud, validation.aud.as_ref()) {
         // A token with an audience but no configured expectation: no principal
         // can claim it, so reject (jsonwebtoken's `(Parsed, None)` arm).
-        (Some(_), None) => Err(Error::new(ErrorKind::InvalidAudience)),
-        (Some(aud), Some(expected)) => {
+        (Some(Ok(_)), None) => Err(Error::new(ErrorKind::InvalidAudience)),
+        (Some(Ok(aud)), Some(expected)) => {
             if !aud.iter().any(|candidate| expected.contains(*candidate)) {
                 Err(Error::new(ErrorKind::InvalidAudience))
             } else {
                 Ok(())
             }
         }
+        // Present but malformed: fail closed (see the iss arm above).
+        (Some(Err(())), _) => Err(Error::new(ErrorKind::InvalidAudience)),
         // No `aud` claim: jsonwebtoken only enforces presence via
         // `required_spec_claims`, which this verifier does not set.
         (None, _) => Ok(()),
     }
 }
 
-fn string_or_string_array(value: &serde_json::Value) -> Option<Vec<&str>> {
-    if let Some(s) = value.as_str() {
-        return Some(vec![s]);
+/// NumericDate as `jsonwebtoken`'s `numeric_type` coerced it: an integer or a
+/// finite non-negative float rounded to `u64`; anything else is "not present".
+fn numeric_date(value: &serde_json::Value) -> Option<u64> {
+    let number = value.as_number()?;
+    if let Some(u) = number.as_u64() {
+        return Some(u);
     }
-    let array = value.as_array()?;
-    array.iter().map(serde_json::Value::as_str).collect()
+    let f = number.as_f64()?;
+    if f.is_finite() && f >= 0.0 && f < (u64::MAX as f64) {
+        Some(f.round() as u64)
+    } else {
+        None
+    }
+}
+
+fn parse_string_or_array(value: &serde_json::Value) -> Result<Vec<&str>, ()> {
+    if let Some(s) = value.as_str() {
+        return Ok(vec![s]);
+    }
+    let array = value.as_array().ok_or(())?;
+    array.iter().map(|entry| entry.as_str().ok_or(())).collect()
 }
 
 /// Decode a base64url segment (RFC 4648 §5, URL-safe alphabet, padding
@@ -482,8 +524,11 @@ pub(crate) fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
-            b'-' | b'+' => 62,
-            b'_' | b'/' => 63,
+            // URL-safe alphabet only, like jsonwebtoken's `URL_SAFE_NO_PAD`:
+            // standard-alphabet `+`/`/` are invalid here even though they name
+            // the same values.
+            b'-' => 62,
+            b'_' => 63,
             _ => return Err(format!("OIDC: invalid base64url char {c:#x}")),
         };
         acc = (acc << 6) | v as u32;
@@ -703,6 +748,57 @@ mod tests {
     }
 
     #[test]
+    fn float_numeric_dates_round_like_jsonwebtoken() {
+        let secret = b"s";
+        let key = Key::from_secret(secret);
+        let future = 4_102_444_800u64;
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.required_spec_claims.insert("sub".into());
+
+        let token = test_sign_hs256(
+            None,
+            secret,
+            &serde_json::json!({"sub": "alice", "exp": future as f64 + 0.6}),
+        );
+        let data: TokenData<serde_json::Value> =
+            decode(&token, &key, &validation).expect("integer-valued float exp is accepted");
+        assert_eq!(numeric_date(&data.claims["exp"]), Some(future + 1));
+    }
+
+    #[test]
+    fn malformed_issuer_and_audience_fail_closed() {
+        let secret = b"s";
+        let key = Key::from_secret(secret);
+        let future = 4_102_444_800u64;
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.required_spec_claims.insert("sub".into());
+        validation.set_issuer(&["https://issuer.example"]);
+        validation.set_audience(&["api-prod"]);
+
+        let bad_iss = test_sign_hs256(
+            None,
+            secret,
+            &serde_json::json!({
+                "sub": "alice", "exp": future,
+                "iss": 123, "aud": "api-prod",
+            }),
+        );
+        let err = decode::<serde_json::Value>(&bad_iss, &key, &validation).unwrap_err();
+        assert_eq!(err.to_string(), "InvalidIssuer");
+
+        let bad_aud = test_sign_hs256(
+            None,
+            secret,
+            &serde_json::json!({
+                "sub": "alice", "exp": future,
+                "iss": "https://issuer.example", "aud": ["api-prod", 5],
+            }),
+        );
+        let err = decode::<serde_json::Value>(&bad_aud, &key, &validation).unwrap_err();
+        assert_eq!(err.to_string(), "InvalidAudience");
+    }
+
+    #[test]
     fn unknown_algorithm_fails_during_header_decode() {
         let secret = b"s";
         let key = Key::from_secret(secret);
@@ -762,6 +858,7 @@ mod tests {
         assert_eq!(base64url_decode("aGVsbG8").unwrap(), b"hello");
         assert_eq!(base64url_decode("_w").unwrap(), b"\xff");
         assert_eq!(base64url_decode("-_w").unwrap(), b"\xfb\xfc");
+        assert!(base64url_decode("+/w").is_err());
         assert!(base64url_decode("ab=c").is_err());
         assert!(base64url_decode("Zh").is_err());
     }

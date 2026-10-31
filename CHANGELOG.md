@@ -27,8 +27,12 @@ User-facing release notes for frp-rs.
   verifies the compact JWS directly on `ring` (HMAC, RSA PKCS#1/PSS, ECDSA
   P-256/P-384, Ed25519) using the same 12-algorithm allowlist and the same
   claims checks; an OIDC-enabled build sheds the `jsonwebtoken` tree. Wire
-  behaviour is unchanged — the JWKS formats, error classification and
-  refresh-on-key-rotation path are the same.
+  behaviour for valid tokens is unchanged — the JWKS formats, error
+  classification and refresh-on-key-rotation path are the same. Two malformed-
+  input differences: base64url segments must use the URL-safe alphabet (as
+  `jsonwebtoken` required), and a non-string `aud`/`iss` with a configured
+  expectation is rejected instead of silently skipping the check; integer-valued
+  float `exp`/`nbf` still round as before.
 
 ## v0.71.1 — 2026-10-24
 

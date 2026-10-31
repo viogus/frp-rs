@@ -12654,8 +12654,14 @@ other.
   `Cargo.lock` (`cargo tree -i jsonwebtoken` finds nothing). The OIDC test
   surface still runs unchanged through a test-only signing shim, plus new
   module tests for HS256/RS256/PS256 (static OpenSSL vectors), ES256 and
-  EdDSA. No wire change: JWKS input, OIDC flows and error classification are
-  identical.
+  EdDSA. Valid-token behaviour is unchanged: JWKS input, OIDC flows and error
+  classification are identical. Two malformed-input tightenings are documented
+  in the CHANGELOG: URL-safe-only base64 segments (jsonwebtoken already required
+  that) and a non-string `aud`/`iss` with a configured expectation is rejected
+  instead of silently skipping the check; integer-valued float dates still
+  round. New end-to-end tests drive RS256 (static vector), ES256 and EdDSA
+  through `verify_login` + `decoding_key_from_jwk`, closing the review's
+  algorithm-coverage gap.
 
 - [x] **`toml` 1.1 accepts config documents that the Go binary rejects.**
   Evidence: the 0.8 → 1.1 bump (PR #552) newly accepts `\xNN` escapes, seconds-less

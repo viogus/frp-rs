@@ -1918,6 +1918,88 @@ mod oidc_impl {
             assert_eq!(ok.jti.as_deref(), Some("jti-1"), "jti claim extraction");
         }
 
+        /// URL-safe base64 of a JWT segment (test fixture).
+        fn b64url(data: &[u8]) -> String {
+            crate::auth::oidc_jwt::base64url_encode(data)
+        }
+
+        /// Header.payload for an HS256-less test token (the caller signs it).
+        fn signing_input(alg: &str, kid: &str, claims: &serde_json::Value) -> String {
+            let header = serde_json::json!({"alg": alg, "kid": kid});
+            format!(
+                "{}.{}",
+                b64url(&serde_json::to_vec(&header).expect("header JSON")),
+                b64url(&serde_json::to_vec(claims).expect("claims JSON"))
+            )
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_rs256_static_vector_through_jwks() {
+            // The dominant real-world IdP algorithm: the RSA JWK goes through
+            // `decoding_key_from_jwk` and the token through the full
+            // `verify_login` path (kid selection, signature, claims).
+            const N: &str = "rrVOVI4qODpvIJMU8UyE84-l0v61s1CdIJWavn4FG04ahIwGsk2OvF3aOSBMy8A_CMqqzg08hSmg_CxF6NeLBczcAa30s1KY0I26NaKR-s44J0PedrgHPwPawZBnWsU7jsHjZ3r-FXCyHG_GcID1RHWN0kALeQkag_jf3dOtCNh4eN52xN0icq_M5XvPEKBqWV602Zd1PalLUPJvaHCmd3qZEoYG4y3CvupA1ZcbQzWJwUyfNuzfCb3J2QSwVcQaZJL8s3WVp4ar9w_Z02Ursy5_686sQF4GjaLesovHnh_D3REyI8_NylWwuUI4WOJyoy7oAiGYI6aUVdp1T4XnnQ";
+            const E: &str = "AQAB";
+            const RS256: &str = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsxIn0.eyJzdWIiOiJhbGljZSIsImV4cCI6NDEwMjQ0NDgwMH0.XPCMTstpjMXM8Bc1jr95YAd0WLdmQfsEv-TVd-W0lJ9s4_pGKPJwIL_6Wy75fm1b8va4hqUt5RdKgDbRWprWBqBLoHTf8nszRMbZUApJVEOIed25Sg-_8x-77CFYpTTHbpEcZ3dByMxBQWwKEgDuIy7m4v2Ku6KtWpepLUYJFGw0mXw8l7ZDbdLawHCR3DQJMGKEqdeX9agCP5UepFW2HTTVI7-S6vV-XkS_tGe1awu3o_wJmunKH6mTwZ-RP-j7DpXfRqhWTXjM22feOCkNSBjYH9JdZupMwIG96gIrfH4RYWLzkYiMKCJZEu5NgIGnDQbiIazEw1vX7IrQxqaWBw";
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [{"kty": "RSA", "kid": "k1", "n": N, "e": E, "alg": "RS256", "use": "sig"}]
+            }))
+            .await;
+            let ok = v
+                .verify_login(RS256)
+                .await
+                .expect("RS256 token through the full verify_login path");
+            assert_eq!(ok.subject, "alice");
+            assert_eq!(ok.expiry, 4_102_444_800);
+        }
+
+        #[tokio::test]
+        async fn oidc_verify_login_ec_and_eddsa_jwks() {
+            use ring::rand::SystemRandom;
+            use ring::signature::{
+                EcdsaKeyPair, Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING,
+            };
+
+            let rng = SystemRandom::new();
+            let claims = serde_json::json!({"sub": "key-user", "exp": now() + 3600});
+
+            // ES256: JWK x/y must come out of the uncompressed public point.
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+            let pair =
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap();
+            let point = pair.public_key().as_ref();
+            let input = signing_input("ES256", "ec1", &claims);
+            let signature = pair.sign(&rng, input.as_bytes()).unwrap();
+            let token = format!("{input}.{}", b64url(signature.as_ref()));
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [{
+                    "kty": "EC", "kid": "ec1", "crv": "P-256",
+                    "x": b64url(&point[1..33]), "y": b64url(&point[33..]),
+                }]
+            }))
+            .await;
+            let ok = v.verify_login(&token).await.expect("ES256 via JWKS");
+            assert_eq!(ok.subject, "key-user");
+
+            // EdDSA: OKP/Ed25519 JWK.
+            let ed_pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+            let ed = Ed25519KeyPair::from_pkcs8(ed_pkcs8.as_ref()).unwrap();
+            let input = signing_input("EdDSA", "ed1", &claims);
+            let signature = ed.sign(input.as_bytes());
+            let token = format!("{input}.{}", b64url(signature.as_ref()));
+            let v = test_verifier_with_jwks(serde_json::json!({
+                "keys": [{
+                    "kty": "OKP", "kid": "ed1", "crv": "Ed25519",
+                    "x": b64url(ed.public_key().as_ref()),
+                }]
+            }))
+            .await;
+            let ok = v.verify_login(&token).await.expect("EdDSA via JWKS");
+            assert_eq!(ok.subject, "key-user");
+        }
+
         #[tokio::test]
         async fn oidc_verify_login_token_with_unknown_kid_rejected() {
             // kid-selection (auth.rs:965-969): a token whose kid is not
