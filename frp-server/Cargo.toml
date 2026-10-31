@@ -84,7 +84,7 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 axum = { workspace = true }
-jsonwebtoken = { workspace = true }
+ring = { workspace = true }
 bytes = { workspace = true }
 criterion = "0.8"
 

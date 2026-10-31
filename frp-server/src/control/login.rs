@@ -1763,6 +1763,25 @@ mod oidc_throttle_tests {
     use super::authenticate;
     use crate::state::AppState;
 
+    /// Sign an HS256 JWT with the given kid/secret/claims (test fixture; the
+    /// production verifier lives in frp-core and never signs).
+    fn sign_hs256(kid: &str, secret: &[u8], claims: &serde_json::Value) -> String {
+        fn b64url(data: &[u8]) -> String {
+            frp_core::base64::encode(data)
+                .replace('+', "-")
+                .replace('/', "_")
+                .trim_end_matches('=')
+                .to_string()
+        }
+        let header = serde_json::json!({"alg": "HS256", "kid": kid});
+        let header = b64url(&serde_json::to_vec(&header).expect("header JSON"));
+        let payload = b64url(&serde_json::to_vec(claims).expect("claims JSON"));
+        let signing_input = format!("{header}.{payload}");
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+        let signature = ring::hmac::sign(&key, signing_input.as_bytes());
+        format!("{signing_input}.{}", b64url(signature.as_ref()))
+    }
+
     /// How long the mock waits for one accepted client's complete request head.
     ///
     /// The accepted socket's mode is **platform-defined**, and it decides which
@@ -2629,16 +2648,11 @@ mod oidc_throttle_tests {
         // JWKS key → OIDC verification fails on every attempt (and the
         // in-verifier JWKS refresh cooldown prevents outbound fetches
         // beyond the first).
-        let forged = jsonwebtoken::encode(
-            &jsonwebtoken::Header {
-                alg: jsonwebtoken::Algorithm::HS256,
-                kid: Some("k1".into()),
-                ..jsonwebtoken::Header::default()
-            },
+        let forged = sign_hs256(
+            "k1",
+            b"attacker-secret",
             &serde_json::json!({"sub": "attacker", "exp": 4_102_444_800_u64}),
-            &jsonwebtoken::EncodingKey::from_secret(b"attacker-secret"),
-        )
-        .expect("encode forged JWT");
+        );
 
         let peer: std::net::SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let ts = std::time::SystemTime::now()
@@ -2728,12 +2742,9 @@ mod oidc_throttle_tests {
 
         // VALIDLY SIGNED token (kid k1 = the mock JWKS key) for alice
         // reusing j1 — a cross-identity replay.
-        let valid_token = jsonwebtoken::encode(
-            &jsonwebtoken::Header {
-                alg: jsonwebtoken::Algorithm::HS256,
-                kid: Some("k1".into()),
-                ..jsonwebtoken::Header::default()
-            },
+        let valid_token = sign_hs256(
+            "k1",
+            b"mock-jwks-secret",
             &serde_json::json!({
                 "sub": "alice",
                 "exp": 4_102_444_800_u64,
@@ -2741,9 +2752,7 @@ mod oidc_throttle_tests {
                 "iss": issuer,
                 "aud": "test-audience",
             }),
-            &jsonwebtoken::EncodingKey::from_secret(b"mock-jwks-secret"),
-        )
-        .expect("encode valid JWT");
+        );
 
         let peer: std::net::SocketAddr = "127.0.0.1:12346".parse().unwrap();
         let ts = std::time::SystemTime::now()
@@ -2818,21 +2827,16 @@ mod oidc_throttle_tests {
         .expect("OidcVerifier against mock");
         let state = state_with_oidc(verifier);
 
-        let valid_jwt = jsonwebtoken::encode(
-            &jsonwebtoken::Header {
-                alg: jsonwebtoken::Algorithm::HS256,
-                kid: Some("k1".into()),
-                ..jsonwebtoken::Header::default()
-            },
+        let valid_jwt = sign_hs256(
+            "k1",
+            b"mock-jwks-secret",
             &serde_json::json!({
                 "sub": "l4-oidc-user",
                 "exp": 4_102_444_800_u64,
                 "iss": issuer_url,
                 "aud": "test-audience",
             }),
-            &jsonwebtoken::EncodingKey::from_secret(b"mock-jwks-secret"),
-        )
-        .expect("encode valid OIDC JWT");
+        );
 
         let peer: std::net::SocketAddr = "127.0.0.2:12345".parse().unwrap();
         let ts = std::time::SystemTime::now()

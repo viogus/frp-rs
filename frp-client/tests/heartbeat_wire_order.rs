@@ -943,7 +943,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
             method: "oidc".into(),
             oidc_client_id: "g7-r2-oidc-client".into(),
             // With a token source, OidcClient::new sets no endpoint and skips
-            // discovery/JWKS entirely (frp-core/src/auth.rs:1333-1336), so this
+            // discovery/JWKS entirely (frp-core/src/auth.rs:1308-1311), so this
             // test needs no identity provider.
             oidc_token_source: Some(frp_core::config::ValueSource {
                 source_type: "exec".into(),

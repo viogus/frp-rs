@@ -86,7 +86,7 @@ Feature flags across crates:
 | `quic` | frp-core | QUIC transport (quinn) — **default ON** (was opt-in) |
 | `kcp` | frp-core | KCP transport (in-tree, kcp-go v5.6.13 aligned) |
 | `websocket` | frp-core/server | WebSocket transport (manual RFC 6455 framing, no tungstenite since 2026-08-09) |
-| `oidc` | frp-core | OIDC auth (jsonwebtoken, hyper) |
+| `oidc` | frp-core | OIDC auth (in-tree ring-based JWT verify, hyper) |
 | `ssh` | frp-server | SSH gateway (russh, rand 0.10) |
 | `dashboard` | frp-server | Metrics/status API (prometheus, axum) |
 | `tls` | frp-core/server/client | TLS encryption (rustls, webpki-roots) |
@@ -252,7 +252,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Compression | `snap` | Snappy, pure Rust |
 | QUIC | `quinn` | |
 | TcpMux | `yamux` | |
-| OIDC/JWT | `jsonwebtoken` | |
+| OIDC/JWT | in-tree `frp-core/src/auth/oidc_jwt.rs` | JWS verify on `ring` (HS/RS/PS/ES/EdDSA); replaced `jsonwebtoken` 9.3.1 on 2026-10-30 |
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` | env-filter |
 | Error handling | `anyhow` + `thiserror` | |
 | Random | `rand` | 0.10.3 direct; 0.9.5 remains in the lock via the opt-in `otel` chain (`opentelemetry_sdk` 0.33) and via `axum` 0.8 → `tokio-tungstenite` 0.29 → `tungstenite` — third-party pins, latest releases |
@@ -270,6 +270,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `lazy_static` — replaced by `std::sync::LazyLock` (stable since Rust 1.80)
 - `hex` — replaced by inline `frp_core::hex_encode`
 - `tokio-tungstenite` — replaced by in-tree manual RFC 6455 framing (`frp-core/src/transport/websocket.rs`)
+- `jsonwebtoken` — replaced by in-tree ring-based JWS verification (`frp-core/src/auth/oidc_jwt.rs`) on 2026-10-30; 11.x has no `ring` backend, so the 9.3.1 line could not be upgraded
 - `libc` — active direct dependency (frp-core Linux splice(2), frp-vnet TUN ioctl)
 
 > Note: "banned" means no **direct** dependency. Several still exist **transitively** in the default frps dependency tree via the SSH feature chain (russh 0.65.0 → ssh-key 0.7.0-rc): `data-encoding` (pulled in by russh itself), `sha2`, `hkdf`, `hmac` (via ed25519-dalek / elliptic-curve / rsa), plus `base64`/`lazy_static` via the dev-only pprof and tracing paths. `aes-gcm` is no longer compiled into frps — it survives only as an orphaned `Cargo.lock` entry. They cannot be removed without replacing russh; only direct use is forbidden.

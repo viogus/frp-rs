@@ -499,7 +499,13 @@ impl AuthConfig {
 // ---------------------------------------------------------------
 
 #[cfg(feature = "oidc")]
+mod oidc_jwt;
+
+#[cfg(feature = "oidc")]
 mod oidc_impl {
+    use super::oidc_jwt;
+    use super::oidc_jwt::base64url_decode;
+
     /// Information extracted from a verified OIDC login token.
     #[derive(Debug, Clone)]
     pub struct LoginOidcToken {
@@ -526,17 +532,8 @@ mod oidc_impl {
         refresh_warranted: bool,
     }
 
-    pub(crate) fn is_key_related_error(err: &jsonwebtoken::errors::Error) -> bool {
-        use jsonwebtoken::errors::ErrorKind;
-        matches!(
-            err.kind(),
-            ErrorKind::InvalidSignature
-                | ErrorKind::InvalidRsaKey(_)
-                | ErrorKind::InvalidEcdsaKey
-                | ErrorKind::InvalidKeyFormat
-                | ErrorKind::InvalidAlgorithm
-                | ErrorKind::Crypto(_)
-        )
+    pub(crate) fn is_key_related_error(err: &oidc_jwt::Error) -> bool {
+        oidc_jwt::is_key_related_error(err)
     }
 
     /// Hard cap on the replay-protection cache entry count. Lazy 24h-TTL
@@ -785,28 +782,25 @@ mod oidc_impl {
             Ok(())
         }
 
-        /// Build a jsonwebtoken::DecodingKey from a JWKS key JSON value.
-        pub(crate) fn decoding_key_from_jwk(
+        /// Build an [`oidc_jwt::Key`] from a JWKS key JSON value.
+        pub(super) fn decoding_key_from_jwk(
             key: &serde_json::Value,
-        ) -> Result<jsonwebtoken::DecodingKey, String> {
+        ) -> Result<oidc_jwt::Key, String> {
             let kty = key["kty"].as_str().unwrap_or("");
             match kty {
                 "RSA" => {
                     let n = key["n"].as_str().ok_or("OIDC: missing RSA n in JWK")?;
                     let e = key["e"].as_str().ok_or("OIDC: missing RSA e in JWK")?;
-                    jsonwebtoken::DecodingKey::from_rsa_components(n, e)
-                        .map_err(|e| format!("OIDC: invalid RSA JWK: {e}"))
+                    oidc_jwt::Key::from_rsa_components(n, e)
                 }
                 "EC" => {
                     let x = key["x"].as_str().ok_or("OIDC: missing EC x in JWK")?;
                     let y = key["y"].as_str().ok_or("OIDC: missing EC y in JWK")?;
-                    jsonwebtoken::DecodingKey::from_ec_components(x, y)
-                        .map_err(|e| format!("OIDC: invalid EC JWK: {e}"))
+                    oidc_jwt::Key::from_ec_components(x, y)
                 }
                 "oct" => {
                     let k = key["k"].as_str().ok_or("OIDC: missing oct k in JWK")?;
-                    jsonwebtoken::DecodingKey::from_base64_secret(k)
-                        .map_err(|e| format!("OIDC: invalid oct JWK: {e}"))
+                    oidc_jwt::Key::from_base64_secret(k)
                 }
                 "OKP" => {
                     let crv = key["crv"].as_str().ok_or("OIDC: missing OKP crv in JWK")?;
@@ -814,8 +808,7 @@ mod oidc_impl {
                         return Err(format!("OIDC: unsupported OKP curve: {crv}"));
                     }
                     let x = key["x"].as_str().ok_or("OIDC: missing OKP x in JWK")?;
-                    jsonwebtoken::DecodingKey::from_ed_components(x)
-                        .map_err(|e| format!("OIDC: invalid OKP/Ed25519 JWK: {e}"))
+                    oidc_jwt::Key::from_ed_components(x)
                 }
                 _ => Err(format!("OIDC: unsupported JWK key type: {kty}")),
             }
@@ -837,35 +830,17 @@ mod oidc_impl {
         /// each call, so it never grows unbounded. Go frp v0.70.1 has no jti
         /// check — this is a frp-rs-specific defense-in-depth measure.
         pub async fn verify_login(&self, token: &str) -> Result<LoginOidcToken, String> {
-            let header = jsonwebtoken::decode_header(token)
+            let header = oidc_jwt::decode_header(token)
                 .map_err(|e| format!("OIDC: failed to decode JWT header: {e}"))?;
 
             let alg = header.alg;
             let kid = header.kid.clone();
 
-            // Allowlist of known JWT algorithms. Includes symmetric HMAC algorithms
-            // (HS256, HS384, HS512) for oct-key use cases (shared secret JWKs).
-            // Algorithm confusion (e.g. HS256 with RSA public key) is prevented by
-            // jsonwebtoken's algorithm-vs-key-type verification: an RSA key cannot
-            // verify an HMAC signature and vice versa. This allowlist provides
-            // defense-in-depth on top of that library-level check.
-            const ALLOWED_ALGS: &[jsonwebtoken::Algorithm] = &[
-                jsonwebtoken::Algorithm::HS256,
-                jsonwebtoken::Algorithm::HS384,
-                jsonwebtoken::Algorithm::HS512,
-                jsonwebtoken::Algorithm::RS256,
-                jsonwebtoken::Algorithm::RS384,
-                jsonwebtoken::Algorithm::RS512,
-                jsonwebtoken::Algorithm::ES256,
-                jsonwebtoken::Algorithm::ES384,
-                jsonwebtoken::Algorithm::PS256,
-                jsonwebtoken::Algorithm::PS384,
-                jsonwebtoken::Algorithm::PS512,
-                jsonwebtoken::Algorithm::EdDSA,
-            ];
-            if !ALLOWED_ALGS.contains(&alg) {
-                return Err(format!("OIDC: algorithm {alg:?} not allowed"));
-            }
+            // The `Algorithm` enum itself is the allowlist: every JOSE name it
+            // can deserialize is accepted, and an unknown name (`none`,
+            // `ES512`, ...) fails in `decode_header` before any key is read.
+            // Algorithm confusion (HS256 vs RSA key, ...) is rejected by the
+            // key-family check in `oidc_jwt::decode`.
 
             // Ensure JWKS cached, refresh if stale
             {
@@ -889,7 +864,7 @@ mod oidc_impl {
                 }
             }
 
-            let mut validation = jsonwebtoken::Validation::new(alg);
+            let mut validation = oidc_jwt::Validation::new(alg);
             validation.validate_exp = !self.skip_expiry;
             validation.validate_nbf = !self.skip_nbf;
             if !self.skip_issuer {
@@ -968,7 +943,7 @@ mod oidc_impl {
         async fn try_verify_token(
             &self,
             token: &str,
-            validation: &jsonwebtoken::Validation,
+            validation: &oidc_jwt::Validation,
             kid: Option<&str>,
         ) -> Result<LoginOidcToken, OidcVerifyError> {
             let cache = self.jwks.read().await;
@@ -1003,7 +978,7 @@ mod oidc_impl {
                     }
                 };
 
-                match jsonwebtoken::decode::<serde_json::Value>(token, &decoding_key, validation) {
+                match oidc_jwt::decode::<serde_json::Value>(token, &decoding_key, validation) {
                     Ok(data) => {
                         let sub = data.claims["sub"].as_str().unwrap_or("").to_string();
                         // Reject tokens with an empty subject — "sub" is
@@ -1537,40 +1512,10 @@ mod oidc_impl {
         }
     }
 
-    /// Decode a base64url segment (RFC 4648 §5, URL-safe alphabet, padding
-    /// optional — JWT payloads are emitted unpadded). Inline (repo policy:
-    /// no new deps; `frp_core::base64` is standard-alphabet only and cannot
-    /// read URL-safe input). Rejects non-zero trailing bits per RFC 4648
-    /// §3.2.
-    fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
-        let mut out = Vec::with_capacity(input.len() / 4 * 3);
-        let mut acc: u32 = 0;
-        let mut nbits: u32 = 0;
-        for c in input.bytes() {
-            let v = match c {
-                b'A'..=b'Z' => c - b'A',
-                b'a'..=b'z' => c - b'a' + 26,
-                b'0'..=b'9' => c - b'0' + 52,
-                b'-' | b'+' => 62,
-                b'_' | b'/' => 63,
-                _ => return Err(format!("OIDC: invalid base64url char {c:#x}")),
-            };
-            acc = (acc << 6) | v as u32;
-            nbits += 6;
-            if nbits >= 8 {
-                nbits -= 8;
-                out.push((acc >> nbits) as u8);
-            }
-        }
-        if nbits != 0 && (acc & ((1u32 << nbits) - 1)) != 0 {
-            return Err("OIDC: invalid base64url trailing bits".to_string());
-        }
-        Ok(out)
-    }
-
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::auth::oidc_jwt::test_compat as jsonwebtoken;
 
         /// Build an `OidcVerifier` without any network I/O. The real `new()`
         /// fetches openid-configuration and JWKS; `check_replay` only touches
@@ -1794,7 +1739,6 @@ mod oidc_impl {
                 &Header {
                     alg: Algorithm::HS256,
                     kid: Some("k1".into()),
-                    ..Header::default()
                 },
                 &serde_json::json!({"sub": "attacker", "exp": 4_102_444_800_u64}),
                 &EncodingKey::from_secret(b"attacker-secret"),
@@ -1857,7 +1801,7 @@ mod oidc_impl {
         /// Seed the JWKS cache AND set the config knobs under test (issuer /
         /// audience / additional_audience / skip flags). `verify_login`
         /// derives its jsonwebtoken `Validation` from exactly these fields
-        /// (auth.rs:892-914: `validate_exp = !skip_expiry`,
+        /// (auth.rs:867-889: `validate_exp = !skip_expiry`,
         /// `validate_nbf = !skip_nbf`, `set_issuer` when `!skip_issuer`,
         /// `set_audience` when an audience is configured), so the semantic
         /// rejection arms (expired / nbf-future / wrong issuer / wrong
@@ -1910,7 +1854,6 @@ mod oidc_impl {
                 &jsonwebtoken::Header {
                     alg: jsonwebtoken::Algorithm::HS256,
                     kid: Some(kid.to_string()),
-                    ..jsonwebtoken::Header::default()
                 },
                 claims,
                 &jsonwebtoken::EncodingKey::from_secret(secret),
@@ -1949,7 +1892,7 @@ mod oidc_impl {
             // A VALID HS256 JWT (oct JWKS key, kid match) must verify through
             // the full verify_login path — algorithm allowlist, kid-key
             // selection, claim validation (sub/exp) — and yield the extracted
-            // subject, expiry and jti (auth.rs:1007-1022).
+            // subject, expiry and jti (auth.rs:982-997).
             const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
             let v = test_verifier_with_jwks(serde_json::json!({
                 "keys": [{
@@ -1977,7 +1920,7 @@ mod oidc_impl {
 
         #[tokio::test]
         async fn oidc_verify_login_token_with_unknown_kid_rejected() {
-            // kid-selection (auth.rs:990-994): a token whose kid is not
+            // kid-selection (auth.rs:965-969): a token whose kid is not
             // present in the JWKS must fail WITHOUT trying any key — and
             // because no key was tried the failure is not key-related, so no
             // refresh-warranted retry (and no outbound JWKS fetch) happens.
@@ -2059,7 +2002,7 @@ mod oidc_impl {
             // "sub" is a required claim (presence is enforced by
             // jsonwebtoken), but an EMPTY subject must still be rejected —
             // subject-based proxy routing would otherwise be bypassable
-            // (auth.rs:1011-1015).
+            // (auth.rs:986-990).
             const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
             let v = test_verifier_with_jwks(serde_json::json!({
                 "keys": [{
@@ -2102,7 +2045,7 @@ mod oidc_impl {
             // Coverage gap D: the EXPIRED-token rejection arm (ExpiredSignature
             // from jsonwebtoken's validate_exp — the e2e suite always sets
             // oidc_skip_expiry=true) is fed adversarially. Expiry is enforced
-            // by default (skip_expiry=false → validate_exp=true, auth.rs:893),
+            // by default (skip_expiry=false → validate_exp=true, auth.rs:868),
             // the signature is VALID against the cached oct key (kid k1), so
             // the rejection must come from the expiry check — and being a
             // semantic error it must NOT warrant a JWKS refetch.
@@ -2162,7 +2105,7 @@ mod oidc_impl {
         async fn oidc_verify_login_rejects_future_nbf_when_nbf_enforced() {
             // Coverage gap D: the nbf-future rejection arm (ImmatureSignature).
             // validate_nbf is off in jsonwebtoken's default Validation and only
-            // fires via auth.rs:894 (`validate_nbf = !self.skip_nbf`), so the
+            // fires via auth.rs:869 (`validate_nbf = !self.skip_nbf`), so the
             // rejection proves the flag reaches the Validation builder. The
             // signature is valid; the token is not yet valid per its own nbf.
             const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
@@ -2218,7 +2161,7 @@ mod oidc_impl {
         #[tokio::test]
         async fn oidc_verify_login_rejects_wrong_issuer_when_issuer_enforced() {
             // Coverage gap D: the wrong-issuer rejection arm (InvalidIssuer).
-            // The issuer check fires only when skip_issuer=false (auth.rs:895)
+            // The issuer check fires only when skip_issuer=false (auth.rs:870)
             // AND the token carries an `iss` claim; the signature is valid, so
             // a mismatch between the token's iss and the verifier's configured
             // issuer must surface InvalidIssuer — a semantic error.
@@ -2301,7 +2244,7 @@ mod oidc_impl {
         async fn oidc_verify_login_rejects_wrong_audience_when_audience_configured() {
             // Coverage gap D: the wrong-audience rejection arm (InvalidAudience).
             // Audience validation fires when an audience is configured and
-            // skip_audience=false (auth.rs:898-910); the token's `aud` claim
+            // skip_audience=false (auth.rs:873-885); the token's `aud` claim
             // must contain the configured audience. The signature is valid, so
             // a mismatch must surface InvalidAudience — a semantic error.
             const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
@@ -2403,15 +2346,14 @@ mod oidc_impl {
 
         #[tokio::test]
         async fn oidc_verify_login_rejects_alg_outside_allowlist_before_verification() {
-            // Coverage gap D: the algorithm rejection surface. The typed
-            // allowlist (auth.rs:852-868) contains every algorithm jsonwebtoken
-            // 9.3.1's enum can represent, so an attacker token whose alg is
-            // NOT allowlisted — "none" (unsigned-JWT attack) or "ES512" (a
-            // real JOSE name the library does not implement) — cannot reach
-            // the allowlist comparison: jsonwebtoken::decode_header itself
-            // rejects the unknown variant, BEFORE signature verification and
-            // before any JWKS access. Both shapes must fail closed with the
-            // header-decode marker and arm nothing.
+            // Coverage gap D: the algorithm rejection surface. The Algorithm
+            // enum (frp-core/src/auth/oidc_jwt.rs:31-44) is the allowlist: it
+            // has exactly the 12 JOSE names OIDC uses, and serde rejects any
+            // other at header decode — "none" (unsigned-JWT attack) or
+            // "ES512" (a real JOSE name the verifier does not implement) —
+            // BEFORE signature verification and before any JWKS access. Both
+            // shapes must fail closed with the header-decode marker and arm
+            // nothing.
             const SECRET: &[u8] = b"oidc-jwks-hs256-secret";
             let v = verifier_with_config("", "", &[], false, false, false, false, oct_jwks(SECRET))
                 .await;
@@ -2524,7 +2466,7 @@ mod oidc_impl {
             // Go frp parity (nonCachingTokenSource): when the token endpoint
             // omits `expires_in` the client cannot know when the token
             // expires, so every get_token call must hit the network again
-            // instead of serving from the cache (auth.rs:1486-1489).
+            // instead of serving from the cache (auth.rs:1461-1464).
             let endpoint = CountingTokenEndpoint::without_expires_in().await;
             let client =
                 test_oidc_client_with_endpoint(&format!("http://{}/token", endpoint._addr)).await;
@@ -2544,7 +2486,7 @@ mod oidc_impl {
         async fn test_oidc_client_caches_token_until_expiry() {
             // With expires_in present, the second call inside the expiry
             // window must be served from the cache — exactly one HTTP fetch
-            // total (auth.rs:1492-1496).
+            // total (auth.rs:1467-1471).
             let endpoint = CountingTokenEndpoint::with_expires_in().await;
             let client =
                 test_oidc_client_with_endpoint(&format!("http://{}/token", endpoint._addr)).await;
@@ -3532,6 +3474,7 @@ mod tests {
     #[test]
     #[cfg(feature = "oidc")]
     fn test_key_related_error_classification() {
+        use crate::auth::oidc_jwt::test_compat as jsonwebtoken;
         use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 
         let future_exp = serde_json::json!({"sub": "user", "exp": 4_102_444_800_u64});
@@ -3635,6 +3578,7 @@ mod tests {
         // configured audience matches, and rejected otherwise. This is the
         // exact mechanism OidcVerifier::verify_login wires up via
         // `audience_validation` + `Validation::set_audience`.
+        use crate::auth::oidc_jwt::test_compat as jsonwebtoken;
         use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 
         let encode_token = |claims: &serde_json::Value| {

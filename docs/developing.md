@@ -1915,7 +1915,7 @@ Some things this table does not say, each measured:
     and all 3 at the head. `frpc`'s OIDC path is where the flip is real: with
     `[auth] method = "oidc"` and **no** `oidc.tokenEndpointURL`, `OidcClient::new`
     fetches `<issuer>/.well-known/openid-configuration`
-    (`frp-core/src/auth.rs:1333-1348`) and the error embeds that URL, so at the
+    (`frp-core/src/auth.rs:1308-1323`) and the error embeds that URL, so at the
     base commit an issuer path containing `auth` gave **3** while four auth-free
     paths (`zzz`, `plain`, `nope`, `x`) gave **4** — each of the five repeated
     four times, one fresh config and one fresh closed port per run, rc read

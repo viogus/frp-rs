@@ -75,7 +75,7 @@ fn oidc_config(server_port: u16, script: &str, log: &str, client_scopes: &[&str]
             method: "oidc".into(),
             oidc_client_id: "req-work-conn-oidc-client".into(),
             // With a token source, OidcClient::new skips endpoint
-            // discovery/JWKS entirely (frp-core/src/auth.rs:1333-1336), so no
+            // discovery/JWKS entirely (frp-core/src/auth.rs:1308-1311), so no
             // identity provider is needed.
             oidc_token_source: Some(ValueSource {
                 source_type: "exec".into(),
@@ -111,7 +111,7 @@ fn assert_oidc_new_work_conn(nwc: &msg::NewWorkConn, invocations: usize) {
         nwc.privilege_key.as_deref(),
         Some(TOKEN),
         "NewWorkConn must carry the RAW token from the exec source (Go OIDC \
-         setNewWorkConn sets only PrivilegeKey, frp-core/src/auth.rs:1530)"
+         setNewWorkConn sets only PrivilegeKey, frp-core/src/auth.rs:1505)"
     );
     assert!(
         nwc.timestamp.is_none(),

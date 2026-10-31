@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=581 weak=101 ambiguous=2 excluded=101 foreign_reported=1118 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=aa58c78e24a51a0d ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=581 weak=101 ambiguous=2 excluded=101 foreign_reported=1118 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=e0d03a3ff97fb6b1 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2376	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2376	1517
@@ -134,22 +134,22 @@ frp-client/tests/plugin_static_file.rs	153	-	a38302f709b598e3	-	absolute	frp-cli
 frp-core/benches/crypto_bridge.rs	60	-	576c3c0b77c0f142	-	absolute	.github/workflows/ci.yml	frp-core/benches/crypto_bridge.rs:60	2554
 frp-core/benches/crypto_bridge.rs	60	-	576c3c0b77c0f142	-	absolute	docs/developing.md	frp-core/benches/crypto_bridge.rs:60	1142
 frp-core/src/admin_auth.rs	36	-	e8bc4966d1e96d97	-	absolute	frp-client/src/admin.rs	frp-core/src/admin_auth.rs:36	987
-frp-core/src/auth.rs	1007	1022	0c7fa4d0b344ca7d	72a2c026bfa33a65	absolute	frp-core/src/auth.rs	auth.rs:1007-1022	1952
-frp-core/src/auth.rs	1011	1015	c813be72aa93ab75	0bf37874b7af9907	absolute	frp-core/src/auth.rs	auth.rs:1011-1015	2062
-frp-core/src/auth.rs	1333	1336	2b7181b8d7316d93	77f0daf880439021	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-core/src/auth.rs:1333-1336	946
-frp-core/src/auth.rs	1333	1336	2b7181b8d7316d93	77f0daf880439021	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-core/src/auth.rs:1333-1336	78
-frp-core/src/auth.rs	1333	1348	2b7181b8d7316d93	becba840f256fe24	absolute	docs/developing.md	frp-core/src/auth.rs:1333-1348	1918
-frp-core/src/auth.rs	1486	1489	627889f22109628c	4ac8b00fd15c08ec	absolute	frp-core/src/auth.rs	auth.rs:1486-1489	2527
-frp-core/src/auth.rs	1492	1496	8cc247361dd28f18	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:1492-1496	2547
-frp-core/src/auth.rs	1530	-	cd41f8b2a107a630	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-core/src/auth.rs:1530	114
+frp-core/src/auth.rs	1308	1311	2b7181b8d7316d93	77f0daf880439021	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-core/src/auth.rs:1308-1311	946
+frp-core/src/auth.rs	1308	1311	2b7181b8d7316d93	77f0daf880439021	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-core/src/auth.rs:1308-1311	78
+frp-core/src/auth.rs	1308	1323	2b7181b8d7316d93	becba840f256fe24	absolute	docs/developing.md	frp-core/src/auth.rs:1308-1323	1918
+frp-core/src/auth.rs	1461	1464	627889f22109628c	4ac8b00fd15c08ec	absolute	frp-core/src/auth.rs	auth.rs:1461-1464	2469
+frp-core/src/auth.rs	1467	1471	8cc247361dd28f18	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:1467-1471	2489
+frp-core/src/auth.rs	1505	-	cd41f8b2a107a630	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-core/src/auth.rs:1505	114
 frp-core/src/auth.rs	347	-	0686c21d983b31b3	-	absolute	frp-client/tests/heartbeat_wire_order.rs	frp-core/src/auth.rs:347	281
-frp-core/src/auth.rs	852	868	5c81f7d0718d3e99	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:852-868	2407
-frp-core/src/auth.rs	892	914	fb696754500a10ed	bc768948e73d9ecd	absolute	frp-core/src/auth.rs	auth.rs:892-914	1860
-frp-core/src/auth.rs	893	-	3eb85db5d9a7e227	-	absolute	frp-core/src/auth.rs	auth.rs:893	2105
-frp-core/src/auth.rs	894	-	66544d81d39e6068	-	absolute	frp-core/src/auth.rs	auth.rs:894	2165
-frp-core/src/auth.rs	895	-	b72456a2147b487b	-	absolute	frp-core/src/auth.rs	auth.rs:895	2221
-frp-core/src/auth.rs	898	910	76e22cd4e59458a1	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:898-910	2304
-frp-core/src/auth.rs	990	994	0db3ab4e2a5efe6e	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:990-994	1980
+frp-core/src/auth.rs	867	889	2e69d4030b1bb434	bc768948e73d9ecd	absolute	frp-core/src/auth.rs	auth.rs:867-889	1804
+frp-core/src/auth.rs	868	-	3eb85db5d9a7e227	-	absolute	frp-core/src/auth.rs	auth.rs:868	2048
+frp-core/src/auth.rs	869	-	66544d81d39e6068	-	absolute	frp-core/src/auth.rs	auth.rs:869	2108
+frp-core/src/auth.rs	870	-	b72456a2147b487b	-	absolute	frp-core/src/auth.rs	auth.rs:870	2164
+frp-core/src/auth.rs	873	885	76e22cd4e59458a1	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:873-885	2247
+frp-core/src/auth.rs	965	969	0db3ab4e2a5efe6e	d10b36aa74a59bcf	absolute	frp-core/src/auth.rs	auth.rs:965-969	1923
+frp-core/src/auth.rs	982	997	0c7fa4d0b344ca7d	72a2c026bfa33a65	absolute	frp-core/src/auth.rs	auth.rs:982-997	1895
+frp-core/src/auth.rs	986	990	c813be72aa93ab75	0bf37874b7af9907	absolute	frp-core/src/auth.rs	auth.rs:986-990	2005
+frp-core/src/auth/oidc_jwt.rs	31	44	aae1b770ca31f8aa	74bb09cf1f882b5e	absolute	frp-core/src/auth.rs	frp-core/src/auth/oidc_jwt.rs:31-44	2350
 frp-core/src/bridge.rs	505	531	003fa8d0789d97e9	3313813633c3beac	absolute	frp-server/src/control/bridge/injector.rs	frp-core/src/bridge.rs:505-531	1363
 frp-core/src/bridge.rs	505	531	003fa8d0789d97e9	3313813633c3beac	absolute	frp-server/src/control/bridge/tests.rs	frp-core/src/bridge.rs:505-531	1478
 frp-core/src/bridge.rs	67	-	0d7fed4728ed765b	-	absolute	frp-core/benches/crypto_bridge.rs	frp-core/src/bridge.rs:67	55
@@ -353,12 +353,12 @@ frp-server/src/control/login.rs	440	-	c2d161844e415cc6	-	shorthand	frp-server/te
 frp-server/src/control/login.rs	648	671	0dbaa1f46393a01d	ce39fe945bbbbd7a	absolute	frp-core/tests/v2_handshake_round14.rs	frp-server/src/control/login.rs:648-671	74
 frp-server/src/control/login.rs	680	-	347f896fe7f45939	-	absolute	frp-server/src/ssh_gateway/tests.rs	login.rs:680	162
 frp-server/src/control/login.rs	949	-	8aa5c0bc253b0a26	-	absolute	frp-server/src/service.rs	frp-server/src/control/login.rs:949	1312
-frp-server/src/control/login/auth.rs	121	126	afac263eee718a25	e9a525627fb6ff55	absolute	frp-server/src/control/login.rs	frp-server/src/control/login/auth.rs:121-126	3099
+frp-server/src/control/login/auth.rs	121	126	afac263eee718a25	e9a525627fb6ff55	absolute	frp-server/src/control/login.rs	frp-server/src/control/login/auth.rs:121-126	3103
 frp-server/src/control/login/auth.rs	332	372	0cd8898007aed5a2	f9e25484e39b9021	absolute	frp-server/src/service.rs	frp-server/src/control/login/auth.rs:332-372	1250
-frp-server/src/control/login/auth.rs	414	-	22e93c8f1f75df32	-	absolute	frp-server/src/control/login.rs	frp-server/src/control/login/auth.rs:414	3233
-frp-server/src/control/login/auth.rs	415	428	31c95f9f6f5d5651	533289851aa2b052	absolute	frp-server/src/control/login.rs	auth.rs:415-428	3234
-frp-server/src/control/login/throttle.rs	58	-	2ebe67a34c35c783	-	absolute	frp-server/src/control/login.rs	frp-server/src/control/login/throttle.rs:58	3156
-frp-server/src/control/login/throttle.rs	58	-	2ebe67a34c35c783	-	absolute	frp-server/src/control/login.rs	throttle.rs:58	3164
+frp-server/src/control/login/auth.rs	414	-	22e93c8f1f75df32	-	absolute	frp-server/src/control/login.rs	frp-server/src/control/login/auth.rs:414	3237
+frp-server/src/control/login/auth.rs	415	428	31c95f9f6f5d5651	533289851aa2b052	absolute	frp-server/src/control/login.rs	auth.rs:415-428	3238
+frp-server/src/control/login/throttle.rs	58	-	2ebe67a34c35c783	-	absolute	frp-server/src/control/login.rs	frp-server/src/control/login/throttle.rs:58	3160
+frp-server/src/control/login/throttle.rs	58	-	2ebe67a34c35c783	-	absolute	frp-server/src/control/login.rs	throttle.rs:58	3168
 frp-server/src/control/login/throttle.rs	91	-	ee5acfa7bf9f2b89	-	absolute	frp-server/src/ssh_gateway/session.rs	frp-server/src/control/login/throttle.rs:91	432
 frp-server/src/control/nathole.rs	380	-	2160c39f8cd87698	-	absolute	frp-server/src/service.rs	frp-server/src/control/nathole.rs:380	1252
 frp-server/src/control/nathole.rs	450	-	5b2f2283b730192f	-	absolute	frp-server/tests/visitor_allow_users_e2e.rs	control/nathole.rs:450	8
