@@ -50,7 +50,6 @@ crossbeam-queue.workspace = true
 quinn = { workspace = true, optional = true }
 
 socket2.workspace = true
-jsonwebtoken = { workspace = true, optional = true }
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 tower-service = { workspace = true, optional = true }
@@ -93,7 +92,7 @@ kcp = []
 # WebSocket transport: manual RFC 6455 frame handling only (the
 # tungstenite variant was removed 2026-08-09 — it had no callers).
 websocket = []
-oidc = ["dep:jsonwebtoken", "http-client"]
+oidc = ["http-client"]
 vnet = []
 # STUN binding helpers (`stun.rs`): client-only NAT traversal (XTCP/STCP),
 # ~900 lines never linked into frp-server. Default on so existing builds are

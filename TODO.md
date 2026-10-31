@@ -12633,7 +12633,7 @@ other.
   comments no longer claim Go answers `NotFoundResponse` on the GET path, and the tcpmux pin in
   `frp-server/tests/common/mod.rs` points at the record.
 
-- [ ] **`jsonwebtoken` is pinned below 11 until a `ring` backend exists.**
+- [x] **`jsonwebtoken` is pinned below 11 until a `ring` backend exists.**
   Evidence: 11.1.0 has no `ring` backend at all — 9.3.1's `ring` is a plain
   dependency, not a feature — so the alternatives are `aws-lc-rs` (banned by the
   dependency policy) or `rust_crypto`, which re-imports `hmac`/`sha2` and a second
@@ -12644,6 +12644,24 @@ other.
   (b) the `aws-lc-rs` ban is revisited with a measured size/security argument, or
   (c) OIDC verification is reimplemented directly on `ring` + the existing `rsa` crate
   and `jsonwebtoken` is dropped.
+  Done (2026-10-30): took (c), with `ring` alone (no direct `rsa`: `ring`'s
+  `RsaPublicKeyComponents` verifies from the JWK's raw `n`/`e`). New in-tree
+  module `frp-core/src/auth/oidc_jwt.rs` implements compact-JWS verification
+  for the same 12 algorithms (HS/RS/PS/ES/EdDSA), the four JWKS key shapes
+  (`RSA`/`EC`/`oct`/`OKP`), and the same claim rules (required `exp`+`sub`,
+  60 s leeway, iss/aud string-or-array, `jsonwebtoken`-shaped error names) on
+  `ring` primitives; `jsonwebtoken` is gone from every manifest and from
+  `Cargo.lock` (`cargo tree -i jsonwebtoken` finds nothing). The OIDC test
+  surface still runs unchanged through a test-only signing shim, plus new
+  module tests for HS256/RS256/PS256 (static OpenSSL vectors), ES256 and
+  EdDSA. Valid-token behaviour is unchanged: JWKS input, OIDC flows and error
+  classification are identical. Two malformed-input tightenings are documented
+  in the CHANGELOG: URL-safe-only base64 segments (jsonwebtoken already required
+  that) and a non-string `aud`/`iss` with a configured expectation is rejected
+  instead of silently skipping the check; integer-valued float dates still
+  round. New end-to-end tests drive RS256 (static vector), ES256 and EdDSA
+  through `verify_login` + `decoding_key_from_jwk`, closing the review's
+  algorithm-coverage gap.
 
 - [x] **`toml` 1.1 accepts config documents that the Go binary rejects.**
   Evidence: the 0.8 → 1.1 bump (PR #552) newly accepts `\xNN` escapes, seconds-less

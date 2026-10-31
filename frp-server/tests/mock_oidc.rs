@@ -1,6 +1,5 @@
 use axum::{extract::State, routing::get, Json, Router};
 use frp_core::base64::encode as base64_encode;
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ struct Claims {
 struct MockOidcState {
     issuer: String,
     jwks: serde_json::Value,
-    encoding_key: EncodingKey,
+    encoding_key: Vec<u8>,
     kid: String,
 }
 
@@ -59,8 +58,7 @@ impl MockOidcProvider {
             }]
         });
 
-        let encoding_key = EncodingKey::from_base64_secret(&encoded_secret)
-            .expect("valid base64 secret for HS256 encoding key");
+        let encoding_key = secret.into_bytes();
 
         let state = Arc::new(MockOidcState {
             issuer: issuer.clone(),
@@ -139,14 +137,31 @@ impl MockOidcProvider {
             jti: jti.map(|s| s.to_string()),
         };
 
-        let header = Header {
-            alg: Algorithm::HS256,
-            kid: Some(self.state.kid.clone()),
-            ..Default::default()
-        };
-
-        encode(&header, &claims, &self.state.encoding_key).expect("JWT encode")
+        sign_hs256(
+            Some(&self.state.kid),
+            &self.state.encoding_key,
+            &serde_json::to_value(&claims).expect("claims JSON"),
+        )
     }
+}
+
+/// Sign an HS256 JWT for the mock provider (the test-side counterpart of a
+/// real IdP; the verifier under test does the checking).
+fn sign_hs256(kid: Option<&str>, secret: &[u8], claims: &serde_json::Value) -> String {
+    fn b64url(data: &[u8]) -> String {
+        base64_encode(data)
+            .replace('+', "-")
+            .replace('/', "_")
+            .trim_end_matches('=')
+            .to_string()
+    }
+    let header = serde_json::json!({"alg": "HS256", "kid": kid});
+    let header = b64url(&serde_json::to_vec(&header).expect("header JSON"));
+    let payload = b64url(&serde_json::to_vec(claims).expect("claims JSON"));
+    let signing_input = format!("{header}.{payload}");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let signature = ring::hmac::sign(&key, signing_input.as_bytes());
+    format!("{signing_input}.{}", b64url(signature.as_ref()))
 }
 
 impl Drop for MockOidcProvider {

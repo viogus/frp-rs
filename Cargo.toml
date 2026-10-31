@@ -71,7 +71,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 rustls-platform-verifier = "0.7"
 ring = "0.17"
-jsonwebtoken = "9"
 # Dev-only (frp-server dashboard integration tests). reqwest 0.13's TLS
 # features either force aws-lc-rs (`rustls`, the banned backend) or panic at
 # `Client::build()` without an installed crypto provider
