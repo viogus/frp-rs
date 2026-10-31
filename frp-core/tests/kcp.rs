@@ -216,22 +216,32 @@ async fn test_kcp_512kib_volume_byte_exact() {
     dial_handle.await.expect("dial task");
 }
 
-/// Bind a KCP listener on the address family `localhost` resolves to *first*.
+/// Bind a KCP listener on the address family a `localhost` dial will use.
 ///
-/// Both `dial_kcp` and `dial_server` use the first address the resolver returns
-/// and never retry the other family (Go's `net.ResolveUDPAddr`, which kcp-go's
-/// `Dial` uses, is likewise a single-address call). A test that hardcoded
-/// `127.0.0.1` for the listener would therefore pass or fail on the host's
-/// resolver order — macOS returns `::1` before `127.0.0.1` for `localhost`.
-/// Binding the family the dialer will actually pick keeps the assertion about
-/// frp-rs's hostname handling rather than about the host's address stack.
-async fn bind_where_localhost_resolves_first(config: KcpConfig) -> KcpListener {
-    let first = tokio::net::lookup_host("localhost:0")
+/// `dial_kcp` and `dial_server`'s KCP arm pick the address Go's
+/// `net.ResolveUDPAddr` — what kcp-go's `Dial` uses — returns, by
+/// `addrList.forResolve` (`net/ipsock.go:79-107`): IPv4 is preferred, and the
+/// list's first entry is used only when the name has no IPv4 address. That is
+/// not the resolver's first entry on this platform (macOS answers `::1` before
+/// `127.0.0.1`), so a listener hardcoded to `127.0.0.1` would still be right
+/// here but wrong on an IPv6-only `localhost`; binding the family the dialer
+/// actually picks keeps the assertion about frp-rs's hostname handling rather
+/// than about the host's address stack.
+async fn bind_where_go_resolves_localhost(config: KcpConfig) -> KcpListener {
+    let peers: Vec<std::net::SocketAddr> = tokio::net::lookup_host("localhost:0")
         .await
         .expect("resolve localhost")
-        .next()
-        .expect("localhost must resolve to at least one address");
-    let bind = if first.is_ipv4() {
+        .collect();
+    assert!(
+        !peers.is_empty(),
+        "localhost must resolve to at least one address"
+    );
+    let go_peer = peers
+        .iter()
+        .find(|peer| peer.is_ipv4())
+        .copied()
+        .unwrap_or(peers[0]);
+    let bind = if go_peer.is_ipv4() {
         "127.0.0.1:0"
     } else {
         "[::1]:0"
@@ -249,7 +259,7 @@ async fn bind_where_localhost_resolves_first(config: KcpConfig) -> KcpListener {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_kcp_dial_hostname_round_trip() {
     let config = no_fec_config();
-    let mut listener = bind_where_localhost_resolves_first(config.clone()).await;
+    let mut listener = bind_where_go_resolves_localhost(config.clone()).await;
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
 
     // Allow driver event loops to start.
@@ -296,7 +306,7 @@ async fn test_kcp_dial_server_accepts_a_hostname() {
     // default_kcp_client_config (FEC 10,3); the listener must match or the
     // FEC-wrapped packets are unparseable.
     let config = default_kcp_client_config();
-    let mut listener = bind_where_localhost_resolves_first(config).await;
+    let mut listener = bind_where_go_resolves_localhost(config).await;
     let port = listener.local_addr().unwrap().port();
 
     // Allow driver event loops to start.

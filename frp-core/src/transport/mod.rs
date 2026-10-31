@@ -26,6 +26,7 @@ mod kcp;
 mod pre_read;
 #[cfg(feature = "quic")]
 mod quic;
+pub(crate) mod resolve;
 mod ssh_channel;
 mod tcp;
 #[cfg(feature = "tls")]
@@ -899,9 +900,10 @@ async fn connect_direct(
     addr: &str,
     peer: std::net::SocketAddr,
     opts: &DialOptions,
+    timeout_budget: Duration,
 ) -> Result<tokio::net::TcpStream, crate::Error> {
     use tokio::net::TcpSocket;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::timeout;
 
     // Create socket for optional local bind
     let socket = if peer.is_ipv4() {
@@ -921,13 +923,10 @@ async fn connect_direct(
             .map_err(|e| crate::Error::Transport(format!("bind to {bind_ip}: {e}").into()))?;
     }
 
-    let stream = timeout(
-        Duration::from_secs(opts.dial_timeout_secs),
-        socket.connect(peer),
-    )
-    .await
-    .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}").into()))?
-    .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}").into()))?;
+    let stream = timeout(timeout_budget, socket.connect(peer))
+        .await
+        .map_err(|_| crate::Error::Transport(format!("dial timeout to {addr}").into()))?
+        .map_err(|e| crate::Error::Transport(format!("dial to {addr}: {e}").into()))?;
 
     // Configure TCP keepalive after connection: idle time + probe
     // interval/retries via `set_keepalive` (same behavior as server-side
@@ -946,6 +945,37 @@ async fn connect_direct(
     );
 
     Ok(stream)
+}
+
+/// Connect to the first of `peers` that accepts, in Go's `net.Dial` order.
+///
+/// `net.Dial` tries every resolved address (`net/dial.go:552-560`, `:659-745`)
+/// and reports "the error from the first address" as most relevant
+/// (`net/dial.go:740-741`); the attempts share one deadline
+/// (`partialDeadline`, `net/dial.go:745-754`) rather than one timeout each, so
+/// a blackholed first address cannot multiply the configured
+/// `dial_timeout_secs` by the number of addresses.
+async fn connect_direct_any(
+    addr: &str,
+    peers: &[SocketAddr],
+    opts: &DialOptions,
+) -> Result<(tokio::net::TcpStream, SocketAddr), crate::Error> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(opts.dial_timeout_secs);
+    let mut first_error: Option<crate::Error> = None;
+    for peer in resolve::dial_order(peers) {
+        let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if budget.is_zero() {
+            break;
+        }
+        match connect_direct(addr, peer, opts, budget).await {
+            Ok(stream) => return Ok((stream, peer)),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error
+        .unwrap_or_else(|| crate::Error::Transport(format!("dial timeout to {addr}").into())))
 }
 
 /// Enable TCP_NODELAY (disable Nagle) on a stream, matching Go frp's default
@@ -1503,42 +1533,37 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         opts.server_addr.clone()
     };
     let addr = format!("{target_ip}:{}", opts.server_port);
-    let peer: std::net::SocketAddr = match addr.parse() {
-        Ok(peer) => peer,
-        Err(_) => {
-            // target_ip is a hostname, not an IP — resolve via system DNS.
-            // Mirrors what TcpStream::connect(addr) did before b4a9359.
-            tokio::net::lookup_host(&addr)
-                .await
-                .map_err(|e| {
-                    crate::Error::Transport(format!("invalid server address '{addr}': {e}").into())
-                })?
-                .next()
-                .ok_or_else(|| {
-                    crate::Error::Transport(
-                        format!("DNS resolve '{addr}': no records found").into(),
-                    )
-                })?
+    // Resolve once and keep every address. Go's `net.Dial` tries all of them
+    // (`net/dial.go:552-560`, `:659-745`), and a name such as `localhost` on
+    // macOS answers `[::1]` first — so taking only `.next()` left an IPv4-only
+    // listener unreachable on every transport.
+    let peers = resolve::resolve_peers(&addr).await.map_err(|e| {
+        if e.kind() == io::ErrorKind::NotFound {
+            crate::Error::Transport(format!("DNS resolve '{addr}': no records found").into())
+        } else {
+            crate::Error::Transport(format!("invalid server address '{addr}': {e}").into())
         }
-    };
+    })?;
+    // Go's `Resolve{UDP,TCP}Addr` returns one address, by `addrList.forResolve`
+    // (`net/ipsock.go:79-107`): IPv4 is preferred unless the dialled string is a
+    // bracketed IPv6 literal. Go tests the *string* for `[`, not the resolved
+    // family, so the check is made on `addr` here too.
+    let bracketed_literal = addr.contains('[');
+    #[cfg_attr(not(any(feature = "kcp", feature = "quic")), allow(unused_variables))]
+    let udp_peer = resolve::pick_for_resolve(&peers, bracketed_literal);
+    let peer = peers[0];
 
     match opts.protocol {
         #[cfg(feature = "kcp")]
         TransportProtocol::Kcp => {
-            // Dial the address resolved above, not `format!("{target_ip}:{port}")`:
-            // with `serverAddr = "kr.cdf.mba"` and no `dns_server`, `target_ip` is
-            // still a hostname, which `dial_kcp` used to reject outright with
-            // `invalid socket address syntax` — a domain never dialled on KCP at
-            // all, while every other transport resolved it. `dial_kcp` resolves
-            // hostnames itself (Go kcp-go parity), but the address is already in
-            // hand here, so KCP resolves exactly once and picks the same address
-            // the TCP/TLS/WS arms below do. (Given the fallback, this arm is not
-            // behaviourally distinguishable from re-resolving in `dial_kcp`: it
-            // is kept so the address dialled is exactly the address `peer`
-            // carries — the one the KCP+TLS stream reports as its `peer_addr` —
-            // and so a second resolver round trip, which a rotating resolver
-            // could answer differently, never happens.)
-            let addr = peer.to_string();
+            // A datagram transport cannot observe a dead address — a packet to
+            // an unreachable peer is dropped, not refused — so there is nothing
+            // to fall back on here. Dial the one address Go's
+            // `net.ResolveUDPAddr` (what kcp-go's `Dial` uses) would return
+            // (`net/ipsock.go:79-107`), resolved exactly once above so the
+            // address dialled is the one the KCP+TLS stream reports as its
+            // `peer_addr`.
+            let addr = udp_peer.to_string();
             let stream = crate::kcp::dial_kcp(&addr, crate::kcp::default_kcp_client_config())
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
@@ -1616,7 +1641,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         .map_err(|e| {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
-                    let peer_addr = peer;
+                    let peer_addr = udp_peer;
                     let tls = connect_tls_with_timeout(
                         &connector,
                         server_name,
@@ -1636,7 +1661,9 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         }
         #[cfg(feature = "quic")]
         TransportProtocol::Quic => {
-            let addr = format!("{target_ip}:{}", opts.server_port);
+            // UDP again: no dead address to observe, so dial the address Go's
+            // `net.ResolveUDPAddr` would return (`net/ipsock.go:79-107`).
+            let addr = udp_peer.to_string();
             let server_name = if !opts.tls_server_name.is_empty() {
                 &opts.tls_server_name
             } else {
@@ -1652,13 +1679,22 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
         _ => {}
     }
 
-    // TCP, WebSocket, WSS: connect via upstream proxy if configured, otherwise direct TCP.
-    #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
-    let mut stream: IoStream = if let Some(ref proxy_url) = opts.proxy_url {
-        if proxy_url.is_empty() {
-            // Empty string = direct connection
-            IoStream::Tcp(connect_direct(&addr, peer, opts).await?)
-        } else {
+    // TCP, WebSocket, WSS: connect via upstream proxy if configured, otherwise
+    // direct TCP. A direct connection tries every resolved address in Go's
+    // `net.Dial` order, so a name whose first address has no listener still
+    // connects on a later one; a proxied one keeps the first resolved address,
+    // because the proxy — not this process — makes the connection.
+    //
+    // `connected_peer` is read only by the TLS wrappers (the TCP arm and the
+    // WSS arm), so a build without `tls` carries it unused.
+    #[cfg_attr(not(feature = "tls"), allow(unused_mut, unused_variables))]
+    let (mut stream, connected_peer): (IoStream, SocketAddr) = match opts.proxy_url.as_deref() {
+        Some("") | None => {
+            // Empty string (or no proxy) = direct connection
+            let (stream, used_peer) = connect_direct_any(&addr, &peers, opts).await?;
+            (IoStream::Tcp(stream), used_peer)
+        }
+        Some(proxy_url) => {
             // socks5h: the proxy resolves the hostname (remote DNS) — pass the
             // original server_addr instead of the locally resolved IP.
             let proxy_target = if proxy_url.starts_with("socks5h://") {
@@ -1666,17 +1702,18 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             } else {
                 &target_ip
             };
-            connect_via_proxy(
-                proxy_url,
-                proxy_target,
-                opts.server_port,
-                opts.dial_timeout_secs,
-                opts.keepalive_secs,
+            (
+                connect_via_proxy(
+                    proxy_url,
+                    proxy_target,
+                    opts.server_port,
+                    opts.dial_timeout_secs,
+                    opts.keepalive_secs,
+                )
+                .await?,
+                peer,
             )
-            .await?
         }
-    } else {
-        IoStream::Tcp(connect_direct(&addr, peer, opts).await?)
     };
 
     // Tls detect / yamux wrapping / V2-V1 detection are all handled by the
@@ -1739,7 +1776,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         .map_err(|e| {
                             crate::Error::Transport(format!("invalid server name: {e}").into())
                         })?;
-                    let peer_addr = peer;
+                    let peer_addr = connected_peer;
                     let tls = connect_tls_with_timeout(
                         &connector,
                         server_name,
