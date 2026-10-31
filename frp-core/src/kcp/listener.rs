@@ -110,7 +110,23 @@ pub async fn dial_kcp_with_driver(
     addr: &str,
     config: KcpConfig,
 ) -> io::Result<(KcpStream, tokio::task::JoinHandle<()>)> {
-    let remote: SocketAddr = addr.parse().map_err(io::Error::other)?;
+    // Go parity: kcp-go's `Dial(raddr string)` resolves its argument with
+    // `net.ResolveUDPAddr`, so a hostname is a valid dial target here too —
+    // rejecting it with a bare parse error was an frp-rs-only restriction that
+    // surfaced as `KCP dial: invalid socket address syntax` one layer up. As in
+    // `dial_server`, the *first* resolved address is used; the other family is
+    // not tried, and no fallback is possible at this layer anyway: a datagram
+    // to a dead or unreachable address fails silently (see the socket-family
+    // note below), so a failure appears later as a retransmission timeout
+    // rather than as an error here.
+    let remote: SocketAddr = match addr.parse() {
+        Ok(remote) => remote,
+        Err(_) => tokio::net::lookup_host(addr)
+            .await
+            .map_err(|e| io::Error::other(format!("resolve '{addr}': {e}")))?
+            .next()
+            .ok_or_else(|| io::Error::other(format!("resolve '{addr}': no records found")))?,
+    };
     let conv: u32 = loop {
         let c = rand::random();
         if c != 0 {
@@ -118,7 +134,24 @@ pub async fn dial_kcp_with_driver(
         } // conv=0 is FEC parity sentinel
     };
 
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    // Bind the wildcard socket of the *remote's* family. `0.0.0.0:0` used to be
+    // unconditional, which made an IPv6 remote undialable — reached by an IPv6
+    // literal and by any host name whose first resolved address is IPv6
+    // (`localhost` on macOS). This socket is never `connect`ed: packets leave
+    // through `UdpSocket::try_send_to`, called from `KcpSocket::send_udp_packet`
+    // and `KcpSocket::drain_pending_udp` (`frp-core/src/kcp/socket.rs`), and a
+    // cross-family `sendto` is silently dropped (macOS even reports success for
+    // the send; elsewhere the send errors and is only `tracing::debug!`-logged),
+    // so the caller sees no error at all and the session dies later as a
+    // retransmission timeout. Go matches the family too: kcp-go dials with
+    // `net.DialUDP("udp", nil, raddr)`, whose nil local address is resolved to
+    // the family of `raddr`.
+    let bind_addr = if remote.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(bind_addr).await?;
 
     // Set socket buffer sizes (1 MiB each), matching the listener — an
     // outbound dial otherwise keeps the OS defaults (~212KB on Linux),
