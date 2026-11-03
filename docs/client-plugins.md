@@ -1,8 +1,9 @@
 # Client Plugin Reference
 
-frpc supports 10 client-side plugin types. Most plugins run as local servers
-on the frpc host, handling application-level protocols before forwarding
-traffic through the frp tunnel. When a proxy config includes a
+frpc supports the 10 Go-parity client-side plugin types plus the frp-rs
+`http2connect` extension. Most plugins run as local servers on the frpc host,
+handling application-level protocols before forwarding traffic through the frp
+tunnel. When a proxy config includes a
 `[proxies.plugin]` section, frpc starts the plugin server instead of
 connecting to an existing local TCP port. The `virtual_net` plugin is the
 exception: it has no local listener and instead hands work connections to the
@@ -48,7 +49,8 @@ http_password = "optional-password"
 
 None. An HTTP forward proxy's CONNECT method is TCP-only (RFC 9110 §9.3.6), so
 there is no UDP ASSOCIATE equivalent here. UDP relaying is available in the
-`socks5` plugin (UDP ASSOCIATE); HTTP/1.1 CONNECT-UDP is not a thing.
+`socks5` plugin (UDP ASSOCIATE) and the `http2connect` plugin (HTTP/2
+CONNECT-UDP); HTTP/1.1 CONNECT-UDP is not a thing.
 
 ### Authentication
 
@@ -560,6 +562,80 @@ plugin terminates TLS on frpc and passes plaintext to the local service.
 
 ------------------------------------------------------------------------------
 
+## 10. HTTP/2 CONNECT (`plugin.type = "http2connect"`, frp-rs extension)
+
+An HTTP/2 forward proxy that supports RFC 9113 `CONNECT` (TCP) and RFC 9298
+extended CONNECT with `:protocol = connect-udp` (UDP over RFC 9297 capsules).
+The listener is h2c (prior knowledge) by default; set `crt_file` and `key_file`
+to terminate TLS with ALPN `h2` instead. Requires the `http2http` Cargo feature
+(default on). This plugin type is not in Go frp.
+
+### Configuration
+
+```toml
+[[proxies]]
+name = "h2_proxy"
+type = "tcp"
+remote_port = 7100
+
+[proxies.plugin]
+type = "http2connect"
+http_user = "optional-user"          # optional Proxy-Authorization
+http_password = "optional-password"
+# crt_file = "/etc/frp/h2.crt"       # optional: TLS + ALPN h2
+# key_file = "/etc/frp/h2.key"
+```
+
+### TCP CONNECT
+
+The client sends `CONNECT` with `:authority = host:port` (the port is required).
+The plugin connects to that TCP target and bridges the h2 stream. Non-CONNECT
+methods are rejected with `405`; a failed target connect is `502`/`504`.
+
+### CONNECT-UDP
+
+The client sends an extended `CONNECT` with `:protocol = connect-udp` and a
+path whose last two segments are `{target_host}/{target_port}` (the RFC 9298
+URI-template form). Any prefix — including `/.well-known/masque/udp/` — is
+ignored; the last two segments are the target. RFC 9297 makes the request
+header `Capsule-Protocol: ?1` a SHOULD; this plugin accepts a request without it
+because `:protocol = connect-udp` makes the capsule dialect unambiguous, and
+the successful response always carries `capsule-protocol: ?1`. Each subsequent
+h2 DATA byte stream is a sequence of RFC 9297 capsules. A `DATAGRAM` capsule
+(type `0x00`) value is `Context ID (varint) + UDP payload`; context `0` carries
+the UDP datagram, and datagrams with an unregistered context ID are dropped.
+Unknown capsule types are skipped. A malformed or oversized DATAGRAM capsule
+(64 KiB cap) closes the stream. After a client half-close the target→client tail
+is closed after 30 s of target silence or 1 h total; a single target write is
+bounded at 30 s so a non-reading target cannot pin the fd indefinitely.
+
+### Authentication
+
+When `http_user`/`http_password` are set, every request must carry a matching
+`Proxy-Authorization: Basic ...` header; otherwise the response is `407` with
+`Proxy-Authenticate: Basic realm="frp"`.
+
+### Security
+
+Like the `http_proxy` plugin this is an open forward proxy once an operator can
+reach it: TCP CONNECT can reach any target, and CONNECT-UDP can send to any
+target the frpc host can route to — including `127.0.0.1` (local backends and,
+with the `admin` feature, frpc's admin API). Put credentials on it and/or
+restrict who can reach the frp remote port. The advertised listener is the frp
+TCP proxy's `remote_port`; TLS only protects the client-to-frpc hop, not the
+target side.
+
+### Fields
+
+| Field           | Type   | Required | Description |
+|-----------------|--------|----------|-------------|
+| `http_user`     | string | no       | Proxy Basic auth username |
+| `http_password` | string | no       | Proxy Basic auth password |
+| `crt_file`      | string | no       | TLS certificate PEM; must be paired with `key_file` |
+| `key_file`      | string | no       | TLS private key PEM; must be paired with `crt_file` |
+
+------------------------------------------------------------------------------
+
 ## Common Plugin Fields Reference
 
 All fields available in the `[proxies.plugin]` section:
@@ -567,16 +643,16 @@ All fields available in the `[proxies.plugin]` section:
 | Field                 | Used by                                    | Description                                    |
 |-----------------------|--------------------------------------------|------------------------------------------------|
 | `type`                | **all**                                    | Plugin type identifier                         |
-| `http_user`           | http_proxy, static_file                    | HTTP Basic auth username                       |
-| `http_password`       | http_proxy, static_file                    | HTTP Basic auth password                       |
+| `http_user`           | http_proxy, http2connect, static_file      | HTTP Basic auth username                       |
+| `http_password`       | http_proxy, http2connect, static_file      | HTTP Basic auth password                       |
 | `username`            | socks5                                     | SOCKS5 username                                |
 | `password`            | socks5                                     | SOCKS5 password                                |
 | `local_addr`          | unix_domain_socket, http2http, http2https, https2http, https2https, tls2raw | Backend address (host:port or socket path) |
 | `local_path`          | static_file                                | Filesystem directory to serve                  |
 | `strip_prefix`        | static_file                                | URL prefix to strip before filesystem lookup   |
 | `host_header_rewrite` | http2http, http2https, https2http, https2https | Override Host header sent to backend        |
-| `crt_file`            | https2http, https2https, tls2raw           | TLS certificate PEM for plugin listener        |
-| `key_file`            | https2http, https2https, tls2raw           | TLS private key PEM for plugin listener        |
+| `crt_file`            | https2http, https2https, tls2raw, http2connect | TLS certificate PEM for plugin listener     |
+| `key_file`            | https2http, https2https, tls2raw, http2connect | TLS private key PEM for plugin listener     |
 
 ------------------------------------------------------------------------------
 
@@ -593,6 +669,7 @@ All fields available in the `[proxies.plugin]` section:
 | https2http       | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
 | https2https      | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
 | tls2raw          | **yes**              | no            | `local_addr`, `crt_file`, `key_file` |
+| http2connect     | no (gated by `http2http`; TLS optional) | no | — (optional `crt_file`/`key_file`) |
 | virtual_net      | no                   | no            | `[virtualNet] address`        |
 
 Plugins compiled without the required feature will return a descriptive error

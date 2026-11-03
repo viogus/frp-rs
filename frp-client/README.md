@@ -59,15 +59,18 @@ demand (when the server sends `ReqWorkConn`) or pre-allocated via `pool_count`.
 | Plugin | Description |
 |--------|-------------|
 | `http_proxy` | HTTP/HTTPS forward proxy |
-| `socks5` | SOCKS5 proxy |
+| `socks5` | SOCKS5 proxy (CONNECT; UDP ASSOCIATE is an frp-rs extension) |
 | `static_file` | Static file serving |
 | `unix_domain_socket` | Unix socket proxy |
 | `tls2raw` | TLS termination → raw TCP forward |
+| `http2connect` | HTTP/2 CONNECT (TCP) + CONNECT-UDP (frp-rs extension) |
 | `http2http` | HTTP → HTTP tunnel |
 | `http2https` | HTTP → HTTPS tunnel |
 | `https2http` | HTTPS → HTTP tunnel |
 | `https2https` | HTTPS → HTTPS tunnel |
 | `visitor_plugin` | STCP/XTCP visitor (NAT traversal) |
+
+`socks5` UDP ASSOCIATE and `http2connect` are **frp-rs extensions**; Go frp v0.71.1 has neither.
 
 ## Usage
 

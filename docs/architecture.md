@@ -164,6 +164,7 @@ frp-rs/
         mod.rs            Plugin dispatch
         http.rs, socks5.rs, socks5_udp.rs, static_file.rs, unix_socket.rs
         http2http.rs, http2https.rs, https2http.rs, https2https.rs, tls2raw.rs
+        http2connect.rs  (HTTP/2 CONNECT + CONNECT-UDP, frp-rs extension)
         context.rs, visitor.rs
   frpc/                   Client binary
     Cargo.toml

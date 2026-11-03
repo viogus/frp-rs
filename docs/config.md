@@ -532,7 +532,7 @@ Per-proxy client plugin configuration. The plugin runs on the client side and ha
 
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
-| `type` | `string` | — | `type` | Plugin type: `"http_proxy"`, `"socks5"`, `"static_file"`, `"unix_domain_socket"`, `"http2https"`, `"https2http"`, `"https2https"`, `"http2http"`, `"tls2raw"`, `"virtual_net"`. |
+| `type` | `string` | — | `type` | Plugin type: `"http_proxy"`, `"socks5"`, `"static_file"`, `"unix_domain_socket"`, `"http2https"`, `"https2http"`, `"https2https"`, `"http2http"`, `"tls2raw"`, `"virtual_net"`, `"http2connect"`. |
 | `http_user` | `string` | `""` | `httpUser` | HTTP basic auth username for the plugin. |
 | `http_password` | `string` | `""` | `httpPassword` | HTTP basic auth password for the plugin. |
 | `local_addr` | `string` | `""` | `localAddr` | Local address for the plugin listener (e.g. `"127.0.0.1:3128"`). |
