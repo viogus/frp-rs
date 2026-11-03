@@ -313,20 +313,22 @@ pub(crate) async fn dispatch_plugin_start(
     // this repo tries to make loud.
     if plugin_cfg.plugin_type != "socks5"
         && (plugin_cfg.udp_enable
+            || plugin_cfg.udp_auto_companion.is_some()
             || !plugin_cfg.udp_bind_addr.trim().is_empty()
             || !plugin_cfg.udp_advertise_addr.trim().is_empty())
     {
         warn!(
             plugin_type = %plugin_cfg.plugin_type,
-            "plugin UDP fields (udp_enable/udp_bind_addr/udp_advertise_addr) are only used by the socks5 plugin; ignored"
+            "plugin UDP fields (udp_enable/udp_auto_companion/udp_bind_addr/udp_advertise_addr) are only used by the socks5 plugin; ignored"
         );
     } else if plugin_cfg.plugin_type == "socks5"
         && !plugin_cfg.udp_enable
-        && (!plugin_cfg.udp_bind_addr.trim().is_empty()
+        && (plugin_cfg.udp_auto_companion.is_some()
+            || !plugin_cfg.udp_bind_addr.trim().is_empty()
             || !plugin_cfg.udp_advertise_addr.trim().is_empty())
     {
         warn!(
-            "socks5 plugin: udp_bind_addr/udp_advertise_addr are set but udp_enable = false; UDP ASSOCIATE stays disabled"
+            "socks5 plugin: udp_auto_companion/udp_bind_addr/udp_advertise_addr are set but udp_enable = false; UDP ASSOCIATE stays disabled"
         );
     }
     match plugin_cfg.plugin_type.as_str() {

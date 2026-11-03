@@ -339,6 +339,10 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
         fields.push(("plugin.request_headers", sorted_map(&pl.request_headers)));
         fields.push(("plugin.enable_http2", format!("{:?}", pl.enable_http2)));
         fields.push(("plugin.udp_enable", pl.udp_enable.to_string()));
+        fields.push((
+            "plugin.udp_auto_companion",
+            format!("{:?}", pl.udp_auto_companion),
+        ));
         fields.push(("plugin.udp_bind_addr", pl.udp_bind_addr.clone()));
         fields.push(("plugin.udp_advertise_addr", pl.udp_advertise_addr.clone()));
     } else {
@@ -635,6 +639,9 @@ mod tests {
         };
         assert!(differs(plugin(base()), |c| {
             c.plugin.as_mut().unwrap().udp_enable = true;
+        }));
+        assert!(differs(plugin(base()), |c| {
+            c.plugin.as_mut().unwrap().udp_auto_companion = Some(false);
         }));
         assert!(differs(plugin(base()), |c| {
             c.plugin.as_mut().unwrap().udp_bind_addr = "127.0.0.1:17000".into();

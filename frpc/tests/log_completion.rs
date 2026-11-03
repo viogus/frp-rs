@@ -308,6 +308,10 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
     {
         let spawned = Spawned::start(&config(dead, "info"), &["--log-level", ""]);
         spawned.wait_for(STARTUP_MARKER);
+        // The startup marker and the first login WARN are emitted by different
+        // tasks, so the marker can appear first. Wait for the WARN too rather
+        // than racing a one-shot stdout snapshot.
+        spawned.wait_for(LOGIN_WARN);
         assert!(
             spawned.stdout().contains(LOGIN_WARN),
             "level = \"info\": the WARN record must still be admitted"

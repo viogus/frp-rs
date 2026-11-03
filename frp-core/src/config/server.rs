@@ -1485,13 +1485,25 @@ pub struct PluginConfig {
     /// frp-rs extension (Go frp's `socks5` plugin is CONNECT-only). Off by
     /// default because the relay is only reachable by clients that can route
     /// to `udp_bind_addr` / `udp_advertise_addr`; see docs/client-plugins.md
-    /// for the tunnel-path setup (a companion `type = "udp"` proxy).
+    /// for the tunnel-path setup (an automatically registered UDP proxy).
     #[serde(default, alias = "udpEnable")]
     pub udp_enable: bool,
+    /// Automatically register a loopback `type = "udp"` proxy for the socks5
+    /// UDP relay, reusing the SOCKS5 proxy's `remote_port`. Unless
+    /// `udp_bind_addr` says otherwise, the relay binds an ephemeral loopback
+    /// port and the companion targets that port. This is what makes UDP work
+    /// through frps without a hand-written companion proxy. Default: `true`
+    /// (`None` = enabled);
+    /// set `false` for a direct deployment or a manually managed companion.
+    /// Requires an explicit non-zero `remote_port`. frp-rs extension.
+    #[serde(default, alias = "udpAutoCompanion")]
+    pub udp_auto_companion: Option<bool>,
     /// UDP relay bind address for `socks5` UDP ASSOCIATE. Empty means
-    /// `127.0.0.1:0` (an OS-assigned loopback port). Bind `0.0.0.0:<port>` when
-    /// the relay must be reachable through a companion UDP proxy (the frpc
-    /// bridge dials this socket) or directly from remote clients.
+    /// `127.0.0.1:0` (an OS-assigned loopback port) when automatic companion
+    /// registration is disabled; with the default auto companion, frpc fills
+    /// this with an ephemeral `127.0.0.1:<port>` and registers a companion on
+    /// the same `remote_port`. Bind `0.0.0.0:<port>` when the
+    /// relay must be reachable directly from remote clients.
     /// frp-rs extension.
     #[serde(default, alias = "udpBindAddr")]
     pub udp_bind_addr: String,
@@ -1502,6 +1514,14 @@ pub struct PluginConfig {
     /// relay's bound port. frp-rs extension.
     #[serde(default, alias = "udpAdvertiseAddr")]
     pub udp_advertise_addr: String,
+}
+
+impl PluginConfig {
+    /// `true` unless `udp_auto_companion = false`; an absent value means the
+    /// automatic companion is enabled (the default for the socks5 plugin).
+    pub fn udp_auto_companion_enabled(&self) -> bool {
+        self.udp_auto_companion.unwrap_or(true)
+    }
 }
 
 /// Feature gate configuration ([feature] section in frps.toml / frpc.toml).

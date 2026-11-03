@@ -963,6 +963,65 @@ async fn register_proxies_aborts_on_control_write_failure() {
 /// (tokio-1.53.1/src/runtime/task/core.rs:427). The binary-level half of
 /// this pin is `frp-server/tests/visitor_multi_sigterm.rs`.
 #[tokio::test]
+async fn socks5_udp_auto_companion_survives_start_allowlist() {
+    let proxy = frp_core::config::ProxyConfig {
+        name: "socks5".to_string(),
+        proxy_type: "tcp".to_string(),
+        local_ip: "127.0.0.1".to_string(),
+        local_port: 1080,
+        remote_port: 7000,
+        plugin: Some(frp_core::config::PluginConfig {
+            plugin_type: "socks5".to_string(),
+            udp_enable: true,
+            ..Default::default()
+        }),
+        enabled: true,
+        ..Default::default()
+    };
+    let cfg = ClientConfig {
+        server_addr: "127.0.0.1".to_string(),
+        server_port: 7000,
+        token: "test-token".to_string(),
+        start: vec!["socks5".to_string()],
+        proxies: vec![proxy],
+        ..Default::default()
+    };
+    let service = Service::with_unsafe_features(cfg, None, UnsafeFeatures::default())
+        .await
+        .expect("service init must succeed");
+
+    let proxies = service.proxies.read().await.clone();
+    let companion = proxies
+        .iter()
+        .find(|p| p.proxy_type == "udp")
+        .expect("auto companion must be registered");
+    assert_eq!(companion.remote_port, 7000);
+    assert_eq!(companion.local_ip, "127.0.0.1");
+    let parent = proxies
+        .iter()
+        .find(|p| p.name == "socks5")
+        .and_then(|p| p.plugin.as_ref())
+        .expect("socks5 parent");
+    assert_eq!(
+        parent.udp_bind_addr,
+        format!("127.0.0.1:{}", companion.local_port)
+    );
+    assert_eq!(
+        companion
+            .annotations
+            .get("frp-rs.auto-companion-parent")
+            .map(String::as_str),
+        Some("socks5")
+    );
+
+    // The `start` allowlist only names the parent; without the companion name
+    // being added, this filter would silently drop the UDP proxy.
+    let cfg = service.cfg.read().await.clone();
+    let active = filter_active_proxies(&cfg, &proxies);
+    assert!(active.iter().any(|p| p.name == "socks5__udp"));
+}
+
+#[tokio::test]
 async fn shutdown_visitor_tasks_tolerates_a_completed_handle() {
     let cfg = ClientConfig {
         server_addr: "127.0.0.1".to_string(),

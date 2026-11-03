@@ -116,19 +116,10 @@ UDP datagrams cannot travel over the frp **TCP** tunnel that carries the SOCKS5
 handshake, so the relay address must be reachable by the client. There are two
 deployments:
 
-**Direct** — frpc is reachable from the client (public host or same LAN):
-
-```toml
-[proxies.plugin]
-type = "socks5"
-udp_enable = true
-udp_bind_addr = "0.0.0.0:17000"
-udp_advertise_addr = "203.0.113.10:17000"   # the frpc host as the client sees it
-```
-
-**Through frps (companion UDP proxy)** — frpc is behind NAT. Point a normal
-frp `type = "udp"` proxy at the loopback relay socket; the client receives the
-frps public address and the **same port** as the SOCKS5 TCP proxy:
+**Through frps (default, automatic companion)** — frpc is behind NAT. Write
+only the SOCKS5 proxy; frpc automatically registers a companion
+`type = "udp"` proxy named `<name>__udp` on the **same remote port** and points
+it at the relay's loopback socket:
 
 ```toml
 [[proxies]]
@@ -139,30 +130,62 @@ remote_port = 7000
 [proxies.plugin]
 type = "socks5"
 udp_enable = true
-udp_bind_addr = "127.0.0.1:17000"
-udp_advertise_addr = "203.0.113.10:7000"    # frps public IP:same port as TCP
-
-[[proxies]]
-name = "socks5_proxy_udp"
-type = "udp"
-remote_port = 7000
-local_ip = "127.0.0.1"
-local_port = 17000
 ```
 
-frps tracks TCP and UDP remote ports separately (Go frp parity), so the
-companion can reuse the SOCKS5 proxy's `remote_port`; the client then uses one
-port for both. The port must be explicit: `remote_port = 0` auto-assigns TCP
-and UDP independently, so the two will not match.
+With no explicit addresses, frpc picks an ephemeral loopback port (for
+example `127.0.0.1:34567`), fills `udp_bind_addr` with it and
+`udp_advertise_addr = "<serverAddr>:7000"`, then registers
+`socks5_proxy__udp` (`type = "udp"`, `remote_port = 7000`,
+`local_ip = "127.0.0.1"`, `local_port = 34567`). The client receives the frps
+public address and one port for both TCP and UDP. frps tracks TCP and UDP
+remote ports separately (Go frp parity), so this is valid.
 
-The companion proxy is a regular UDP proxy: it forwards each client datagram to
-the plugin's relay socket, and the relay's replies go back through it. The
-companion setup **requires a fixed `udp_bind_addr` and an explicit
-`udp_advertise_addr`** (frps' public address:UDP remote port); an empty
-`udp_bind_addr` binds an OS-assigned port that the companion's fixed
-`local_port` cannot reach, and the connection answers `REP_SUCCEEDED` while
-every datagram is black-holed. The loopback bind keeps a *second* raw relay off
-the network, but it does not make the companion's public frps UDP port private.
+The companion is a normal UDP proxy on the wire, so it works against a Go frps
+as well. It is **not** added to a `group`: UDP has a single owner per port, so
+a grouped/HA SOCKS5 fleet can only have one member serving the UDP side at a
+time; the TCP group is unaffected. The companion is visible in proxy/status
+listings as `<name>__udp`; set
+`udp_auto_companion = false` in `[proxies.plugin]` to disable the automatic
+proxy. Automatic registration needs an explicit non-zero `remote_port`;
+`remote_port = 0` cannot give TCP and UDP the same port, so frpc logs a warning
+and skips the companion (the plugin still runs in direct mode). A user-written
+UDP proxy already targeting the same `remote_port` wins; frpc does not add a
+duplicate and warns if its `local_port` does not match `udp_bind_addr`. The
+companion's address can still be overridden with explicit
+`udp_bind_addr` / `udp_advertise_addr`; with the automatic companion an explicit
+advertise port must equal `remote_port` (a bare IP gets `remote_port`); if it
+does not, frpc logs a warning and skips the companion rather than refusing to
+start. A deployment that sets **both** addresses and advertises a different
+port is recognised as the direct shape below and left alone rather than
+refused.
+
+**Direct** — frpc is reachable from the client (public host or same LAN).
+Disable the automatic companion and advertise the frpc host:
+
+```toml
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_auto_companion = false
+udp_bind_addr = "0.0.0.0:17000"
+udp_advertise_addr = "203.0.113.10:17000"   # the frpc host as the client sees it
+```
+
+**Manual companion** — a user-written proxy is still accepted for custom
+topologies (for example, a UDP proxy on a different remote port). It is a
+regular UDP proxy: it forwards each client datagram to the plugin's relay
+socket, and the relay's replies go back through it. A manual companion
+**requires a fixed `udp_bind_addr` and an explicit `udp_advertise_addr`**
+(frps' public address:UDP remote port); an empty `udp_bind_addr` binds an
+OS-assigned port that the companion's fixed `local_port` cannot reach, and the
+connection answers `REP_SUCCEEDED` while every datagram is black-holed. frpc
+warns when it detects this combination. The
+loopback bind keeps a *second* raw relay off the network, but it does not make
+the companion's public frps UDP port private.
+
+The automatic companion leaves the same exposure: the frps UDP port is an open
+relay while an association is alive. Firewall it exactly as you would the
+manual proxy.
 
 Association lifetime and scale:
 - The association ends when its TCP control connection closes (a TCP
@@ -196,10 +219,10 @@ Association lifetime and scale:
 > network ACLs. The relay sends target traffic with the **frpc host's** source
 > address, so the advertised public UDP port is an open UDP reflector: anyone
 > who can reach it while an association is alive can make that host send UDP to
-> arbitrary destinations. In the companion deployment, loopback binding does
-> not reduce this exposure — frps forwards the whole internet to that loopback
-> socket. Enable UDP only on a trusted network, or front the port with a
-> firewall/ACL that restricts who may send to it.
+> arbitrary destinations. In either companion deployment (automatic or manual),
+> loopback binding does not reduce this exposure — frps forwards the whole
+> internet to that loopback socket. Enable UDP only on a trusted network, or
+> front the port with a firewall/ACL that restricts who may send to it.
 
 ### Fields
 
@@ -208,8 +231,9 @@ Association lifetime and scale:
 | `username` | string | no       | SOCKS5 username (method 0x02)      |
 | `password` | string | no       | SOCKS5 password                    |
 | `udp_enable` | bool | no     | Enable `UDP ASSOCIATE` (frp-rs extension) |
-| `udp_bind_addr` | string | no | UDP relay bind address; empty = `127.0.0.1:0`. Bind on first association. |
-| `udp_advertise_addr` | string | no | `BND.ADDR`/`BND.PORT` returned to clients; empty = the bound address, with an unspecified bind (`0.0.0.0`/`[::]`) rewritten to loopback. A bare IP (no port) uses the bound port. |
+| `udp_auto_companion` | bool | no | Automatically register the same-port `type = "udp"` proxy for the relay. Default: `true`. Needs an explicit non-zero `remote_port`; `remote_port = 0` logs a warning and skips the companion. Set `false` for direct or manually managed deployments. |
+| `udp_bind_addr` | string | no | UDP relay bind address. Empty with auto companion = an ephemeral `127.0.0.1:<port>` chosen by frpc (the companion targets it); empty with auto disabled = `127.0.0.1:0` (OS-assigned). The socket binds on first association. |
+| `udp_advertise_addr` | string | no | `BND.ADDR`/`BND.PORT` returned to clients. Empty with auto companion = `<serverAddr>:<remote_port>`; an explicit port must equal `remote_port`, and a bare IP gets `remote_port`. Empty with auto disabled = the bound address, with an unspecified bind (`0.0.0.0`/`[::]`) rewritten to loopback. A bare IP (no port) uses the bound port. |
 
 ------------------------------------------------------------------------------
 
