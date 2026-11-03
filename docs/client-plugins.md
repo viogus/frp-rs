@@ -44,6 +44,12 @@ http_password = "optional-password"
 | CONNECT     | Tunnel to target host:port (HTTPS pass-through)   |
 | GET, POST, ... | Proxy the request to the upstream HTTP server |
 
+### UDP
+
+None. An HTTP forward proxy's CONNECT method is TCP-only (RFC 9110 §9.3.6), so
+there is no UDP ASSOCIATE equivalent here. UDP relaying is available in the
+`socks5` plugin (UDP ASSOCIATE); HTTP/1.1 CONNECT-UDP is not a thing.
+
 ### Authentication
 
 Optional. When `http_user` and `http_password` are both non-empty, the proxy
@@ -61,8 +67,10 @@ standard HTTP 407 Proxy Authentication Required challenge.
 
 ## 2. SOCKS5 (`plugin.type = "socks5"`)
 
-A SOCKS5 proxy server (RFC 1928). Supports CONNECT command only (TCP tunnel).
-Optional username/password authentication.
+A SOCKS5 proxy server (RFC 1928). Supports CONNECT (TCP tunnel) and,
+when `udp_enable = true`, UDP ASSOCIATE (RFC 1928 §7; frp-rs extension —
+Go frp's `socks5` plugin is CONNECT-only). Optional username/password
+authentication.
 
 ### Configuration
 
@@ -91,12 +99,110 @@ Omit both `username` and `password` for an open SOCKS5 proxy (no auth).
 
 IPv4, domain name, and IPv6 targets are all supported.
 
+### UDP ASSOCIATE
+
+UDP is off by default. Enabling it binds a shared SOCKS5 UDP relay on the
+frpc side **on the first `UDP ASSOCIATE`** (so a reload of a fixed
+`udp_bind_addr` does not collide with the previous instance) and answers with
+the configured `BND.ADDR`/`BND.PORT`. The relay forwards unfragmented datagrams
+(`FRAG = 0`) to IPv4/IPv6/domain targets and frames replies with the concrete
+host that sent them (a domain request is answered with its resolved IP, per
+RFC 1928 §7). Fragmented datagrams are dropped. The receive buffer is 16 KiB,
+so larger datagrams are truncated; keep application datagrams below that.
+
+UDP datagrams cannot travel over the frp **TCP** tunnel that carries the SOCKS5
+handshake, so the relay address must be reachable by the client. There are two
+deployments:
+
+**Direct** — frpc is reachable from the client (public host or same LAN):
+
+```toml
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_bind_addr = "0.0.0.0:17000"
+udp_advertise_addr = "203.0.113.10:17000"   # the frpc host as the client sees it
+```
+
+**Through frps (companion UDP proxy)** — frpc is behind NAT. Point a normal
+frp `type = "udp"` proxy at the loopback relay socket; the client receives the
+frps public address:UDP port:
+
+```toml
+[[proxies]]
+name = "socks5_proxy"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_bind_addr = "127.0.0.1:17000"
+udp_advertise_addr = "203.0.113.10:7001"    # frps public IP:UDP remote port
+
+[[proxies]]
+name = "socks5_proxy_udp"
+type = "udp"
+remote_port = 7001
+local_ip = "127.0.0.1"
+local_port = 17000
+```
+
+The companion proxy is a regular UDP proxy: it forwards each client datagram to
+the plugin's relay socket, and the relay's replies go back through it. The
+companion setup **requires a fixed `udp_bind_addr` and an explicit
+`udp_advertise_addr`** (frps' public address:UDP remote port); an empty
+`udp_bind_addr` binds an OS-assigned port that the companion's fixed
+`local_port` cannot reach, and the connection answers `REP_SUCCEEDED` while
+every datagram is black-holed. The loopback bind keeps a *second* raw relay off
+the network, but it does not make the companion's public frps UDP port private.
+
+Association lifetime and scale:
+- The association ends when its TCP control connection closes (a TCP
+  half-close also ends it). An absolute 1-hour cap bounds an association whose
+  peer vanished without FIN/RST; the plugin closes the control connection with
+  no SOCKS-level signal, so a client holding an association longer than an hour
+  must treat EOF as normal expiry and re-associate.
+- A reply is only forwarded to a client if the source address is one the client
+  requested. A protocol whose replies come from a different address/port than
+  the request (some anycast/load-balanced UDP services) will not work.
+- The relay forwards a target's reply to the datagram's source. A spoofed
+  source address therefore makes the frpc host send the reply to the victim —
+  a classic UDP reflector with the target's amplification factor. A source-IP
+  ACL on the relay port does not mitigate spoofed sources; firewall the
+  advertised UDP port.
+- The relay admits at most 128 client sources (256 sockets) and remembers at
+  most 256 targets per client per address family (up to 512 across both). Both
+  caps evict the oldest entry; the client cap is by last activity, so a spray
+  of more than 128 sources evicts legitimate clients too.
+- At most 64 associations per plugin; the 65th gets `REP_GENERAL_FAILURE`.
+- The forwarding gate is **per plugin, not per association**: while at least
+  one association is live, datagrams from any source are accepted. A closed
+  association's UDP source can therefore keep relaying until the last
+  association closes (the 10-minute idle TTL only reaps its per-client state
+  once traffic stops).
+
+> **Security note:** RFC 1928 UDP framing carries no session token, so the
+> relay cannot prove that a datagram was sent by the same client that completed
+> the TCP association. SOCKS5 authentication gates *who may hold the association
+> open*, not who may send datagrams through it, and it is not a substitute for
+> network ACLs. The relay sends target traffic with the **frpc host's** source
+> address, so the advertised public UDP port is an open UDP reflector: anyone
+> who can reach it while an association is alive can make that host send UDP to
+> arbitrary destinations. In the companion deployment, loopback binding does
+> not reduce this exposure — frps forwards the whole internet to that loopback
+> socket. Enable UDP only on a trusted network, or front the port with a
+> firewall/ACL that restricts who may send to it.
+
 ### Fields
 
 | Field      | Type   | Required | Description                        |
 |------------|--------|----------|------------------------------------|
 | `username` | string | no       | SOCKS5 username (method 0x02)      |
 | `password` | string | no       | SOCKS5 password                    |
+| `udp_enable` | bool | no     | Enable `UDP ASSOCIATE` (frp-rs extension) |
+| `udp_bind_addr` | string | no | UDP relay bind address; empty = `127.0.0.1:0`. Bind on first association. |
+| `udp_advertise_addr` | string | no | `BND.ADDR`/`BND.PORT` returned to clients; empty = the bound address, with an unspecified bind (`0.0.0.0`/`[::]`) rewritten to loopback. A bare IP (no port) uses the bound port. |
 
 ------------------------------------------------------------------------------
 

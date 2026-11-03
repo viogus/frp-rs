@@ -1481,6 +1481,27 @@ pub struct PluginConfig {
     /// Go frp compat: enableHTTP2.
     #[serde(default, alias = "enableHTTP2")]
     pub enable_http2: Option<bool>,
+    /// Enable SOCKS5 UDP ASSOCIATE on the `socks5` plugin (RFC 1928 §7).
+    /// frp-rs extension (Go frp's `socks5` plugin is CONNECT-only). Off by
+    /// default because the relay is only reachable by clients that can route
+    /// to `udp_bind_addr` / `udp_advertise_addr`; see docs/client-plugins.md
+    /// for the tunnel-path setup (a companion `type = "udp"` proxy).
+    #[serde(default, alias = "udpEnable")]
+    pub udp_enable: bool,
+    /// UDP relay bind address for `socks5` UDP ASSOCIATE. Empty means
+    /// `127.0.0.1:0` (an OS-assigned loopback port). Bind `0.0.0.0:<port>` when
+    /// the relay must be reachable through a companion UDP proxy (the frpc
+    /// bridge dials this socket) or directly from remote clients.
+    /// frp-rs extension.
+    #[serde(default, alias = "udpBindAddr")]
+    pub udp_bind_addr: String,
+    /// Address returned to the SOCKS5 client in the UDP ASSOCIATE reply
+    /// (BND.ADDR/BND.PORT). Empty means the relay socket's own local address.
+    /// Set this to the publicly reachable address:port when the relay is
+    /// exposed through a companion UDP proxy. A port of 0 is replaced with the
+    /// relay's bound port. frp-rs extension.
+    #[serde(default, alias = "udpAdvertiseAddr")]
+    pub udp_advertise_addr: String,
 }
 
 /// Feature gate configuration ([feature] section in frps.toml / frpc.toml).

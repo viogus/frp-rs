@@ -906,7 +906,7 @@ mechanism.
 The surface is much smaller than a proxy type's, and unlike a proxy type it has
 **no config allow-list at all**:
 
-- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:294`) is the only
+- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:301`) is the only
   dispatcher. It matches `plugin_cfg.plugin_type.as_str()` and returns
   `Err(frp_core::Error::Config("unknown plugin type: <name>"))` for anything it
   does not know — at *runtime*, when frpc starts the plugin, not at config load.
@@ -2399,7 +2399,7 @@ set per **struct** (`PROXY_KNOWN_KEYS` and friends in
 
 - **Strict mode does not refuse everywhere: it walks only the tables it has a
   key list for.** `section_known_keys`
-  (`frp-core/src/config/strict.rs:496`) has nine arms, plus the top level
+  (`frp-core/src/config/strict.rs:502`) has nine arms, plus the top level
   `check_strict` is entered with and, since the array recursion, the proxy /
   visitor / client-plugin / visitor-plugin / http-plugin element sets. Each
   walked position is listed here with a capitalised key measured as refused at
@@ -4033,7 +4033,7 @@ is default-on (`frp-server/Cargo.toml:46`). The `http-proxy` feature is
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
-of its own (`frp-client/src/plugin/mod.rs:351`), so it follows the opt-in
+of its own (`frp-client/src/plugin/mod.rs:379`), so it follows the opt-in
 `vnet` tier: it is named in the Opt-in row above and is the one client plugin
 not counted in Keep.
 
@@ -4079,7 +4079,7 @@ work; a bug fix on a frozen surface never needs an unfreeze.
   repo's CI does not exercise vnet on Windows.
 - **Non-default XTCP data plane (KCP+yamux)** — selected by `protocol = "kcp"`;
   the default is QUIC (`frp-core/src/config/client.rs:912`,
-  `docs/config.md:668`). Unfreeze if a case is reported that the QUIC plane
+  `docs/config.md:671`). Unfreeze if a case is reported that the QUIC plane
   cannot serve (for example a hole punch where the QUIC handshake never
   completes but KCP does).
 

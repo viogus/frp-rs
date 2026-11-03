@@ -12349,6 +12349,54 @@ enableHTTP2 = true
 }
 
 #[test]
+fn test_socks5_udp_associate_fields() {
+    // frp-rs extension: PluginConfig.udp_enable / udp_bind_addr /
+    // udp_advertise_addr, with camelCase aliases and snake_case names.
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5-camel"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udpEnable = true
+udpBindAddr = "127.0.0.1:17000"
+udpAdvertiseAddr = "203.0.113.10:7001"
+
+[[proxies]]
+name = "socks5-snake"
+type = "tcp"
+remote_port = 7002
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_bind_addr = "0.0.0.0:17002"
+udp_advertise_addr = "203.0.113.11:7003"
+"#;
+    let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    let p = cfg.proxies[0].plugin.as_ref().expect("camelCase plugin");
+    assert!(p.udp_enable);
+    assert_eq!(p.udp_bind_addr, "127.0.0.1:17000");
+    assert_eq!(p.udp_advertise_addr, "203.0.113.10:7001");
+
+    let p = cfg.proxies[1].plugin.as_ref().expect("snake_case plugin");
+    assert!(p.udp_enable);
+    assert_eq!(p.udp_bind_addr, "0.0.0.0:17002");
+    assert_eq!(p.udp_advertise_addr, "203.0.113.11:7003");
+
+    // Defaults: UDP stays off unless explicitly enabled.
+    let p = PluginConfig::default();
+    assert!(!p.udp_enable);
+    assert!(p.udp_bind_addr.is_empty());
+    assert!(p.udp_advertise_addr.is_empty());
+}
+
+#[test]
 fn test_http_proxy_full_sample_extended() {
     // Extends the http coverage with http_user/http_pwd/host_header_rewrite/
     // locations/route_by_http_user/subdomain (Go HTTPProxyConfig fields).
@@ -14789,7 +14837,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:1499` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:1333`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:13485`).
+/// `frp-core/src/config/tests.rs:13533`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -15205,7 +15253,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:13680`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:13728`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
@@ -15355,7 +15403,7 @@ fn default_section_header_is_an_ordinary_section_both_modes() {
 /// and loads zero proxies. The strict rc agrees; only the message and the
 /// non-strict verdict diverge, and matching Go's non-strict message would mean
 /// addressing the array element as `proxies[0]`, which the `.ini` reader does not
-/// do (pinned as out of scope at `frp-core/src/config/tests.rs:13722`). Both
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:13770`). Both
 /// modes pinned.
 #[test]
 fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {

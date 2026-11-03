@@ -4,6 +4,7 @@ use tracing::debug;
 
 use frp_core::config::PluginConfig;
 
+use super::socks5_udp::UdpAssociateHandle;
 use super::{serve_plugin, PluginHandle};
 
 use crate::util::opt_if_empty;
@@ -20,13 +21,21 @@ const SOCKS5_VERSION: u8 = 0x05;
 /// handshake read — total budget 60s from the first byte. The data-relay
 /// phase after CONNECT is deliberately unbounded.
 const SOCKS5_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Absolute cap on one UDP association. RFC 1928 ties the association to its
+/// TCP control connection, but a client that vanishes without FIN/RST leaves
+/// that connection half-open (frps' keepalive is 2h by default and can be
+/// disabled). The cap bounds how long such a leaked association can keep the
+/// relay's gate open; clients re-associate after it expires.
+const UDP_ASSOCIATION_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3600);
 const AUTH_NO_AUTH: u8 = 0x00;
 const AUTH_USER_PASS: u8 = 0x02;
 const AUTH_NO_ACCEPTABLE: u8 = 0xFF;
 const CMD_CONNECT: u8 = 0x01;
+const CMD_UDP_ASSOCIATE: u8 = 0x03;
 const ATYP_IPV4: u8 = 0x01;
 const ATYP_DOMAIN: u8 = 0x03;
 const ATYP_IPV6: u8 = 0x04;
+const REP_GENERAL_FAILURE: u8 = 0x01;
 const REP_SUCCEEDED: u8 = 0x00;
 const REP_HOST_UNREACHABLE: u8 = 0x04;
 const REP_CMD_NOT_SUPPORTED: u8 = 0x07;
@@ -37,23 +46,35 @@ const USERPASS_FAIL: u8 = 0x01;
 
 /// Start a SOCKS5 proxy plugin server.
 ///
-/// Supports CONNECT command only (TCP tunnel).
-/// Optional username/password auth via PluginConfig `username` / `password`.
+/// Supports CONNECT and, when `plugin.udp_enable` is set, UDP ASSOCIATE
+/// (RFC 1928 §7). Optional username/password auth via PluginConfig
+/// `username` / `password`.
 pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_core::Error> {
     let user = opt_if_empty!(cfg.username);
     let pass = opt_if_empty!(cfg.password);
-    serve_plugin("socks5", (user, pass), |stream, peer, (u, p)| async move {
-        if let Err(e) = handle_socks5_conn(stream, u, p).await {
-            debug!(%peer, error = %e, "socks5: {peer} error: {e}");
-        }
-    })
-    .await
+    // Cancelled when the returned PluginHandle is dropped; the UDP relay binds
+    // lazily on the first UDP ASSOCIATE and watches this token.
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let udp = super::socks5_udp::UdpRelay::from_config(cfg, cancel.clone()).await?;
+    let mut handle = serve_plugin(
+        "socks5",
+        (user, pass, udp),
+        |stream, peer, (u, p, udp)| async move {
+            if let Err(e) = handle_socks5_conn(stream, u, p, udp).await {
+                debug!(%peer, error = %e, "socks5: {peer} error: {e}");
+            }
+        },
+    )
+    .await?;
+    handle.cancel = cancel;
+    Ok(handle)
 }
 
 async fn handle_socks5_conn(
     mut client: TcpStream,
     user: Option<String>,
     pass: Option<String>,
+    udp: Option<UdpAssociateHandle>,
 ) -> Result<(), String> {
     let mut buf = [0u8; 512];
 
@@ -185,6 +206,59 @@ async fn handle_socks5_conn(
     }
     let cmd = buf[1];
     let atyp = buf[3];
+
+    if cmd == CMD_UDP_ASSOCIATE {
+        let Some(udp) = udp.as_ref() else {
+            let reply = make_socks5_reply(REP_CMD_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
+            client
+                .write_all(&reply)
+                .await
+                .map_err(|e| format!("write reply: {e}"))?;
+            return Err("UDP ASSOCIATE requested but plugin.udp_enable is false".into());
+        };
+        // The client's declared UDP endpoint is advisory (RFC 1928 §7: it may
+        // be all-zero when the source port is not known yet). Parse it to
+        // consume the request, but bind no per-client state: the shared relay
+        // learns datagram sources when they arrive.
+        let _ = parse_socks5_target(deadline, &mut client, atyp, &mut buf).await?;
+
+        // The relay binds lazily here (so a reload of a fixed udp_bind_addr
+        // does not collide with the previous plugin instance, which is still
+        // serving until the reload commits). The association is counted before
+        // the reply is written, so the first datagram cannot race the gate.
+        let (_guard, advertise) = match udp.enter().await {
+            Ok(v) => v,
+            Err(e) => {
+                let reply = make_socks5_reply(REP_GENERAL_FAILURE, ATYP_IPV4, &[0, 0, 0, 0], 0);
+                let _ = client.write_all(&reply).await;
+                return Err(e);
+            }
+        };
+        let reply = make_socks5_reply_for_addr(REP_SUCCEEDED, advertise);
+        client
+            .write_all(&reply)
+            .await
+            .map_err(|e| format!("write udp associate reply: {e}"))?;
+
+        // RFC 1928: the association lives as long as this TCP connection. It
+        // carries no further protocol data; read until EOF (or an error) so a
+        // half-closed control connection still terminates the association. The
+        // absolute cap is a safety valve for a silently dead peer that never
+        // produces EOF (see UDP_ASSOCIATION_MAX_LIFETIME).
+        let mut sink = [0u8; 256];
+        let deadline = tokio::time::Instant::now() + UDP_ASSOCIATION_MAX_LIFETIME;
+        loop {
+            match tokio::time::timeout_at(deadline, client.read(&mut sink)).await {
+                Err(_) => {
+                    debug!("socks5 UDP association reached its maximum lifetime; closing");
+                    break;
+                }
+                Ok(Ok(0)) | Ok(Err(_)) => break,
+                Ok(Ok(_)) => {}
+            }
+        }
+        return Ok(());
+    }
 
     if cmd != CMD_CONNECT {
         let reply = make_socks5_reply(REP_CMD_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
@@ -355,6 +429,14 @@ async fn parse_socks5_target(
     }
 }
 
+/// Build a SOCKS5 reply for a concrete bound address (UDP ASSOCIATE BND.ADDR).
+fn make_socks5_reply_for_addr(rep: u8, addr: std::net::SocketAddr) -> Vec<u8> {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => make_socks5_reply(rep, ATYP_IPV4, &ip.octets(), addr.port()),
+        std::net::IpAddr::V6(ip) => make_socks5_reply(rep, ATYP_IPV6, &ip.octets(), addr.port()),
+    }
+}
+
 /// Build a SOCKS5 reply packet.
 fn make_socks5_reply(rep: u8, atyp: u8, addr: &[u8], port: u16) -> Vec<u8> {
     let mut reply = Vec::with_capacity(6 + addr.len());
@@ -436,7 +518,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             // No username/password → no-auth only
-            if let Err(e) = handle_socks5_conn(stream, None, None).await {
+            if let Err(e) = handle_socks5_conn(stream, None, None, None).await {
                 tracing::debug!(error = %e, "plugin relay error: {}", e);
             }
         });
@@ -475,7 +557,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None).await;
+            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None, None).await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -515,7 +597,7 @@ mod tests {
             // Username-only config: "alice" must authenticate with the
             // empty password. After auth the handler reads the CONNECT
             // request; client closes → handler exits, error expected.
-            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None).await;
+            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None, None).await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -558,7 +640,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None).await;
+            let _ = handle_socks5_conn(stream, Some("alice".to_string()), None, None).await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -603,7 +685,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_socks5_conn(stream, None, None).await
+            handle_socks5_conn(stream, None, None, None).await
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -636,7 +718,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             if let Err(e) =
-                handle_socks5_conn(stream, Some("alice".into()), Some("s3cret".into())).await
+                handle_socks5_conn(stream, Some("alice".into()), Some("s3cret".into()), None).await
             {
                 tracing::debug!(error = %e, "plugin relay error: {}", e);
             }
@@ -689,7 +771,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             // Password-only config: user=None, pass=Some("s3cret").
-            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string())).await;
+            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string()), None).await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -726,7 +808,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             // After USERPASS_OK the handler reads the CONNECT request;
             // client closes → handler exits, error expected.
-            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string())).await;
+            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string()), None).await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -771,7 +853,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string())).await;
+            let _ = handle_socks5_conn(stream, None, Some("s3cret".to_string()), None).await;
         });
 
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();

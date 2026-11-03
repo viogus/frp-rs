@@ -6,7 +6,8 @@
 //!
 //! Supported plugin types:
 //! - `http_proxy`: HTTP/HTTPS forward proxy with optional basic auth.
-//! - `socks5`: SOCKS5 proxy (CONNECT only) with optional username/password auth.
+//! - `socks5`: SOCKS5 proxy (CONNECT, plus UDP ASSOCIATE when
+//!   `plugin.udp_enable` is set) with optional username/password auth.
 //! - `static_file`: Serve static files from a local directory with optional basic auth.
 //! - `virtual_net`: Hand work connections to the vnet controller (no listener).
 //! - `visitor_plugin`: STATUS: Placeholder for STCP/XTCP visitor connection
@@ -31,6 +32,7 @@ mod http2https;
 mod https2http;
 mod https2https;
 mod socks5;
+mod socks5_udp;
 mod static_file;
 #[cfg(test)]
 mod test_support;
@@ -56,6 +58,9 @@ pub struct PluginHandle {
     pub local_addr: SocketAddr,
     /// Abort handle for the server task.
     _task: tokio::task::JoinHandle<()>,
+    /// Plugin-owned cancellation (e.g. the lazily started SOCKS5 UDP relay).
+    /// Cancelled when the handle is dropped, alongside the server task.
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
     /// Signal to shut down (None after drop).
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -65,6 +70,7 @@ impl Drop for PluginHandle {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
+        self.cancel.cancel();
     }
 }
 
@@ -270,6 +276,7 @@ where
     Ok(PluginHandle {
         local_addr,
         _task: task,
+        cancel: tokio_util::sync::CancellationToken::new(),
         shutdown: Some(shutdown_tx),
     })
 }
@@ -295,6 +302,27 @@ pub(crate) async fn dispatch_plugin_start(
     plugin_cfg: &frp_core::config::PluginConfig,
     plugin_ctx: Option<PluginContext>,
 ) -> Result<PluginHandle, frp_core::Error> {
+    // The UDP fields live on the shared PluginConfig but only the socks5
+    // plugin reads them. A silently inert setting is the exact failure class
+    // this repo tries to make loud.
+    if plugin_cfg.plugin_type != "socks5"
+        && (plugin_cfg.udp_enable
+            || !plugin_cfg.udp_bind_addr.trim().is_empty()
+            || !plugin_cfg.udp_advertise_addr.trim().is_empty())
+    {
+        warn!(
+            plugin_type = %plugin_cfg.plugin_type,
+            "plugin UDP fields (udp_enable/udp_bind_addr/udp_advertise_addr) are only used by the socks5 plugin; ignored"
+        );
+    } else if plugin_cfg.plugin_type == "socks5"
+        && !plugin_cfg.udp_enable
+        && (!plugin_cfg.udp_bind_addr.trim().is_empty()
+            || !plugin_cfg.udp_advertise_addr.trim().is_empty())
+    {
+        warn!(
+            "socks5 plugin: udp_bind_addr/udp_advertise_addr are set but udp_enable = false; UDP ASSOCIATE stays disabled"
+        );
+    }
     match plugin_cfg.plugin_type.as_str() {
         "http_proxy" => start_http_proxy(plugin_cfg).await,
         "socks5" => start_socks5_proxy(plugin_cfg).await,
