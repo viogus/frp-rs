@@ -128,7 +128,7 @@ udp_advertise_addr = "203.0.113.10:17000"   # the frpc host as the client sees i
 
 **Through frps (companion UDP proxy)** — frpc is behind NAT. Point a normal
 frp `type = "udp"` proxy at the loopback relay socket; the client receives the
-frps public address:UDP port:
+frps public address and the **same port** as the SOCKS5 TCP proxy:
 
 ```toml
 [[proxies]]
@@ -140,15 +140,20 @@ remote_port = 7000
 type = "socks5"
 udp_enable = true
 udp_bind_addr = "127.0.0.1:17000"
-udp_advertise_addr = "203.0.113.10:7001"    # frps public IP:UDP remote port
+udp_advertise_addr = "203.0.113.10:7000"    # frps public IP:same port as TCP
 
 [[proxies]]
 name = "socks5_proxy_udp"
 type = "udp"
-remote_port = 7001
+remote_port = 7000
 local_ip = "127.0.0.1"
 local_port = 17000
 ```
+
+frps tracks TCP and UDP remote ports separately (Go frp parity), so the
+companion can reuse the SOCKS5 proxy's `remote_port`; the client then uses one
+port for both. The port must be explicit: `remote_port = 0` auto-assigns TCP
+and UDP independently, so the two will not match.
 
 The companion proxy is a regular UDP proxy: it forwards each client datagram to
 the plugin's relay socket, and the relay's replies go back through it. The
