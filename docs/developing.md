@@ -906,7 +906,7 @@ mechanism.
 The surface is much smaller than a proxy type's, and unlike a proxy type it has
 **no config allow-list at all**:
 
-- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:301`) is the only
+- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:307`) is the only
   dispatcher. It matches `plugin_cfg.plugin_type.as_str()` and returns
   `Err(frp_core::Error::Config("unknown plugin type: <name>"))` for anything it
   does not know — at *runtime*, when frpc starts the plugin, not at config load.
@@ -4019,8 +4019,8 @@ scope.
 
 | Tier | What a change means | Surfaces |
 |---|---|---|
-| **Keep** — full parity maintained | Go-parity work and cross-compat coverage are welcome; a regression is a bug. | TCP, UDP, HTTP, HTTPS, STCP, XTCP; V1 and V2 wire protocol; encryption and compression; TCP multiplexing; the transports (TCP, WebSocket, TLS, KCP, QUIC); OIDC; the dashboard; the SSH gateway; 9 of the 10 client plugins; the server-side `[[httpPlugins]]` manager. |
-| **Opt-in** — best-effort | Fixes when a user needs them; no proactive parity investment. Staying out of the default build is intentional. | `vnet` (L3 VPN/TUN) and the `virtual_net` client plugin that rides it, `mimalloc`, `otel`, the frpc `admin` API. |
+| **Keep** — full parity maintained | Go-parity work and cross-compat coverage are welcome; a regression is a bug. | TCP, UDP, HTTP, HTTPS, STCP, XTCP; V1 and V2 wire protocol; encryption and compression; TCP multiplexing; the transports (TCP, WebSocket, TLS, KCP, QUIC); OIDC; the dashboard; the SSH gateway; 9 of the 10 Go-parity client plugins; the server-side `[[httpPlugins]]` manager. |
+| **Opt-in** — best-effort | Fixes when a user needs them; no proactive parity investment. Staying out of the default build is intentional (except `http2connect`, which is an frp-rs extension compiled by the default `http2http` feature). | `vnet` (L3 VPN/TUN) and the `virtual_net` client plugin that rides it, the `http2connect` client plugin (frp-rs HTTP/2 CONNECT + CONNECT-UDP extension), `mimalloc`, `otel`, the frpc `admin` API. |
 | **Freeze** — bug-fix only | No new Go-parity work, no Go-parity-only tests, no refactor. Not removed. | SUDP; h2c; Windows TUN; the non-default XTCP data plane (KCP+yamux). |
 
 Three build-tier facts the tier names alone would hide. The dashboard is
@@ -4032,10 +4032,11 @@ is default-on (`frp-server/Cargo.toml:46`). The `http-proxy` feature is
 (`frp-server/src/vhost.rs:28`), so h2c's freeze is a code-review rule rather
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
-the 10 client plugins, `virtual_net`, is the TUN-backed path with no listener
-of its own (`frp-client/src/plugin/mod.rs:379`), so it follows the opt-in
-`vnet` tier: it is named in the Opt-in row above and is the one client plugin
-not counted in Keep.
+the 10 Go-parity client plugins, `virtual_net`, is the TUN-backed path with no
+listener of its own (`frp-client/src/plugin/mod.rs:391`), so it follows the
+opt-in `vnet` tier: it is named in the Opt-in row above and is the one
+Go-parity client plugin not counted in Keep. `http2connect` is the additional
+frp-rs extension, also named in that row.
 
 One **CLI-surface** entry belongs in the same record, because it is the same kind
 of decision and would otherwise read as an oversight: **cobra's `completion` and

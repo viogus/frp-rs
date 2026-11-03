@@ -8,6 +8,8 @@
 //! - `http_proxy`: HTTP/HTTPS forward proxy with optional basic auth.
 //! - `socks5`: SOCKS5 proxy (CONNECT, plus UDP ASSOCIATE when
 //!   `plugin.udp_enable` is set) with optional username/password auth.
+//! - `http2connect`: HTTP/2 CONNECT (TCP) and CONNECT-UDP (RFC 9298) proxy
+//!   (frp-rs extension; requires the `http2http` feature).
 //! - `static_file`: Serve static files from a local directory with optional basic auth.
 //! - `virtual_net`: Hand work connections to the vnet controller (no listener).
 //! - `visitor_plugin`: STATUS: Placeholder for STCP/XTCP visitor connection
@@ -27,6 +29,8 @@ mod context;
 #[cfg(feature = "http2http")]
 mod h2;
 mod http;
+#[cfg(feature = "http2http")]
+mod http2connect;
 mod http2http;
 mod http2https;
 mod https2http;
@@ -42,6 +46,8 @@ mod visitor;
 
 pub(crate) use context::PluginContext;
 pub use http::start_http_proxy;
+#[cfg(feature = "http2http")]
+pub use http2connect::start_http2connect;
 pub use http2http::start_http2http_plugin;
 pub use http2https::start_http2https_plugin;
 pub use https2http::start_https2http_plugin;
@@ -330,6 +336,12 @@ pub(crate) async fn dispatch_plugin_start(
         "unix_domain_socket" => start_unix_socket_plugin(plugin_cfg).await,
         "tls2raw" => start_tls2raw_plugin(plugin_cfg).await,
         "http2http" => start_http2http_plugin(plugin_cfg).await,
+        #[cfg(feature = "http2http")]
+        "http2connect" => start_http2connect(plugin_cfg).await,
+        #[cfg(not(feature = "http2http"))]
+        "http2connect" => Err(frp_core::Error::Config(
+            "http2connect plugin requires the http2http feature".into(),
+        )),
         "http2https" => start_http2https_plugin(plugin_cfg).await,
         "https2http" => start_https2http_plugin(plugin_cfg).await,
         "https2https" => start_https2https_plugin(plugin_cfg).await,
