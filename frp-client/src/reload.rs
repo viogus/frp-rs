@@ -328,6 +328,19 @@ pub(crate) fn config_snapshot(p: &ProxyConfig) -> String {
         fields.push(("plugin.secret_key", hash_secret(&pl.secret_key)));
         fields.push(("plugin.bind_addr", pl.bind_addr.clone()));
         fields.push(("plugin.bind_port", pl.bind_port.to_string()));
+        // Security-relevant live toggles: a reload that flips udp_enable off
+        // (or changes the relay address) must take effect, not report "no
+        // changes detected". proxy_protocol_version / request_headers /
+        // enable_http2 were already missing before the UDP fields.
+        fields.push((
+            "plugin.proxy_protocol_version",
+            pl.proxy_protocol_version.clone(),
+        ));
+        fields.push(("plugin.request_headers", sorted_map(&pl.request_headers)));
+        fields.push(("plugin.enable_http2", format!("{:?}", pl.enable_http2)));
+        fields.push(("plugin.udp_enable", pl.udp_enable.to_string()));
+        fields.push(("plugin.udp_bind_addr", pl.udp_bind_addr.clone()));
+        fields.push(("plugin.udp_advertise_addr", pl.udp_advertise_addr.clone()));
     } else {
         fields.push(("plugin.type", "(none)".to_string()));
     }
@@ -598,6 +611,50 @@ mod tests {
         assert!(differs(p(), |c| c.disable_assisted_addrs = true));
         // And a proxy with none of them set still snapshots.
         assert!(!config_snapshot(&p()).is_empty());
+    }
+
+    /// The plugin block is part of the reload fingerprint too: a reload that
+    /// only flips `udp_enable` (or changes the relay address) must restart the
+    /// plugin, not report "no changes detected". This pins the security-
+    /// relevant toggle that was missing from the snapshot.
+    #[test]
+    fn config_snapshot_covers_plugin_fields() {
+        fn plugin(cfg: frp_core::config::PluginConfig) -> ProxyConfig {
+            let mut c = proxy("p");
+            c.plugin = Some(cfg);
+            c
+        }
+        fn differs(mut c: ProxyConfig, mutate: impl FnOnce(&mut ProxyConfig)) -> bool {
+            let base = config_snapshot(&c);
+            mutate(&mut c);
+            base != config_snapshot(&c)
+        }
+        let base = || frp_core::config::PluginConfig {
+            plugin_type: "socks5".into(),
+            ..Default::default()
+        };
+        assert!(differs(plugin(base()), |c| {
+            c.plugin.as_mut().unwrap().udp_enable = true;
+        }));
+        assert!(differs(plugin(base()), |c| {
+            c.plugin.as_mut().unwrap().udp_bind_addr = "127.0.0.1:17000".into();
+        }));
+        assert!(differs(plugin(base()), |c| {
+            c.plugin.as_mut().unwrap().udp_advertise_addr = "203.0.113.10:7001".into();
+        }));
+        assert!(differs(plugin(base()), |c| {
+            c.plugin.as_mut().unwrap().proxy_protocol_version = "v2".into();
+        }));
+        assert!(differs(plugin(base()), |c| {
+            c.plugin
+                .as_mut()
+                .unwrap()
+                .request_headers
+                .insert("x".into(), "y".into());
+        }));
+        assert!(differs(plugin(base()), |c| {
+            c.plugin.as_mut().unwrap().enable_http2 = Some(false);
+        }));
     }
 
     /// Round-19 audit M7 pin: map-typed fields must snapshot in key order,

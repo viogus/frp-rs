@@ -98,6 +98,7 @@ pub async fn start_visitor_plugin(
                 .parse()
                 .expect("constant literal socket addr always parses"),
             _task: tokio::spawn(std::future::ready(())),
+            cancel: tokio_util::sync::CancellationToken::new(),
             shutdown: Some(shutdown_tx),
         });
     }
@@ -213,6 +214,7 @@ pub async fn start_visitor_plugin(
     Ok(PluginHandle {
         local_addr,
         _task: task,
+        cancel: tokio_util::sync::CancellationToken::new(),
         shutdown: Some(shutdown_tx),
     })
 }

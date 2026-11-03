@@ -119,6 +119,7 @@ pub async fn start_unix_socket_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     Ok(PluginHandle {
         local_addr,
         _task: task,
+        cancel: tokio_util::sync::CancellationToken::new(),
         shutdown: Some(shutdown_tx),
     })
 }
