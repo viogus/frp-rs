@@ -14,6 +14,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   # ── Prepare: freeze tag → commit SHA once. Prevents TOCTOU
   # where a moved tag causes different platforms to build different
@@ -238,6 +242,7 @@ jobs:
   publish:
     needs: [prepare, build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: write
     env:
@@ -254,14 +259,37 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          if gh release view "$RELEASE_TAG" &>/dev/null; then
-            echo "Release $RELEASE_TAG already exists — will re-upload assets."
-          else
-            gh release create "$RELEASE_TAG" \
+          set -euo pipefail
+          : "${RELEASE_TAG:?}"
+
+          # `gh release view` can also hit transient 502s. A failed view falls
+          # through to create, which then fails with "already exists"; retry the
+          # view/create pair so that path converges instead of aborting.
+          release_ready=false
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+              echo "Release $RELEASE_TAG already exists — will re-upload assets."
+              release_ready=true
+              break
+            fi
+            if gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
               --generate-notes \
-              --verify-tag
+              --verify-tag; then
+              release_ready=true
+              break
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              delay=$((attempt * 10))
+              echo "::warning::release create/view failed (attempt ${attempt}/5); retrying in ${delay}s"
+              sleep "$delay"
+            fi
+          done
+          if [ "$release_ready" != true ]; then
+            echo "::error::could not create or find release ${RELEASE_TAG}"
+            exit 1
           fi
 
       - name: Upload assets to release
@@ -269,34 +297,80 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          : "${RELEASE_TAG:?}"
 
           # GitHub's release-asset endpoint intermittently returns HTTP 502 while
-          # an asset is being replaced. Retry every upload (including checksums)
-          # with backoff so one transient failure cannot leave the release with a
-          # missing or stale asset. --clobber re-uploads the same file safely.
+          # an asset is being replaced. Retry transient failures with backoff.
+          # --clobber deletes the old asset before uploading, so a persistent
+          # failure can still leave that asset missing; the job nevertheless
+          # fails, and the stale checksums are removed below.
           upload_asset() {
-            local asset="$1" attempt delay
+            local asset="$1" attempt delay output
             for attempt in 1 2 3 4 5; do
-              if gh release upload "$RELEASE_TAG" "$asset" --clobber; then
+              if output=$(timeout 120 gh release upload "$RELEASE_TAG" "$asset" --clobber 2>&1); then
                 return 0
               fi
-              delay=$((attempt * 10))
-              echo "::warning::upload of ${asset} failed (attempt ${attempt}/5); retrying in ${delay}s"
-              sleep "$delay"
+              printf '%s\n' "$output"
+              case "$output" in
+                *"HTTP 401"*|*"HTTP 403"*|*"HTTP 422"*)
+                  echo "::error::upload of ${asset} failed with a non-retryable response"
+                  return 1
+                  ;;
+              esac
+              if [ "$attempt" -lt 5 ]; then
+                delay=$((attempt * 10))
+                echo "::warning::upload of ${asset} failed (attempt ${attempt}/5); retrying in ${delay}s"
+                sleep "$delay"
+              fi
             done
             echo "::error::failed to upload ${asset} after 5 attempts"
             return 1
           }
 
+          assets_file=$(mktemp)
+          trap 'rm -f "$assets_file" checksums.txt' EXIT
+
+          # Materialise the file list once so a missing/unreadable artifacts/
+          # directory fails here instead of silently uploading zero assets.
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 > "$assets_file"
+          asset_count=$(tr -cd '\0' < "$assets_file" | wc -c | tr -d ' ')
+          # 9 Linux targets x 3 profiles + 2 macOS x 3 + 2 Windows x 3.
+          expected_count=39
+          if [ "$asset_count" -ne "$expected_count" ]; then
+            echo "::error::expected ${expected_count} release archives, found ${asset_count}; refusing to publish a partial release"
+            exit 1
+          fi
+
           while IFS= read -r -d '' asset; do
             echo "Uploading: ${asset}"
-            upload_asset "$asset" || exit 1
-          done < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0)
+            upload_asset "$asset"
+          done < "$assets_file"
 
           # sha256 checksums (bare filenames, so `sha256sum -c checksums.txt`
           # works against the downloaded assets in one directory)
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
-            -exec sha256sum {} \; \
-            | awk '{n = split($2, a, "/"); print $1, a[n]}' > checksums.txt
+          : > checksums.txt
+          while IFS= read -r -d '' asset; do
+            hash=$(sha256sum "$asset")
+            hash=${hash%% *}
+            printf '%s  %s\n' "$hash" "${asset##*/}" >> checksums.txt
+          done < "$assets_file"
           upload_asset checksums.txt
+
+          actual_count=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
+          if [ "$actual_count" -ne $((expected_count + 1)) ]; then
+            echo "::error::release ${RELEASE_TAG} has ${actual_count} assets, expected $((expected_count + 1))"
+            exit 1
+          fi
+
+      - name: Remove stale checksums after a failed publish
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RELEASE_TAG:?}"
+          # A failed run must not leave a checksums.txt that describes a mix of
+          # old and new archives. Deleting it is safer than leaving stale hashes.
+          gh release delete-asset "$RELEASE_TAG" checksums.txt --yes || true
