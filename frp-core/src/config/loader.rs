@@ -615,7 +615,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 /// no-acceptor branch at `:778`), so this variant's certificate clauses would
 /// describe a path it cannot take. Every lane builds at the
 /// workspace root with `tiny`/`micro`
-/// (`.github/workflows/release.yml:100/102/108/110/159/162/210/213` and
+/// (`.github/workflows/release.yml:112/114/120/122/171/174/222/225` and
 /// `.github/workflows/ci.yml:4250`/`.github/workflows/ci.yml:4254`), where the
 /// two crates' `tls` agree, so the mixed shape is a known, unshipped one.
 #[cfg(feature = "tls")]
