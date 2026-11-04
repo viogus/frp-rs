@@ -428,7 +428,396 @@ impl Default for ClientConfig {
     }
 }
 
+const AUTO_COMPANION_ANNOTATION: &str = "frp-rs.auto-companion";
+const AUTO_COMPANION_PARENT_ANNOTATION: &str = "frp-rs.auto-companion-parent";
+
+/// Format a host and port, bracketing IPv6 literals. Empty hosts fall back to
+/// loopback so a config with no `serverAddr` still produces a parseable
+/// advertise address.
+fn format_host_port(host: &str, port: u16) -> String {
+    let host = host.trim();
+    let host = if host.is_empty() { "127.0.0.1" } else { host };
+    if host.starts_with('[') {
+        format!("{host}:{port}")
+    } else if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Split `host:port`, `[v6]:port`, a bare IP, or a bare `[v6]`. A missing or
+/// zero port is returned as 0; callers replace it with the SOCKS5 remote port.
+fn split_host_port(raw: &str) -> Option<(String, u16)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(addr) = raw.parse::<std::net::SocketAddr>() {
+        return Some((addr.ip().to_string(), addr.port()));
+    }
+    if let Ok(ip) = raw.parse::<std::net::IpAddr>() {
+        return Some((ip.to_string(), 0));
+    }
+    if let Some(rest) = raw.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        if after.is_empty() {
+            return Some((format!("[{host}]"), 0));
+        }
+        let port = after.strip_prefix(':')?.parse().ok()?;
+        return Some((format!("[{host}]"), port));
+    }
+    let (host, port) = raw.rsplit_once(':')?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// Pick a loopback UDP port for the automatic companion's relay. The socket
+/// is dropped immediately, so the plugin can bind it a moment later; a
+/// same-process race is not a concern because both sides use this one port.
+fn allocate_udp_relay_port(bind_host: &str) -> Result<u16, String> {
+    let addr = format_host_port(bind_host, 0);
+    let socket = std::net::UdpSocket::bind(&addr)
+        .map_err(|e| format!("cannot allocate UDP relay port on {addr}: {e}"))?;
+    socket
+        .local_addr()
+        .map(|a| a.port())
+        .map_err(|e| format!("cannot read UDP relay port on {addr}: {e}"))
+}
+
+fn unique_companion_name(proxies: &[ProxyConfig], parent: &str) -> String {
+    let base = format!("{parent}__udp");
+    if !proxies.iter().any(|p| p.name == base) {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}_{n}");
+        if !proxies.iter().any(|p| p.name == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// Return the parent name when `p` is an auto-registered SOCKS5 UDP companion.
+pub fn auto_companion_parent(p: &ProxyConfig) -> Option<&str> {
+    if p.proxy_type != "udp" {
+        return None;
+    }
+    if p.annotations
+        .get(AUTO_COMPANION_ANNOTATION)
+        .map(String::as_str)
+        != Some("socks5-udp")
+    {
+        return None;
+    }
+    p.annotations
+        .get(AUTO_COMPANION_PARENT_ANNOTATION)
+        .map(String::as_str)
+}
+
 impl ClientConfig {
+    /// Register the UDP proxy that carries the socks5 UDP relay through frps.
+    ///
+    /// A SOCKS5 `UDP ASSOCIATE` reply contains a `BND.ADDR:BND.PORT` the client
+    /// sends raw datagrams to; those datagrams are not part of the frp TCP
+    /// tunnel. When the socks5 proxy has an explicit `remote_port`, frpc can
+    /// expose the loopback relay as an ordinary `type = "udp"` proxy on the same
+    /// remote port. That is what removes the hand-written companion proxy from
+    /// the user's config while remaining compatible with a Go frps (it is a
+    /// normal UDP proxy on the wire).
+    ///
+    /// Idempotent: an existing auto companion is detected by its annotations,
+    /// and a user-written UDP proxy targeting the same relay/remote port wins
+    /// over auto-registration. Call after `enabled` filtering and before the
+    /// `start` allowlist is applied.
+    pub fn inject_socks5_udp_companions(&mut self) -> Result<(), String> {
+        self.inject_socks5_udp_companions_preserving(&[])
+    }
+
+    /// Same as [`Self::inject_socks5_udp_companions`], but reuses the bind port
+    /// of an auto companion from `previous`. A reload rebuilds the config from
+    /// scratch, so without this an unchanged config would allocate a new
+    /// ephemeral port and make the reload diff restart the SOCKS5 plugin (and
+    /// drop its live sessions) on every `SIGUSR1`.
+    pub fn inject_socks5_udp_companions_preserving(
+        &mut self,
+        previous: &[ProxyConfig],
+    ) -> Result<(), String> {
+        struct Addition {
+            parent: String,
+            bind_addr: Option<String>,
+            advertise_addr: Option<String>,
+            proxy: ProxyConfig,
+        }
+
+        let mut additions = Vec::new();
+        for idx in 0..self.proxies.len() {
+            let p = &self.proxies[idx];
+            let Some(plugin) = p.plugin.as_ref() else {
+                continue;
+            };
+            if plugin.plugin_type != "socks5"
+                || !plugin.udp_enable
+                || !plugin.udp_auto_companion_enabled()
+            {
+                continue;
+            }
+            // Do not create a companion for a parent the `start` allowlist
+            // excludes: it would be filtered out anyway, and if a stale
+            // `start = ["<name>__udp"]` kept the companion it would target a
+            // relay whose plugin never started.
+            if !self.start.is_empty() && !self.start.iter().any(|n| n == &p.name) {
+                continue;
+            }
+            let bind_raw = plugin.udp_bind_addr.trim();
+            let advertise_raw = plugin.udp_advertise_addr.trim();
+
+            if p.proxy_type != "tcp" {
+                tracing::warn!(
+                    proxy = %p.name,
+                    proxy_type = %p.proxy_type,
+                    "socks5 UDP auto companion is only supported on type = \"tcp\"; skipping \
+                     (set udp_auto_companion = false for a direct or manual deployment)"
+                );
+                continue;
+            }
+            // A direct deployment sets both addresses and advertises a port
+            // other than remote_port: there is no companion listening there.
+            // That is the pre-existing documented shape, so keep it working
+            // instead of refusing startup now that the default is on.
+            if !bind_raw.is_empty() && !advertise_raw.is_empty() {
+                if let Some((_, advertise_port)) = split_host_port(advertise_raw) {
+                    if advertise_port != 0 && advertise_port != p.remote_port {
+                        tracing::warn!(
+                            proxy = %p.name,
+                            remote_port = p.remote_port,
+                            advertise = %advertise_raw,
+                            "socks5 UDP explicit bind/advertise addresses look like a direct \
+                             deployment; skipping the automatic companion (set \
+                             udp_auto_companion = false to silence)"
+                        );
+                        continue;
+                    }
+                }
+            }
+            if p.remote_port == 0 {
+                tracing::warn!(
+                    proxy = %p.name,
+                    "socks5 UDP auto companion requires an explicit remote_port; skipping \
+                     (set remote_port, or udp_auto_companion = false for direct mode)"
+                );
+                continue;
+            }
+            if !p.group.is_empty() {
+                tracing::warn!(
+                    proxy = %p.name,
+                    group = %p.group,
+                    "socks5 UDP automatic companion is not added to the group: UDP has a                      single owner per port, so only one group member can serve remote_port;                      the TCP group is unaffected"
+                );
+            }
+
+            let already = self.proxies.iter().any(|q| {
+                q.annotations
+                    .get(AUTO_COMPANION_ANNOTATION)
+                    .map(String::as_str)
+                    == Some("socks5-udp")
+                    && q.annotations
+                        .get(AUTO_COMPANION_PARENT_ANNOTATION)
+                        .map(String::as_str)
+                        == Some(p.name.as_str())
+            });
+            if already {
+                continue;
+            }
+
+            // A user-written UDP proxy already serving this remote port is the
+            // manual setup. Warn when its target cannot match the relay bind:
+            // that combination reports UDP ASSOCIATE success but drops every
+            // datagram.
+            if let Some(manual) = self
+                .proxies
+                .iter()
+                .find(|q| q.proxy_type == "udp" && q.remote_port == p.remote_port)
+            {
+                let bind_port = split_host_port(bind_raw).map(|(_, port)| port);
+                if bind_raw.is_empty() {
+                    tracing::warn!(
+                        proxy = %p.name,
+                        manual_proxy = %manual.name,
+                        remote_port = p.remote_port,
+                        manual_local_port = manual.local_port,
+                        "socks5 UDP has a user-written UDP proxy on the same remote_port but \
+                         udp_bind_addr is empty; the relay will bind an ephemeral loopback \
+                         port, so that proxy will drop datagrams. Set udp_bind_addr = \
+                         \"127.0.0.1:<manual local_port>\" or udp_auto_companion = false"
+                    );
+                } else if bind_port != Some(manual.local_port) {
+                    tracing::warn!(
+                        proxy = %p.name,
+                        manual_proxy = %manual.name,
+                        remote_port = p.remote_port,
+                        manual_local_port = manual.local_port,
+                        bind = %bind_raw,
+                        "socks5 UDP user-written UDP proxy target does not match udp_bind_addr; \
+                         the relay will not receive its datagrams (set udp_auto_companion = false \
+                         for a manual deployment)"
+                    );
+                }
+                continue;
+            }
+
+            let previous_bind = if bind_raw.is_empty()
+                && previous
+                    .iter()
+                    .any(|q| auto_companion_parent(q) == Some(p.name.as_str()))
+            {
+                previous
+                    .iter()
+                    .find(|q| q.name == p.name)
+                    .and_then(|q| q.plugin.as_ref())
+                    .map(|pl| pl.udp_bind_addr.trim())
+                    .filter(|s| !s.is_empty())
+                    .and_then(split_host_port)
+                    .filter(|(_, port)| *port != 0)
+            } else {
+                None
+            };
+            let (bind_host, bind_port) = if let Some((host, port)) = previous_bind {
+                (host, port)
+            } else if bind_raw.is_empty() {
+                // A fixed `remote_port` would collide with frps' own UDP
+                // listener when frpc and frps share a host (and with any
+                // other local service). Let the OS pick a loopback port;
+                // the companion targets exactly that port.
+                let port = allocate_udp_relay_port("127.0.0.1")
+                    .map_err(|e| format!("socks5 proxy '{}': {e}", p.name))?;
+                ("127.0.0.1".to_string(), port)
+            } else {
+                let (host, port) = split_host_port(bind_raw).ok_or_else(|| {
+                    format!(
+                        "socks5 proxy '{}': invalid udp_bind_addr '{}' for UDP auto companion \
+                         (set udp_auto_companion = false for a direct deployment)",
+                        p.name, bind_raw
+                    )
+                })?;
+                let port = if port == 0 {
+                    allocate_udp_relay_port(&host)
+                        .map_err(|e| format!("socks5 proxy '{}': {e}", p.name))?
+                } else {
+                    port
+                };
+                (host, port)
+            };
+            let target_host = match bind_host.as_str() {
+                "0.0.0.0" => "127.0.0.1".to_string(),
+                "::" | "[::]" => "::1".to_string(),
+                other => other.to_string(),
+            };
+            let is_loopback = bind_host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or_else(|_| bind_host.eq_ignore_ascii_case("localhost"));
+            if !is_loopback {
+                tracing::warn!(
+                    proxy = %p.name,
+                    bind = %format_host_port(&bind_host, bind_port),
+                    "socks5 UDP relay binds a non-loopback address while the automatic \
+                     companion targets loopback; the relay is reachable directly from the \
+                     network (set udp_auto_companion = false if that is not intended)"
+                );
+            }
+
+            let name = unique_companion_name(&self.proxies, &p.name);
+            let bind_addr = if bind_raw.is_empty()
+                || split_host_port(bind_raw).map(|(_, port)| port) == Some(0)
+            {
+                Some(format_host_port(&bind_host, bind_port))
+            } else {
+                None
+            };
+            let advertise_addr = if plugin.udp_advertise_addr.trim().is_empty() {
+                Some(format_host_port(&self.server_addr, p.remote_port))
+            } else {
+                // With an automatic companion the datagrams must arrive on
+                // `remote_port`; a bare IP would otherwise inherit the
+                // relay's ephemeral bind port and black-hole.
+                match split_host_port(plugin.udp_advertise_addr.trim()) {
+                    Some((host, 0)) => Some(format_host_port(&host, p.remote_port)),
+                    Some((_, port)) if port != p.remote_port => {
+                        tracing::warn!(
+                            proxy = %p.name,
+                            remote_port = p.remote_port,
+                            advertise = %plugin.udp_advertise_addr,
+                            "socks5 UDP automatic companion needs udp_advertise_addr to use \
+                             remote_port (or no port); skipping the companion (set \
+                             udp_bind_addr to a fixed relay port for a direct deployment, or \
+                             udp_auto_companion = false)"
+                        );
+                        continue;
+                    }
+                    Some(_) => None,
+                    None => {
+                        return Err(format!(
+                            "socks5 proxy '{}': invalid udp_advertise_addr '{}' for UDP auto companion (set udp_auto_companion = false for a direct deployment)",
+                            p.name, plugin.udp_advertise_addr
+                        ));
+                    }
+                }
+            };
+            let mut proxy = ProxyConfig {
+                name,
+                proxy_type: "udp".to_string(),
+                local_ip: target_host,
+                local_port: bind_port,
+                remote_port: p.remote_port,
+                use_encryption: p.use_encryption,
+                use_compression: p.use_compression,
+                bandwidth_limit: p.bandwidth_limit.clone(),
+                bandwidth_limit_mode: p.bandwidth_limit_mode.clone(),
+                enabled: true,
+                ..Default::default()
+            };
+            proxy.annotations.insert(
+                AUTO_COMPANION_ANNOTATION.to_string(),
+                "socks5-udp".to_string(),
+            );
+            proxy
+                .annotations
+                .insert(AUTO_COMPANION_PARENT_ANNOTATION.to_string(), p.name.clone());
+            additions.push(Addition {
+                parent: p.name.clone(),
+                bind_addr,
+                advertise_addr,
+                proxy,
+            });
+        }
+
+        for addition in additions {
+            if let Some(parent) = self.proxies.iter_mut().find(|p| p.name == addition.parent) {
+                if let Some(plugin) = parent.plugin.as_mut() {
+                    if let Some(bind_addr) = addition.bind_addr {
+                        plugin.udp_bind_addr = bind_addr;
+                    }
+                    if let Some(advertise_addr) = addition.advertise_addr {
+                        plugin.udp_advertise_addr = advertise_addr;
+                    }
+                }
+            }
+            if !self.start.is_empty()
+                && self.start.iter().any(|n| n == &addition.parent)
+                && !self.start.iter().any(|n| n == &addition.proxy.name)
+            {
+                self.start.push(addition.proxy.name.clone());
+            }
+            self.proxies.push(addition.proxy);
+        }
+        Ok(())
+    }
+
     /// Apply conditional defaults matching Go frp dev (fatedier/frp@d486018)
     /// `ClientCommonConfig.Complete()` + `ClientTransportConfig.Complete()`.
     /// Call after deserialization, before consuming the config.

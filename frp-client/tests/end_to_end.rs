@@ -1,12 +1,16 @@
 mod common;
 
-use common::{allocate_port, init_tracing, start_echo_server, wait_for_port, TestHarness};
+use common::{
+    allocate_port, allocate_udp_port, init_tracing, start_echo_server, start_frps,
+    start_udp_echo_server, wait_for_port, TestHarness,
+};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use frp_client::service::Service as ClientService;
-use frp_core::config::{ClientConfig, ProxyConfig, ServerConfig};
+use frp_core::config::{ClientConfig, PluginConfig, ProxyConfig, ServerConfig};
 use frp_server::service::Service as ServerService;
 
 fn tls_cert_dir() -> PathBuf {
@@ -593,4 +597,166 @@ async fn test_e2e_tcp_proxy_over_yamux() {
     let mut buf2 = vec![0u8; payload2.len()];
     stream.read_exact(&mut buf2).await.expect("read 2");
     assert_eq!(&buf2, payload2, "second yamux echo should match");
+}
+
+async fn socks5_connect_with_retry(proxy_port: u16, target_port: u16) -> tokio::net::TcpStream {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut tcp) = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await
+        {
+            if tcp.write_all(&[0x05, 0x01, 0x00]).await.is_ok() {
+                let mut greeting = [0u8; 2];
+                if tcp.read_exact(&mut greeting).await.is_ok() && greeting == [0x05, 0x00] {
+                    let mut connect = vec![0x05, 0x01, 0x00, 0x01];
+                    connect.extend_from_slice(&[127, 0, 0, 1]);
+                    connect.extend_from_slice(&target_port.to_be_bytes());
+                    if tcp.write_all(&connect).await.is_ok() {
+                        let mut reply = [0u8; 10];
+                        if tcp.read_exact(&mut reply).await.is_ok()
+                            && reply[0] == 0x05
+                            && reply[1] == 0x00
+                        {
+                            return tcp;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "SOCKS5 CONNECT did not become ready within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// End-to-end test: SOCKS5 UDP ASSOCIATE with the automatic same-port
+/// companion.
+///
+/// The frpc config contains only the SOCKS5 TCP proxy. `udp_enable` makes
+/// `ClientConfig::inject_socks5_udp_companions` register `<name>__udp` on the
+/// same `remote_port`, so the client sees one port for TCP CONNECT and UDP
+/// ASSOCIATE. No manual `type = "udp"` proxy is configured.
+#[tokio::test]
+async fn test_e2e_socks5_udp_auto_companion_same_port() {
+    init_tracing();
+    let server_port = allocate_port();
+    // `remote_port` is a TCP *and* UDP port at frps; `allocate_port` only
+    // probes TCP, so ask the UDP allocator and then confirm TCP is free too.
+    let remote_port = loop {
+        let candidate = allocate_udp_port();
+        if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+            break candidate;
+        }
+    };
+    let tcp_echo_port = allocate_port();
+    let udp_echo_port = allocate_udp_port();
+    let token = "e2e-socks5-udp-auto-token";
+
+    let _tcp_echo = start_echo_server(tcp_echo_port);
+    let _udp_echo = start_udp_echo_server(udp_echo_port);
+    let _server = start_frps(server_port, token).await;
+    let server_addr: SocketAddr = format!("127.0.0.1:{server_port}").parse().unwrap();
+    wait_for_port(server_addr, Duration::from_secs(5))
+        .await
+        .expect("server port ready");
+
+    let cfg = ClientConfig {
+        server_addr: "127.0.0.1".into(),
+        server_port,
+        token: token.into(),
+        login_fail_exit: false,
+        tcp_mux: false,
+        tls_enable: false,
+        proxies: vec![ProxyConfig {
+            name: "socks5".into(),
+            proxy_type: "tcp".into(),
+            local_ip: "127.0.0.1".into(),
+            local_port: 0, // plugin proxies have no fixed local port
+            remote_port,
+            plugin: Some(PluginConfig {
+                plugin_type: "socks5".into(),
+                udp_enable: true,
+                // Leave both addresses empty: auto companion fills them.
+                ..Default::default()
+            }),
+            enabled: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let client = ClientService::new(cfg, None)
+        .await
+        .expect("create client service");
+    let _client = tokio::spawn(async move {
+        let _ = client.run().await;
+    });
+
+    // 1. TCP CONNECT through the same remote port. Retry the real handshake
+    // instead of sleeping: the listener and the auto companion register after
+    // login, and a bare port probe would consume a pooled work connection.
+    let mut tcp = socks5_connect_with_retry(remote_port, tcp_echo_port).await;
+    let tcp_payload = b"same-port tcp\n";
+    tcp.write_all(tcp_payload).await.unwrap();
+    let mut tcp_echo = vec![0u8; tcp_payload.len()];
+    tcp.read_exact(&mut tcp_echo).await.unwrap();
+    assert_eq!(&tcp_echo, tcp_payload);
+
+    // 2. UDP ASSOCIATE through the same remote port, using only the
+    // automatically registered companion.
+    let mut control = tokio::net::TcpStream::connect(format!("127.0.0.1:{remote_port}"))
+        .await
+        .expect("connect socks5 udp control");
+    control.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+    let mut greeting = [0u8; 2];
+    control.read_exact(&mut greeting).await.unwrap();
+    assert_eq!(greeting, [0x05, 0x00]);
+    control
+        .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut hdr = [0u8; 4];
+    control.read_exact(&mut hdr).await.unwrap();
+    assert_eq!(hdr[0], 0x05);
+    assert_eq!(hdr[1], 0x00, "UDP ASSOCIATE must succeed");
+    let bnd_port = match hdr[3] {
+        0x01 => {
+            let mut addr = [0u8; 6];
+            control.read_exact(&mut addr).await.unwrap();
+            assert_eq!(&addr[..4], &[127, 0, 0, 1]);
+            u16::from_be_bytes([addr[4], addr[5]])
+        }
+        0x04 => {
+            let mut addr = [0u8; 18];
+            control.read_exact(&mut addr).await.unwrap();
+            u16::from_be_bytes([addr[16], addr[17]])
+        }
+        other => panic!("unexpected BND ATYP {other}"),
+    };
+    assert_eq!(
+        bnd_port, remote_port,
+        "automatic companion must advertise the same remote port"
+    );
+
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut datagram = vec![0, 0, 0, 0x01, 127, 0, 0, 1];
+    datagram.extend_from_slice(&udp_echo_port.to_be_bytes());
+    datagram.extend_from_slice(b"same-port udp\n");
+    udp.send_to(&datagram, format!("127.0.0.1:{bnd_port}"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(5), udp.recv_from(&mut buf))
+        .await
+        .expect("udp reply timeout")
+        .expect("udp reply");
+    assert!(n > 10, "short UDP reply");
+    assert_eq!(&buf[..3], &[0, 0, 0], "UDP reply RSV/FRAG");
+    let header_len = match buf[3] {
+        0x01 => 10,                          // ATYP IPv4: 4 + 4 + 2
+        0x04 => 22,                          // ATYP IPv6: 4 + 16 + 2
+        0x03 => 4 + 1 + buf[4] as usize + 2, // ATYP domain
+        other => panic!("unexpected UDP reply ATYP {other}"),
+    };
+    assert_eq!(&buf[header_len..n], b"same-port udp\n");
 }

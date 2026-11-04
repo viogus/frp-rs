@@ -12364,6 +12364,7 @@ remote_port = 7000
 [proxies.plugin]
 type = "socks5"
 udpEnable = true
+udpAutoCompanion = false
 udpBindAddr = "127.0.0.1:17000"
 udpAdvertiseAddr = "203.0.113.10:7001"
 
@@ -12375,25 +12376,471 @@ remote_port = 7002
 [proxies.plugin]
 type = "socks5"
 udp_enable = true
+udp_auto_companion = true
 udp_bind_addr = "0.0.0.0:17002"
 udp_advertise_addr = "203.0.113.11:7003"
 "#;
     let cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
     let p = cfg.proxies[0].plugin.as_ref().expect("camelCase plugin");
     assert!(p.udp_enable);
+    assert_eq!(p.udp_auto_companion, Some(false));
     assert_eq!(p.udp_bind_addr, "127.0.0.1:17000");
     assert_eq!(p.udp_advertise_addr, "203.0.113.10:7001");
 
     let p = cfg.proxies[1].plugin.as_ref().expect("snake_case plugin");
     assert!(p.udp_enable);
+    assert_eq!(p.udp_auto_companion, Some(true));
     assert_eq!(p.udp_bind_addr, "0.0.0.0:17002");
     assert_eq!(p.udp_advertise_addr, "203.0.113.11:7003");
 
-    // Defaults: UDP stays off unless explicitly enabled.
+    // Defaults: UDP stays off unless explicitly enabled; an absent auto
+    // companion means enabled.
     let p = PluginConfig::default();
     assert!(!p.udp_enable);
+    assert_eq!(p.udp_auto_companion, None);
+    assert!(p.udp_auto_companion_enabled());
     assert!(p.udp_bind_addr.is_empty());
     assert!(p.udp_advertise_addr.is_empty());
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_defaults() {
+    let toml = r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+use_encryption = true
+use_compression = true
+bandwidth_limit = "1MB"
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    assert_eq!(cfg.proxies.len(), 2, "parent + auto companion");
+
+    let plugin = cfg.proxies[0].plugin.as_ref().expect("socks5 plugin");
+    assert!(plugin.udp_bind_addr.starts_with("127.0.0.1:"));
+    assert_eq!(plugin.udp_advertise_addr, "203.0.113.10:7000");
+    let bound_port: u16 = plugin
+        .udp_bind_addr
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(bound_port, 0);
+
+    let c = &cfg.proxies[1];
+    assert_eq!(c.name, "socks5__udp");
+    assert_eq!(c.proxy_type, "udp");
+    assert_eq!(c.local_ip, "127.0.0.1");
+    assert_eq!(c.local_port, bound_port);
+    assert_eq!(c.remote_port, 7000);
+    assert!(c.use_encryption);
+    assert!(c.use_compression);
+    assert_eq!(c.bandwidth_limit, "1MB");
+    assert_eq!(
+        c.annotations
+            .get("frp-rs.auto-companion")
+            .map(String::as_str),
+        Some("socks5-udp")
+    );
+    assert_eq!(
+        c.annotations
+            .get("frp-rs.auto-companion-parent")
+            .map(String::as_str),
+        Some("socks5")
+    );
+
+    // Idempotent: a second pass must not add a duplicate companion.
+    cfg.inject_socks5_udp_companions().expect("second inject");
+    assert_eq!(cfg.proxies.len(), 2);
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_preserves_explicit_addresses() {
+    let toml = r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_bind_addr = "0.0.0.0:17000"
+udp_advertise_addr = "198.51.100.1:7000"
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
+    assert_eq!(plugin.udp_bind_addr, "0.0.0.0:17000");
+    assert_eq!(plugin.udp_advertise_addr, "198.51.100.1:7000");
+    let c = &cfg.proxies[1];
+    assert_eq!(c.local_ip, "127.0.0.1");
+    assert_eq!(c.local_port, 17000);
+    assert_eq!(c.remote_port, 7000);
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_can_be_disabled() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_auto_companion = false
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions().expect("inject no-op");
+    assert_eq!(cfg.proxies.len(), 1);
+    let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
+    assert!(plugin.udp_bind_addr.is_empty());
+    assert!(plugin.udp_advertise_addr.is_empty());
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_skips_manual_companion() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_bind_addr = "127.0.0.1:17000"
+udp_advertise_addr = "203.0.113.10:7000"
+
+[[proxies]]
+name = "manual_udp"
+type = "udp"
+remote_port = 7000
+local_ip = "127.0.0.1"
+local_port = 17000
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    assert_eq!(
+        cfg.proxies.len(),
+        2,
+        "manual companion must not be duplicated"
+    );
+    assert!(cfg.proxies.iter().all(|p| p.name != "socks5__udp"));
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_skips_manual_without_bind() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+
+[[proxies]]
+name = "manual_udp"
+type = "udp"
+remote_port = 7000
+local_ip = "127.0.0.1"
+local_port = 17000
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("a manual companion without a bind must not refuse startup");
+    assert_eq!(cfg.proxies.len(), 2);
+    assert!(cfg.proxies.iter().all(|p| p.name != "socks5__udp"));
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_skips_without_remote_port() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("remote_port = 0 must not refuse startup");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert!(cfg.proxies.iter().all(|p| p.name != "socks5__udp"));
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_direct_mode_is_not_refused() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 17100
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_bind_addr = "0.0.0.0:17001"
+udp_advertise_addr = "203.0.113.9:17001"
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("an explicit direct deployment must keep starting");
+    assert_eq!(cfg.proxies.len(), 1);
+    let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
+    assert_eq!(plugin.udp_bind_addr, "0.0.0.0:17001");
+    assert_eq!(plugin.udp_advertise_addr, "203.0.113.9:17001");
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_skips_non_tcp_parent() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "stcp"
+remote_port = 7000
+sk = "secret"
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("non-tcp parents must not refuse startup");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert!(cfg.proxies.iter().all(|p| p.name != "socks5__udp"));
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_does_not_copy_group() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+group = "g"
+group_key = "k"
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    let companion = cfg
+        .proxies
+        .iter()
+        .find(|p| p.name == "socks5__udp")
+        .unwrap();
+    assert!(companion.group.is_empty());
+    assert!(companion.group_key.is_empty());
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_ipv6_advertise() {
+    let toml = r#"
+serverAddr = "2001:db8::10"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
+    assert!(plugin.udp_bind_addr.starts_with("127.0.0.1:"));
+    assert_eq!(plugin.udp_advertise_addr, "[2001:db8::10]:7000");
+    let bound_port: u16 = plugin
+        .udp_bind_addr
+        .rsplit(':')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(cfg.proxies[1].local_port, bound_port);
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_bare_advertise_uses_remote_port() {
+    let toml = r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_advertise_addr = "198.51.100.1"
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    let plugin = cfg.proxies[0].plugin.as_ref().unwrap();
+    assert_eq!(plugin.udp_advertise_addr, "198.51.100.1:7000");
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_skips_advertise_port_mismatch() {
+    let toml = r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+udp_advertise_addr = "198.51.100.1:7001"
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("a mismatched advertise port must warn and skip, not refuse startup");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert!(cfg.proxies.iter().all(|p| p.name != "socks5__udp"));
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_reuses_previous_bind() {
+    let toml = r#"
+serverAddr = "203.0.113.10"
+serverPort = 7000
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut first: ClientConfig = load_client_config_from_str(toml).unwrap();
+    first
+        .inject_socks5_udp_companions()
+        .expect("first inject companion");
+    let bind = first.proxies[0]
+        .plugin
+        .as_ref()
+        .unwrap()
+        .udp_bind_addr
+        .clone();
+    let local_port = first.proxies[1].local_port;
+    assert!(local_port != 0);
+
+    let mut reloaded: ClientConfig = load_client_config_from_str(toml).unwrap();
+    reloaded
+        .inject_socks5_udp_companions_preserving(&first.proxies)
+        .expect("reload inject companion");
+    assert_eq!(
+        reloaded.proxies[0].plugin.as_ref().unwrap().udp_bind_addr,
+        bind,
+        "an unchanged reload must keep the same ephemeral bind port"
+    );
+    assert_eq!(reloaded.proxies[1].local_port, local_port);
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_skips_unselected_parent() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+start = ["socks5__udp"]
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    assert_eq!(cfg.proxies.len(), 1);
+    assert!(cfg.proxies.iter().all(|p| p.name != "socks5__udp"));
+}
+
+#[test]
+fn test_socks5_udp_auto_companion_follows_start_allowlist() {
+    let toml = r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+start = ["socks5"]
+
+[[proxies]]
+name = "socks5"
+type = "tcp"
+remote_port = 7000
+
+[proxies.plugin]
+type = "socks5"
+udp_enable = true
+"#;
+    let mut cfg: ClientConfig = load_client_config_from_str(toml).unwrap();
+    cfg.inject_socks5_udp_companions()
+        .expect("inject companion");
+    assert!(cfg.start.iter().any(|n| n == "socks5__udp"));
 }
 
 #[test]
@@ -14837,7 +15284,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:1499` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:1333`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:13533`).
+/// `frp-core/src/config/tests.rs:13980`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -15253,7 +15700,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:13728`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:13959`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2187` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]

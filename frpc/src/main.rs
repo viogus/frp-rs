@@ -17,7 +17,7 @@ use frp_core::config::{
 };
 use frp_core::logging;
 use frp_core::unsafe_features::UnsafeFeatures;
-use frp_core::{EXIT_CONFIG, EXIT_RUNTIME};
+use frp_core::{EXIT_BIND, EXIT_CONFIG, EXIT_RUNTIME};
 
 use frp_core::base64::encode as base64_encode;
 
@@ -873,7 +873,7 @@ async fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[Stri
     let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
     let unsafe_features = UnsafeFeatures::new(&refs);
     match load_client_config_with_presence_checked(config_path, strict_config, &unsafe_features) {
-        Ok((cfg, presence)) => {
+        Ok((mut cfg, presence)) => {
             // This path installs its console logger **before** the load, so the
             // sink exists: emit the `[web_server.tls] enable` diagnostic here to
             // keep the coverage this subcommand had while the loader warned (and
@@ -892,6 +892,19 @@ async fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[Stri
                 println!("Config file {} is invalid: {}", config_path, e);
                 // Go v0.71.0 `frpc verify -c <bad>` exits 1 (`cmd/frpc/sub/verify.go`).
                 process::exit(EXIT_RUNTIME);
+            }
+            // `run` filters disabled proxies before injecting the automatic
+            // SOCKS5 UDP companion; do the same here so `verify` cannot reject
+            // a config that `run` accepts.
+            cfg.proxies.retain(|p| p.enabled);
+            // `run` refuses a socks5 UDP proxy that asks for the automatic
+            // companion but has a malformed explicit advertise address; verify
+            // must agree, and must count the synthetic proxy it will register.
+            // The same `InitErrorKind::Other` exit code as `run` keeps the two
+            // commands consistent for this class of construction failure.
+            if let Err(e) = cfg.inject_socks5_udp_companions() {
+                println!("Config file {} is invalid: {}", config_path, e);
+                process::exit(EXIT_BIND);
             }
             // Go v0.71.0 `cmd/frpc/sub/verify.go:52` prints exactly
             // `frpc: the configuration file <path> syntax is ok` — the same

@@ -193,7 +193,7 @@ Add a field only for a genuinely new knob, and then follow the house rules:
 
 - `#[serde(default, alias = "camelCaseName")]` so the Go spelling still parses
   (e.g. the `proxyProtocolVersion` alias on `proxy_protocol_version` at
-  `frp-core/src/config/client.rs:764`).
+  `frp-core/src/config/client.rs:998`).
 - **snake_case on the wire.** `NewProxy`'s JSON keys must stay snake_case
   (`http_user`, `host_header_rewrite`, …). A camelCase wire key is *silently
   ignored* by Go frp — the config is accepted and the setting is dropped. This is
@@ -4079,7 +4079,7 @@ work; a bug fix on a frozen surface never needs an unfreeze.
   Wintun (`wintun.dll`) integration *and* can test on a Windows host; this
   repo's CI does not exercise vnet on Windows.
 - **Non-default XTCP data plane (KCP+yamux)** — selected by `protocol = "kcp"`;
-  the default is QUIC (`frp-core/src/config/client.rs:912`,
+  the default is QUIC (`frp-core/src/config/client.rs:1034`,
   `docs/config.md:671`). Unfreeze if a case is reported that the QUIC plane
   cannot serve (for example a hole punch where the QUIC handshake never
   completes but KCP does).

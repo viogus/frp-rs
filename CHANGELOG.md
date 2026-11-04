@@ -11,6 +11,10 @@ User-facing release notes for frp-rs.
 
 ## Unreleased
 
+### Features
+
+- **SOCKS5 `UDP ASSOCIATE` works through frps without a hand-written companion proxy.** Setting `udp_enable = true` on the `socks5` plugin now auto-registers a `<name>__udp` UDP proxy on the **same `remote_port`** by default; frpc picks an ephemeral loopback relay port and fills `udp_advertise_addr` from `serverAddr`. The client uses one port for TCP and UDP, and the synthetic proxy is a normal UDP proxy on the wire (works against Go frps). Deployments that set both `udp_bind_addr` and an `udp_advertise_addr` whose port differs from `remote_port` are recognised as direct mode and skip the companion; `remote_port = 0` and non-TCP parents log a warning and skip it. Set `udp_auto_companion = false` to opt out explicitly. The companion is visible in proxy/status listings; it is **not** added to a proxy `group` because UDP has a single owner per port, so grouped/HA deployments keep TCP grouping but only one member can serve the UDP side at a time.
+
 ### Fixes
 
 - **The SSH gateway no longer runs `exec`/`env` on a work connection.** A

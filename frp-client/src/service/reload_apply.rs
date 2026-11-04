@@ -127,6 +127,14 @@ impl Service {
         // reload diff never registers store/config proxies outside `start`.
         new_cfg.proxies.retain(|p| p.enabled);
         new_cfg.visitors.retain(|v| v.enabled);
+        // Recompute the synthetic socks5 UDP companions from the reloaded
+        // parent proxies before the start allowlist is applied. A parent that
+        // is removed/disabled therefore drops its companion too, and a newly
+        // enabled parent gains one. Pass the previous proxies so an unchanged
+        // auto companion keeps its ephemeral bind port; otherwise every reload
+        // would look like a change and restart the SOCKS5 plugin.
+        let previous_proxies = self.proxies.read().await.clone();
+        new_cfg.inject_socks5_udp_companions_preserving(previous_proxies.as_slice())?;
         let active_proxies = filter_active_proxies(&new_cfg, &new_cfg.proxies);
         new_cfg.proxies = active_proxies;
         new_cfg.visitors = filter_active_visitors(&new_cfg, &new_cfg.visitors);

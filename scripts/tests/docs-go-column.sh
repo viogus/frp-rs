@@ -68,7 +68,7 @@
 #
 # Scenarios
 #   1  the row-by-row scan of `$DOCS_CONFIG` (default docs/config.md): 17 Go-column tables,
-#      195 data rows, 27 divergence markers, 0 alias rows, the key-set artifact diff, the 41
+#      196 data rows, 28 divergence markers, 0 alias rows, the key-set artifact diff, the 41
 #      alias resolutions, one check per data row and one per pinned row.
 #   2  seven mutations of a copy of the repository's own docs/config.md, each of which must red —
 #      M1 reword the `websocket_port` divergence to `websocketPort`, M2 reword `tls_enable` to
@@ -165,13 +165,13 @@ import sys
 HDR = "| Field | Type | Default | Go frp Equivalent | Description |"
 GO_ARTIFACT = sys.argv[2]
 EXPECTED_TABLES = 17
-EXPECTED_ROWS = 195
-EXPECTED_DIVERGENT = 27
+EXPECTED_ROWS = 196
+EXPECTED_DIVERGENT = 28
 EXPECTED_ALIAS_ROWS = 0
 EXPECTED_GO_KEYS = 261
 EXPECTED_GO_DOTTED = 108
 EXPECTED_GO_BARE = 153
-EXPECTED_ROW_PATHS = 195
+EXPECTED_ROW_PATHS = 196
 EXPECTED_RESOLUTIONS = 41
 
 # --- curated Go frp v0.71.0 spellings: dotted json paths + bare json field names ---
@@ -703,6 +703,7 @@ ROW_GO_PATHS = {
     (16, 'bind_addr'): 'go:bindAddr',
     (16, 'bind_port'): 'go:bindPort',
     (16, 'udp_enable'): 'divergent',
+    (16, 'udp_auto_companion'): 'divergent',
     (16, 'udp_bind_addr'): 'divergent',
     (16, 'udp_advertise_addr'): 'divergent',
     # table 17

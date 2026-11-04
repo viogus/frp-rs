@@ -96,7 +96,7 @@ version number is deliberately not independent (see
 Client plugins: `http_proxy`, `socks5`, `static_file`, `unix_domain_socket`, `http2https`, `https2http`, `https2https`, `http2http`, `tls2raw`, `virtual_net`, `http2connect`.
 
 **frp-rs extensions Go frp does not have:**
-- **SOCKS5 `UDP ASSOCIATE`** (RFC 1928 §7) in the `socks5` plugin — Go frp's `socks5` plugin is CONNECT-only. Enable with `plugin.udp_enable`; see [Client Plugins § SOCKS5](docs/client-plugins.md#2-socks5-plugintype--socks5).
+- **SOCKS5 `UDP ASSOCIATE`** (RFC 1928 §7) in the `socks5` plugin — Go frp's `socks5` plugin is CONNECT-only. Enable with `plugin.udp_enable`; frpc automatically registers a same-port UDP companion, so no second `[[proxies]]` block is needed. See [Client Plugins § SOCKS5](docs/client-plugins.md#2-socks5-plugintype--socks5).
 - **`http2connect`** — an HTTP/2 `CONNECT` (TCP) and RFC 9298 `CONNECT-UDP` forward proxy. Go frp has no HTTP/2 CONNECT plugin; see [Client Plugins § HTTP/2 CONNECT](docs/client-plugins.md#10-http2-connect-plugintype--http2connect-frp-rs-extension).
 
 \* Store semantics differ: the client store (`store.path`) persists runtime proxy/visitor entries for admin API CRUD; the server store (`frps_store.json`) persists dashboard-created proxies.

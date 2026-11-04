@@ -574,6 +574,13 @@ impl Service {
         // Go frp source.Load() treats enabled=false as source-local filtering.
         cfg.proxies.retain(|p| p.enabled);
         cfg.visitors.retain(|v| v.enabled);
+        // A socks5 UDP relay lives outside the frp TCP tunnel, so frpc needs a
+        // UDP proxy on frps to carry its datagrams. Register that proxy here
+        // (same remote_port as the socks5 proxy) so users do not have to write
+        // a companion [[proxies]] block. This runs before the `start` filter;
+        // inject_socks5_udp_companions also adds the synthetic names to
+        // `start` when their parent is selected, so the filter keeps them.
+        cfg.inject_socks5_udp_companions()?;
         // Go frp FilterClientConfigurers applies `start` to visitors too, so
         // visitors outside the allowlist must not register or start.
         cfg.visitors = filter_active_visitors(&cfg, &cfg.visitors);
