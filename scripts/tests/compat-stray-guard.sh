@@ -8,13 +8,15 @@
 # of that, so the guard is driven here against synthetic `frps` processes whose
 # name is real and whose command line is the only thing that distinguishes them.
 #
-# A synthetic server is a symlink named `frps` to `sleep` (scenario 5's two
-# helpers use the same trick under the name `helper`, where the process name is
-# not the point):
-# `pgrep -x frps` sees the name (the kernel names a process after the path it was
-# exec'd through, symlink included), `ps -o command=` shows that path, and the
-# process is long-lived and port-free. No compat server, no ports, no repo
-# binaries.
+# A synthetic server is a private copy of `sleep` named `frps` (scenario 5's
+# two helpers use the same trick under the name `helper`, where the process name
+# is not the point):
+# `pgrep -x frps` sees the name (the kernel names a process after its executable
+# basename), `ps -o command=` shows that path, and the process is long-lived and
+# port-free. No compat server, no ports, no repo binaries. On Linux the helper
+# is a copy, so `comm` is `frps` even when a symlink would exec through the
+# target's basename; macOS keeps the symlink because AMFI kills a copied signed
+# binary.
 #
 # Scenarios
 #   1  clean run: assert_no_strays returns 0, and neither an in-`$TEST_DIR`
@@ -1018,14 +1020,19 @@ sleep_bin=$(command -v sleep) || { printf 'FAIL  cannot find sleep\n'; exit 1; }
 BASH_BIN=${BASH:-/bin/bash}
 command -v pgrep >/dev/null 2>&1 || { printf 'FAIL  this fixture harness needs pgrep on PATH\n'; exit 1; }
 
-# spawn_fake <dir-under-which-the-symlink-lives> [name] -> echoes the pid
-# The symlink is `<dir>/<name>` (default `frps`); running it puts that path in
-# the command line, which is what makes the process match (or not match)
+# spawn_fake <dir-under-which-the-copy-lives> [name] -> echoes the pid
+# The private copy is `<dir>/<name>` (default `frps`); running it puts that path
+# in the command line, which is what makes the process match (or not match)
 # `$TEST_DIR/` and what the exit trap's ownership predicate matches on.
 spawn_fake() {
   local dir=$1 name=${2:-frps}
   mkdir -p "$dir"
-  ln -sfn "$sleep_bin" "$dir/$name"
+  if [ "$(uname -s)" = Darwin ]; then
+    ln -sfn "$sleep_bin" "$dir/$name"
+  else
+    cp "$sleep_bin" "$dir/$name"
+    chmod +x "$dir/$name"
+  fi
   "$dir/$name" 300 >/dev/null 2>&1 &
   printf '%s' "$!"
 }
@@ -1133,7 +1140,7 @@ for _ in $(seq 1 50); do
   if pid_seen "$selfpid"; then seen=true; break; fi
   sleep 0.1
 done
-hdr 'fixture setup: a symlink named `frps` is visible to `pgrep -x frps`'
+hdr 'fixture setup: a copy named `frps` is visible to `pgrep -x frps`'
 if $seen; then
   ok "pgrep -x frps sees synthetic server pid $selfpid"
 else
@@ -1254,7 +1261,7 @@ hdr 'scenario 5: cleanup_pids does not wait on an untracked child'
 export TEST_DIR="$WORK/run5"
 # shellcheck source=/dev/null
 source "$LIB"
-# Both helpers are synthetic servers under `$WORK` (symlinks to `sleep`, exactly
+# Both helpers are synthetic servers under `$WORK` (copies of `sleep`, exactly
 # like `spawn_fake`'s), so the exit trap's directory-scoped predicate reaps them
 # and "every synthetic pid we start" is true rather than aspirational: deleting
 # the explicit leg below cannot leave the untracked one behind. `cleanup_pids`
