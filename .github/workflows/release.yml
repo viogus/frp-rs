@@ -39,6 +39,11 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           TAG="${INPUT_TAG:-$REF_NAME}"
+          # Reject option-like or non-version tags before passing them to gh.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+ ]]; then
+            echo "ERROR: invalid release tag: ${TAG}"
+            exit 1
+          fi
           SHA="$(git rev-parse HEAD)"
           # Verify HEAD is actually a tag (not a branch).
           if ! git describe --tags --exact-match HEAD >/dev/null 2>&1; then
@@ -270,14 +275,23 @@ jobs:
           # `gh release view` can also hit transient 502s. A failed view falls
           # through to create, which then fails with "already exists"; retry the
           # view/create pair so that path converges instead of aborting.
+          # If the release is already published, convert it to a draft before
+          # touching assets so a failed upload cannot leave a mixed public set.
           release_ready=false
           for attempt in 1 2 3 4 5; do
-            if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-              echo "Release $RELEASE_TAG already exists — will re-upload assets."
+            if is_draft=$(timeout 120 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+              if [ "$is_draft" != true ]; then
+                echo "Release $RELEASE_TAG is published; converting to draft before upload."
+                if ! timeout 120 gh release edit "$RELEASE_TAG" --draft=true; then
+                  echo "::error::could not convert ${RELEASE_TAG} to a draft; refusing to clobber a published release"
+                  exit 1
+                fi
+              fi
+              echo "Release $RELEASE_TAG is a draft — will upload assets."
               release_ready=true
               break
             fi
-            if output=$(gh release create "$RELEASE_TAG" \
+            if output=$(timeout 120 gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
               --generate-notes \
               --draft \
@@ -305,9 +319,9 @@ jobs:
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
-          # Keep the whole upload step below the 45-minute job timeout so its
-          # failure cleanup can still run instead of the job being killed.
-          UPLOAD_DEADLINE=$((SECONDS + 1800))
+          # Keep the archive loop well below the 45-minute job timeout so the
+          # tail (checksums, verification, publish) and cleanup can still run.
+          UPLOAD_DEADLINE=$((SECONDS + 1200))
           TOUCHED="${RUNNER_TEMP:-/tmp}/release-assets-touched"
           rm -f "$TOUCHED"
 
@@ -381,23 +395,34 @@ jobs:
           sort -o "$expected_names" "$expected_names"
 
           remote_names=""
+          remote_listed=false
           for attempt in 1 2 3; do
-            if remote_names=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
+            if remote_names=$(timeout 120 gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
+              remote_listed=true
               break
             fi
             if [ "$attempt" -lt 3 ]; then
               sleep $((attempt * 5))
             fi
           done
-          printf '%s\n' "$remote_names" | sed '/^$/d' | sort > "$actual_names"
+          if [ "$remote_listed" != true ]; then
+            echo "::error::could not list assets for ${RELEASE_TAG} after 3 attempts; the release remains a draft"
+            exit 1
+          fi
+          printf '%s\n' "$remote_names" | sed '/^$/d' | sort -u > "$actual_names"
           if ! diff -u "$expected_names" "$actual_names"; then
-            echo "::error::release ${RELEASE_TAG} asset set does not match the uploaded set"
+            echo "::error::release ${RELEASE_TAG} asset set does not match the uploaded set; inspect or remove the draft with 'gh release delete ${RELEASE_TAG} --yes' and re-run"
             exit 1
           fi
 
-          # Everything is present; publish only now. A failed upload leaves a
-          # draft (new release) or the previous published release untouched.
-          gh release edit "$RELEASE_TAG" --draft=false
+          # Everything is present; publish only now. A failed upload leaves the
+          # release as a draft, never a mixed public release.
+          timeout 120 gh release edit "$RELEASE_TAG" --draft=false
+          published=$(timeout 120 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
+          if [ "$published" != false ]; then
+            echo "::error::release ${RELEASE_TAG} is still a draft after publish"
+            exit 1
+          fi
 
       - name: Remove stale checksums after a failed publish
         if: always() && (steps.upload.outcome == 'failure' || steps.upload.outcome == 'cancelled')
@@ -407,11 +432,15 @@ jobs:
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
-          # Only strip checksums if this run actually touched an archive;
-          # otherwise a checkout/download/count failure would remove a good
-          # checksums.txt from an untouched release.
+          # Only strip checksums if this run actually touched an archive and the
+          # release is still a draft; never mutate a published release.
           if [ ! -f "${RUNNER_TEMP:-/tmp}/release-assets-touched" ]; then
             echo "No archive upload was attempted; leaving existing checksums untouched."
+            exit 0
+          fi
+          is_draft=$(timeout 60 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          if [ "$is_draft" != true ]; then
+            echo "Release is not a draft; leaving published assets and checksums untouched."
             exit 0
           fi
           gh release delete-asset "$RELEASE_TAG" checksums.txt --yes || true
