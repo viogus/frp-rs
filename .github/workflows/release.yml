@@ -264,13 +264,32 @@ jobs:
         with:
           path: artifacts
 
+      - name: Validate downloaded artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets_file="${RUNNER_TEMP:-/tmp}/release-assets.list"
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 > "$assets_file"
+          asset_count=$(tr -cd '\0' < "$assets_file" | wc -c | tr -d ' ')
+          # 13 targets x 3 profiles; keep in sync with build-*-matrix above.
+          # 9 Linux x 3 + 2 macOS x 3 + 2 Windows x 3.
+          expected_count=39
+          if [ "$asset_count" -ne "$expected_count" ]; then
+            echo "::error::expected ${expected_count} release archives, found ${asset_count}; refusing to touch the release"
+            exit 1
+          fi
+          echo "Validated ${asset_count} release archives."
+
       - name: Create release
+        id: create
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
+          WAS_PUBLISHED="${RUNNER_TEMP:-/tmp}/release-was-published"
+          rm -f "$WAS_PUBLISHED"
 
           # `gh release view` can also hit transient 502s. A failed view falls
           # through to create, which then fails with "already exists"; retry the
@@ -286,6 +305,7 @@ jobs:
                   echo "::error::could not convert ${RELEASE_TAG} to a draft; refusing to clobber a published release"
                   exit 1
                 fi
+                touch "$WAS_PUBLISHED"
               fi
               echo "Release $RELEASE_TAG is a draft — will upload assets."
               release_ready=true
@@ -351,20 +371,15 @@ jobs:
             return 1
           }
 
-          assets_file=$(mktemp)
+          assets_file="${RUNNER_TEMP:-/tmp}/release-assets.list"
           expected_names=$(mktemp)
           actual_names=$(mktemp)
-          trap 'rm -f "$assets_file" "$expected_names" "$actual_names" checksums.txt' EXIT
+          trap 'rm -f "$expected_names" "$actual_names" checksums.txt' EXIT
 
-          # Materialise the file list once so a missing/unreadable artifacts/
-          # directory fails here instead of silently uploading zero assets.
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 > "$assets_file"
-          asset_count=$(tr -cd '\0' < "$assets_file" | wc -c | tr -d ' ')
-          # 13 targets x 3 profiles; keep in sync with build-*-matrix above.
-          # 9 Linux x 3 + 2 macOS x 3 + 2 Windows x 3.
-          expected_count=39
-          if [ "$asset_count" -ne "$expected_count" ]; then
-            echo "::error::expected ${expected_count} release archives, found ${asset_count}; refusing to publish a partial release"
+          # The validation step already materialised and counted this list; if
+          # it is missing, fail before uploading anything.
+          if [ ! -s "$assets_file" ]; then
+            echo "::error::validated asset list is missing or empty: ${assets_file}"
             exit 1
           fi
 
@@ -424,18 +439,27 @@ jobs:
             exit 1
           fi
 
-      - name: Remove stale checksums after a failed publish
-        if: always() && (steps.upload.outcome == 'failure' || steps.upload.outcome == 'cancelled')
+      - name: Remove stale checksums or restore the published release
+        if: always() && (steps.create.outcome == 'failure' || steps.upload.outcome == 'failure' || steps.upload.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
-          # Only strip checksums if this run actually touched an archive and the
-          # release is still a draft; never mutate a published release.
+          # If we converted a published release to a draft but never attempted
+          # an upload, restore its published state. If any archive was touched,
+          # leave it as a draft rather than exposing a possibly mixed set.
           if [ ! -f "${RUNNER_TEMP:-/tmp}/release-assets-touched" ]; then
-            echo "No archive upload was attempted; leaving existing checksums untouched."
+            if [ -f "${RUNNER_TEMP:-/tmp}/release-was-published" ]; then
+              is_draft=$(timeout 60 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+              if [ "$is_draft" = true ]; then
+                timeout 120 gh release edit "$RELEASE_TAG" --draft=false || true
+                echo "Restored the previously published release after a pre-upload failure."
+              fi
+            else
+              echo "No archive upload was attempted; leaving existing checksums untouched."
+            fi
             exit 0
           fi
           is_draft=$(timeout 60 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
