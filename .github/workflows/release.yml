@@ -301,11 +301,13 @@ jobs:
             if is_draft=$(timeout 120 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
               if [ "$is_draft" != true ]; then
                 echo "Release $RELEASE_TAG is published; converting to draft before upload."
+                # Record intent before the mutation: a timeout/502 can apply the
+                # edit server-side without returning success.
+                touch "$WAS_PUBLISHED"
                 if ! timeout 120 gh release edit "$RELEASE_TAG" --draft=true; then
                   echo "::error::could not convert ${RELEASE_TAG} to a draft; refusing to clobber a published release"
                   exit 1
                 fi
-                touch "$WAS_PUBLISHED"
               fi
               echo "Release $RELEASE_TAG is a draft — will upload assets."
               release_ready=true
@@ -357,6 +359,9 @@ jobs:
                 echo "::error::upload deadline exceeded before ${asset}"
                 return 1
               fi
+              # Mark touched only once an upload is actually attempted; a
+              # deadline failure must leave the published release restorable.
+              touch "$TOUCHED"
               if output=$(timeout 120 gh release upload "$RELEASE_TAG" "$asset" --clobber 2>&1); then
                 return 0
               fi
@@ -382,12 +387,14 @@ jobs:
             echo "::error::validated asset list is missing or empty: ${assets_file}"
             exit 1
           fi
+          asset_count=$(tr -cd '\0' < "$assets_file" | wc -c | tr -d ' ')
+          if [ "$asset_count" -ne 39 ]; then
+            echo "::error::expected 39 archives in the validated list, found ${asset_count}"
+            exit 1
+          fi
 
           while IFS= read -r -d '' asset; do
             echo "Uploading: ${asset}"
-            # Mark the release as touched before the attempt: --clobber deletes
-            # the old asset first, so even a permanent failure can leave a mix.
-            touch "$TOUCHED"
             upload_asset "$asset"
           done < "$assets_file"
 
@@ -432,7 +439,22 @@ jobs:
 
           # Everything is present; publish only now. A failed upload leaves the
           # release as a draft, never a mixed public release.
-          timeout 120 gh release edit "$RELEASE_TAG" --draft=false
+          publish_ok=false
+          for attempt in 1 2 3 4 5; do
+            if timeout 120 gh release edit "$RELEASE_TAG" --draft=false; then
+              publish_ok=true
+              break
+            fi
+            if [ "$attempt" -lt 5 ]; then
+              delay=$((attempt * 10))
+              echo "::warning::publish failed (attempt ${attempt}/5); retrying in ${delay}s"
+              sleep "$delay"
+            fi
+          done
+          if [ "$publish_ok" != true ]; then
+            echo "::error::could not publish ${RELEASE_TAG} after 5 attempts"
+            exit 1
+          fi
           published=$(timeout 120 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
           if [ "$published" != false ]; then
             echo "::error::release ${RELEASE_TAG} is still a draft after publish"
@@ -440,31 +462,60 @@ jobs:
           fi
 
       - name: Remove stale checksums or restore the published release
-        if: always() && (steps.create.outcome == 'failure' || steps.upload.outcome == 'failure' || steps.upload.outcome == 'cancelled')
+        if: always() && (steps.create.outcome == 'failure' || steps.create.outcome == 'cancelled' || steps.upload.outcome == 'failure' || steps.upload.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
+          publish_retry() {
+            local attempt delay
+            for attempt in 1 2 3 4 5; do
+              if timeout 120 gh release edit "$RELEASE_TAG" --draft=false; then
+                return 0
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                delay=$((attempt * 10))
+                echo "::warning::restore publish failed (attempt ${attempt}/5); retrying in ${delay}s"
+                sleep "$delay"
+              fi
+            done
+            return 1
+          }
+          is_draft_retry() {
+            local attempt out
+            for attempt in 1 2 3; do
+              if out=$(timeout 60 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null); then
+                printf '%s\n' "$out"
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then sleep $((attempt * 5)); fi
+            done
+            return 1
+          }
+
           # If we converted a published release to a draft but never attempted
           # an upload, restore its published state. If any archive was touched,
           # leave it as a draft rather than exposing a possibly mixed set.
           if [ ! -f "${RUNNER_TEMP:-/tmp}/release-assets-touched" ]; then
             if [ -f "${RUNNER_TEMP:-/tmp}/release-was-published" ]; then
-              is_draft=$(timeout 60 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
-              if [ "$is_draft" = true ]; then
-                timeout 120 gh release edit "$RELEASE_TAG" --draft=false || true
-                echo "Restored the previously published release after a pre-upload failure."
+              if ! publish_retry; then
+                echo "::error::could not restore published state for ${RELEASE_TAG}"
+                exit 1
               fi
+              echo "Restored the previously published release after a pre-upload failure."
             else
               echo "No archive upload was attempted; leaving existing checksums untouched."
             fi
             exit 0
           fi
-          is_draft=$(timeout 60 gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' 2>/dev/null || true)
+          if ! is_draft=$(is_draft_retry); then
+            echo "::error::could not determine draft state for ${RELEASE_TAG}"
+            exit 1
+          fi
           if [ "$is_draft" != true ]; then
             echo "Release is not a draft; leaving published assets and checksums untouched."
             exit 0
           fi
-          gh release delete-asset "$RELEASE_TAG" checksums.txt --yes || true
+          timeout 60 gh release delete-asset "$RELEASE_TAG" checksums.txt --yes || true
