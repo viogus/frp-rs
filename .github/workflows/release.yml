@@ -270,13 +270,33 @@ jobs:
         shell: bash
         run: |
           set -e
-          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) | while read asset; do
+
+          # GitHub's release-asset endpoint intermittently returns HTTP 502 while
+          # an asset is being replaced. Retry every upload (including checksums)
+          # with backoff so one transient failure cannot leave the release with a
+          # missing or stale asset. --clobber re-uploads the same file safely.
+          upload_asset() {
+            local asset="$1" attempt delay
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$RELEASE_TAG" "$asset" --clobber; then
+                return 0
+              fi
+              delay=$((attempt * 10))
+              echo "::warning::upload of ${asset} failed (attempt ${attempt}/5); retrying in ${delay}s"
+              sleep "$delay"
+            done
+            echo "::error::failed to upload ${asset} after 5 attempts"
+            return 1
+          }
+
+          while IFS= read -r -d '' asset; do
             echo "Uploading: ${asset}"
-            gh release upload "$RELEASE_TAG" "${asset}" --clobber
-          done
+            upload_asset "$asset" || exit 1
+          done < <(find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0)
+
           # sha256 checksums (bare filenames, so `sha256sum -c checksums.txt`
           # works against the downloaded assets in one directory)
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
             -exec sha256sum {} \; \
             | awk '{n = split($2, a, "/"); print $1, a[n]}' > checksums.txt
-          gh release upload "$RELEASE_TAG" checksums.txt --clobber
+          upload_asset checksums.txt
