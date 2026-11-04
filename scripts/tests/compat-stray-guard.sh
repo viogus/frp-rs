@@ -8,13 +8,14 @@
 # of that, so the guard is driven here against synthetic `frps` processes whose
 # name is real and whose command line is the only thing that distinguishes them.
 #
-# A synthetic server is a symlink named `frps` to `sleep` (scenario 5's two
-# helpers use the same trick under the name `helper`, where the process name is
-# not the point):
-# `pgrep -x frps` sees the name (the kernel names a process after the path it was
-# exec'd through, symlink included), `ps -o command=` shows that path, and the
+# A synthetic server is a private helper named `frps` (scenario 5's two helpers
+# use the same trick under the name `helper`, where the process name is not the
+# point): `pgrep -x frps` sees the name, `ps -o command=` shows that path, and the
 # process is long-lived and port-free. No compat server, no ports, no repo
-# binaries.
+# binaries. On Linux the helper is a small shell script: the kernel names a
+# script after its filename, so `comm` is `frps` even though the coreutils
+# `sleep` shipped on CI is a multicall shim that exits when renamed. macOS keeps
+# a symlink to the real `sleep` because AMFI kills a copied signed binary.
 #
 # Scenarios
 #   1  clean run: assert_no_strays returns 0, and neither an in-`$TEST_DIR`
@@ -190,16 +191,16 @@ fails=0
 # decoy `# --- end substance pin: scenario-10 ---` truncates the hashed text
 # (still needs a refreshed pin to stay green); the accept-direction line in
 # `enforce_substance`'s mutation-probe caller loop
-# (`scripts/tests/compat-stray-guard.sh:842`,
+# (`scripts/tests/compat-stray-guard.sh:841`,
 # `region_pin_check "$name" "$const" "$got" "$copy" 2>/dev/null || mutated_fail=1`)
 # is a single unguarded command that a one-file edit can neuter; and that loop's
-# ledger assertion (`scripts/tests/compat-stray-guard.sh:847`) is the sole catcher
+# ledger assertion (`scripts/tests/compat-stray-guard.sh:846`) is the sole catcher
 # of a forged `MUTATION_PROBE_RECORD` — neutering it alone stays green on a healthy
 # guard. The list is not exhaustive: the reject-direction block just above the
 # assertion and the `region_hash_verdict … || return 1` call are the same shape.
 # R18 (F1, adversarial round 17) named the third one and changed its disposition:
 # `region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1`
-# (`scripts/tests/compat-stray-guard.sh:885`) is a one-file neuter that leaves this
+# (`scripts/tests/compat-stray-guard.sh:884`) is a one-file neuter that leaves this
 # suite printing `FAIL  pinned-region set changed: …` and still exiting 0 with
 # `RESULT: 40 fixture check(s) hold` (measured). The call is not repaired here —
 # it stays declared — but the `Stray guard` CI step now rejects a log line
@@ -1018,14 +1019,28 @@ sleep_bin=$(command -v sleep) || { printf 'FAIL  cannot find sleep\n'; exit 1; }
 BASH_BIN=${BASH:-/bin/bash}
 command -v pgrep >/dev/null 2>&1 || { printf 'FAIL  this fixture harness needs pgrep on PATH\n'; exit 1; }
 
-# spawn_fake <dir-under-which-the-symlink-lives> [name] -> echoes the pid
-# The symlink is `<dir>/<name>` (default `frps`); running it puts that path in
-# the command line, which is what makes the process match (or not match)
+# spawn_fake <dir-under-which-the-copy-lives> [name] -> echoes the pid
+# The private copy is `<dir>/<name>` (default `frps`); running it puts that path
+# in the command line, which is what makes the process match (or not match)
 # `$TEST_DIR/` and what the exit trap's ownership predicate matches on.
 spawn_fake() {
   local dir=$1 name=${2:-frps}
   mkdir -p "$dir"
-  ln -sfn "$sleep_bin" "$dir/$name"
+  if [ "$(uname -s)" = Darwin ]; then
+    ln -sfn "$sleep_bin" "$dir/$name"
+  else
+    # The runner's /usr/bin/sleep is a coreutils multicall shim: copied under
+    # another name it exits immediately. A shell script named `frps` gives the
+    # process the right `comm` without depending on that shim's argv[0] dispatch.
+    cat > "$dir/$name" <<'FAKE'
+#!/bin/sh
+sleep "${1:-300}" &
+child=$!
+trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
+wait "$child"
+FAKE
+    chmod +x "$dir/$name"
+  fi
   "$dir/$name" 300 >/dev/null 2>&1 &
   printf '%s' "$!"
 }
@@ -1133,7 +1148,7 @@ for _ in $(seq 1 50); do
   if pid_seen "$selfpid"; then seen=true; break; fi
   sleep 0.1
 done
-hdr 'fixture setup: a symlink named `frps` is visible to `pgrep -x frps`'
+hdr 'fixture setup: a copy named `frps` is visible to `pgrep -x frps`'
 if $seen; then
   ok "pgrep -x frps sees synthetic server pid $selfpid"
 else
@@ -1254,7 +1269,7 @@ hdr 'scenario 5: cleanup_pids does not wait on an untracked child'
 export TEST_DIR="$WORK/run5"
 # shellcheck source=/dev/null
 source "$LIB"
-# Both helpers are synthetic servers under `$WORK` (symlinks to `sleep`, exactly
+# Both helpers are synthetic servers under `$WORK` (copies of `sleep`, exactly
 # like `spawn_fake`'s), so the exit trap's directory-scoped predicate reaps them
 # and "every synthetic pid we start" is true rather than aspirational: deleting
 # the explicit leg below cannot leave the untracked one behind. `cleanup_pids`

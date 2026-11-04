@@ -399,8 +399,8 @@ jobs:
         # closed — examples: `region_lines` stops at the first end marker (a decoy
         # end marker truncates the hashed text); the unguarded accept-direction
         # `region_pin_check` in `enforce_substance`'s mutation-probe caller loop
-        # (`scripts/tests/compat-stray-guard.sh:842`) is a one-file neuter; and that
-        # loop's ledger assertion (`scripts/tests/compat-stray-guard.sh:847`) is the
+        # (`scripts/tests/compat-stray-guard.sh:841`) is a one-file neuter; and that
+        # loop's ledger assertion (`scripts/tests/compat-stray-guard.sh:846`) is the
         # sole catcher of a forged `MUTATION_PROBE_RECORD`. The list is not
         # exhaustive — the reject-direction block above the assertion and the
         # `region_hash_verdict … || return 1` call are the same shape.
@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.$$.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=200e8a514663226022d79917e65cf81630acc8825326b44a10d5068dc44eca03
+          guard_pin=938da262c97be3a90c8ad9eaf08804afe44bb967742dc442837b5d25c8f686b8
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -514,7 +514,7 @@ jobs:
           # `FAIL  pinned-region set changed: markers name [scenario-2
           # scenario-10 scenario-10 scenario-12 scenario-13], expected …`;
           # neutering that one call (`|| return 1` → `|| true`,
-          # `scripts/tests/compat-stray-guard.sh:885`) plus the mandatory in-file
+          # `scripts/tests/compat-stray-guard.sh:884`) plus the mandatory in-file
           # pin refresh left this step green at exit 0. So an emitted failure line
           # is fatal here on its own: the evidence chain may not report a green
           # run that reported a failure. An honest run prints no such line
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=203954411f93f23d2c6be0ad40ebc3eb81d0ea1bab2a9f870e2f6efbec019f20
+          guard_data_pin=c40d03240e3a95ebdd7fb5529e853aecf6f2e32507d0fdbe7cfa1bd9db8c9a6f
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

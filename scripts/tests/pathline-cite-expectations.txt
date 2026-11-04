@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=581 weak=106 ambiguous=2 excluded=101 foreign_reported=1141 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=9126226f414c613e ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=581 weak=108 ambiguous=2 excluded=101 foreign_reported=1141 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=0c2ac78b11d235f9 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2376	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2376	1517
@@ -573,7 +573,7 @@ scripts/compat-test.sh	1169	-	2874a3ae84a43612	-	shorthand	docs/developing.md	:1
 scripts/compat-test.sh	1197	-	0564b0370037e213	-	shorthand	docs/developing.md	:1197	680
 scripts/compat-test.sh	168	-	50fa4c4746e4f6fd	-	absolute	docs/developing.md	scripts/compat-test.sh:168	816
 scripts/compat-test.sh	185	-	d7c28a7b57682063	-	absolute	scripts/lib/compat-stray-guard.sh	scripts/compat-test.sh:185	51
-scripts/compat-test.sh	185	-	d7c28a7b57682063	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/compat-test.sh:185	1505
+scripts/compat-test.sh	185	-	d7c28a7b57682063	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/compat-test.sh:185	1520
 scripts/compat-test.sh	298	-	ff3d8db2d3997b06	-	absolute	scripts/compat-test.sh	scripts/compat-test.sh:298	4693
 scripts/compat-test.sh	327	-	be518b6bbe48f83e	-	shorthand	docs/developing.md	:327	794
 scripts/compat-test.sh	484	-	f9ff311b1300f889	-	absolute	docs/developing.md	scripts/compat-test.sh:484	793
@@ -588,12 +588,12 @@ scripts/compat-test.sh	906	-	0cba1b6b6e222dd9	-	shorthand	docs/developing.md	:90
 scripts/compat-test.sh	94	95	25bc8ce0ed2a1a90	18a30e396ec8d2cc	absolute	docs/developing.md	scripts/compat-test.sh:94-95	693
 scripts/compat-test.sh	96	-	4b761a3a14c5f0a5	-	shorthand	docs/developing.md	:96	690
 scripts/lib/compat-stray-guard.sh	75	-	90c658af0607de4a	-	absolute	scripts/compat-test.sh	scripts/lib/compat-stray-guard.sh:75	4703
-scripts/tests/compat-stray-guard.sh	842	-	a826e07e3f6b32e5	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:842	402
-scripts/tests/compat-stray-guard.sh	842	-	a826e07e3f6b32e5	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:842	193
-scripts/tests/compat-stray-guard.sh	847	-	b4bdc848109722a3	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:847	403
-scripts/tests/compat-stray-guard.sh	847	-	b4bdc848109722a3	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:847	196
-scripts/tests/compat-stray-guard.sh	885	-	312be6217c6d2c32	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:885	517
-scripts/tests/compat-stray-guard.sh	885	-	312be6217c6d2c32	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:885	202
+scripts/tests/compat-stray-guard.sh	841	-	f4db96035af330f6	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:841	402
+scripts/tests/compat-stray-guard.sh	841	-	f4db96035af330f6	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:841	194
+scripts/tests/compat-stray-guard.sh	846	-	c48a9e446d5acea6	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:846	403
+scripts/tests/compat-stray-guard.sh	846	-	c48a9e446d5acea6	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:846	197
+scripts/tests/compat-stray-guard.sh	884	-	9195c73fa0a35f63	-	absolute	.github/workflows/ci.yml	scripts/tests/compat-stray-guard.sh:884	517
+scripts/tests/compat-stray-guard.sh	884	-	9195c73fa0a35f63	-	absolute	scripts/tests/compat-stray-guard.sh	scripts/tests/compat-stray-guard.sh:884	203
 scripts/tests/repo-health-fixtures.sh	623	-	eaa8791726c717ec	-	absolute	scripts/tests/repo-health-fixtures.sh	scripts/tests/repo-health-fixtures.sh:623	165
 scripts/tests/repo-health-fixtures.sh	628	-	6018ad7271207f2f	-	absolute	scripts/tests/repo-health-fixtures.sh	scripts/tests/repo-health-fixtures.sh:628	168
 scripts/tests/repo-health-fixtures.sh	666	-	ea3a01e306ae784f	-	absolute	.github/workflows/ci.yml	scripts/tests/repo-health-fixtures.sh:666	270
