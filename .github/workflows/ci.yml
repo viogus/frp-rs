@@ -4629,3 +4629,25 @@ jobs:
       # `vendor/*/Cargo.toml` and fails the job on a match.
       - name: cargo audit vendored crates out of band (patched tree is invisible to advisory checks)
         run: bash scripts/vendored-advisory-check.sh
+
+  debug-synthetic:
+    name: Debug synthetic helper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe background process visibility
+        run: |
+          set -x
+          tmp=$(mktemp -d)
+          echo "TMPDIR=${TMPDIR:-unset} tmp=$tmp"
+          command -v sleep
+          ls -l "$(command -v sleep)"
+          cp "$(command -v sleep)" "$tmp/frps"
+          chmod +x "$tmp/frps"
+          "$tmp/frps" 300 >/dev/null 2>&1 &
+          p=$!
+          sleep 0.2
+          ps -o pid,comm,stat,command -p "$p" || true
+          pgrep -a -x frps || true
+          cat "/proc/$p/comm" || true
+          if kill -0 "$p" 2>/dev/null; then echo ALIVE; else echo DEAD; fi
+          kill "$p" 2>/dev/null || true
