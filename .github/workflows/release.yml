@@ -34,8 +34,11 @@ jobs:
 
       - name: Resolve tag to commit SHA
         id: resolve
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
+          TAG="${INPUT_TAG:-$REF_NAME}"
           SHA="$(git rev-parse HEAD)"
           # Verify HEAD is actually a tag (not a branch).
           if ! git describe --tags --exact-match HEAD >/dev/null 2>&1; then
@@ -274,13 +277,15 @@ jobs:
               release_ready=true
               break
             fi
-            if gh release create "$RELEASE_TAG" \
+            if output=$(gh release create "$RELEASE_TAG" \
               --title "$RELEASE_TAG" \
               --generate-notes \
-              --verify-tag; then
+              --draft \
+              --verify-tag 2>&1); then
               release_ready=true
               break
             fi
+            printf '%s\n' "$output"
             if [ "$attempt" -lt 5 ]; then
               delay=$((attempt * 10))
               echo "::warning::release create/view failed (attempt ${attempt}/5); retrying in ${delay}s"
@@ -293,12 +298,18 @@ jobs:
           fi
 
       - name: Upload assets to release
+        id: upload
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
+          # Keep the whole upload step below the 45-minute job timeout so its
+          # failure cleanup can still run instead of the job being killed.
+          UPLOAD_DEADLINE=$((SECONDS + 1800))
+          TOUCHED="${RUNNER_TEMP:-/tmp}/release-assets-touched"
+          rm -f "$TOUCHED"
 
           # GitHub's release-asset endpoint intermittently returns HTTP 502 while
           # an asset is being replaced. Retry transient failures with backoff.
@@ -308,16 +319,14 @@ jobs:
           upload_asset() {
             local asset="$1" attempt delay output
             for attempt in 1 2 3 4 5; do
+              if [ "$SECONDS" -ge "$UPLOAD_DEADLINE" ]; then
+                echo "::error::upload deadline exceeded before ${asset}"
+                return 1
+              fi
               if output=$(timeout 120 gh release upload "$RELEASE_TAG" "$asset" --clobber 2>&1); then
                 return 0
               fi
               printf '%s\n' "$output"
-              case "$output" in
-                *"HTTP 401"*|*"HTTP 403"*|*"HTTP 422"*)
-                  echo "::error::upload of ${asset} failed with a non-retryable response"
-                  return 1
-                  ;;
-              esac
               if [ "$attempt" -lt 5 ]; then
                 delay=$((attempt * 10))
                 echo "::warning::upload of ${asset} failed (attempt ${attempt}/5); retrying in ${delay}s"
@@ -329,13 +338,16 @@ jobs:
           }
 
           assets_file=$(mktemp)
-          trap 'rm -f "$assets_file" checksums.txt' EXIT
+          expected_names=$(mktemp)
+          actual_names=$(mktemp)
+          trap 'rm -f "$assets_file" "$expected_names" "$actual_names" checksums.txt' EXIT
 
           # Materialise the file list once so a missing/unreadable artifacts/
           # directory fails here instead of silently uploading zero assets.
           find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 > "$assets_file"
           asset_count=$(tr -cd '\0' < "$assets_file" | wc -c | tr -d ' ')
-          # 9 Linux targets x 3 profiles + 2 macOS x 3 + 2 Windows x 3.
+          # 13 targets x 3 profiles; keep in sync with build-*-matrix above.
+          # 9 Linux x 3 + 2 macOS x 3 + 2 Windows x 3.
           expected_count=39
           if [ "$asset_count" -ne "$expected_count" ]; then
             echo "::error::expected ${expected_count} release archives, found ${asset_count}; refusing to publish a partial release"
@@ -344,6 +356,9 @@ jobs:
 
           while IFS= read -r -d '' asset; do
             echo "Uploading: ${asset}"
+            # Mark the release as touched before the attempt: --clobber deletes
+            # the old asset first, so even a permanent failure can leave a mix.
+            touch "$TOUCHED"
             upload_asset "$asset"
           done < "$assets_file"
 
@@ -357,20 +372,46 @@ jobs:
           done < "$assets_file"
           upload_asset checksums.txt
 
-          actual_count=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
-          if [ "$actual_count" -ne $((expected_count + 1)) ]; then
-            echo "::error::release ${RELEASE_TAG} has ${actual_count} assets, expected $((expected_count + 1))"
+          # Compare the exact asset-name set, not a length: extra stale assets
+          # must not make a partial upload look complete.
+          while IFS= read -r -d '' asset; do
+            printf '%s\n' "${asset##*/}" >> "$expected_names"
+          done < "$assets_file"
+          printf '%s\n' checksums.txt >> "$expected_names"
+          sort -o "$expected_names" "$expected_names"
+
+          remote_names=""
+          for attempt in 1 2 3; do
+            if remote_names=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' 2>/dev/null); then
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep $((attempt * 5))
+            fi
+          done
+          printf '%s\n' "$remote_names" | sed '/^$/d' | sort > "$actual_names"
+          if ! diff -u "$expected_names" "$actual_names"; then
+            echo "::error::release ${RELEASE_TAG} asset set does not match the uploaded set"
             exit 1
           fi
 
+          # Everything is present; publish only now. A failed upload leaves a
+          # draft (new release) or the previous published release untouched.
+          gh release edit "$RELEASE_TAG" --draft=false
+
       - name: Remove stale checksums after a failed publish
-        if: failure()
+        if: always() && (steps.upload.outcome == 'failure' || steps.upload.outcome == 'cancelled')
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
-          # A failed run must not leave a checksums.txt that describes a mix of
-          # old and new archives. Deleting it is safer than leaving stale hashes.
+          # Only strip checksums if this run actually touched an archive;
+          # otherwise a checkout/download/count failure would remove a good
+          # checksums.txt from an untouched release.
+          if [ ! -f "${RUNNER_TEMP:-/tmp}/release-assets-touched" ]; then
+            echo "No archive upload was attempted; leaving existing checksums untouched."
+            exit 0
+          fi
           gh release delete-asset "$RELEASE_TAG" checksums.txt --yes || true
