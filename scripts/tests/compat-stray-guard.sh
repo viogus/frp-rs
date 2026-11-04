@@ -191,16 +191,16 @@ fails=0
 # decoy `# --- end substance pin: scenario-10 ---` truncates the hashed text
 # (still needs a refreshed pin to stay green); the accept-direction line in
 # `enforce_substance`'s mutation-probe caller loop
-# (`scripts/tests/compat-stray-guard.sh:842`,
+# (`scripts/tests/compat-stray-guard.sh:841`,
 # `region_pin_check "$name" "$const" "$got" "$copy" 2>/dev/null || mutated_fail=1`)
 # is a single unguarded command that a one-file edit can neuter; and that loop's
-# ledger assertion (`scripts/tests/compat-stray-guard.sh:847`) is the sole catcher
+# ledger assertion (`scripts/tests/compat-stray-guard.sh:846`) is the sole catcher
 # of a forged `MUTATION_PROBE_RECORD` — neutering it alone stays green on a healthy
 # guard. The list is not exhaustive: the reject-direction block just above the
 # assertion and the `region_hash_verdict … || return 1` call are the same shape.
 # R18 (F1, adversarial round 17) named the third one and changed its disposition:
 # `region_set_verdict "$found" "${PINNED_REGIONS:-}" || return 1`
-# (`scripts/tests/compat-stray-guard.sh:885`) is a one-file neuter that leaves this
+# (`scripts/tests/compat-stray-guard.sh:884`) is a one-file neuter that leaves this
 # suite printing `FAIL  pinned-region set changed: …` and still exiting 0 with
 # `RESULT: 40 fixture check(s) hold` (measured). The call is not repaired here —
 # it stays declared — but the `Stray guard` CI step now rejects a log line
