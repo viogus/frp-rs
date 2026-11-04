@@ -8,15 +8,14 @@
 # of that, so the guard is driven here against synthetic `frps` processes whose
 # name is real and whose command line is the only thing that distinguishes them.
 #
-# A synthetic server is a private copy of `sleep` named `frps` (scenario 5's
-# two helpers use the same trick under the name `helper`, where the process name
-# is not the point):
-# `pgrep -x frps` sees the name (the kernel names a process after its executable
-# basename), `ps -o command=` shows that path, and the process is long-lived and
-# port-free. No compat server, no ports, no repo binaries. On Linux the helper
-# is a copy, so `comm` is `frps` even when a symlink would exec through the
-# target's basename; macOS keeps the symlink because AMFI kills a copied signed
-# binary.
+# A synthetic server is a private helper named `frps` (scenario 5's two helpers
+# use the same trick under the name `helper`, where the process name is not the
+# point): `pgrep -x frps` sees the name, `ps -o command=` shows that path, and the
+# process is long-lived and port-free. No compat server, no ports, no repo
+# binaries. On Linux the helper is a small shell script: the kernel names a
+# script after its filename, so `comm` is `frps` even though the coreutils
+# `sleep` shipped on CI is a multicall shim that exits when renamed. macOS keeps
+# a symlink to the real `sleep` because AMFI kills a copied signed binary.
 #
 # Scenarios
 #   1  clean run: assert_no_strays returns 0, and neither an in-`$TEST_DIR`
@@ -1030,7 +1029,16 @@ spawn_fake() {
   if [ "$(uname -s)" = Darwin ]; then
     ln -sfn "$sleep_bin" "$dir/$name"
   else
-    cp "$sleep_bin" "$dir/$name"
+    # The runner's /usr/bin/sleep is a coreutils multicall shim: copied under
+    # another name it exits immediately. A shell script named `frps` gives the
+    # process the right `comm` without depending on that shim's argv[0] dispatch.
+    cat > "$dir/$name" <<'FAKE'
+#!/bin/sh
+sleep "${1:-300}" &
+child=$!
+trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
+wait "$child"
+FAKE
     chmod +x "$dir/$name"
   fi
   "$dir/$name" 300 >/dev/null 2>&1 &

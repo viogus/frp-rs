@@ -416,7 +416,7 @@ jobs:
           log=/tmp/frp-compat-stray-guard-fixtures.$$.log
           status=0
           guard_file=scripts/tests/compat-stray-guard.sh
-          guard_pin=66bea69dab6aac3fe36de45686ac2a673e0fa75999981e8098f4fab7fd96b430
+          guard_pin=322af3db6cfd650b6935cb67fd5f9cc2a8a38ce8eaa49eda24162277d7a9c716
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -4629,25 +4629,3 @@ jobs:
       # `vendor/*/Cargo.toml` and fails the job on a match.
       - name: cargo audit vendored crates out of band (patched tree is invisible to advisory checks)
         run: bash scripts/vendored-advisory-check.sh
-
-  debug-synthetic:
-    name: Debug synthetic helper
-    runs-on: ubuntu-latest
-    steps:
-      - name: Probe background process visibility
-        run: |
-          set -x
-          tmp=$(mktemp -d)
-          echo "TMPDIR=${TMPDIR:-unset} tmp=$tmp"
-          command -v sleep
-          ls -l "$(command -v sleep)"
-          cp "$(command -v sleep)" "$tmp/frps"
-          chmod +x "$tmp/frps"
-          "$tmp/frps" 300 >/dev/null 2>&1 &
-          p=$!
-          sleep 0.2
-          ps -o pid,comm,stat,command -p "$p" || true
-          pgrep -a -x frps || true
-          cat "/proc/$p/comm" || true
-          if kill -0 "$p" 2>/dev/null; then echo ALIVE; else echo DEAD; fi
-          kill "$p" 2>/dev/null || true
