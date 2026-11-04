@@ -250,7 +250,9 @@ jobs:
   publish:
     needs: [prepare, build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Worst case is ~76 min of bounded retries (create 22, upload 32,
+    # tail 22); leave room for cleanup so a job timeout never skips restore.
+    timeout-minutes: 120
     permissions:
       contents: write
     env:
@@ -341,7 +343,7 @@ jobs:
         run: |
           set -euo pipefail
           : "${RELEASE_TAG:?}"
-          # Keep the archive loop well below the 45-minute job timeout so the
+          # Keep the archive loop well below the 120-minute job timeout so the
           # tail (checksums, verification, publish) and cleanup can still run.
           UPLOAD_DEADLINE=$((SECONDS + 1200))
           TOUCHED="${RUNNER_TEMP:-/tmp}/release-assets-touched"
