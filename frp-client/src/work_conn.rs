@@ -714,6 +714,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
             tls_enable,
             tls_server_name: &tls_server_name,
             tls_ca_file: &tls_ca_file,
+            tls_use_system_ca,
             tls_cert_file: &tls_cert_file,
             tls_key_file: &tls_key_file,
             disable_custom_tls_first_byte,
