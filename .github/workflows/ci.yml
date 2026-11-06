@@ -2503,7 +2503,8 @@ jobs:
         # `*_reader_answers_from_this_build` pins and the gated-listener records
         # test took it to 368, all five gated only by this crate's own features;
         # the vhost CONNECT body gate's `test_connect_head_has_body` (#548) is
-        # the 369th.
+        # the 369th; the v0.72.0 `metricsServer` route test is the 370th (it
+        # does not need TLS, so it runs in this lane too).
         # (still a count, not a floor: a floor would let this shape quietly lose one).
         shell: bash
         run: |
@@ -2519,7 +2520,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=369
+          n_expected=370
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1
