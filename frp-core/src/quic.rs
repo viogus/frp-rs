@@ -458,6 +458,8 @@ pub async fn dial_quic(
     server_name: &str,
     ca_file: Option<&str>,
     dial_timeout_secs: Option<u64>,
+    use_system_ca: bool,
+    skip_verify: bool,
 ) -> io::Result<(QuicStream, QuicConnection)> {
     dial_quic_with_params(
         addr,
@@ -467,12 +469,15 @@ pub async fn dial_quic(
         None,
         QuicTransportParams::default(),
         dial_timeout_secs,
+        use_system_ca,
+        skip_verify,
     )
     .await
 }
 
 /// Dial a QUIC connection to a remote peer with custom transport parameters
 /// and optional client certificate (mTLS).
+#[allow(clippy::too_many_arguments)]
 pub async fn dial_quic_with_params(
     addr: &str,
     server_name: &str,
@@ -481,6 +486,8 @@ pub async fn dial_quic_with_params(
     key_file: Option<&str>,
     params: QuicTransportParams,
     dial_timeout_secs: Option<u64>,
+    use_system_ca: bool,
+    skip_verify: bool,
 ) -> io::Result<(QuicStream, QuicConnection)> {
     let connection = dial_quic_connection_with_params(
         addr,
@@ -490,6 +497,8 @@ pub async fn dial_quic_with_params(
         key_file,
         params,
         dial_timeout_secs,
+        use_system_ca,
+        skip_verify,
     )
     .await?;
     let stream = connection.open_bi().await?;
@@ -498,6 +507,7 @@ pub async fn dial_quic_with_params(
 
 /// Dial and authenticate a QUIC connection without opening its first stream.
 /// This is useful to separate connection admission from stream admission.
+#[allow(clippy::too_many_arguments)]
 pub async fn dial_quic_connection_with_params(
     addr: &str,
     server_name: &str,
@@ -506,6 +516,8 @@ pub async fn dial_quic_connection_with_params(
     key_file: Option<&str>,
     params: QuicTransportParams,
     dial_timeout_secs: Option<u64>,
+    use_system_ca: bool,
+    skip_verify: bool,
 ) -> io::Result<QuicConnection> {
     // Go frp compat: server_addr may be a hostname, not just an IP
     // (Go transport/quic.go resolves via net.ResolveUDPAddr). QUIC is UDP, so
@@ -528,7 +540,44 @@ pub async fn dial_quic_connection_with_params(
 
     // Build TLS config: either custom CA store or platform verifier.
     // mTLS (client certificate) is only supported with a custom CA store.
-    let mut tls_config = if let Some(store) = roots {
+    // Go frp v0.72.0 applies its `transport.tls` config to QUIC too, so
+    // `useSystemCa` has to participate here as well: with both sources set the
+    // composite verifier mirrors the TCP/TLS path.
+    // `tls_skip_verify` wins over every trust source (frp-rs extension), the
+    // same precedence the stream transports use.
+    let mut tls_config = if skip_verify {
+        let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
+        tracing::error!(
+            "QUIC TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+             All control and data-plane traffic is vulnerable to MITM attacks."
+        );
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth()
+    } else if use_system_ca {
+        let verifier = crate::transport::tls::build_verifier(roots, true)
+            .map_err(|e| io::Error::other(format!("QUIC TLS verifier: {e}")))?;
+        let builder = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier);
+        if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
+            let cert_pem = std::fs::read_to_string(cert_path)
+                .map_err(|e| io::Error::other(format!("read QUIC client cert: {e}")))?;
+            let key_pem = std::fs::read_to_string(key_path)
+                .map_err(|e| io::Error::other(format!("read QUIC client key: {e}")))?;
+            let cert_chain = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| io::Error::other(format!("parse QUIC client cert: {e}")))?;
+            let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
+                .map_err(|e| io::Error::other(format!("parse QUIC client key: {e}")))?;
+            builder
+                .with_client_auth_cert(cert_chain, key)
+                .map_err(|e| io::Error::other(format!("QUIC mTLS config: {e}")))?
+        } else {
+            builder.with_no_client_auth()
+        }
+    } else if let Some(store) = roots {
         let builder =
             rustls::ClientConfig::builder().with_root_certificates(std::sync::Arc::new(store));
 

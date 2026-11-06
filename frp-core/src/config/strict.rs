@@ -733,6 +733,8 @@ pub(super) const WEB_SERVER_TLS_KNOWN_KEYS: &[&str] = &[
     "trustedCaFile",
     "server_name",
     "serverName",
+    "use_system_ca",
+    "useSystemCa",
 ];
 
 /// Key set of a nested **table** child, by the kind of table it sits in.

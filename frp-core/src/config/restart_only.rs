@@ -370,6 +370,7 @@ fn web_server_restart_changes(
         key_file: _old_tls_key_file_nested,
         trusted_ca_file: _old_tls_trusted_ca_file,
         server_name: _old_tls_server_name_nested,
+        use_system_ca: _old_tls_use_system_ca_nested,
     } = old_tls;
     let WebServerTlsConfig {
         enable: _new_tls_enable,
@@ -377,6 +378,7 @@ fn web_server_restart_changes(
         key_file: _new_tls_key_file_nested,
         trusted_ca_file: _new_tls_trusted_ca_file,
         server_name: _new_tls_server_name_nested,
+        use_system_ca: _new_tls_use_system_ca_nested,
     } = new_tls;
 
     // Read in every build, by `Service::with_unsafe_features`.
@@ -764,6 +766,7 @@ impl ServerConfig {
             // Reported by the reload itself.
             bind_addr: _old_bind_addr,
             bind_port: _old_bind_port,
+            tls_use_system_ca: _old_tls_use_system_ca,
             proxy_bind_addr: old_proxy_bind_addr,
             vhost_http_port: old_vhost_http_port,
             vhost_https_port: old_vhost_https_port,
@@ -828,6 +831,7 @@ impl ServerConfig {
         let ServerConfig {
             bind_addr: _new_bind_addr,
             bind_port: _new_bind_port,
+            tls_use_system_ca: _new_tls_use_system_ca,
             proxy_bind_addr: new_proxy_bind_addr,
             vhost_http_port: new_vhost_http_port,
             vhost_https_port: new_vhost_https_port,

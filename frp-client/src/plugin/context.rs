@@ -9,6 +9,9 @@ pub struct PluginContext {
     pub tls_enable: bool,
     pub tls_server_name: String,
     pub tls_ca_file: Option<String>,
+    /// Go frp v0.72.0 `transport.tls.useSystemCa`, inherited from the client's
+    /// transport config.
+    pub tls_use_system_ca: bool,
     pub use_encryption: bool,
     pub use_compression: bool,
     pub token: String,

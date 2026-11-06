@@ -65,6 +65,8 @@ pub(crate) struct VisitorListenerConfig {
     pub disable_custom_tls_first_byte: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    /// Go frp v0.72.0 `transport.tls.useSystemCa`.
+    pub tls_use_system_ca: bool,
     pub v2: bool,
     /// Negotiated UDPPacket codec (`"binary-v1"` or empty) of this frpc's
     /// control session (Go frp v0.71.0). The SUDP visitor data plane uses it
@@ -151,6 +153,9 @@ struct VisitorTransportConfig {
     pub disable_custom_tls_first_byte: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
+    /// Go frp v0.72.0 `transport.tls.useSystemCa`, inherited from the client's
+    /// transport config.
+    pub tls_use_system_ca: bool,
     pub v2: bool,
 }
 
@@ -191,6 +196,7 @@ fn plan_visitor_dial(
         tls_server_name: tls_server_name.to_string(),
         tls_ca_file: tls_ca_file.clone(),
         tls_skip_verify: false,
+        tls_use_system_ca: transport.tls_use_system_ca,
         tls_cert_file: transport.tls_cert_file.clone(),
         tls_key_file: transport.tls_key_file.clone(),
         dns_server: transport.dns_server.clone(),
@@ -808,6 +814,7 @@ mod transport_tests {
             disable_custom_tls_first_byte: true,
             tls_cert_file: Some("/path/cert.pem".into()),
             tls_key_file: Some("/path/key.pem".into()),
+            tls_use_system_ca: false,
             v2: true,
         }
     }
@@ -891,6 +898,7 @@ mod transport_tests {
             disable_custom_tls_first_byte: false,
             tls_cert_file: Some("/c.pem".into()),
             tls_key_file: Some("/k.pem".into()),
+            tls_use_system_ca: false,
             v2: false,
         };
         let plan = plan_visitor_dial(

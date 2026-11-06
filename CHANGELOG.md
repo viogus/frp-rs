@@ -55,6 +55,21 @@ User-facing release notes for frp-rs.
   Go's 300 ms Happy-Eyeballs race, so the second family starts after the first
   attempt's share rather than 300 ms in.
 
+- **`frpc` can verify the server certificate against the system trust store
+  (`transport.tls.useSystemCa`, Go frp v0.72.0).** The key is accepted where Go
+  accepts it and rejected where Go rejects it: the server refuses
+  `transport.tls.useSystemCa` (`transport.tls.useSystemCa is only supported in
+  frpc transport.tls`), and the client requires `transport.tls.enable` unless
+  the protocol is `wss` (which turns TLS on regardless). With `trustedCaFile`
+  also set, both trust sources are honoured — the platform verifier first, the
+  file's roots second, which is Go's documented macOS/Windows fallback — and the
+  switch applies to every client dial path: control, work connections, visitors
+  (including `virtual_net`), and QUIC. Without either source, verification stays
+  off, exactly as before. **Note** — a CA file whose contents contain no
+  parsable certificate is now an error (`no root trust anchors were provided`)
+  instead of a connector that fails every handshake, matching Go's
+  `newCertPool`; no shipped configuration relied on the old tolerance.
+
 ## v0.71.1 — 2026-10-24
 
 Tracks Go frp v0.71.1 (`0.71.1` released 2026-10-14; our compat target moves with

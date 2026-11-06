@@ -921,6 +921,7 @@ pub(super) fn normalize_server_config(
                     "certFile" => "tls_cert_file",
                     "keyFile" => "tls_key_file",
                     "trustedCaFile" => "tls_ca_file",
+                    "useSystemCa" => "tls_use_system_ca",
                     "serverName" => "tls_server_name",
                     other => other,
                 };
@@ -1488,6 +1489,7 @@ pub(super) fn normalize_client_config(
                     "certFile" => "tls_cert_file",
                     "keyFile" => "tls_key_file",
                     "trustedCaFile" => "tls_ca_file",
+                    "useSystemCa" => "tls_use_system_ca",
                     "serverName" => "tls_server_name",
                     "disableCustomTLSFirstByte" => "disable_custom_tls_first_byte",
                     other => other,

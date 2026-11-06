@@ -325,6 +325,124 @@ pub fn build_tls_acceptor_or_generate(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Select the server-certificate verifier for a client connector.
+///
+/// `use_system_ca` mirrors Go frp v0.72.0's `transport.tls.useSystemCa`; the
+/// file roots (when present) are the second trust source. The combination is a
+/// composite verifier rather than one merged pool: `rustls-platform-verifier`
+/// does not expose the platform roots as a `RootCertStore`, and Go's own
+/// behaviour (documented at `pkg/transport/tls.go:163-167`) is "use the platform
+/// verifier, then fall back to the added CAs". Go's *code* merges both into one
+/// pool on every platform, so a chain that needs a file intermediate plus a
+/// system root verifies there and fails here — a narrower trust set, never a
+/// wider one, and the only case where the two differ.
+pub(crate) fn build_verifier(
+    root_store: Option<rustls::RootCertStore>,
+    use_system_ca: bool,
+) -> Result<std::sync::Arc<dyn rustls::client::danger::ServerCertVerifier>, crate::Error> {
+    let file_roots = match root_store {
+        Some(store) => Some(
+            rustls::client::WebPkiServerVerifier::builder(Arc::new(store))
+                .build()
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "build webpki verifier: {e}"
+                    )))
+                })?,
+        ),
+        None => None,
+    };
+    match (file_roots, use_system_ca) {
+        (Some(file_roots), true) => {
+            let platform = rustls_platform_verifier::Verifier::new(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
+            })?;
+            Ok(Arc::new(CompositeVerifier {
+                platform: Arc::new(platform),
+                file_roots,
+            })
+                as Arc<dyn rustls::client::danger::ServerCertVerifier>)
+        }
+        (Some(file_roots), false) => Ok(file_roots),
+        (None, true) => {
+            let platform = rustls_platform_verifier::Verifier::new(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
+            })?;
+            Ok(Arc::new(platform) as Arc<dyn rustls::client::danger::ServerCertVerifier>)
+        }
+        // Unreachable: `verify` requires at least one trust source.
+        (None, false) => Err(crate::Error::Transport(TransportError::Other(
+            "internal: no certificate trust source selected".into(),
+        ))),
+    }
+}
+
+/// verifier that tries the host trust store first and the configured CA file
+/// second — Go frp v0.72.0's `caPath && useSystemCa` shape.
+#[derive(Debug)]
+struct CompositeVerifier {
+    platform: Arc<rustls_platform_verifier::Verifier>,
+    file_roots: Arc<rustls::client::WebPkiServerVerifier>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for CompositeVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        match self.platform.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        ) {
+            Ok(verified) => Ok(verified),
+            // The file's roots are the second chance; surface their error when
+            // both fail, because that is the trust source the operator added.
+            Err(_platform_error) => self.file_roots.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            ),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.platform.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.platform.supported_verify_schemes()
+    }
+}
+
 /// Build a `RootCertStore` from a custom CA file path.
 /// Returns `None` when no custom CA is specified (caller should use
 /// the platform verifier instead).
@@ -493,6 +611,10 @@ struct ConnectorKey {
     /// verify configs must never share a cached connector (the verifier
     /// selected differs).
     skip_verify: bool,
+    /// Whether the host trust store participates. Two configs that differ only
+    /// in this flag select different verifiers, so they must not share a
+    /// cached connector.
+    use_system_ca: bool,
 }
 
 impl PartialEq for ConnectorKey {
@@ -501,6 +623,7 @@ impl PartialEq for ConnectorKey {
             && self.cert == other.cert
             && self.key == other.key
             && self.skip_verify == other.skip_verify
+            && self.use_system_ca == other.use_system_ca
     }
 }
 
@@ -617,12 +740,14 @@ fn connector_key(
     cert_file: Option<&str>,
     key_file: Option<&str>,
     skip_verify: bool,
+    use_system_ca: bool,
 ) -> ConnectorKey {
     ConnectorKey {
         ca: non_empty(ca_file).map(|p| (p.to_string(), file_hash(p))),
         cert: non_empty(cert_file).map(|p| (p.to_string(), file_hash(p))),
         key: non_empty(key_file).map(|p| (p.to_string(), file_hash(p))),
         skip_verify,
+        use_system_ca,
     }
 }
 
@@ -640,6 +765,7 @@ struct ConnectorInputs {
     cert: Option<(String, Option<(std::time::SystemTime, u64)>)>,
     key: Option<(String, Option<(std::time::SystemTime, u64)>)>,
     skip_verify: bool,
+    use_system_ca: bool,
 }
 
 /// Process-local "last connector key" cache keyed by [`ConnectorInputs`].
@@ -795,6 +921,7 @@ pub fn build_tls_connector_skip_verify(
     cert_file: Option<&str>,
     key_file: Option<&str>,
     skip_verify: bool,
+    use_system_ca: bool,
 ) -> Result<TlsConnector, crate::Error> {
     // Warn per TLS-enabled connection (not once per process at connector
     // build — the connector is cached, so the build-time log was easy to
@@ -802,7 +929,10 @@ pub fn build_tls_connector_skip_verify(
     // path, i.e. whenever no CA file is configured (or skip_verify is
     // forced). Rate-limited so busy deployments get the first occurrence at
     // warn level but no flood.
-    if non_empty(ca_file).is_none() || skip_verify {
+    // `useSystemCa` verifies against the host trust store, so it is not a
+    // skip-verify configuration: the warning (and its "set tls.ca_file"
+    // remediation) would be wrong and would train operators to ignore it.
+    if (!use_system_ca && non_empty(ca_file).is_none()) || skip_verify {
         warn_skip_verify_rate_limited();
     }
     // Key-cache hit: same connector inputs as the last dial → reuse its
@@ -814,6 +944,7 @@ pub fn build_tls_connector_skip_verify(
         cert: non_empty(cert_file).map(|p| (p.to_string(), file_stat(p))),
         key: non_empty(key_file).map(|p| (p.to_string(), file_stat(p))),
         skip_verify,
+        use_system_ca,
     };
     // Clone the cached entry out of the read guard BEFORE the match below:
     // the guard is a scrutinee temporary of the match, so it stays alive
@@ -829,7 +960,7 @@ pub fn build_tls_connector_skip_verify(
         _ => {
             // Recompute once per input change; the stat→hash memo inside
             // `connector_key` keeps even this path free of redundant reads.
-            let key = connector_key(ca_file, cert_file, key_file, skip_verify);
+            let key = connector_key(ca_file, cert_file, key_file, skip_verify, use_system_ca);
             *CONNECTOR_KEY_CACHE
                 .write()
                 .unwrap_or_else(|e| e.into_inner()) = Some((inputs, key.clone()));
@@ -846,8 +977,13 @@ pub fn build_tls_connector_skip_verify(
         }
     }
 
-    let connector =
-        build_tls_connector_skip_verify_inner(ca_file, cert_file, key_file, skip_verify)?;
+    let connector = build_tls_connector_skip_verify_inner(
+        ca_file,
+        cert_file,
+        key_file,
+        skip_verify,
+        use_system_ca,
+    )?;
     #[cfg(test)]
     CONNECTOR_BUILD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     *CONNECTOR_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some((key, connector.clone()));
@@ -859,58 +995,62 @@ fn build_tls_connector_skip_verify_inner(
     cert_file: Option<&str>,
     key_file: Option<&str>,
     skip_verify: bool,
+    use_system_ca: bool,
 ) -> Result<TlsConnector, crate::Error> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
     let root_store = build_root_store(ca_file)?;
 
-    // Force-skip when requested; otherwise verify whenever a CA store is
-    // available, and fall back to skip-verify only when none is configured
-    // (Go frp's auto-generated self-signed default).
-    let verify = !skip_verify && root_store.is_some();
+    // Go frp v0.72.0 `newClientTLSConfig` (`pkg/transport/tls.go:147-190`):
+    //   ca && useSystemCa -> system trust store, with the file's CAs appended
+    //   ca                -> the file's CAs only
+    //   useSystemCa       -> the system trust store only
+    //   neither           -> no verification (Go's auto-generated self-signed
+    //                        default; `skip_verify` forces this branch too)
+    // frp-rs keeps the same four outcomes; the combined case is a verifier that
+    // tries the platform store first and the file's roots second, which is what
+    // Go's documented macOS/Windows fallback does.
+    let verify = !skip_verify && (root_store.is_some() || use_system_ca);
     let config = if verify {
-        // Custom CA provided: verify against it normally.
-        let store = root_store.expect("verify requires a root store");
-        if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
-            if !cert_path.is_empty() && !key_path.is_empty() {
-                let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+        let verifier = build_verifier(root_store, use_system_ca)?;
+        let wants_client_cert = match (cert_file, key_file) {
+            (Some(cert_path), Some(key_path)) => !cert_path.is_empty() && !key_path.is_empty(),
+            _ => false,
+        };
+        let builder = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier);
+        if wants_client_cert {
+            let cert_path = cert_file.expect("checked above");
+            let key_path = key_file.expect("checked above");
+            let cert_bytes = std::fs::read(cert_path).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!(
+                    "open client cert file: {e}"
+                )))
+            })?;
+            let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!(
-                        "open client cert file: {e}"
+                        "read client certs: {e}"
                     )))
                 })?;
-                let client_certs = CertificateDer::pem_slice_iter(&cert_bytes)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| {
-                        crate::Error::Transport(TransportError::Other(format!(
-                            "read client certs: {e}"
-                        )))
-                    })?;
-                let key_bytes = std::fs::read(key_path).map_err(|e| {
+            let key_bytes = std::fs::read(key_path).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("open client key file: {e}")))
+            })?;
+            let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+                crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
+            })?;
+            builder
+                .with_client_auth_cert(client_certs, client_key)
+                .map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!(
-                        "open client key file: {e}"
+                        "build mTLS client config: {e}"
                     )))
-                })?;
-                let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
-                    crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
-                })?;
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(Arc::new(store))
-                    .with_client_auth_cert(client_certs, client_key)
-                    .map_err(|e| {
-                        crate::Error::Transport(TransportError::Other(format!(
-                            "build mTLS client config: {e}"
-                        )))
-                    })?
-            } else {
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(Arc::new(store))
-                    .with_no_client_auth()
-            }
+                })?
         } else {
-            rustls::ClientConfig::builder()
-                .with_root_certificates(Arc::new(store))
-                .with_no_client_auth()
+            builder.with_no_client_auth()
         }
     } else {
         // No CA file: skip certificate verification (InsecureSkipVerify=true).
@@ -1162,8 +1302,39 @@ mod connector_cache_tests {
     // process-global statics, so parallel tests would race on them.
     use super::*;
 
-    fn dummy_ca_pem() -> String {
-        "-----BEGIN CERTIFICATE-----\nMIID\n-----END CERTIFICATE-----\n".to_string()
+    /// A real self-signed certificate: connector building now rejects a CA file
+    /// with no parsable anchor (Go's `newCertPool` does too), so the cache test
+    /// needs a usable PEM rather than the old "MIID" placeholder.
+    fn dummy_ca_pem(cn: &str) -> String {
+        let cert = rcgen::generate_simple_self_signed(vec![cn.to_string()]).unwrap();
+        let der = cert.cert.der();
+        // PEM-encode the DER by hand: `rcgen`'s `Certificate` does not expose a
+        // `pem()` in the version this workspace pins.
+        let b64 = crate::base64::encode(der.as_ref());
+        let mut pem = String::from("-----BEGIN CERTIFICATE-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+        pem
+    }
+
+    /// Go frp v0.72.0 `newClientTLSConfig` selects a verifier for each trust
+    /// source combination; only "neither" is rejected, and the caller never
+    /// reaches it (`verify` requires at least one source).
+    #[test]
+    fn build_verifier_covers_go_trust_source_combinations() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let mut store = rustls::RootCertStore::empty();
+        store.add(cert.cert.der().clone()).unwrap();
+        assert!(
+            build_verifier(Some(store.clone()), true).is_ok(),
+            "ca + system"
+        );
+        assert!(build_verifier(Some(store), false).is_ok(), "ca only");
+        assert!(build_verifier(None, true).is_ok(), "system only");
+        assert!(build_verifier(None, false).is_err(), "neither");
     }
 
     #[test]
@@ -1176,23 +1347,42 @@ mod connector_cache_tests {
             .unwrap_or_else(|e| e.into_inner());
         // 1) Cache hit: identical args must not rebuild.
         let before = connector_build_count();
-        let _ = build_tls_connector_skip_verify(None, None, None, false).unwrap();
-        let _ = build_tls_connector_skip_verify(None, None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(None, None, None, false, false).unwrap();
+        let _ = build_tls_connector_skip_verify(None, None, None, false, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 1,
             "second call with identical args must hit the cache"
         );
 
+        // 1b) `useSystemCa` selects a different verifier for identical inputs,
+        //     so the manual `ConnectorKey::eq` must distinguish it: sharing the
+        //     slot would silently downgrade verification to the file roots.
+        //     (step 1 left the `use_system_ca = false` connector cached, so a
+        //     build here proves the slot is not shared.)
+        let before = connector_build_count();
+        let _ = build_tls_connector_skip_verify(None, None, None, false, true).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before + 1,
+            "useSystemCa must not reuse the cached use_system_ca=false connector"
+        );
+        let _ = build_tls_connector_skip_verify(None, None, None, false, true).unwrap();
+        assert_eq!(
+            connector_build_count(),
+            before + 1,
+            "identical inputs with the flag hit their own cache slot"
+        );
+
         // 2) An input (path) change → new key → rebuild; identical inputs
         //    → cache hit (key computed once per distinct input set).
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.pem");
-        std::fs::write(&ca_path, dummy_ca_pem()).unwrap();
+        std::fs::write(&ca_path, dummy_ca_pem("ca-one")).unwrap();
         let ca = ca_path.to_str().unwrap().to_string();
         let before = connector_build_count();
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
-        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca), None, None, false, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 1,
@@ -1200,9 +1390,9 @@ mod connector_cache_tests {
         );
         // A different CA path → key recomputed → connector rebuilds.
         let ca2_path = dir.path().join("ca2.pem");
-        std::fs::write(&ca2_path, dummy_ca_pem().replace("MIID", "MIIE")).unwrap();
+        std::fs::write(&ca2_path, dummy_ca_pem("ca-two")).unwrap();
         let ca2 = ca2_path.to_str().unwrap().to_string();
-        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 2,
@@ -1213,7 +1403,7 @@ mod connector_cache_tests {
         // MEDIUM), so a rewrite at an unchanged path changes the stamp,
         // misses the key cache, and rebuilds the connector on the fresh
         // content hash.
-        std::fs::write(&ca2_path, dummy_ca_pem().replace("MIIE", "MIID")).unwrap();
+        std::fs::write(&ca2_path, dummy_ca_pem("ca-two")).unwrap();
         {
             let f = std::fs::File::options()
                 .write(true)
@@ -1222,7 +1412,7 @@ mod connector_cache_tests {
             f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
                 .unwrap();
         }
-        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before + 3,
@@ -1232,14 +1422,22 @@ mod connector_cache_tests {
         // 3) A failing build must not be cached (and a missing-file key must
         //    not collide with the no-CA entry from step 1).
         let before = connector_build_count();
-        assert!(
-            build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None, false)
-                .is_err()
-        );
-        assert!(
-            build_tls_connector_skip_verify(Some("/nonexistent/ca.pem"), None, None, false)
-                .is_err()
-        );
+        assert!(build_tls_connector_skip_verify(
+            Some("/nonexistent/ca.pem"),
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
+        assert!(build_tls_connector_skip_verify(
+            Some("/nonexistent/ca.pem"),
+            None,
+            None,
+            false,
+            false
+        )
+        .is_err());
         assert_eq!(
             connector_build_count(),
             before,
@@ -1263,7 +1461,7 @@ mod connector_cache_tests {
             f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
                 .unwrap();
         }
-        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false, false).unwrap();
         assert_eq!(
             file_read_count(),
             before_reads + 1,
@@ -1276,7 +1474,7 @@ mod connector_cache_tests {
         );
         // Same stat, different inputs (skip_verify toggle) → key recompute
         // hits the memo: zero file reads, connector rebuilds (distinct key).
-        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, true).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, true, false).unwrap();
         assert_eq!(
             file_read_count(),
             before_reads + 1,
@@ -1289,7 +1487,7 @@ mod connector_cache_tests {
         );
         // Content change at the same path + input change → recompute
         // re-reads exactly once and rebuilds.
-        std::fs::write(&ca2_path, dummy_ca_pem().replace("MIID", "MIIX")).unwrap();
+        std::fs::write(&ca2_path, dummy_ca_pem("ca-three")).unwrap();
         {
             let f = std::fs::File::options()
                 .write(true)
@@ -1298,7 +1496,7 @@ mod connector_cache_tests {
             f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
                 .unwrap();
         }
-        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, false, false).unwrap();
         assert_eq!(
             file_read_count(),
             before_reads + 2,
@@ -1314,7 +1512,7 @@ mod connector_cache_tests {
         //    connector cached above: the key differs by skip_verify, so it
         //    rebuilds (the insecure verifier is installed).
         let before_sv_builds = connector_build_count();
-        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, true).unwrap();
+        let _ = build_tls_connector_skip_verify(Some(&ca2), None, None, true, false).unwrap();
         assert_eq!(
             connector_build_count(),
             before_sv_builds + 1,

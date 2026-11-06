@@ -54,6 +54,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         tls_enable,
         tls_server_name,
         tls_ca_file,
+        tls_use_system_ca,
         // SUDP has no retry / NAT-traversal / fallback options; all unused.
         visitor_type: _,
         fallback_timeout_ms: _,
@@ -224,6 +225,7 @@ pub(crate) async fn run_sudp_visitor_listener(config: VisitorListenerConfig) {
         disable_custom_tls_first_byte,
         tls_cert_file,
         tls_key_file,
+        tls_use_system_ca,
         v2,
     };
 

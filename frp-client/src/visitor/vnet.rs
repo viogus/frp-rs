@@ -56,6 +56,8 @@ pub(crate) struct VirtualNetVisitorConfig {
     pub tls_enable: bool,
     pub tls_server_name: String,
     pub tls_ca_file: Option<String>,
+    /// Go frp v0.72.0 `transport.tls.useSystemCa`.
+    pub tls_use_system_ca: bool,
     /// Client's user name for proxy_name prefix (Go frp BuildTargetServerProxyName compat).
     pub user: String,
     /// Current session run_id for NewVisitorConn (Go frp compat).
@@ -356,6 +358,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
         tls_enable,
         tls_server_name,
         tls_ca_file,
+        tls_use_system_ca,
         user,
         run_id,
         destination_cidr,
@@ -399,6 +402,7 @@ pub(crate) async fn run_virtual_net_visitor(config: VirtualNetVisitorConfig) {
             disable_custom_tls_first_byte,
             tls_cert_file: tls_cert_file.clone(),
             tls_key_file: tls_key_file.clone(),
+            tls_use_system_ca,
             v2,
         };
         let plan = plan_visitor_dial(

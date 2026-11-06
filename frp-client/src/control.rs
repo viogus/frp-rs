@@ -85,6 +85,7 @@ pub struct ControlConnection {
     tls_server_name: String,
     tls_ca_file: Option<String>,
     tls_skip_verify: bool,
+    tls_use_system_ca: bool,
     tls_cert_file: Option<String>,
     tls_key_file: Option<String>,
     dns_server: Option<String>,
@@ -130,6 +131,7 @@ impl ControlConnection {
         tls_server_name: String,
         tls_ca_file: Option<String>,
         tls_skip_verify: bool,
+        tls_use_system_ca: bool,
         tls_cert_file: Option<String>,
         tls_key_file: Option<String>,
         dns_server: Option<String>,
@@ -163,6 +165,7 @@ impl ControlConnection {
             tls_server_name,
             tls_ca_file,
             tls_skip_verify,
+            tls_use_system_ca,
             tls_cert_file,
             tls_key_file,
             dns_server,
@@ -204,6 +207,7 @@ impl ControlConnection {
             tls_server_name: self.tls_server_name.clone(),
             tls_ca_file: self.tls_ca_file.clone(),
             tls_skip_verify: self.tls_skip_verify,
+            tls_use_system_ca: self.tls_use_system_ca,
             tls_cert_file: self.tls_cert_file.clone(),
             tls_key_file: self.tls_key_file.clone(),
             dns_server: self.dns_server.clone(),
@@ -242,6 +246,8 @@ impl ControlConnection {
                     self.tls_key_file.as_deref(),
                     self.quic_params.clone(),
                     Some(self.dial_server_timeout as u64),
+                    self.tls_use_system_ca,
+                    self.tls_skip_verify,
                 )
                 .await
                 .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;

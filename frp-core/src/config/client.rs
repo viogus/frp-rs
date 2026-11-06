@@ -268,6 +268,12 @@ pub struct ClientConfig {
     pub tls_key_file: String,
     #[serde(default)]
     pub tls_ca_file: String,
+    /// Verify the server certificate against the host's system trust store
+    /// (Go frp v0.72.0 `transport.tls.useSystemCa`). With `tls_ca_file` also
+    /// set, both trust sources are honoured. Requires `tls_enable` unless the
+    /// transport protocol is `wss`.
+    #[serde(default, alias = "useSystemCa")]
+    pub tls_use_system_ca: bool,
     /// Explicitly skip TLS server-certificate verification (Go frp's
     /// InsecureSkipVerify=true). Default `false` preserves the Go-compatible
     /// behavior: with `tls_ca_file` set the server cert is verified against
@@ -398,6 +404,7 @@ impl Default for ClientConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
+            tls_use_system_ca: false,
             tls_skip_verify: false,
             tls_server_name: String::new(),
             disable_custom_tls_first_byte: true,
