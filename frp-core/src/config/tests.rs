@@ -16279,3 +16279,25 @@ useSystemCa = true
         "unexpected error: {err}"
     );
 }
+
+/// Go frp v0.72.0 rejects `webServer.tls.useSystemCa` too (it is a client
+/// transport-only switch) — and does so with its own message.
+#[test]
+fn test_server_web_server_tls_use_system_ca_is_rejected() {
+    let err = load_server_config_from_str(
+        r#"
+bindPort = 7000
+
+[webServer.tls]
+certFile = "/c.pem"
+keyFile = "/k.pem"
+useSystemCa = true
+"#,
+    )
+    .expect_err("the dashboard TLS block must reject useSystemCa");
+    assert!(
+        err.to_string()
+            .contains("webServer.tls.useSystemCa is only supported in frpc transport.tls"),
+        "unexpected error: {err}"
+    );
+}

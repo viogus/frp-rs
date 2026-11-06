@@ -1691,6 +1691,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 ca_file,
                 Some(opts.dial_timeout_secs),
                 opts.tls_use_system_ca,
+                opts.tls_skip_verify,
             )
             .await
             .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}").into()))?;

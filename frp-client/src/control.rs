@@ -247,6 +247,7 @@ impl ControlConnection {
                     self.quic_params.clone(),
                     Some(self.dial_server_timeout as u64),
                     self.tls_use_system_ca,
+                    self.tls_skip_verify,
                 )
                 .await
                 .map_err(|e| frp_core::Error::Transport(format!("QUIC dial: {e}").into()))?;

@@ -459,6 +459,7 @@ pub async fn dial_quic(
     ca_file: Option<&str>,
     dial_timeout_secs: Option<u64>,
     use_system_ca: bool,
+    skip_verify: bool,
 ) -> io::Result<(QuicStream, QuicConnection)> {
     dial_quic_with_params(
         addr,
@@ -469,6 +470,7 @@ pub async fn dial_quic(
         QuicTransportParams::default(),
         dial_timeout_secs,
         use_system_ca,
+        skip_verify,
     )
     .await
 }
@@ -485,6 +487,7 @@ pub async fn dial_quic_with_params(
     params: QuicTransportParams,
     dial_timeout_secs: Option<u64>,
     use_system_ca: bool,
+    skip_verify: bool,
 ) -> io::Result<(QuicStream, QuicConnection)> {
     let connection = dial_quic_connection_with_params(
         addr,
@@ -495,6 +498,7 @@ pub async fn dial_quic_with_params(
         params,
         dial_timeout_secs,
         use_system_ca,
+        skip_verify,
     )
     .await?;
     let stream = connection.open_bi().await?;
@@ -513,6 +517,7 @@ pub async fn dial_quic_connection_with_params(
     params: QuicTransportParams,
     dial_timeout_secs: Option<u64>,
     use_system_ca: bool,
+    skip_verify: bool,
 ) -> io::Result<QuicConnection> {
     // Go frp compat: server_addr may be a hostname, not just an IP
     // (Go transport/quic.go resolves via net.ResolveUDPAddr). QUIC is UDP, so
@@ -538,7 +543,19 @@ pub async fn dial_quic_connection_with_params(
     // Go frp v0.72.0 applies its `transport.tls` config to QUIC too, so
     // `useSystemCa` has to participate here as well: with both sources set the
     // composite verifier mirrors the TCP/TLS path.
-    let mut tls_config = if use_system_ca {
+    // `tls_skip_verify` wins over every trust source (frp-rs extension), the
+    // same precedence the stream transports use.
+    let mut tls_config = if skip_verify {
+        let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
+        tracing::error!(
+            "QUIC TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
+             All control and data-plane traffic is vulnerable to MITM attacks."
+        );
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth()
+    } else if use_system_ca {
         let verifier = crate::transport::tls::build_verifier(roots, true)
             .map_err(|e| io::Error::other(format!("QUIC TLS verifier: {e}")))?;
         let builder = rustls::ClientConfig::builder()

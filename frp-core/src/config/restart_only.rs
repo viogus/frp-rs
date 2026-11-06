@@ -370,6 +370,7 @@ fn web_server_restart_changes(
         key_file: _old_tls_key_file_nested,
         trusted_ca_file: _old_tls_trusted_ca_file,
         server_name: _old_tls_server_name_nested,
+        use_system_ca: _old_tls_use_system_ca_nested,
     } = old_tls;
     let WebServerTlsConfig {
         enable: _new_tls_enable,
@@ -377,6 +378,7 @@ fn web_server_restart_changes(
         key_file: _new_tls_key_file_nested,
         trusted_ca_file: _new_tls_trusted_ca_file,
         server_name: _new_tls_server_name_nested,
+        use_system_ca: _new_tls_use_system_ca_nested,
     } = new_tls;
 
     // Read in every build, by `Service::with_unsafe_features`.

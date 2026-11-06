@@ -1604,6 +1604,14 @@ pub(super) fn validate_server_config(cfg: &mut ServerConfig) -> Result<(), Strin
             "transport.tls.useSystemCa is only supported in frpc transport.tls".to_string(),
         );
     }
+    // Go frp v0.72.0 `validation/common.go:26-28`: same for the dashboard TLS
+    // block (`metricsServer.tls.useSystemCa` has the same shape once the
+    // metrics listener exists).
+    if cfg.web_server.tls.use_system_ca {
+        return Err(
+            "webServer.tls.useSystemCa is only supported in frpc transport.tls".to_string(),
+        );
+    }
     // Go frp v0.71.0: a negative transport.maxPoolCount is invalid.
     if cfg.transport.max_pool_count < 0 {
         return Err(format!(

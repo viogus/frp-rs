@@ -332,7 +332,10 @@ pub fn build_tls_acceptor_or_generate(
 /// composite verifier rather than one merged pool: `rustls-platform-verifier`
 /// does not expose the platform roots as a `RootCertStore`, and Go's own
 /// behaviour (documented at `pkg/transport/tls.go:163-167`) is "use the platform
-/// verifier, then fall back to the added CAs".
+/// verifier, then fall back to the added CAs". Go's *code* merges both into one
+/// pool on every platform, so a chain that needs a file intermediate plus a
+/// system root verifies there and fails here — a narrower trust set, never a
+/// wider one, and the only case where the two differ.
 pub(crate) fn build_verifier(
     root_store: Option<rustls::RootCertStore>,
     use_system_ca: bool,
@@ -926,7 +929,10 @@ pub fn build_tls_connector_skip_verify(
     // path, i.e. whenever no CA file is configured (or skip_verify is
     // forced). Rate-limited so busy deployments get the first occurrence at
     // warn level but no flood.
-    if non_empty(ca_file).is_none() || skip_verify {
+    // `useSystemCa` verifies against the host trust store, so it is not a
+    // skip-verify configuration: the warning (and its "set tls.ca_file"
+    // remediation) would be wrong and would train operators to ignore it.
+    if (!use_system_ca && non_empty(ca_file).is_none()) || skip_verify {
         warn_skip_verify_rate_limited();
     }
     // Key-cache hit: same connector inputs as the last dial → reuse its

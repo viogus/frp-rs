@@ -984,6 +984,11 @@ pub struct WebServerTlsConfig {
     /// TLS server name (Go WebServerConfig.TLS.serverName).
     #[serde(default, alias = "serverName")]
     pub server_name: String,
+    /// Go frp v0.72.0 rejects `webServer.tls.useSystemCa` (it is a client
+    /// transport-only switch). The field exists so the key produces Go's error
+    /// instead of being silently ignored.
+    #[serde(default, alias = "useSystemCa")]
+    pub use_system_ca: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
