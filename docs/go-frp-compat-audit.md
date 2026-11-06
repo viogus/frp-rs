@@ -286,7 +286,7 @@ labels its buckets as UTC on purpose, documented here and next to
 
 ## Known Limitations
 
-Current limitations as of frp-rs 0.71.1:
+Current limitations as of frp-rs 0.72.0:
 
 - **HTTP vhost reverse-proxy semantics**: frps forwards HTTP vhost traffic at
   the byte level (X-Forwarded-For and requestHeaders are injected, Host

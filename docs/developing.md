@@ -699,7 +699,7 @@ executable — `GO_FRPS`, `GO_FRPC`, `$PROJECT_DIR/target/release/frps`,
   This is the only build §2.6 needs; the in-process test in §2.5 needs none.
 - The Go pair must be present even for a Rust↔Rust scenario, because the preflight
   checks all four paths. `scripts/download-go-frp.sh` fetches it (`--go-version`
-  overrides the default `0.71.1`).
+  overrides the default `0.72.0`).
 - The certs are checked for every scenario, TLS-less ones included.
 
 Add your scenario function beside the existing ones and register it with the other
@@ -932,7 +932,7 @@ in 2.7 applies unchanged.
 
 The release path is [§ 6. Release Process](#6-release-process): a pre-release
 checklist, the mandatory version alignment (frp-rs's version *is* the Go frp
-version it tracks — currently `0.71.1`; `frp-vnet` is the documented exception),
+version it tracks — currently `0.72.0`; `frp-vnet` is the documented exception),
 and `bash scripts/repo-health.sh` as the local mirror of the `health` CI job.
 Run `bash scripts/repo-health.sh` before you trust any number in the docs: the
 countable figures are generated, the doc-figure gate covers only an enumerated
@@ -1435,7 +1435,7 @@ single easiest mistake to make in this repository.
 
 | Gate | What it establishes |
 |---|---|
-| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.71.1 | Wire and behavioural parity with the reference implementation |
+| `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.72.0 | Wire and behavioural parity with the reference implementation |
 | `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination |
 | Daily `xtcp-compat.yml` on a VPS | XTCP hole punching against Go frpc across a real NAT |
 
@@ -3909,7 +3909,7 @@ covered by any gate and are the ones that have actually been missed before.
 ### Version Bumping
 
 **frp-rs 自身版本号严格对齐 Go frp 的发布号** (mandatory): the version
-equals the current compat target Go frp release — currently **0.71.1** — and
+equals the current compat target Go frp release — currently **0.72.0** — and
 bumps only when Go frp releases a new number. Update the version in ALL
 sync locations:
 

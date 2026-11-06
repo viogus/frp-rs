@@ -1120,7 +1120,7 @@ dependencies = [
 
 [[package]]
 name = "frp-client"
-version = "0.71.1"
+version = "0.72.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "frp-core"
-version = "0.71.1"
+version = "0.72.0"
 dependencies = [
  "aes",
  "anyhow",
@@ -1208,7 +1208,7 @@ dependencies = [
 
 [[package]]
 name = "frp-server"
-version = "0.71.1"
+version = "0.72.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1255,7 +1255,7 @@ dependencies = [
 
 [[package]]
 name = "frpc"
-version = "0.71.1"
+version = "0.72.0"
 dependencies = [
  "frp-client",
  "frp-core",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "frps"
-version = "0.71.1"
+version = "0.72.0"
 dependencies = [
  "frp-core",
  "frp-server",
