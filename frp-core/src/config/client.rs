@@ -260,6 +260,10 @@ pub struct ClientConfig {
     /// Go frp v0.70.1 compat: [store] section.
     #[serde(default, alias = "store")]
     pub store: Option<StoreConfig>,
+    /// Go frp v0.72.0 `metricsServer`: a separate health/metrics/profiling
+    /// listener, disabled unless `port` is set.
+    #[serde(default, alias = "metricsServer")]
+    pub metrics_server: crate::config::MetricsServerConfig,
     #[serde(default = "default_true")]
     pub tls_enable: bool,
     #[serde(default)]
@@ -400,6 +404,7 @@ impl Default for ClientConfig {
             start: Vec::new(),
             includes: Vec::new(),
             store: None,
+            metrics_server: crate::config::MetricsServerConfig::default(),
             tls_enable: true,
             tls_cert_file: String::new(),
             tls_key_file: String::new(),

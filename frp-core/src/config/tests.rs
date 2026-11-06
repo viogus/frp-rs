@@ -6816,10 +6816,12 @@ fn field_name_at(text: &str) -> Option<(String, usize)> {
 fn strict_array_element_keys_match_struct_fields() {
     use super::strict::{
         CLIENT_PLUGIN_KNOWN_KEYS, HEALTH_CHECK_HEADER_KNOWN_KEYS, HTTP_PLUGIN_KNOWN_KEYS,
-        PROXY_KNOWN_KEYS, VISITOR_KNOWN_KEYS, VISITOR_PLUGIN_KNOWN_KEYS, WEB_SERVER_TLS_KNOWN_KEYS,
+        METRICS_SERVER_KNOWN_KEYS, METRICS_SERVER_TLS_KNOWN_KEYS, PROXY_KNOWN_KEYS,
+        VISITOR_KNOWN_KEYS, VISITOR_PLUGIN_KNOWN_KEYS, WEB_SERVER_TLS_KNOWN_KEYS,
     };
     let client_src = include_str!("client.rs");
     let server_src = include_str!("server.rs");
+    let metrics_src = include_str!("metrics_server.rs");
 
     // Extractor self-check: a struct whose `#[serde(...)]` groups span several
     // lines must still yield every alias, and a `rename` must replace the field
@@ -6907,6 +6909,19 @@ fn strict_array_element_keys_match_struct_fields() {
             "WebServerTlsConfig",
             WEB_SERVER_TLS_KNOWN_KEYS,
         ),
+        (
+            // Gor frp v0.72.0 `[metricsServer]`, both binaries.
+            "METRICS_SERVER_KNOWN_KEYS",
+            metrics_src,
+            "MetricsServerConfig",
+            METRICS_SERVER_KNOWN_KEYS,
+        ),
+        (
+            "METRICS_SERVER_TLS_KNOWN_KEYS",
+            metrics_src,
+            "MetricsServerTlsConfig",
+            METRICS_SERVER_TLS_KNOWN_KEYS,
+        ),
     ] {
         let extracted = serde_keys_of_struct(src, struct_name);
         let listed: std::collections::BTreeSet<String> =
@@ -6958,6 +6973,8 @@ fn strict_known_key_lists_are_all_covered() {
         "HTTP_PLUGIN_KNOWN_KEYS",
         "HEALTH_CHECK_HEADER_KNOWN_KEYS",
         "WEB_SERVER_TLS_KNOWN_KEYS",
+        "METRICS_SERVER_KNOWN_KEYS",
+        "METRICS_SERVER_TLS_KNOWN_KEYS",
     ];
     let mut covered_sorted: Vec<String> = covered.iter().map(|s| s.to_string()).collect();
     covered_sorted.sort();
@@ -16298,6 +16315,136 @@ useSystemCa = true
     assert!(
         err.to_string()
             .contains("webServer.tls.useSystemCa is only supported in frpc transport.tls"),
+        "unexpected error: {err}"
+    );
+}
+
+/// Go frp v0.72.0 `metricsServer`: the section parses on both binaries, and
+/// every rejection carries Go's wording.
+#[test]
+fn test_metrics_server_config_surface() {
+    let cfg = load_client_config_from_str(
+        r#"
+serverAddr = "127.0.0.1"
+serverPort = 7000
+
+[metricsServer]
+addr = "0.0.0.0"
+port = 7400
+user = "monitor"
+password = "s3cret"
+pprofEnable = true
+
+[metricsServer.tls]
+certFile = "/m.pem"
+keyFile = "/m.key"
+"#,
+    )
+    .expect("metricsServer parses on the client");
+    assert_eq!(cfg.metrics_server.addr, "0.0.0.0");
+    assert_eq!(cfg.metrics_server.port, 7400);
+    assert_eq!(cfg.metrics_server.user, "monitor");
+    assert!(cfg.metrics_server.pprof_enable);
+    assert_eq!(cfg.metrics_server.tls.cert_file, "/m.pem");
+
+    // Defaults: 127.0.0.1, port 0 (disabled) — Go's `Complete()`.
+    let server = load_server_config_from_str("bindPort = 7000").expect("minimal server config");
+    assert_eq!(server.metrics_server.addr, "127.0.0.1");
+    assert_eq!(server.metrics_server.port, 0);
+
+    // Only one TLS file is an error (Go's message).
+    let err = load_server_config_from_str(
+        r#"
+bindPort = 7000
+
+[metricsServer]
+port = 7400
+
+[metricsServer.tls]
+certFile = "/m.pem"
+"#,
+    )
+    .expect_err("tls must name both files");
+    assert!(
+        err.to_string().contains(
+            "metricsServer.tls.certFile and metricsServer.tls.keyFile must both be specified"
+        ),
+        "unexpected error: {err}"
+    );
+
+    // `useSystemCa` is client-transport only.
+    let err = load_server_config_from_str(
+        r#"
+bindPort = 7000
+
+[metricsServer]
+port = 7400
+
+[metricsServer.tls]
+certFile = "/m.pem"
+keyFile = "/m.key"
+useSystemCa = true
+"#,
+    )
+    .expect_err("metricsServer.tls.useSystemCa must be refused");
+    assert!(
+        err.to_string()
+            .contains("metricsServer.tls.useSystemCa is only supported in frpc transport.tls"),
+        "unexpected error: {err}"
+    );
+
+    // Strict mode knows the section's key set: an unknown key inside it is
+    // named (the check that the new whitelist actually bites). `from_str` does
+    // not run the strict walker, so drive it directly — the same shape the
+    // existing strict tests use.
+    let value: toml::Value = toml::from_str(
+        r#"
+serverAddr = "127.0.0.1"
+
+[metricsServer]
+port = 7400
+bogus = 1
+
+[metricsServer.tls]
+certFile = "/c.pem"
+bogusTls = 1
+"#,
+    )
+    .unwrap();
+    let errors = super::strict::run_strict_check(
+        &value,
+        &super::strict::known_client_keys(),
+        "metrics.toml",
+    )
+    .expect_err("strict mode must reject unknown metricsServer keys");
+    let text = errors.to_string();
+    assert!(
+        text.contains("metricsServer.bogus"),
+        "unexpected error: {text}"
+    );
+    assert!(
+        text.contains("metricsServer.tls.bogusTls"),
+        "unexpected error: {text}"
+    );
+
+    // An exact duplicate of the dashboard address is rejected.
+    let err = load_server_config_from_str(
+        r#"
+bindPort = 7000
+
+[webServer]
+addr = "127.0.0.1"
+port = 7500
+
+[metricsServer]
+addr = "127.0.0.1"
+port = 7500
+"#,
+    )
+    .expect_err("duplicate addr:port must be refused");
+    assert!(
+        err.to_string()
+            .contains("metricsServer.addr:port conflicts with webServer.addr:port"),
         "unexpected error: {err}"
     );
 }

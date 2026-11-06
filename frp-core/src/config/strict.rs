@@ -53,6 +53,8 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "auth",
         "log",
         "web_server",
+        "metricsServer",
+        "metrics_server",
         "transport",
         "allow_port_start",
         "allow_port_end",
@@ -204,6 +206,8 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "proxies",
         "visitors",
         "web_server",
+        "metricsServer",
+        "metrics_server",
         "virtual_net",
         "virtualNet",
         "feature",
@@ -714,6 +718,10 @@ enum Ctx {
     /// The nested `[web_server.tls]` table, which survives normalization only
     /// when it holds a key the hoist does not map.
     WebServerTls,
+    /// A `[metricsServer]` section (Go frp v0.72.0), both binaries.
+    MetricsServer,
+    /// The nested `[metricsServer.tls]` table.
+    MetricsServerTls,
 }
 
 /// `WebServerTlsConfig` (`frp-core/src/config/server.rs`) — the keys
@@ -737,6 +745,28 @@ pub(super) const WEB_SERVER_TLS_KNOWN_KEYS: &[&str] = &[
     "useSystemCa",
 ];
 
+/// `MetricsServerConfig` (`frp-core/src/config/metrics_server.rs`) — Go frp
+/// v0.72.0's separate health/metrics listener, present on both binaries.
+pub(super) const METRICS_SERVER_KNOWN_KEYS: &[&str] = &[
+    "addr",
+    "port",
+    "user",
+    "password",
+    "pprof_enable",
+    "pprofEnable",
+    "tls",
+];
+
+/// `MetricsServerTlsConfig` — the nested `[metricsServer.tls]` table.
+pub(super) const METRICS_SERVER_TLS_KNOWN_KEYS: &[&str] = &[
+    "cert_file",
+    "certFile",
+    "key_file",
+    "keyFile",
+    "use_system_ca",
+    "useSystemCa",
+];
+
 /// Key set of a nested **table** child, by the kind of table it sits in.
 ///
 /// Deliberately an explicit whitelist. The other nested values inside a proxy
@@ -747,15 +777,23 @@ pub(super) const WEB_SERVER_TLS_KNOWN_KEYS: &[&str] = &[
 /// so it is checked as an element key instead.
 fn child_table_keys(ctx: Ctx, key: &str) -> Option<&'static [&'static str]> {
     match ctx {
-        Ctx::Root => section_known_keys(key),
+        Ctx::Root => {
+            if key == "metricsServer" || key == "metrics_server" {
+                Some(METRICS_SERVER_KNOWN_KEYS)
+            } else {
+                section_known_keys(key)
+            }
+        }
         Ctx::ProxyElement => (key == "plugin").then_some(CLIENT_PLUGIN_KNOWN_KEYS),
         Ctx::VisitorElement => (key == "plugin").then_some(VISITOR_PLUGIN_KNOWN_KEYS),
         Ctx::WebServer => (key == "tls").then_some(WEB_SERVER_TLS_KNOWN_KEYS),
+        Ctx::MetricsServer => (key == "tls").then_some(METRICS_SERVER_TLS_KNOWN_KEYS),
         Ctx::HttpPluginElement
         | Ctx::ProxyPlugin
         | Ctx::VisitorPlugin
         | Ctx::HealthCheckHeader
-        | Ctx::WebServerTls => None,
+        | Ctx::WebServerTls
+        | Ctx::MetricsServerTls => None,
     }
 }
 
@@ -788,6 +826,8 @@ fn child_ctx(ctx: Ctx, key: &str) -> Ctx {
         (Ctx::VisitorElement, "plugin") => Ctx::VisitorPlugin,
         (Ctx::Root, "web_server") => Ctx::WebServer,
         (Ctx::WebServer, "tls") => Ctx::WebServerTls,
+        (Ctx::Root, "metricsServer" | "metrics_server") => Ctx::MetricsServer,
+        (Ctx::MetricsServer, "tls") => Ctx::MetricsServerTls,
         _ => Ctx::Root,
     }
 }
