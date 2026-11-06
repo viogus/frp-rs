@@ -16346,7 +16346,11 @@ keyFile = "/m.key"
     assert_eq!(cfg.metrics_server.user, "monitor");
     assert!(cfg.metrics_server.pprof_enable);
     assert_eq!(
-        cfg.metrics_server.tls.as_ref().expect("tls block").cert_file,
+        cfg.metrics_server
+            .tls
+            .as_ref()
+            .expect("tls block")
+            .cert_file,
         "/m.pem"
     );
 
