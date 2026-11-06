@@ -553,19 +553,31 @@ where
     let mut consecutive_idle = 0u32;
     tokio::task::spawn(async move {
         loop {
-            let result = tokio::time::timeout(
-                keepalive,
-                poll_fn(|cx| {
-                    match conn.poll_next_inbound(cx) {
-                        Poll::Ready(r) => Poll::Ready(r),
-                        Poll::Pending => {
-                            // Second poll: flush pending_frames to socket
-                            conn.poll_next_inbound(cx)
+            // Wake on the control handler's exit *as well as* on the keepalive
+            // tick: Go frp v0.72.0 closes a replaced control's mux session
+            // immediately (`#5596`), and polling this signal only in the
+            // elapsed branch below delayed the close until the next tick
+            // (default 30 s) or the dead-session reaper. `biased` so a closed
+            // signal wins over an already-ready read.
+            let result = tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => {
+                    debug!("yamux server: shutdown signal, closing session");
+                    break;
+                }
+                r = tokio::time::timeout(
+                    keepalive,
+                    poll_fn(|cx| {
+                        match conn.poll_next_inbound(cx) {
+                            Poll::Ready(r) => Poll::Ready(r),
+                            Poll::Pending => {
+                                // Second poll: flush pending_frames to socket
+                                conn.poll_next_inbound(cx)
+                            }
                         }
-                    }
-                }),
-            )
-            .await;
+                    }),
+                ) => r,
+            };
 
             let stream = match result {
                 Ok(r) => r,
@@ -595,6 +607,8 @@ where
                         shutdown_rx.try_recv(),
                         Err(oneshot::error::TryRecvError::Closed)
                     ) {
+                        // Belt-and-braces: the `select!` above also wakes on
+                        // this signal, so this arm is only reached on a race.
                         debug!("yamux server: shutdown signal, stopping acceptor");
                         break;
                     }
@@ -1133,6 +1147,62 @@ mod tests {
 
     /// The bounded request queue is a backpressure valve, not a permanent
     /// wedge: once the driver drains it, `open_stream()` must succeed again.
+    /// Go frp v0.72.0 `#5596`: a replaced control's mux session is closed
+    /// **immediately**, not at the next keepalive tick. The frp-rs signal is the
+    /// `IncomingStreams` sender's drop; this pins that the acceptor wakes on it
+    /// instead of waiting out `keepalive_interval` (30 s here, with a 2 s bound).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_incoming_streams_closes_the_session_before_the_keepalive_tick() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mux_cfg = TcpMuxConfig {
+            keepalive_interval: Duration::from_secs(30),
+            // auto: keepalive-derived, far beyond the test bound
+            idle_dead_timeout: None,
+            ..Default::default()
+        };
+
+        // The client must open the first stream: `server_mux` waits for it.
+        let client = tokio::spawn({
+            let mux_cfg = mux_cfg.clone();
+            async move {
+                let (mut control, session) = client_mux(client_io, &mux_cfg).await?;
+                // The control stream reaches the peer on its first write.
+                tokio::io::AsyncWriteExt::write_all(&mut control, b"c").await?;
+                tokio::io::AsyncWriteExt::flush(&mut control).await?;
+                Ok::<_, crate::Error>((control, session))
+            }
+        });
+        let (mut control, incoming) = server_mux(
+            server_io,
+            &mux_cfg,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("server_mux");
+        let (_client_control, _session) = client.await.expect("client task").expect("client_mux");
+
+        // The control stream is live; dropping the acceptor handle is the
+        // "control handler exited / replaced" signal.
+        drop(incoming);
+
+        // The peer must observe a close promptly, not after 30 s.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buf = [0u8; 64];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut control, &mut buf[..]).await {
+                    Ok(0) => return,
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "the mux session must close on the shutdown signal, not at the next keepalive tick"
+        );
+    }
+
     /// The queue is filled without yielding (the driver cannot run while the
     /// test task executes synchronously), refusal is checked, then the
     /// driver's next keepalive I/O pass drains the channel — the queued
