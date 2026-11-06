@@ -24,6 +24,7 @@ use frp_core::admin_auth::apply_go_basic_auth;
 use frp_core::config::MetricsServerConfig;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(feature = "tls")]
 use crate::admin::TlsListener;
 
 /// Unix seconds when the listener started.
@@ -125,6 +126,7 @@ pub async fn run(
     let bind_addr = format!("{}:{}", cfg.addr, cfg.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
+    #[cfg_attr(not(feature = "tls"), allow(unused_variables))]
     if let Some(tls) = &cfg.tls {
         #[cfg(feature = "tls")]
         {

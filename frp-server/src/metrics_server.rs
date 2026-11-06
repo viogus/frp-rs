@@ -23,7 +23,9 @@ use frp_core::admin_auth::apply_go_basic_auth;
 use frp_core::config::MetricsServerConfig;
 use tokio_util::sync::CancellationToken;
 
-use crate::dashboard::{NoDelayListener, TlsListener};
+use crate::dashboard::NoDelayListener;
+#[cfg(feature = "tls")]
+use crate::dashboard::TlsListener;
 use crate::service::AppState;
 
 /// `GET /healthz` — anonymous by design: Go keeps health checks reachable
@@ -97,6 +99,7 @@ pub async fn run_with_listener(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| format!("{}:{}", cfg.addr, cfg.port));
 
+    #[cfg_attr(not(feature = "tls"), allow(unused_variables))]
     if let Some(tls) = &cfg.tls {
         #[cfg(feature = "tls")]
         {
