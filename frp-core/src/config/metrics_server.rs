@@ -44,10 +44,11 @@ pub struct MetricsServerConfig {
     /// recorded divergence, not a silent no-op — the routes exist and answer.
     #[serde(default, alias = "pprofEnable")]
     pub pprof_enable: bool,
-    /// TLS for this listener. Go enables TLS when the block is present and
-    /// requires both files (validation below).
+    /// TLS for this listener. Go models it as `*TLSConfig`: **presence** of the
+    /// block enables TLS and then requires both files, so `tls = {}` is a
+    /// config error rather than a silent plaintext listener.
     #[serde(default)]
-    pub tls: MetricsServerTlsConfig,
+    pub tls: Option<MetricsServerTlsConfig>,
 }
 
 impl Default for MetricsServerConfig {
@@ -58,7 +59,7 @@ impl Default for MetricsServerConfig {
             user: String::new(),
             password: String::new(),
             pprof_enable: false,
-            tls: MetricsServerTlsConfig::default(),
+            tls: None,
         }
     }
 }

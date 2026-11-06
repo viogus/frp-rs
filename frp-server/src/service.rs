@@ -452,6 +452,7 @@ fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
     match reader {
         ServerReader::Any => true,
         ServerReader::Dashboard => cfg!(feature = "dashboard"),
+        ServerReader::MetricsServer => cfg!(feature = "dashboard"),
         ServerReader::Ssh => cfg!(feature = "ssh"),
         // The three listener ports: `frp-core`'s features decide whether the
         // *field* exists, these decide whether anything reads it.

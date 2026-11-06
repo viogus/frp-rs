@@ -20,34 +20,40 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{http::StatusCode, Router};
-use frp_core::admin_auth::apply_admin_auth;
+use frp_core::admin_auth::apply_go_basic_auth;
 use frp_core::config::MetricsServerConfig;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin::TlsListener;
 
-/// Unix seconds at first use — the process start time, captured lazily so it
-/// does not need a global initialised before `main`.
-fn process_start_time_seconds() -> u64 {
-    use std::sync::LazyLock;
+/// Unix seconds when the listener started.
+///
+/// Captured by `run`, not on the first scrape: a `LazyLock` in the handler
+/// would report the first-scrape time, which is not what the metric name
+/// promises.
+#[derive(Clone, Copy)]
+struct ProcessStart(u64);
+
+fn now_unix_seconds() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    static START: LazyLock<u64> = LazyLock::new(|| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0)
-    });
-    *START
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Resident set size in bytes, where the OS exposes it without a dependency.
+///
+/// `/proc/self/status`'s `VmRSS` is already in kB, so there is no hard-coded
+/// page size to get wrong on 16 KiB/64 KiB-page kernels (the `statm` page-count
+/// form would be).
 fn resident_memory_bytes() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        // /proc/self/statm: field 2 is the resident page count.
-        let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-        let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-        Some(pages * 4096)
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        Some(kb * 1024)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -61,7 +67,7 @@ async fn healthz() -> &'static str {
 }
 
 /// `GET /metrics` — Prometheus text exposition of the subset frp-rs can report.
-async fn metrics(State(_state): State<Arc<()>>) -> String {
+async fn metrics(State(start): State<Arc<ProcessStart>>) -> String {
     let mut out = String::new();
     out.push_str("# HELP frpc_build_info Build information for this frpc.\n");
     out.push_str("# TYPE frpc_build_info gauge\n");
@@ -71,10 +77,7 @@ async fn metrics(State(_state): State<Arc<()>>) -> String {
     ));
     out.push_str("# HELP process_start_time_seconds Start time of the process since unix epoch in seconds.\n");
     out.push_str("# TYPE process_start_time_seconds gauge\n");
-    out.push_str(&format!(
-        "process_start_time_seconds {}\n",
-        process_start_time_seconds()
-    ));
+    out.push_str(&format!("process_start_time_seconds {}\n", start.0));
     if let Some(rss) = resident_memory_bytes() {
         out.push_str("# HELP process_resident_memory_bytes Resident memory size in bytes.\n");
         out.push_str("# TYPE process_resident_memory_bytes gauge\n");
@@ -102,25 +105,31 @@ pub async fn run(
     cfg: &MetricsServerConfig,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let authed = Router::new()
+    // Capture the start time before anything else: the metric reports when the
+    // listener came up, not when it was first scraped.
+    let start_time = now_unix_seconds();
+    let mut authed = Router::new();
+    if cfg.pprof_enable {
+        authed = authed
+            .route("/debug/pprof", get(pprof_index))
+            .route("/debug/pprof/{*path}", get(pprof));
+    }
+    let authed = authed
         .route("/metrics", get(metrics))
-        .route("/debug/pprof", get(pprof_index))
-        .route("/debug/pprof/{*path}", get(pprof))
-        .with_state(Arc::new(()));
-    let authed = apply_admin_auth(authed, &cfg.user, &cfg.password);
+        .with_state(Arc::new(ProcessStart(start_time)));
+    // Go's middleware variant: a half-configured user/password pair is
+    // enforced, not skipped (this listener has no loopback fallback).
+    let authed = apply_go_basic_auth(authed, &cfg.user, &cfg.password);
     let app = Router::new().route("/healthz", get(healthz)).merge(authed);
 
     let bind_addr = format!("{}:{}", cfg.addr, cfg.port);
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
 
-    if !cfg.tls.cert_file.is_empty() {
+    if let Some(tls) = &cfg.tls {
         #[cfg(feature = "tls")]
         {
-            let acceptor = frp_core::transport::build_tls_acceptor(
-                &cfg.tls.cert_file,
-                &cfg.tls.key_file,
-                None,
-            )?;
+            let acceptor =
+                frp_core::transport::build_tls_acceptor(&tls.cert_file, &tls.key_file, None)?;
             tracing::info!(addr = %bind_addr, "frpc metrics server listening on {} (TLS)", bind_addr);
             axum::serve(TlsListener::new(listener, acceptor), app)
                 .with_graceful_shutdown(shutdown.cancelled_owned())

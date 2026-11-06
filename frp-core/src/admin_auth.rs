@@ -37,13 +37,53 @@ pub fn apply_admin_auth<S>(router: Router<S>, user: &str, password: &str) -> Rou
 where
     S: Clone + Send + Sync + 'static,
 {
-    let enabled = !user.is_empty() && !password.is_empty();
+    apply_basic_auth_with(router, user, password, HalfConfigured::Disabled)
+}
+
+/// Apply Basic Auth the way **Go's `NewHTTPAuthMiddleware`** does
+/// (`pkg/util/net/http.go:45-56`): the middleware is off only when *both*
+/// `user` and `password` are empty, and otherwise the exact pair is enforced —
+/// including a half-empty pair (`user=""` still requires the password).
+///
+/// Go uses this middleware for the v0.72.0 `metricsServer`, which has no
+/// localhost fallback of its own, so the "skip when half configured" rule
+/// [`apply_admin_auth`] uses (safe there only because its callers force a
+/// loopback bind) would turn `password = "s3cret"` with no user into an
+/// **unauthenticated** endpoint on whatever address was configured.
+pub fn apply_go_basic_auth<S>(router: Router<S>, user: &str, password: &str) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    apply_basic_auth_with(router, user, password, HalfConfigured::Enforced)
+}
+
+/// What a half-configured credential pair (`user` or `password` empty, not
+/// both) does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HalfConfigured {
+    /// Keep auth off (the dashboard/admin rule; its callers bind loopback).
+    Disabled,
+    /// Enforce the exact pair (Go's middleware).
+    Enforced,
+}
+
+fn apply_basic_auth_with<S>(
+    router: Router<S>,
+    user: &str,
+    password: &str,
+    half: HalfConfigured,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let enabled = !user.is_empty() && !password.is_empty()
+        || (half == HalfConfigured::Enforced && !(user.is_empty() && password.is_empty()));
     if enabled {
         tracing::warn!(
             "Admin API: Basic Auth enabled without TLS — credentials sent in plaintext. \
              Use a reverse proxy with TLS termination in production."
         );
-    } else if user.is_empty() != password.is_empty() {
+    } else if user.is_empty() != password.is_empty() && half == HalfConfigured::Disabled {
         // Half-configured: exactly one of user/password is empty. Auth stays
         // OFF (AND semantics — an empty half must not become an accepted
         // empty credential), but an operator setting one of the two may

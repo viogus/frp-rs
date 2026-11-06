@@ -16345,7 +16345,10 @@ keyFile = "/m.key"
     assert_eq!(cfg.metrics_server.port, 7400);
     assert_eq!(cfg.metrics_server.user, "monitor");
     assert!(cfg.metrics_server.pprof_enable);
-    assert_eq!(cfg.metrics_server.tls.cert_file, "/m.pem");
+    assert_eq!(
+        cfg.metrics_server.tls.as_ref().expect("tls block").cert_file,
+        "/m.pem"
+    );
 
     // Defaults: 127.0.0.1, port 0 (disabled) — Go's `Complete()`.
     let server = load_server_config_from_str("bindPort = 7000").expect("minimal server config");
@@ -16365,6 +16368,26 @@ certFile = "/m.pem"
 "#,
     )
     .expect_err("tls must name both files");
+    assert!(
+        err.to_string().contains(
+            "metricsServer.tls.certFile and metricsServer.tls.keyFile must both be specified"
+        ),
+        "unexpected error: {err}"
+    );
+
+    // An *empty* `tls` block is a config error, not "TLS off" (Go: the pointer
+    // being non-nil enables TLS and then requires both files).
+    let err = load_server_config_from_str(
+        r#"
+bindPort = 7000
+
+[metricsServer]
+port = 7400
+
+[metricsServer.tls]
+"#,
+    )
+    .expect_err("an empty tls block must be refused");
     assert!(
         err.to_string().contains(
             "metricsServer.tls.certFile and metricsServer.tls.keyFile must both be specified"

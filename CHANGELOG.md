@@ -76,8 +76,9 @@ User-facing release notes for frp-rs.
   `Complete()`), with its own basic-auth credentials and optional TLS:
   `/healthz` stays anonymous so an orchestrator probe needs no secret, while
   `/metrics` and the profiling routes require the configured credentials.
-  `frps` serves the same six Go-aligned metrics the dashboard renders — and,
-  like Go, does so without `enablePrometheus`; `frpc` serves the honest subset
+  `frps` serves the same metrics the dashboard renders (six Go-aligned series
+  plus five frp-rs pool series) — and, like Go, does so without
+  `enablePrometheus`; `frpc` serves the honest subset
   a Rust process can report without a metrics dependency (`frpc_build_info`,
   `process_start_time_seconds`, `process_resident_memory_bytes` on Linux), not
   Go's runtime metrics. The profiling routes answer the documented

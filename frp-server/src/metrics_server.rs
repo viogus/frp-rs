@@ -19,7 +19,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::routing::get;
 use axum::{http::StatusCode, Router};
-use frp_core::admin_auth::apply_admin_auth;
+use frp_core::admin_auth::apply_go_basic_auth;
 use frp_core::config::MetricsServerConfig;
 use tokio_util::sync::CancellationToken;
 
@@ -76,14 +76,20 @@ pub async fn run_with_listener(
     // `enablePrometheus`; `register_all` is a `Once`, so this is idempotent with
     // the dashboard's own registration.
     crate::metrics::prom::register_all();
-    let authed = Router::new()
-        .route("/metrics", get(metrics))
-        .route("/debug/pprof", get(pprof_index))
-        .route("/debug/pprof/{*path}", get(pprof))
-        .with_state(state);
+    let mut authed = Router::new().route("/metrics", get(metrics));
+    // Go registers the profiling routes only when `pprofEnable` is set
+    // (`metrics_server.go:39-50`); with it off they 404.
+    if cfg.pprof_enable {
+        authed = authed
+            .route("/debug/pprof", get(pprof_index))
+            .route("/debug/pprof/{*path}", get(pprof));
+    }
+    let authed = authed.with_state(state);
     // Go's auth middleware wraps `/metrics` and the profiling routes only;
-    // `/healthz` is mounted outside it, exactly as in `NewMetricsServer`.
-    let authed = apply_admin_auth(authed, &cfg.user, &cfg.password);
+    // `/healthz` is mounted outside it, exactly as in `NewMetricsServer`. The
+    // Go variant is used on purpose: a half-configured pair (only user or only
+    // password) is *enforced* there, not skipped.
+    let authed = apply_go_basic_auth(authed, &cfg.user, &cfg.password);
     let app = Router::new().route("/healthz", get(healthz)).merge(authed);
 
     let bind_addr = listener
@@ -91,14 +97,11 @@ pub async fn run_with_listener(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| format!("{}:{}", cfg.addr, cfg.port));
 
-    if !cfg.tls.cert_file.is_empty() {
+    if let Some(tls) = &cfg.tls {
         #[cfg(feature = "tls")]
         {
-            let acceptor = frp_core::transport::build_tls_acceptor(
-                &cfg.tls.cert_file,
-                &cfg.tls.key_file,
-                None,
-            )?;
+            let acceptor =
+                frp_core::transport::build_tls_acceptor(&tls.cert_file, &tls.key_file, None)?;
             tracing::info!(addr = %bind_addr, "Metrics server listening on {} (TLS)", bind_addr);
             axum::serve(TlsListener::new(listener, acceptor), app)
                 .with_graceful_shutdown(shutdown.cancelled_owned())
@@ -188,6 +191,55 @@ mod tests {
             "the Go-aligned metrics must render: {body}"
         );
 
+        // A half-configured credential pair is *enforced* (Go's middleware),
+        // not skipped: `password` alone still refuses an unauthenticated scrape.
+        // (The listener binds whatever `addr` says, so a skipped check here
+        // would be an unauthenticated metrics endpoint on that interface.)
+        shutdown.cancel();
+        let _ = handle.await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = MetricsServerConfig {
+            addr: "127.0.0.1".to_string(),
+            port: addr.port(),
+            user: String::new(),
+            password: "s3cret".to_string(),
+            ..Default::default()
+        };
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                let _ = run_with_listener(&cfg, test_state(), shutdown, listener).await;
+            }
+        });
+        let (status, _) = get(addr, "/metrics", None).await;
+        assert_eq!(
+            status, 401,
+            "password-only config must still enforce auth (Go semantics)"
+        );
+        shutdown.cancel();
+        let _ = handle.await;
+
+        // Re-run the pprof assertions on a fresh listener with pprof enabled.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cfg = MetricsServerConfig {
+            addr: "127.0.0.1".to_string(),
+            port: addr.port(),
+            user: "monitor".to_string(),
+            password: "s3cret".to_string(),
+            pprof_enable: true,
+            ..Default::default()
+        };
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            async move {
+                let _ = run_with_listener(&cfg, test_state(), shutdown, listener).await;
+            }
+        });
         // `/debug/pprof` is the index (200): the dashboard's documented
         // divergence is "pprof exists, Go profiles do not".
         let (status, body) = get(addr, "/debug/pprof", Some(&b64_creds())).await;
