@@ -99,14 +99,14 @@ use tokio_rustls::server::TlsAcceptor;
 /// TLS listener wrapper implementing axum's Listener trait.
 /// Used by dashboard and admin API servers to accept TLS connections.
 #[cfg(feature = "tls")]
-struct TlsListener {
+pub(crate) struct TlsListener {
     inner: TcpListener,
     acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
 }
 
 #[cfg(feature = "tls")]
 impl TlsListener {
-    fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+    pub(crate) fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
         Self {
             inner,
             acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
@@ -189,8 +189,8 @@ impl axum::serve::Listener for TlsListener {
 /// directly from a `TcpListener` with no nodelay hook, while Go net/http sets
 /// TCP_NODELAY on accepted conns by default. Mirrors `TlsListener`'s retry
 /// loop (transient accept errors must not kill the dashboard listener).
-struct NoDelayListener {
-    inner: TcpListener,
+pub(crate) struct NoDelayListener {
+    pub(crate) inner: TcpListener,
 }
 
 impl axum::serve::Listener for NoDelayListener {

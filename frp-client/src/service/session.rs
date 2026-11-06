@@ -206,6 +206,22 @@ impl Service {
         #[cfg(feature = "admin")]
         let mut admin_handle: Option<tokio::task::JoinHandle<()>> =
             self.spawn_admin_server(&_reload_tx, &self.stop).await;
+        #[cfg(feature = "admin")]
+        self.spawn_metrics_server(&self.stop).await;
+        // Accepted-but-unserved in builds without the axum tier, matching the
+        // other reader-gated listener ports rather than staying silent.
+        #[cfg(not(feature = "admin"))]
+        {
+            let port = self.cfg.read().await.metrics_server.port;
+            if port > 0 {
+                tracing::warn!(
+                    port,
+                    "metricsServer.port has no effect in this build: `frpc` was compiled \
+                     without the `admin` feature, which carries the HTTP server; rebuild with \
+                     `--features admin` to serve it"
+                );
+            }
+        }
         #[cfg(not(feature = "admin"))]
         let mut admin_handle: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -1347,6 +1363,26 @@ impl Service {
         // the no-admin compile stays warning-free.
         #[cfg(not(feature = "admin"))]
         let _ = admin_handle;
+    }
+
+    /// Start Go frp v0.72.0's `metricsServer` listener if configured.
+    ///
+    /// Independent of the admin server: `/healthz` and `/metrics` are the point
+    /// of the listener, so it must come up even when `web_server.port == 0`.
+    #[cfg(feature = "admin")]
+    async fn spawn_metrics_server(&self, stop: &CancellationToken) {
+        let cfg = self.cfg.read().await.metrics_server.clone();
+        if cfg.port == 0 {
+            return;
+        }
+        let addr = format!("{}:{}", cfg.addr, cfg.port);
+        let shutdown = stop.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics_server::run(&cfg, shutdown).await {
+                tracing::error!(error = %e, "frpc metrics server failed: {}", e);
+            }
+        });
+        info!(addr = %addr, "frpc metrics server starting on {}", addr);
     }
 
     /// Start the admin HTTP server if configured.

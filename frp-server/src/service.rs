@@ -819,6 +819,12 @@ impl Service {
         #[cfg(feature = "dashboard")]
         self.start_dashboard_listener().await;
 
+        // Go frp v0.72.0 metricsServer (separate health/metrics listener)
+        #[cfg(feature = "dashboard")]
+        self.start_metrics_server_listener().await;
+        #[cfg(not(feature = "dashboard"))]
+        self.warn_inert_metrics_server_port();
+
         // Background cleanup for stale NAT hole punch sessions.
         // Sessions should normally be completed by the provider's NatHoleReport,
         // but if the provider crashes or the network drops, this ensures sessions
