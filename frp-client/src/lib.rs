@@ -6,6 +6,8 @@ pub mod admin;
 pub mod backoff;
 pub mod control;
 pub mod health;
+#[cfg(feature = "admin")]
+pub mod metrics_server;
 pub mod nat_hole;
 pub mod plugin;
 pub mod proxy;

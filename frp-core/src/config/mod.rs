@@ -1,10 +1,12 @@
 mod server;
+pub use metrics_server::{MetricsServerConfig, MetricsServerTlsConfig};
 pub use server::*;
 
 mod restart_only;
 pub use restart_only::*;
 
 mod client;
+mod metrics_server;
 pub use client::*;
 
 mod loader;

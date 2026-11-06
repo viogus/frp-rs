@@ -452,6 +452,7 @@ fn server_reader_present(reader: frp_core::config::ServerReader) -> bool {
     match reader {
         ServerReader::Any => true,
         ServerReader::Dashboard => cfg!(feature = "dashboard"),
+        ServerReader::MetricsServer => cfg!(feature = "dashboard"),
         ServerReader::Ssh => cfg!(feature = "ssh"),
         // The three listener ports: `frp-core`'s features decide whether the
         // *field* exists, these decide whether anything reads it.
@@ -818,6 +819,12 @@ impl Service {
         // Start dashboard server if configured
         #[cfg(feature = "dashboard")]
         self.start_dashboard_listener().await;
+
+        // Go frp v0.72.0 metricsServer (separate health/metrics listener)
+        #[cfg(feature = "dashboard")]
+        self.start_metrics_server_listener().await;
+        #[cfg(not(feature = "dashboard"))]
+        self.warn_inert_metrics_server_port();
 
         // Background cleanup for stale NAT hole punch sessions.
         // Sessions should normally be completed by the provider's NatHoleReport,

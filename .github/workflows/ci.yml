@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=a4efd1a7b08137d59704d167344b9358bb377231ae815dfe71a3df19e8dcc6a3
+          guard_data_pin=02f0fd8832b83355bbe3013068a6bf5225e7c8e7ebf93c23112aba89f722f2e5
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2503,7 +2503,8 @@ jobs:
         # `*_reader_answers_from_this_build` pins and the gated-listener records
         # test took it to 368, all five gated only by this crate's own features;
         # the vhost CONNECT body gate's `test_connect_head_has_body` (#548) is
-        # the 369th.
+        # the 369th; the v0.72.0 `metricsServer` route test is the 370th (it
+        # does not need TLS, so it runs in this lane too).
         # (still a count, not a floor: a floor would let this shape quietly lose one).
         shell: bash
         run: |
@@ -2519,7 +2520,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=369
+          n_expected=370
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1

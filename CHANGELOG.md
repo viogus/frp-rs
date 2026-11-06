@@ -70,6 +70,23 @@ User-facing release notes for frp-rs.
   instead of a connector that fails every handshake, matching Go's
   `newCertPool`; no shipped configuration relied on the old tolerance.
 
+- **A `metricsServer` listener serves health checks, metrics and (opt-in)
+  profiling without exposing the dashboard (Go frp v0.72.0).** Disabled unless
+  `metricsServer.port` is set, bound to `127.0.0.1` by default (Go's
+  `Complete()`), with its own basic-auth credentials and optional TLS:
+  `/healthz` stays anonymous so an orchestrator probe needs no secret, while
+  `/metrics` and the profiling routes require the configured credentials.
+  `frps` serves the same metrics the dashboard renders (six Go-aligned series
+  plus five frp-rs pool series) — and, like Go, does so without
+  `enablePrometheus`; `frpc` serves the honest subset
+  a Rust process can report without a metrics dependency (`frpc_build_info`,
+  `process_start_time_seconds`, `process_resident_memory_bytes` on Linux), not
+  Go's runtime metrics. The profiling routes answer the documented
+  placeholders (`/debug/pprof` 200, profiles 501) rather than pretending.
+  Build tiers: the listener needs the HTTP tier — the `dashboard` feature on
+  `frps`, `admin` on `frpc` — and a build without it accepts the section and
+  warns that the port is not served.
+
 ## v0.71.1 — 2026-10-24
 
 Tracks Go frp v0.71.1 (`0.71.1` released 2026-10-14; our compat target moves with

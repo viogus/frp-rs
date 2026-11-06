@@ -93,6 +93,9 @@ pub enum ServerReader {
     /// `frps`'s `init_logging` (`#[cfg(feature = "otel")]` on the binary, which
     /// forwards `frp-core/otel`).
     Otel,
+    /// The v0.72.0 `metricsServer` listener
+    /// (`#[cfg(feature = "dashboard")]`: that tier carries the HTTP server).
+    MetricsServer,
 }
 
 /// One restart-only field whose value differs between the running and the loaded
@@ -122,6 +125,28 @@ pub struct RestartOnlyChange {
     pub name_only: bool,
     /// Which build feature has to be on for this field's only reader to exist.
     pub reader: ServerReader,
+}
+
+/// Render `[metricsServer]` for the restart summary without its password.
+///
+/// Injective for every field the listener reads (`addr`, `port`, the pprof
+/// switch, TLS files, and *whether* credentials are set), which is what the
+/// comparison needs; the password's value is deliberately not part of it (only
+/// `password_set`), so a password-only change is still reported as a restart
+/// without printing the secret.
+fn show_metrics_server(cfg: &super::MetricsServerConfig) -> String {
+    let tls = match &cfg.tls {
+        Some(t) => format!("tls({},{})", t.cert_file, t.key_file),
+        None => "tls(off)".to_string(),
+    };
+    format!(
+        "{}:{} user_set={} password_set={} pprof={} {tls}",
+        cfg.addr,
+        cfg.port,
+        !cfg.user.is_empty(),
+        !cfg.password.is_empty(),
+        cfg.pprof_enable,
+    )
 }
 
 /// Render an `Option<u32>`-shaped server limit: `None` prints as `<unset>`.
@@ -766,6 +791,7 @@ impl ServerConfig {
             // Reported by the reload itself.
             bind_addr: _old_bind_addr,
             bind_port: _old_bind_port,
+            metrics_server: old_metrics_server,
             tls_use_system_ca: _old_tls_use_system_ca,
             proxy_bind_addr: old_proxy_bind_addr,
             vhost_http_port: old_vhost_http_port,
@@ -831,6 +857,7 @@ impl ServerConfig {
         let ServerConfig {
             bind_addr: _new_bind_addr,
             bind_port: _new_bind_port,
+            metrics_server: new_metrics_server,
             tls_use_system_ca: _new_tls_use_system_ca,
             proxy_bind_addr: new_proxy_bind_addr,
             vhost_http_port: new_vhost_http_port,
@@ -891,6 +918,17 @@ impl ServerConfig {
 
         // Borrow the accumulator mutably for `push` and the group helpers.
         let out = &mut out;
+
+        // `[metricsServer]` is read once, when `Service::run` starts the
+        // listener, so a reload that changes it needs a restart. Rendered, not
+        // `Debug`-ed: the password must not reach the reload summary.
+        push(
+            out,
+            &show_metrics_server(old_metrics_server),
+            &show_metrics_server(new_metrics_server),
+            "metrics_server",
+            ServerReader::MetricsServer,
+        );
 
         let any = ServerReader::Any;
         push(

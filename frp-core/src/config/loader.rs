@@ -582,7 +582,7 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 ///
 /// **Two variants, selected by the `tls` feature**, because the certificate
 /// clauses are false in a build with no TLS: `frp-server`'s whole acceptor block
-/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:746`) while this
+/// is `#[cfg(feature = "tls")]` (`frp-server/src/service.rs:747`) while this
 /// warning is not, and `release.yml` ships `frps-micro` / `frps-tiny` (tiny keeps
 /// `tls`; **micro does not**). Measured on a real `frps-micro`
 /// (`/tmp/tls-warn-probe/run-micro.sh`): `tls_enable = true` + only
@@ -611,8 +611,8 @@ pub const WEB_SERVER_TLS_ENABLE_INERT_WARNING_NO_TLS: &str = "web_server.tls.ena
 /// "tls" (command-line)` → `frp-client feature "tls"`); the same command with
 /// `-i frp-server` shows frp-server's only branch as `frps feature "micro"
 /// (command-line)`, with no `tls` feature. That binary gates the acceptor off
-/// (`frp-server/src/service.rs:746` is `#[cfg(feature = "tls")]`, with the
-/// no-acceptor branch at `:778`), so this variant's certificate clauses would
+/// (`frp-server/src/service.rs:747` is `#[cfg(feature = "tls")]`, with the
+/// no-acceptor branch at `:779`), so this variant's certificate clauses would
 /// describe a path it cannot take. Every lane builds at the
 /// workspace root with `tiny`/`micro`
 /// (`.github/workflows/release.yml:112/114/120/122/171/174/222/225` and
@@ -1580,6 +1580,38 @@ fn validate_oidc_client_config(auth: &AuthClientConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Go frp v0.72.0 `validation/common.go:38-60` (`validateMetricsServerConfig`):
+/// the TLS block must name both files (or neither), `useSystemCa` is a client
+/// transport-only switch, and only an *exact* duplicate of the dashboard's
+/// address is rejected (Go leaves different addresses on one port to
+/// `net.Listen`).
+fn validate_metrics_server(
+    cfg: &crate::config::MetricsServerConfig,
+    web_server: Option<(&str, u16)>,
+) -> Result<(), String> {
+    if let Some(tls) = &cfg.tls {
+        if tls.use_system_ca {
+            return Err(
+                "metricsServer.tls.useSystemCa is only supported in frpc transport.tls".to_string(),
+            );
+        }
+        // Go: `TLS != nil` enables TLS, then both files are required.
+        if tls.cert_file.is_empty() || tls.key_file.is_empty() {
+            return Err(
+                "metricsServer.tls.certFile and metricsServer.tls.keyFile must both be specified \
+                 when tls is enabled"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some((web_addr, web_port)) = web_server {
+        if cfg.port > 0 && web_port > 0 && cfg.port == web_port && cfg.addr == web_addr {
+            return Err("metricsServer.addr:port conflicts with webServer.addr:port".to_string());
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate_server_config(cfg: &mut ServerConfig) -> Result<(), String> {
     // `auth.method` first, in Go's order: `ServerConfig.Complete()` runs
     // `Auth.Complete()` — the empty→token fill, `pkg/config/v1/server.go:136-139`
@@ -1597,6 +1629,10 @@ pub(super) fn validate_server_config(cfg: &mut ServerConfig) -> Result<(), Strin
         crate::feature_gate::validate_keys(&cfg.feature.gates)
             .map_err(|e| format!("server config: {e}"))?;
     }
+    validate_metrics_server(
+        &cfg.metrics_server,
+        Some((&cfg.web_server.addr, cfg.web_server.port)),
+    )?;
     // Go frp v0.72.0 `validation/server.go`: the system-CA switch is a client
     // transport feature only (message text is Go's).
     if cfg.tls_use_system_ca {
@@ -1657,6 +1693,10 @@ pub(super) fn validate_client_config(cfg: &mut ClientConfig) -> Result<(), Strin
                 .to_string(),
         );
     }
+    validate_metrics_server(
+        &cfg.metrics_server,
+        Some((&cfg.web_server.addr, cfg.web_server.port)),
+    )?;
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
     // Go frp v0.71.0 validation/visitor.go:42-63 (round 10 MEDIUM): visitors

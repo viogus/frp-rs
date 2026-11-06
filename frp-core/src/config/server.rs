@@ -66,6 +66,10 @@ pub struct ServerConfig {
     pub log: LogConfig,
     #[serde(default, alias = "webServer")]
     pub web_server: WebServerConfig,
+    /// Go frp v0.72.0 `metricsServer`: a separate health/metrics/profiling
+    /// listener, disabled unless `port` is set.
+    #[serde(default, alias = "metricsServer")]
+    pub metrics_server: crate::config::MetricsServerConfig,
     #[serde(default)]
     pub transport: ServerTransportConfig,
     #[serde(default = "default_allow_port_start")]
@@ -366,6 +370,7 @@ impl Default for ServerConfig {
             auth: AuthServerConfig::default(),
             log: LogConfig::default(),
             web_server: WebServerConfig::default(),
+            metrics_server: crate::config::MetricsServerConfig::default(),
             transport: ServerTransportConfig::default(),
             allow_port_start: default_allow_port_start(),
             allow_port_end: default_allow_port_end(),

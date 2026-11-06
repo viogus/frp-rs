@@ -849,14 +849,14 @@ use tokio_rustls::server::TlsAcceptor;
 
 /// TLS listener wrapper implementing axum's Listener trait.
 #[cfg(feature = "tls")]
-struct TlsListener {
+pub(crate) struct TlsListener {
     inner: TcpListener,
     acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
 }
 
 #[cfg(feature = "tls")]
 impl TlsListener {
-    fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+    pub(crate) fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
         Self {
             inner,
             acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),

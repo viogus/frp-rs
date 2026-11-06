@@ -1041,6 +1041,41 @@ impl Service {
         }
     }
 
+    /// Go frp v0.72.0 `metricsServer`: a health/metrics/profiling listener that
+    /// does not expose the dashboard. Gated on the `dashboard` feature (the
+    /// axum + Prometheus tier); a build without it warns that the port is not
+    /// served rather than staying silent.
+    #[cfg(feature = "dashboard")]
+    pub(super) async fn start_metrics_server_listener(&self) {
+        if self.cfg.metrics_server.port == 0 {
+            return;
+        }
+        let cfg = self.cfg.metrics_server.clone();
+        let addr = format!("{}:{}", cfg.addr, cfg.port);
+        let state = self.state.clone();
+        let shutdown = self.state.shutdown_token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::metrics_server::run(&cfg, state, shutdown).await {
+                tracing::error!(error = %e, "Metrics server failed: {}", e);
+            }
+        });
+        tracing::info!(addr = %addr, "Metrics server starting on {}", addr);
+    }
+
+    /// The reader-gated twin: without the `dashboard` feature the section is
+    /// accepted (a 0.72 config must still load) but nothing serves it.
+    #[cfg(not(feature = "dashboard"))]
+    pub(super) fn warn_inert_metrics_server_port(&self) {
+        if self.cfg.metrics_server.port > 0 {
+            tracing::warn!(
+                port = self.cfg.metrics_server.port,
+                "metricsServer.port has no effect in this build: `frps` was compiled \
+                 without the `dashboard` feature, which carries the HTTP server and the \
+                 metrics registry; rebuild with `--features dashboard` to serve it"
+            );
+        }
+    }
+
     pub(super) async fn start_tcpmux_listener(&self) {
         if self.cfg.tcpmux_httpconnect_port > 0 {
             let mux_bind = if self.cfg.proxy_bind_addr.is_empty() {

@@ -9,6 +9,8 @@ pub mod event;
 pub mod handlers;
 pub mod lock;
 pub mod metrics;
+#[cfg(feature = "dashboard")]
+pub mod metrics_server;
 pub mod nathole;
 pub mod plugin;
 pub mod proxy;
