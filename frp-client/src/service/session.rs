@@ -574,6 +574,7 @@ impl Service {
         let wc_tls_enable = cfg_local.tls_enable;
         let wc_tls_server_name = cfg_local.tls_server_name.clone();
         let wc_tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+        let wc_tls_use_system_ca = cfg_local.tls_use_system_ca;
         let wc_tls_cert_file = opt_if_empty!(cfg_local.tls_cert_file);
         let wc_tls_key_file = opt_if_empty!(cfg_local.tls_key_file);
         let wc_dns_server = opt_if_empty!(cfg_local.dns_server);
@@ -600,6 +601,7 @@ impl Service {
             cfg_local.tls_server_name.clone(),
             opt_if_empty!(cfg_local.tls_ca_file),
             cfg_local.tls_skip_verify,
+            cfg_local.tls_use_system_ca,
             opt_if_empty!(cfg_local.tls_cert_file),
             opt_if_empty!(cfg_local.tls_key_file),
             opt_if_empty!(cfg_local.dns_server),
@@ -756,6 +758,7 @@ impl Service {
             wc_tls_enable,
             wc_tls_server_name,
             wc_tls_ca_file,
+            wc_tls_use_system_ca,
             wc_tls_cert_file,
             wc_tls_key_file,
             wc_dns_server,
@@ -930,6 +933,7 @@ impl Service {
                         let tls_enable = cfg_local.tls_enable;
                         let tls_server_name = cfg_local.tls_server_name.clone();
                         let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+                        let tls_use_system_ca = cfg_local.tls_use_system_ca;
                         let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
                         let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
                         let transport_bind =
@@ -969,6 +973,7 @@ impl Service {
                                     tls_enable,
                                     tls_server_name,
                                     tls_ca_file,
+                                    tls_use_system_ca,
                                     user,
                                     run_id: rid,
                                     tcp_mux: transport_tcp_mux,
@@ -1010,6 +1015,7 @@ impl Service {
             let tls_enable = cfg_local.tls_enable;
             let tls_server_name = cfg_local.tls_server_name.clone();
             let tls_ca_file = opt_if_empty!(cfg_local.tls_ca_file);
+            let tls_use_system_ca = cfg_local.tls_use_system_ca;
             let transport_proxy_url = opt_if_empty!(cfg_local.proxy_url.clone());
             let transport_dns = opt_if_empty!(cfg_local.dns_server.clone());
             let transport_bind = opt_if_empty!(cfg_local.connect_server_local_ip.clone());
@@ -1090,6 +1096,7 @@ impl Service {
                     tls_enable,
                     tls_server_name,
                     tls_ca_file,
+                    tls_use_system_ca,
                     visitor_type,
                     fallback_timeout_ms,
                     keep_tunnel_open,

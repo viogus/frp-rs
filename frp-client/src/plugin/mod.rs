@@ -402,6 +402,7 @@ impl Service {
                 tls_enable: current_cfg.tls_enable,
                 tls_server_name: current_cfg.tls_server_name.clone(),
                 tls_ca_file: opt_if_empty!(current_cfg.tls_ca_file),
+                tls_use_system_ca: current_cfg.tls_use_system_ca,
                 use_encryption,
                 use_compression,
                 token: self.auth_cfg.token.clone(),

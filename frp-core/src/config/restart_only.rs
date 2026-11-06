@@ -764,6 +764,7 @@ impl ServerConfig {
             // Reported by the reload itself.
             bind_addr: _old_bind_addr,
             bind_port: _old_bind_port,
+            tls_use_system_ca: _old_tls_use_system_ca,
             proxy_bind_addr: old_proxy_bind_addr,
             vhost_http_port: old_vhost_http_port,
             vhost_https_port: old_vhost_https_port,
@@ -828,6 +829,7 @@ impl ServerConfig {
         let ServerConfig {
             bind_addr: _new_bind_addr,
             bind_port: _new_bind_port,
+            tls_use_system_ca: _new_tls_use_system_ca,
             proxy_bind_addr: new_proxy_bind_addr,
             vhost_http_port: new_vhost_http_port,
             vhost_https_port: new_vhost_https_port,

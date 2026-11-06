@@ -784,9 +784,9 @@ length: 144116287587483648 (max: 10240), raw header: 000200010000000000`. A plai
 mismatch — server `tcp_mux = false`, client snake_case `tcp_mux = true` — fails
 identically. Do not generalise the drop to every camelCase key: `transport.tcpMux`
 under a `[transport]` table is **not** dropped — `normalize_client_config`
-(`frp-core/src/config/normalize.rs:1172`, called from
+(`frp-core/src/config/normalize.rs:1173`, called from
 `frp-core/src/config/loader.rs:186`) flattens `[transport]` and maps
-`"tcpMux" => "tcp_mux"` (`frp-core/src/config/normalize.rs:1446`), so that
+`"tcpMux" => "tcp_mux"` (`frp-core/src/config/normalize.rs:1447`), so that
 spelling logs in and registers fine.
 
 Helper line numbers for orientation: `start_echo_server`

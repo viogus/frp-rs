@@ -1725,6 +1725,7 @@ mod tests {
             wc_tls_enable: false,
             wc_tls_server_name: String::new(),
             wc_tls_ca_file: None,
+            wc_tls_use_system_ca: false,
             wc_tls_cert_file: None,
             wc_tls_key_file: None,
             wc_dns_server: None,

@@ -47,6 +47,12 @@ pub struct ServerConfig {
     pub tls_key_file: String,
     #[serde(default, alias = "tls_trusted_ca_file")]
     pub tls_ca_file: String,
+    /// Go frp v0.72.0 accepts `transport.tls.useSystemCa` only in the client's
+    /// transport TLS config; the server rejects it in validation. The field
+    /// exists so that key produces Go's error rather than a serde
+    /// unknown-field error.
+    #[serde(default, alias = "useSystemCa")]
+    pub tls_use_system_ca: bool,
     #[serde(default, alias = "tlsServerName")]
     pub tls_server_name: String,
     /// When true, the main bind_port only accepts TLS connections.
@@ -354,6 +360,7 @@ impl Default for ServerConfig {
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
             tls_ca_file: String::new(),
+            tls_use_system_ca: false,
             tls_server_name: String::new(),
             tls_only: false,
             auth: AuthServerConfig::default(),

@@ -30,7 +30,7 @@ pub(crate) mod resolve;
 mod ssh_channel;
 mod tcp;
 #[cfg(feature = "tls")]
-mod tls;
+pub(crate) mod tls;
 #[cfg(feature = "websocket")]
 mod websocket;
 mod yamux;
@@ -635,6 +635,10 @@ pub struct DialOptions {
     /// verify; unset ⇒ skip (self-signed default). See
     /// [`crate::config`] `tls.skip_verify`.
     pub tls_skip_verify: bool,
+    /// Verify the server certificate against the host trust store (Go frp
+    /// v0.72.0 `transport.tls.useSystemCa`); combined with `tls_ca_file` when
+    /// both are set.
+    pub tls_use_system_ca: bool,
     pub tls_cert_file: Option<String>,
     pub tls_key_file: Option<String>,
     pub dns_server: Option<String>,
@@ -670,6 +674,7 @@ impl Default for DialOptions {
             tls_server_name: String::new(),
             tls_ca_file: None,
             tls_skip_verify: false,
+            tls_use_system_ca: false,
             tls_cert_file: None,
             tls_key_file: None,
             dns_server: None,
@@ -1640,6 +1645,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
                         opts.tls_skip_verify,
+                        opts.tls_use_system_ca,
                     )?;
                     let server_name = if !opts.tls_server_name.is_empty() {
                         opts.tls_server_name.clone()
@@ -1679,10 +1685,15 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                 &opts.server_addr
             };
             let ca_file = opts.tls_ca_file.as_deref();
-            let (stream, _conn) =
-                crate::quic::dial_quic(&addr, server_name, ca_file, Some(opts.dial_timeout_secs))
-                    .await
-                    .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}").into()))?;
+            let (stream, _conn) = crate::quic::dial_quic(
+                &addr,
+                server_name,
+                ca_file,
+                Some(opts.dial_timeout_secs),
+                opts.tls_use_system_ca,
+            )
+            .await
+            .map_err(|e| crate::Error::Transport(format!("QUIC dial: {e}").into()))?;
             return Ok(IoStream::Quic(stream));
         }
         _ => {}
@@ -1775,6 +1786,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
                         opts.tls_skip_verify,
+                        opts.tls_use_system_ca,
                     )?;
                     let server_name = if !opts.tls_server_name.is_empty() {
                         opts.tls_server_name.clone()
@@ -1841,6 +1853,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
                         opts.tls_cert_file.as_deref(),
                         opts.tls_key_file.as_deref(),
                         opts.tls_skip_verify,
+                        opts.tls_use_system_ca,
                     )?;
                     let server_name = if !opts.tls_server_name.is_empty() {
                         opts.tls_server_name.clone()
@@ -2777,7 +2790,7 @@ mod tests {
         let _build_serial = crate::transport::tls::CONNECTOR_BUILD_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let connector = build_tls_connector_skip_verify(None, None, None, true).unwrap();
+        let connector = build_tls_connector_skip_verify(None, None, None, true, false).unwrap();
         let server_name = || rustls::pki_types::ServerName::try_from("localhost").unwrap();
         drop(_build_serial);
 

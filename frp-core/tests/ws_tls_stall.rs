@@ -48,8 +48,9 @@ async fn ws_over_tls_burst_does_not_stall() {
 
     let server_cfg = frp_core::transport::generate_self_signed_tls_config().expect("server cfg");
     let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
-    let connector = frp_core::transport::build_tls_connector_skip_verify(None, None, None, true)
-        .expect("connector");
+    let connector =
+        frp_core::transport::build_tls_connector_skip_verify(None, None, None, true, false)
+            .expect("connector");
     let server_name = rustls::pki_types::ServerName::try_from("localhost").expect("sni");
 
     let server_handle = tokio::spawn(async move {

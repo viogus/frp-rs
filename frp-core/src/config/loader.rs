@@ -1597,6 +1597,13 @@ pub(super) fn validate_server_config(cfg: &mut ServerConfig) -> Result<(), Strin
         crate::feature_gate::validate_keys(&cfg.feature.gates)
             .map_err(|e| format!("server config: {e}"))?;
     }
+    // Go frp v0.72.0 `validation/server.go`: the system-CA switch is a client
+    // transport feature only (message text is Go's).
+    if cfg.tls_use_system_ca {
+        return Err(
+            "transport.tls.useSystemCa is only supported in frpc transport.tls".to_string(),
+        );
+    }
     // Go frp v0.71.0: a negative transport.maxPoolCount is invalid.
     if cfg.transport.max_pool_count < 0 {
         return Err(format!(
@@ -1633,6 +1640,15 @@ pub(super) fn validate_server_config(cfg: &mut ServerConfig) -> Result<(), Strin
 }
 
 pub(super) fn validate_client_config(cfg: &mut ClientConfig) -> Result<(), String> {
+    // Go frp v0.72.0 `validation/client.go:167-170`: system-CA verification
+    // needs TLS on, except under `wss`, which turns TLS on regardless.
+    if cfg.tls_use_system_ca && !cfg.tls_enable && cfg.transport_protocol != "wss" {
+        return Err(
+            "transport.tls.useSystemCa requires transport.tls.enable to be true unless \
+             transport.protocol is wss"
+                .to_string(),
+        );
+    }
     validate_proxy_configs(&cfg.proxies)?;
     validate_no_duplicate_names(&cfg.proxies, &cfg.visitors)?;
     // Go frp v0.71.0 validation/visitor.go:42-63 (round 10 MEDIUM): visitors

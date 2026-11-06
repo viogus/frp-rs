@@ -171,11 +171,12 @@ pub async fn start_visitor_plugin(
                             let bind = ctx_bind.clone();
                             let tls_cert = ctx_tls_cert.clone();
                             let tls_key = ctx_tls_key.clone();
+                            let tls_system_ca = ctx.tls_use_system_ca;
                             let proxy = ctx_proxy.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = handle_visitor_conn(
                                     user_conn, &sn, &sk, &at, &sa, sp, te, &tsn,
-                                    tcf.as_deref(), ue, uc, &tp, oidc,
+                                    tcf.as_deref(), tls_system_ca, ue, uc, &tp, oidc,
                                     ctx_tcp_mux, ctx_tcp_mux_keepalive,
                                     ctx_tcp_mux_keepalive_timeout,
                                     &dns, ctx_keepalive, &bind,
@@ -231,6 +232,7 @@ async fn handle_visitor_conn(
     tls_enable: bool,
     tls_server_name: &str,
     tls_ca_file: Option<&str>,
+    tls_use_system_ca: bool,
     use_encryption: bool,
     use_compression: bool,
     transport_protocol: &str,
@@ -267,6 +269,7 @@ async fn handle_visitor_conn(
         tls_server_name: tls_server_name.to_string(),
         tls_ca_file: tls_ca_file.map(|s| s.to_string()),
         tls_skip_verify: false,
+        tls_use_system_ca,
         tls_cert_file: tls_cert_file.clone(),
         tls_key_file: tls_key_file.clone(),
         dns_server: dns_server.clone(),

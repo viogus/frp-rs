@@ -65,9 +65,10 @@ pub async fn start_https2https_plugin(cfg: &PluginConfig) -> Result<PluginHandle
     let tls_acceptor = build_tls_acceptor_with_alpn(&cfg.crt_file, &cfg.key_file, None, alpn)?;
     // Go frp compat (https2https.go:45): the HTTPS backend is connected with
     // InsecureSkipVerify — frp does not validate the backend certificate.
-    let tls_connector = build_tls_connector_skip_verify(None, None, None, false).map_err(|e| {
-        frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
-    })?;
+    let tls_connector =
+        build_tls_connector_skip_verify(None, None, None, false, false).map_err(|e| {
+            frp_core::Error::Transport(format!("https2https plugin: TLS connector: {e}").into())
+        })?;
     let (backend_host, backend_port) = split_host_port(&target_addr);
     let backend_host = backend_host.to_string();
     serve_plugin(
@@ -341,7 +342,7 @@ pub(crate) mod tests {
     ) -> tokio_rustls::client::TlsStream<TcpStream> {
         let tcp = TcpStream::connect(addr).await.unwrap();
         let connector =
-            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false)
+            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false, false)
                 .expect("tls connector");
         let server_name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
         connector

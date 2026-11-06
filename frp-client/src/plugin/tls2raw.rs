@@ -426,7 +426,7 @@ mod tests {
         let mut tcp = TcpStream::connect(plugin_addr).await.unwrap();
         tcp.write_all(header).await.unwrap();
         let connector =
-            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false)
+            frp_core::transport::build_tls_connector_skip_verify(None, None, None, false, false)
                 .expect("tls connector");
         let server_name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
         connector
