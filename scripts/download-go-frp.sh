@@ -8,7 +8,7 @@
 # =============================================================================
 set -euo pipefail
 
-VERSION="${1:-0.71.1}"
+VERSION="${1:-0.72.0}"
 
 # Auto-detect host platform, matching compat-test.sh's path convention
 # (/tmp/frp_${VERSION}_${os}_${arch}).
