@@ -16477,7 +16477,7 @@ port = 7500
 }
 
 /// Go frp v0.72.0's `metricsServer.tls` also carries `trustedCaFile` and
-/// `serverName`. `newServer` (`pkg/util/http/server.go`) builds the listener's
+/// `serverName`. `newServer` (`pkg/util/http/server.go:61`) builds the listener's
 /// `tls.Config` from the cert/key pair only, so both are accepted and inert —
 /// and frp-rs must accept them too, or a Go config fails to load here.
 #[test]
@@ -16526,4 +16526,51 @@ server_name = "metrics.internal"
         "metrics-tls.toml",
     )
     .expect("strict mode must accept the four recorded spellings");
+
+    // The camelCase spellings go through the strict walker too, not only
+    // through the lenient loader above.
+    let camel: toml::Value = toml::from_str(
+        r#"
+serverAddr = "127.0.0.1"
+
+[metricsServer]
+port = 7400
+
+[metricsServer.tls]
+certFile = "/m.pem"
+keyFile = "/m.key"
+trustedCaFile = "/m-ca.pem"
+serverName = "metrics.internal"
+"#,
+    )
+    .unwrap();
+    super::strict::run_strict_check(
+        &camel,
+        &super::strict::known_client_keys(),
+        "metrics-tls-camel.toml",
+    )
+    .expect("strict mode must accept the camelCase spellings too");
+
+    // A flat key under `[metricsServer]` is still unknown: the TLS block is
+    // nested-only.
+    let flat: toml::Value = toml::from_str(
+        r#"
+serverAddr = "127.0.0.1"
+
+[metricsServer]
+port = 7400
+trustedCaFile = "/m-ca.pem"
+"#,
+    )
+    .unwrap();
+    let err = super::strict::run_strict_check(
+        &flat,
+        &super::strict::known_client_keys(),
+        "metrics-tls-flat.toml",
+    )
+    .expect_err("a flat trustedCaFile must stay unknown");
+    assert!(
+        err.to_string().contains("metricsServer.trustedCaFile"),
+        "unexpected error: {err}"
+    );
 }

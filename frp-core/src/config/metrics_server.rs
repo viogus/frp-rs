@@ -77,7 +77,7 @@ pub struct MetricsServerTlsConfig {
     #[serde(default, alias = "useSystemCa")]
     pub use_system_ca: bool,
     /// Accepted for parity, **inert** — exactly as in Go: `newServer`
-    /// (`pkg/util/http/server.go`) builds the listener's `tls.Config` from
+    /// (`pkg/util/http/server.go:61`) builds the listener's `tls.Config` from
     /// `CertFile`/`KeyFile` only, so a `trustedCaFile` here does not enable
     /// client-certificate verification on the metrics listener (that switch is
     /// the *transport* server's, `pkg/transport/tls.go:120-129`).
