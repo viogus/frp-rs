@@ -163,6 +163,13 @@ pub struct TcpMuxConfig {
     /// config (0/negative/positive seconds) via
     /// `idle_dead_timeout_from_secs`.
     pub idle_dead_timeout: Option<Duration>,
+    /// How long a frame may sit unflushed on a transport that stopped
+    /// accepting bytes before the session is torn down (Go frp v0.72.0
+    /// `#5595`: `ConnectionWriteTimeout` enforced as a write deadline on the
+    /// underlying transport). Go's hashicorp-derived default is 10 s; without
+    /// it the session parks until the idle-dead reaper (30-90 s) even though
+    /// the peer is gone.
+    pub write_deadline: Duration,
 }
 
 impl Default for TcpMuxConfig {
@@ -171,9 +178,17 @@ impl Default for TcpMuxConfig {
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             max_stream_window_size: 6 * 1024 * 1024,
             idle_dead_timeout: None,
+            write_deadline: DEFAULT_WRITE_DEADLINE,
         }
     }
 }
+
+/// Default bound on a stalled yamux write (Go's `ConnectionWriteTimeout`).
+pub const DEFAULT_WRITE_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How often the write-stall watchdog looks at the transport.
+#[cfg(feature = "tcp-mux")]
+const WRITE_STALL_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Map the user-facing `tcp_mux_keepalive_timeout` (seconds) to the mux
 /// session's idle-dead timeout:
@@ -207,18 +222,59 @@ impl ActivityState {
     }
 }
 
+/// Records whether the transport has stopped accepting bytes.
+///
+/// Go frp v0.72.0 `#5595` turned `ConnectionWriteTimeout` into a *write
+/// deadline on the underlying transport*: a write blocked because the peer
+/// stopped reading must fail the session, not park it until the keepalive
+/// reaper notices the silence. This is the observation half — `ActivityIo`
+/// marks the first `Pending` write and clears it on any progress — and
+/// [`write_stall_watchdog`] is the enforcement half.
+#[cfg(feature = "tcp-mux")]
+#[derive(Default)]
+struct WriteStall {
+    blocked_since: std::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+#[cfg(feature = "tcp-mux")]
+impl WriteStall {
+    /// The transport accepted nothing for this write.
+    fn pending(&self) {
+        let mut guard = self.blocked_since.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get_or_insert_with(tokio::time::Instant::now);
+    }
+
+    /// Bytes moved: the transport is not stalled.
+    fn progress(&self) {
+        *self.blocked_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// How long the transport has been stalled, if it is.
+    fn stalled_for(&self) -> Option<Duration> {
+        self.blocked_since
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .map(|since| since.elapsed())
+    }
+}
+
 /// Wraps the yamux socket so inbound I/O (including internal PING/PONG)
 /// can be observed without inspecting yamux's private RTT state.
 #[cfg(feature = "tcp-mux")]
 struct ActivityIo<T> {
     inner: T,
     state: Arc<ActivityState>,
+    stall: Arc<WriteStall>,
 }
 
 #[cfg(feature = "tcp-mux")]
 impl<T> ActivityIo<T> {
-    fn new(inner: T, state: Arc<ActivityState>) -> Self {
-        Self { inner, state }
+    fn new(inner: T, state: Arc<ActivityState>, stall: Arc<WriteStall>) -> Self {
+        Self {
+            inner,
+            state,
+            stall,
+        }
     }
 }
 
@@ -245,14 +301,28 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<Result<usize, std::io::Error>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+        match &result {
+            std::task::Poll::Pending => this.stall.pending(),
+            std::task::Poll::Ready(Ok(n)) if *n > 0 => this.stall.progress(),
+            _ => {}
+        }
+        result
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
-        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_flush(cx);
+        match &result {
+            std::task::Poll::Pending => this.stall.pending(),
+            std::task::Poll::Ready(Ok(())) => this.stall.progress(),
+            _ => {}
+        }
+        result
     }
 
     fn poll_shutdown(
@@ -285,6 +355,73 @@ fn idle_dead_bound(keepalive: Duration, idle_dead_timeout: Option<Duration>) -> 
         Some(d) if d.is_zero() => None,
         Some(d) => Some(MIN_IDLE_DEAD_TIME.max(d)),
     }
+}
+
+/// Wait until the force-close channel carries `true`.
+///
+/// `watch::Receiver::wait_for` holds a read guard across the await and is not
+/// `Send`; this loop drops the guard before awaiting, which keeps the driver
+/// futures `Send`.
+#[cfg(feature = "tcp-mux")]
+async fn wait_force_close(rx: &mut tokio::sync::watch::Receiver<bool>) {
+    loop {
+        let closed = *rx.borrow_and_update();
+        if closed {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            // Every sender is gone. That is **not** "close": the watchdog (and
+            // the server-side keeper) hold senders only while the session is
+            // alive, and a disabled deadline (`write_deadline = 0`) makes the
+            // watchdog exit immediately. Parking here keeps the semantics
+            // "close only on an explicit `true`".
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Enforce [`TcpMuxConfig::write_deadline`]: when the transport has accepted
+/// no bytes for longer than the deadline, close the session.
+///
+/// Runs beside the driver rather than inside it because a stalled transport is
+/// exactly the case in which the driver is *parked on the socket's waker* and
+/// will not poll again — a check inside the poll loop could not fire. The
+/// watchdog closes through the same `watch` channel the supersession path uses
+/// ([`MuxShutdown`]), so the driver wakes and drops the connection, failing
+/// every stream on it.
+#[cfg(feature = "tcp-mux")]
+fn write_stall_watchdog(
+    stall: Arc<WriteStall>,
+    deadline: Duration,
+    closer: tokio::sync::watch::Sender<bool>,
+) -> tokio::task::JoinHandle<()> {
+    if deadline.is_zero() {
+        // Explicitly disabled.
+        return tokio::spawn(async {});
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(WRITE_STALL_CHECK_INTERVAL).await;
+            // The driver drops its receiver when the session ends.
+            if closer.is_closed() {
+                return;
+            }
+            if closer.borrow().to_owned() {
+                return;
+            }
+            if let Some(stalled) = stall.stalled_for() {
+                if stalled >= deadline {
+                    warn!(
+                        stalled_ms = stalled.as_millis() as u64,
+                        deadline_ms = deadline.as_millis() as u64,
+                        "yamux: transport accepted no bytes for longer than the write deadline; closing the session (Go frp v0.72.0 #5595)"
+                    );
+                    let _ = closer.send(true);
+                    return;
+                }
+            }
+        }
+    })
 }
 
 #[cfg(feature = "tcp-mux")]
@@ -570,7 +707,8 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let activity = Arc::new(ActivityState::default());
-    let compat = ActivityIo::new(stream, activity.clone()).compat();
+    let stall = Arc::new(WriteStall::default());
+    let compat = ActivityIo::new(stream, activity.clone(), stall.clone()).compat();
     let yamux_cfg = yamux_config(mux_cfg);
     let mut conn = Connection::new(compat, yamux_cfg, Mode::Server);
 
@@ -614,6 +752,8 @@ where
     // Holding it makes sender-drop invisible: the arm completes only on a real
     // `true`.
     let _force_close_keeper = force_close_tx.clone();
+    let _stall_watchdog =
+        write_stall_watchdog(stall, mux_cfg.write_deadline, force_close_tx.clone());
 
     // Spawn background task: accept yamux streams and drive connection I/O.
     //
@@ -635,7 +775,7 @@ where
             // keepalive tick. `biased` so a close already signalled wins.
             let result = tokio::select! {
                 biased;
-                _ = force_close_rx.wait_for(|closed| *closed) => {
+                _ = wait_force_close(&mut force_close_rx) => {
                     debug!("yamux server: supersession close, dropping the session");
                     break;
                 }
@@ -782,6 +922,7 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let activity = Arc::new(ActivityState::default());
+    let stall = Arc::new(WriteStall::default());
     let yamux_cfg = yamux_config(mux_cfg);
     // The driver owns the Connection exclusively: it BOTH opens outbound
     // streams (request-channel from open_stream) and drives connection I/O,
@@ -790,7 +931,7 @@ where
     // while an open is in flight — a caller holding the lock to poll the
     // connection would stall those ACK reads and add measurable setup latency.
     let mut conn: Connection<Box<dyn MuxSocket>> = Connection::new(
-        Box::new(ActivityIo::new(stream, activity.clone()).compat()),
+        Box::new(ActivityIo::new(stream, activity.clone(), stall.clone()).compat()),
         yamux_cfg,
         Mode::Client,
     );
@@ -828,8 +969,17 @@ where
     // configured interval cannot be used alone as the dead bound.
     let dead_after = idle_dead_bound(keepalive, mux_cfg.idle_dead_timeout);
     let mut consecutive_idle = 0u32;
+    // Write-deadline enforcement (see `write_stall_watchdog`): the watchdog
+    // fires this channel and the driver's select closes the session.
+    let (force_close_tx, mut force_close_rx) = tokio::sync::watch::channel(false);
+    let _stall_watchdog =
+        write_stall_watchdog(stall, mux_cfg.write_deadline, force_close_tx.clone());
 
     tokio::task::spawn(async move {
+        // Keep one sender alive for the driver's lifetime, so the sender set
+        // only empties when the session is being torn down — the same role
+        // `_force_close_keeper` plays in `server_mux`.
+        let _force_close_keeper = force_close_tx;
         // Open requests drained from the channel but not yet answerable
         // because the outbound ACK backlog is full (yamux MAX_ACK_BACKLOG).
         // Served non-blockingly on the I/O branch; the driver NEVER parks
@@ -869,6 +1019,15 @@ where
         keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                biased;
+                // Write deadline (Go frp v0.72.0 `#5595`): the transport
+                // stopped accepting bytes, so fail the session instead of
+                // parking on its waker.
+                _ = wait_force_close(&mut force_close_rx) => {
+                    warn!("yamux client: write deadline exceeded; closing the session");
+                    bg_alive.store(false, Ordering::Release);
+                    break;
+                }
                 // Drive connection I/O and serve queued open requests in the
                 // SAME poll.
                 //
@@ -1332,6 +1491,174 @@ mod tests {
         );
     }
 
+    /// A transport that accepts the handshake and then stops taking bytes must
+    /// tear the session down once `write_deadline` elapses — Go frp v0.72.0
+    /// `#5595` turned `ConnectionWriteTimeout` into a write deadline on the
+    /// underlying transport for exactly this. Without it the session parks on
+    /// the socket's waker until the idle-dead reaper (30-90 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_write_tears_the_session_down_within_the_write_deadline() {
+        /// Duplex whose write side can be switched to "block forever".
+        struct BlockedIo {
+            inner: tokio::io::DuplexStream,
+            blocked: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl tokio::io::AsyncRead for BlockedIo {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+                buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+            }
+        }
+
+        impl tokio::io::AsyncWrite for BlockedIo {
+            fn poll_write(
+                mut self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                buf: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
+                    // Accepts nothing, and never wakes: the pathological peer
+                    // the deadline exists for.
+                    return std::task::Poll::Pending;
+                }
+                std::pin::Pin::new(&mut self.inner).poll_write(_cx, buf)
+            }
+
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                if self.blocked.load(std::sync::atomic::Ordering::Acquire) {
+                    return std::task::Poll::Pending;
+                }
+                std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+            }
+
+            fn poll_shutdown(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+            }
+        }
+
+        let (inner_client, server_io) = tokio::io::duplex(64 * 1024);
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client_io = BlockedIo {
+            inner: inner_client,
+            blocked: blocked.clone(),
+        };
+        let mux_cfg = TcpMuxConfig {
+            // Short enough for the test, long enough for the handshake.
+            write_deadline: Duration::from_millis(300),
+            keepalive_interval: Duration::from_secs(30),
+            idle_dead_timeout: None,
+            ..Default::default()
+        };
+
+        let client = tokio::spawn({
+            let mux_cfg = mux_cfg.clone();
+            async move {
+                let (mut control, session) = client_mux(client_io, &mux_cfg).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut control, b"c").await?;
+                tokio::io::AsyncWriteExt::flush(&mut control).await?;
+                Ok::<_, crate::Error>((control, session))
+            }
+        });
+        let (_server_control, _incoming) = server_mux(
+            server_io,
+            &mux_cfg,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("server_mux");
+        let (mut client_control, _session) =
+            client.await.expect("client task").expect("client_mux");
+
+        // Stop accepting bytes, then make the driver want to write.
+        blocked.store(true, std::sync::atomic::Ordering::Release);
+        let _ = tokio::io::AsyncWriteExt::write(&mut client_control, b"stall").await;
+
+        // The session must fail well inside the idle-dead reaper's window.
+        let torn_down = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut buf = [0u8; 64];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut client_control, &mut buf[..]).await {
+                    Ok(0) => return,
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+        assert!(
+            torn_down.is_ok(),
+            "a stalled write must tear the session down at the write deadline, not park it"
+        );
+    }
+
+    /// The deadline must never fire on a session that is merely **idle**: a
+    /// stall is marked only by a write that returned `Pending`, so a quiet
+    /// session has no timestamp to age out. Pinned because the failure mode
+    /// would be a session torn down by its own watchdog while both ends are
+    /// healthy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_session_outlives_the_write_deadline() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mux_cfg = TcpMuxConfig {
+            write_deadline: Duration::from_millis(200),
+            keepalive_interval: Duration::from_secs(30),
+            idle_dead_timeout: None,
+            ..Default::default()
+        };
+
+        let client = tokio::spawn({
+            let mux_cfg = mux_cfg.clone();
+            async move {
+                let (mut control, session) = client_mux(client_io, &mux_cfg).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut control, b"c").await?;
+                tokio::io::AsyncWriteExt::flush(&mut control).await?;
+                Ok::<_, crate::Error>((control, session))
+            }
+        });
+        let (mut control, _incoming) = server_mux(
+            server_io,
+            &mux_cfg,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("server_mux");
+        let (_client_control, _session) = client.await.expect("client task").expect("client_mux");
+
+        // Drain the control byte the client wrote during the handshake.
+        let mut one = [0u8; 1];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut control, &mut one),
+        )
+        .await
+        .expect("handshake byte")
+        .expect("read handshake byte");
+
+        // Well past the 200 ms deadline, with no traffic at all: the next read
+        // must simply stay pending, i.e. the watchdog must not have closed it.
+        let still_open = tokio::time::timeout(Duration::from_millis(800), async {
+            let mut buf = [0u8; 1];
+            tokio::io::AsyncReadExt::read(&mut control, &mut buf)
+                .await
+                .is_ok()
+        })
+        .await;
+        assert!(
+            still_open.is_err(),
+            "an idle session must not be closed by the write-deadline watchdog"
+        );
+    }
+
     /// The queue is filled without yielding (the driver cannot run while the
     /// test task executes synchronously), refusal is checked, then the
     /// driver's next keepalive I/O pass drains the channel — the queued
@@ -1390,7 +1717,14 @@ mod tests {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let mut conn: Connection<Box<dyn MuxSocket>> = Connection::new(
-            Box::new(ActivityIo::new(stream, Arc::new(ActivityState::default())).compat()),
+            Box::new(
+                ActivityIo::new(
+                    stream,
+                    Arc::new(ActivityState::default()),
+                    Arc::new(WriteStall::default()),
+                )
+                .compat(),
+            ),
             yamux_cfg,
             Mode::Client,
         );

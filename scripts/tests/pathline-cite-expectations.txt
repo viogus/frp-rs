@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=608 weak=134 ambiguous=2 excluded=101 foreign_reported=1154 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=36b6f831e7a50c06 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=608 weak=131 ambiguous=2 excluded=101 foreign_reported=1154 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=a578e2f1f92ed914 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2376	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2376	1524
@@ -65,13 +65,13 @@ frp-client/src/admin.rs	2045	-	ebfe8e660b31114e	-	absolute	frpc/tests/admin_conf
 frp-client/src/admin.rs	391	-	a891a6a9bba37da4	-	absolute	docs/developing.md	frp-client/src/admin.rs:391	237
 frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	525
 frp-client/src/admin.rs	771	-	17779174fa7e31b6	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-client/src/admin.rs:771	535
-frp-client/src/control.rs	309	311	79162ce6617445e7	5eb9e1d313c86491	absolute	frp-client/tests/end_to_end.rs	frp-client/src/control.rs:309-311	123
-frp-client/src/control.rs	350	-	dc937b59892604f5	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/control.rs:350	171
-frp-client/src/control.rs	389	395	d14a46c4d991d2f8	8943aadc26663e90	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-client/src/control.rs:389-395	60
+frp-client/src/control.rs	309	311	141cc70ea91c1664	81b56f59ba6f5136	absolute	frp-client/tests/end_to_end.rs	frp-client/src/control.rs:309-311	123
+frp-client/src/control.rs	350	-	1b964e65841faa37	-	absolute	frp-client/tests/req_work_conn_token_source.rs	frp-client/src/control.rs:350	171
+frp-client/src/control.rs	389	395	8374bc5cd9873796	55751df211f1a5e3	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-client/src/control.rs:389-395	60
 frp-client/src/control.rs	39	42	3662ccabe5670d2a	2494981b307ace60	absolute	frp-client/tests/end_to_end.rs	frp-client/src/control.rs:39-42	122
-frp-client/src/control.rs	401	403	deae1565210c2676	435de4e8a51833bd	shorthand	frp-client/tests/end_to_end.rs	:401-403	123
-frp-client/src/control.rs	429	431	435de4e8a51833bd	5eb9e1d313c86491	shorthand	frp-client/tests/end_to_end.rs	:429-431	123
-frp-client/src/control.rs	478	486	fc72ca2003590dff	13713c3692359d7c	absolute	frp-core/tests/v2_handshake_round14.rs	control.rs:478-486	74
+frp-client/src/control.rs	401	403	0e86781cdb2295e9	1037da22d2fe0228	shorthand	frp-client/tests/end_to_end.rs	:401-403	123
+frp-client/src/control.rs	429	431	b48b06a48abf16fb	81b56f59ba6f5136	shorthand	frp-client/tests/end_to_end.rs	:429-431	123
+frp-client/src/control.rs	478	486	1429a5e794a2974a	339d15c24d5ee688	absolute	frp-core/tests/v2_handshake_round14.rs	control.rs:478-486	74
 frp-client/src/plugin/mod.rs	307	-	2c9ec9c2f0b207a8	-	absolute	docs/developing.md	frp-client/src/plugin/mod.rs:307	909
 frp-client/src/plugin/mod.rs	391	-	1dcb3c0c97d690ad	-	absolute	docs/developing.md	frp-client/src/plugin/mod.rs:391	4036
 frp-client/src/proxy.rs	154	161	4785904c85d0c9d1	d10b36aa74a59bcf	absolute	frp-client/tests/round14_proxy_msg.rs	proxy.rs:154-161	68
@@ -336,8 +336,8 @@ frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_complet
 frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:443	832
 frp-core/src/logging.rs	467	-	e46b9fc201aa016b	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:467	833
 frp-core/src/msg.rs	694	699	2d3748ed9d43c0a1	981b6bd3b6da21de	absolute	frp-core/tests/protocol_round14.rs	frp-core/src/msg.rs:694-699	198
-frp-core/src/mux.rs	730	740	e6e173e9879e8709	29576b54e255e3c9	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:730-740	354
-frp-core/src/mux.rs	950	970	d10b36aa74a59bcf	d10b36aa74a59bcf	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:950-970	356
+frp-core/src/mux.rs	730	740	0c049cf1444bfb9b	31cf04fef0f6e2f9	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:730-740	354
+frp-core/src/mux.rs	950	970	4eefcb9d83304f0c	f9b7e4abb104708a	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:950-970	356
 frp-core/src/transport/mod.rs	2267	-	019e0dbb9b972bfb	-	absolute	frp-core/src/transport/mod.rs	transport/mod.rs:2267	3354
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2437
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	frp-core/src/config/tests.rs	frp-core/src/unsafe_features.rs:10	13139
