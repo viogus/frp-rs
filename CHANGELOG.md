@@ -9,9 +9,37 @@ User-facing release notes for frp-rs.
 > write the same detail in both; see the
 > [docs conventions](docs/README.md#conventions-for-these-docs).
 
-## Unreleased
+## v0.72.0 — 2026-11-07
+
+Tracks Go frp **v0.72.0** (released 2026-11-04). The version number is the
+compat target by rule, so this release is the whole v0.72.0 alignment: the
+mechanical bump, the two config surfaces 0.72.0 added, and the triage of its
+five release-note fixes (three were already satisfied, two are filed audits).
+The wire protocol did not change — the compat suite passes 86/86 against the Go
+v0.72.0 binaries, in both directions, with KCP/TLS/mux scenarios included.
 
 ### Features
+
+- **`transport.tls.useSystemCa` (frpc).** Server-certificate verification
+  against the host trust store, optionally combined with `trustedCaFile`: with
+  both set, the platform store is tried first and the file's roots second
+  (Go's documented macOS/Windows fallback). The server refuses the key with
+  Go's message, and the client requires `transport.tls.enable` unless the
+  protocol is `wss`. Applies to every client dial path — control, work
+  connections, STCP/SUDP/XTCP/`virtual_net` visitors and QUIC. A CA file with
+  no parsable anchor is now rejected when the connector is built (a dial-time
+  transport error, where Go's `newCertPool` fails at the same point), instead of
+  producing a connector that fails every handshake.
+- **`metricsServer` (frps and frpc).** A listener dedicated to health checks,
+  metrics and opt-in profiling, separate from the dashboard/admin API:
+  `/healthz` stays anonymous, `/metrics` and the profiling routes require the
+  configured credentials, TLS when the `tls` block is present. `frps` serves
+  the same metrics the dashboard renders (and, like Go, does so without
+  `enablePrometheus`); `frpc` serves the process-metric subset a Rust process
+  can report without a metrics dependency. The listener needs the HTTP tier —
+  `dashboard` on `frps`, `admin` on `frpc` — and a build without it accepts the
+  section and warns that the port is not served.
+
 
 - **SOCKS5 `UDP ASSOCIATE` works through frps without a hand-written companion proxy.** Setting `udp_enable = true` on the `socks5` plugin now auto-registers a `<name>__udp` UDP proxy on the **same `remote_port`** by default; frpc picks an ephemeral loopback relay port and fills `udp_advertise_addr` from `serverAddr`. The client uses one port for TCP and UDP, and the synthetic proxy is a normal UDP proxy on the wire (works against Go frps). Deployments that set both `udp_bind_addr` and an `udp_advertise_addr` whose port differs from `remote_port` are recognised as direct mode and skip the companion; `remote_port = 0` and non-TCP parents log a warning and skip it. Set `udp_auto_companion = false` to opt out explicitly. The companion is visible in proxy/status listings; it is **not** added to a proxy `group` because UDP has a single owner per port, so grouped/HA deployments keep TCP grouping but only one member can serve the UDP side at a time.
 

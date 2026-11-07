@@ -669,7 +669,7 @@ There are two cases, and they are not the same amount of work:
   ```
 
   What you add instead is a **Rust↔Rust** scenario in the same runner
-  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5319`, is the existing
+  (`test_kcp_rust_to_rust`, `scripts/compat-test.sh:5341`, is the existing
   template). It still drives the real `frps` and `frpc` binaries and the real wire
   protocol, and it is what a reviewer will ask for. Say in the PR that compat with
   Go frpc is *not applicable* rather than leaving the section empty.

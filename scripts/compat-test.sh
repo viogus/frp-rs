@@ -787,37 +787,52 @@ port = int(os.environ["SE_PORT"])
 domain = os.environ["SE_DOMAIN"]
 test_data = os.environ["SE_DATA"].encode()
 timeout = float(os.environ["SE_TO"])
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.settimeout(timeout)
 deadline = time.time() + timeout
+req = b"CONNECT " + domain.encode() + b":22 HTTP/1.1\r\nHost: " + domain.encode() + b":22\r\n\r\n"
+# Retry the whole CONNECT, not just `connect()`: a 404 is a definitive
+# answer from a running frps whose tcpmux route table does not yet contain
+# the proxy (`rust-to-go-tcpmux` starts the Rust frpc and sends immediately,
+# so the first CONNECT can land before registration). Retrying only the
+# socket connect turned that race into a hard failure; retrying a non-200
+# response keeps the test about the CONNECT round trip.
+last = ""
 while True:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # Per-attempt timeout bounded by what is left, so one blocking syscall
+    # cannot overshoot the deadline by a whole timeout.
+    s.settimeout(max(0.1, deadline - time.time()))
     try:
         s.connect(("127.0.0.1", port))
-        break
     except (ConnectionRefusedError, OSError):
+        s.close()
         if time.time() > deadline:
             print("FAIL:CONNECT_TIMEOUT")
             raise SystemExit(0)
         time.sleep(0.5)
-req = b"CONNECT " + domain.encode() + b":22 HTTP/1.1\r\nHost: " + domain.encode() + b":22\r\n\r\n"
-s.sendall(req)
-resp = b""
-while b"\r\n\r\n" not in resp:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    resp += chunk
-if not resp.startswith(b"HTTP/1.1 200"):
-    print("FAIL:CONNECT_RESPONSE " + repr(resp[:200]))
+        continue
+    s.sendall(req)
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = s.recv(4096)
+        if not chunk:
+            break
+        resp += chunk
+    if not resp.startswith(b"HTTP/1.1 200"):
+        last = "FAIL:CONNECT_RESPONSE " + repr(resp[:200])
+        s.close()
+        if time.time() > deadline:
+            print(last)
+            raise SystemExit(0)
+        time.sleep(0.2)
+        continue
+    s.sendall(test_data)
+    reply = s.recv(4096)
     s.close()
+    if reply == test_data:
+        print("OK:tcpmux")
+    else:
+        print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(reply[:200]))
     raise SystemExit(0)
-s.sendall(test_data)
-reply = s.recv(4096)
-s.close()
-if reply == test_data:
-    print("OK:tcpmux")
-else:
-    print("FAIL:MISMATCH expected=" + repr(test_data) + " got=" + repr(reply[:200]))
 ' 2>&1
 }
 
