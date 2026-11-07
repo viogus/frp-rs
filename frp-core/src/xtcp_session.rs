@@ -655,11 +655,8 @@ where
     // select below breaks on it. One sender stays with the driver for its
     // lifetime, so a sender-drop never reads as "close".
     let (stall_close_tx, mut stall_close_rx) = watch::channel(false);
-    let _stall_watchdog = crate::mux::write_stall_watchdog(
-        stall,
-        write_deadline,
-        stall_close_tx.clone(),
-    );
+    let _stall_watchdog =
+        crate::mux::write_stall_watchdog(stall, write_deadline, stall_close_tx.clone());
     let alive = Arc::new(AtomicBool::new(true));
     let bg_alive = alive.clone();
     // Mirror of the connection's live stream-map count (see `max_streams`
