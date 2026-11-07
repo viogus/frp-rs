@@ -321,6 +321,68 @@ caller would see the gate fire 256 streams early. frp never calls
 `on_drop_stream` and does decrement — so the counter is exact for every
 reachable transition. `drop_active` resets it to 0.
 
+## Audit: Go frp v0.72.0's yamux fixes (`#5595`) against this port
+
+Go frp v0.72.0's release notes record: *"Updated yamux to fix a 100% CPU busy
+loop after a session shuts down and a session close that could hang when the
+underlying connection (for example WebSocket) blocks on a write, which could
+also delay reconnection."* The fix landed in `fatedier/yamux` **v0.3.0** (Go,
+commit `967a750`). frp-rs does not use that library — this directory is the
+**Rust** `yamux` 0.14.1 port — so the Go commit cannot be applied, and the
+question is whether the two *symptoms* are reachable here. They are not, for
+reasons that are checkable in this tree:
+
+**1. The close-hang symptom has no reachable code path: nothing calls
+`poll_close`.** A tree-wide grep for `poll_close` outside `vendor/yamux` finds
+no caller — neither `frp-core/src/mux.rs` (`server_mux`, `client_mux`) nor any
+transport helper closes a yamux connection gracefully. Both paths **drop** the
+`Connection` when they are done, and the `Drop` impl
+(`vendor/yamux/src/connection.rs:270-279`) only drops streams: it performs no
+I/O, so a blocked underlying write cannot stall it. The graceful path that can
+block (`ConnectionState::Closing` → `Closing::poll` → `poll_flush`, reached only
+through `poll_close`, `vendor/yamux/src/connection.rs:227-268`) is therefore
+unreachable in frp-rs. This is a deliberate difference from Go, where the
+session is closed explicitly.
+
+**2. The busy-loop symptom needs a caller that keeps polling a terminal
+connection; both frp-rs call sites stop.** The port's state machine
+(`vendor/yamux/src/connection.rs:280-300`) has one terminal state, `Closed`,
+whose polls return `Ready(None)` / `Ready(Err(ConnectionError::Closed))` — a
+*caller* that polls again would indeed get an immediate `Ready` every time, i.e.
+a spin. Neither caller does:
+
+- the server acceptor (`frp-core/src/mux.rs:730-740`) `break`s on `Some(Err(e))`
+  and on `None`, and its poll is wrapped in `timeout(keepalive, ..)`, so even a
+  pathological immediate `Ready` ends the task on that iteration;
+- the client driver (`frp-core/src/mux.rs:950-970`) does the same on
+  `Some(Err(e))`/`None`, and its poll sits inside a `select!` whose other branch
+  is a synchronous single poll (never parks), so a closed connection exits the
+  driver rather than spinning it.
+
+**3. A blocked write parks rather than spins.** Writes go through
+`Active::poll`'s `poll_ready_unpin` / `start_send_unpin` / `poll_flush_unpin`
+(`vendor/yamux/src/connection.rs:468-500`): a full socket returns `Pending` from
+`poll_ready_unpin` (or from the flush), which registers the socket's waker and
+parks the task. The queued frames are finite — `start_send` consumes one frame
+per iteration and the queues are bounded by the yamux protocol's own windows —
+so the loop makes progress or parks.
+
+**Residual risk this audit does not remove.** The `Closing` path is *dead* code
+in frp-rs rather than *absent*: if a future caller started using `poll_close`
+(e.g. to flush a goodbye frame before dropping the socket), the Go symptom's
+shape — a close waiting on a write to a WebSocket whose peer stopped reading —
+could reappear, and its only bound would be whatever timeout the new caller
+added. Any future use of `poll_close` should be wrapped in a deadline, and the
+per-connection tasks in `frp-core/src/mux.rs` are the place to check.
+
+**Not measured:** this is a code-path audit, not a reproduction. Neither symptom
+was reproduced against the vendored crate (the Go report's WebSocket-blocked
+write was not re-created here), because the reachability argument above is what
+decides it: a path with no caller and a caller with no spin cannot exhibit the
+symptoms. If a future change adds a `poll_close` caller, the honest next step is
+a regression test that blocks `AsyncWrite::poll_flush` and asserts the close is
+bounded.
+
 ## Minor deviations (not patches)
 
 - `frame::header::internal_error()` / `Frame::internal_error()` (GoAway
