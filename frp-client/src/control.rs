@@ -57,6 +57,7 @@ pub(crate) async fn wrap_client_mux(
         keepalive_interval: Duration::from_secs(keepalive_interval.max(1) as u64),
         max_stream_window_size: 6 * 1024 * 1024,
         idle_dead_timeout: mux::idle_dead_timeout_from_secs(idle_dead_timeout),
+        ..Default::default()
     };
     // Go frp v0.70.1 wraps every non-QUIC transport in yamux; QUIC never
     // gets wrapped (the QUIC connection itself multiplexes streams).
