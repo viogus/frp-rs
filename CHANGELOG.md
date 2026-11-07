@@ -27,7 +27,9 @@ v0.72.0 binaries, in both directions, with KCP/TLS/mux scenarios included.
   Go's message, and the client requires `transport.tls.enable` unless the
   protocol is `wss`. Applies to every client dial path — control, work
   connections, STCP/SUDP/XTCP/`virtual_net` visitors and QUIC. A CA file with
-  no parsable anchor is now a config error, as in Go.
+  no parsable anchor is now rejected when the connector is built (a dial-time
+  transport error, where Go's `newCertPool` fails at the same point), instead of
+  producing a connector that fails every handshake.
 - **`metricsServer` (frps and frpc).** A listener dedicated to health checks,
   metrics and opt-in profiling, separate from the dashboard/admin API:
   `/healthz` stays anonymous, `/metrics` and the profiling routes require the

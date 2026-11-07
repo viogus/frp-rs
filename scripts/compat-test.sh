@@ -798,7 +798,9 @@ req = b"CONNECT " + domain.encode() + b":22 HTTP/1.1\r\nHost: " + domain.encode(
 last = ""
 while True:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
+    # Per-attempt timeout bounded by what is left, so one blocking syscall
+    # cannot overshoot the deadline by a whole timeout.
+    s.settimeout(max(0.1, deadline - time.time()))
     try:
         s.connect(("127.0.0.1", port))
     except (ConnectionRefusedError, OSError):
