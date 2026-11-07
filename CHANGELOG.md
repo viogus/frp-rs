@@ -13,6 +13,8 @@ User-facing release notes for frp-rs.
 
 ### Fixes
 
+- **A replaced control connection's multiplexed session is closed by the new login, as in Go frp v0.72.0.** When a client reconnects with the same `run_id`, the superseding login now closes the old session's yamux connection directly, releasing its streams and work connections immediately instead of waiting for the old handler to finish (or for the keepalive reaper). Dropping the accept handle keeps its existing meaning — "stop accepting", which the STCP visitor path relies on — so this is a separate explicit close, pinned by a test that closes through the handle while the receiver is still held.
+
 - **A Go frp v0.72.0 `[metricsServer.tls]` block carrying `trustedCaFile` or `serverName` now loads.** Both keys are accepted and inert, which is exactly Go's behaviour: `newServer` builds the metrics listener's TLS from the cert/key pair only, so `trustedCaFile` does not enable client-certificate verification on that listener and `serverName` is never used. Previously strict mode refused the config as an unknown field and a non-strict load dropped the keys silently.
 
 ## v0.72.0 — 2026-11-07

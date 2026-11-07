@@ -604,6 +604,14 @@ pub(crate) async fn authenticate(
     let handoff_barrier: Option<oneshot::Receiver<()>> = {
         if let Some(old_ctl) = state.run_id_to_ctl_tx.get(&run_id).map(|c| c.clone()) {
             warn!(run_id = %run_id, "Duplicate run_id {}: shutting down old control handler for replacement", run_id);
+            // Go frp v0.72.0 `#5596`: close the replaced control's multiplexed
+            // session from the *new* session, so its streams and work
+            // connections are released even if the old handler never reaches
+            // its cleanup (a wedged dispatch). The handler's own drop remains
+            // the polite path; this is the guarantee.
+            if let Some(mux) = &old_ctl.mux_shutdown {
+                mux.close();
+            }
             let (tx, rx) = oneshot::channel();
             match old_ctl.tx.try_send(InternalMsg::Shutdown { done: tx }) {
                 Ok(()) => Some(rx),
@@ -694,6 +702,7 @@ pub(crate) async fn authenticate(
             // wire-protocol enforcement).
             wire_v2: v2,
             superseded: superseded.clone(),
+            mux_shutdown: incoming.as_ref().map(|streams| streams.shutdown_handle()),
         },
     );
 

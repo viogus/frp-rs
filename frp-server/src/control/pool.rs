@@ -1213,6 +1213,7 @@ mod tests {
             run_id.to_string(),
             crate::state::ControlTx {
                 tx,
+                mux_shutdown: None,
                 client_addr: None,
                 login_time: std::time::Instant::now(),
                 login_time_unix: 0,

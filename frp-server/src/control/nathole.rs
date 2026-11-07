@@ -1473,6 +1473,7 @@ mod vnet_route_tests {
             run_id.to_string(),
             ControlTx {
                 tx,
+                mux_shutdown: None,
                 client_addr: None,
                 login_time: StdInstant::now(),
                 login_time_unix: 0,
