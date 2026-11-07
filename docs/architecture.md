@@ -847,16 +847,25 @@ removed during connection handoff"* (`#5592`). frp-rs has no listener-held
 pending connection to leak, and this section records why, because the property
 is structural rather than tested.
 
-**There is one handoff, and it moves the stream.** `frp-server/src/vhost.rs:709`
-looks the route's `run_id` up in `run_id_to_ctl_tx`, and `:723` sends
-`InternalMsg::ProxyUserConn { user_conn: wrap(stream), .. }`. The stream is
-**moved** into the message: after that call the vhost task no longer holds a
-copy, so there is no "listener still owns it" state for a removal to strand.
+**Every handoff moves the stream.** There are four of them, one per surface
+(HTTP/1.1 vhost, HTTPS SNI passthrough, tcpmux, h2c) and they all have the same
+shape. `frp-server/src/vhost.rs:709` looks the route's `run_id` up in
+`run_id_to_ctl_tx`, and `:723` sends `InternalMsg::ProxyUserConn { user_conn:
+wrap(stream), .. }`. The stream is **moved** into the message: after that call
+the vhost task no longer holds a copy, so there is no "listener still owns it"
+state for a removal to strand. The other three are
+`frp-server/src/vhost/https.rs:157`/`:171` (HTTPS SNI passthrough — the direct
+frp-rs analogue of Go's fixed `Muxer`, see below), `frp-server/src/tcpmux.rs:665`/`:680`
+and `frp-server/src/vhost_h2c.rs:363`/`:393` (the h2c stream is moved as an
+`IoStream::SshChannel`).
 The three ways the send can end all close the connection or transfer it:
 
 - delivered — the message (and the stream) now belongs to the control handler's
   `select!` loop (`docs/architecture.md` § [Server Control Plane](#server-control-plane-the-internalmsg-channel)),
-  which either bridges it or drops it during cleanup;
+  which either bridges it or drops it when the handler exits (the supersession
+  path drains buffered messages to answer them cleanly; the other break paths
+  drop them, which the client sees as a reset — a close either way, never a
+  leak);
 - channel closed (`Ok(Err(_))`) — the message is returned in the error and
   dropped with its stream, so the client observes a close;
 - `CTL_SEND_TIMEOUT` (`frp-server/src/state.rs:312`, 15 s) — the `send` future is
@@ -865,9 +874,16 @@ The three ways the send can end all close the connection or transfer it:
 
 A route whose control is already gone never reaches the send at all:
 `frp-server/src/vhost.rs:765` writes Go's `NotFoundResponse` and returns,
-dropping the stream. The tcpmux handoff has the same shape one function over —
-`frp-server/src/tcpmux.rs:665` looks up, `:680` sends the same moved
-`ProxyUserConn`, and `:714` answers `NotFoundResponse` when the control is gone.
+dropping the stream; the tcpmux path answers the same way at
+`frp-server/src/tcpmux.rs:714`.
+
+**Which Go code this mirrors.** Go's `#5592` changed `pkg/util/vhost/vhost.go`'s
+`Muxer`/`Listener`, which serves **HTTPS** (`pkg/util/vhost/https.go`,
+`NewMuxer`) and **tcpmux** (`HTTPConnectTCPMuxer` embeds `*vhost.Muxer`). Its
+analogue here is `frp-server/src/vhost/https.rs`, not the HTTP/1.1 reverse-proxy
+surface — Go's HTTP vhost is `httputil.ReverseProxy` (`pkg/util/vhost/http.go`)
+and `#5592` did not touch it. Both are audited above because both hand off the
+same way.
 
 **What removal does, and does not, touch.** Unregistering a proxy removes the
 route from `vhost_manager`/tcpmux state; it does not reach into a connection
@@ -878,7 +894,7 @@ only by the vhost task's own stack frame, and every path out of that frame
 Go's bug, where the listener kept the pending connection in a structure that
 outlived the removal.
 
-**Not covered:** no test removes a vhost or tcpmux listener *while* a handoff is
+**Not covered:** no test removes a vhost, HTTPS or tcpmux route *while* a handoff is
 in flight and asserts the client is closed — the race needs an unregister
 interleaved with a forward, which the current integration harness does not
 drive. The claim above is therefore a code-path audit (the same evidence
