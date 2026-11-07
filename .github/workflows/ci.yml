@@ -1093,9 +1093,9 @@ jobs:
           log=/tmp/frp-docs-go-column.$$.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=aea64480da83b12ada1792f2dad6617683924fa8e704399aa0e4b469ccce7f48
-          guard_exact=271
-          guard_floor=271
+          guard_pin=5bbe09e4869528edfc096491ea9cdce6dc7b75025e5a49154fd0c436ac4b1a9c
+          guard_exact=273
+          guard_floor=273
           guard_canary='M1 (websocket_port reworded'
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=f80addc94bc371babcc772ebb50b74341ba8b3664c2e358299261952c703c064
+          guard_data_pin=ac6cf9f9e9189bce9b37503728ac71d0d1d40007816b0130177b394f0c191d03
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

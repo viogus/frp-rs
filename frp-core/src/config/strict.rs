@@ -765,6 +765,10 @@ pub(super) const METRICS_SERVER_TLS_KNOWN_KEYS: &[&str] = &[
     "keyFile",
     "use_system_ca",
     "useSystemCa",
+    "trusted_ca_file",
+    "trustedCaFile",
+    "server_name",
+    "serverName",
 ];
 
 /// Key set of a nested **table** child, by the kind of table it sits in.

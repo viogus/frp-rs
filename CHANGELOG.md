@@ -9,6 +9,12 @@ User-facing release notes for frp-rs.
 > write the same detail in both; see the
 > [docs conventions](docs/README.md#conventions-for-these-docs).
 
+## Unreleased
+
+### Fixes
+
+- **A Go frp v0.72.0 `[metricsServer.tls]` block carrying `trustedCaFile` or `serverName` now loads.** Both keys are accepted and inert, which is exactly Go's behaviour: `newServer` builds the metrics listener's TLS from the cert/key pair only, so `trustedCaFile` does not enable client-certificate verification on that listener and `serverName` is never used. Previously strict mode refused the config as an unknown field and a non-strict load dropped the keys silently.
+
 ## v0.72.0 — 2026-11-07
 
 Tracks Go frp **v0.72.0** (released 2026-11-04). The version number is the

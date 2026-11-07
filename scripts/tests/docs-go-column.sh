@@ -70,7 +70,7 @@
 #
 # Scenarios
 #   1  the row-by-row scan of `$DOCS_CONFIG` (default docs/config.md): 18 Go-column tables,
-#      206 data rows, 30 divergence markers, 0 alias rows, the key-set artifact diff, the 41
+#      208 data rows, 30 divergence markers, 0 alias rows, the key-set artifact diff, the 41
 #      alias resolutions, one check per data row and one per pinned row.
 #   2  seven mutations of a copy of the repository's own docs/config.md, each of which must red —
 #      M1 reword the `websocket_port` divergence to `websocketPort`, M2 reword `tls_enable` to
@@ -167,13 +167,13 @@ import sys
 HDR = "| Field | Type | Default | Go frp Equivalent | Description |"
 GO_ARTIFACT = sys.argv[2]
 EXPECTED_TABLES = 18
-EXPECTED_ROWS = 206
+EXPECTED_ROWS = 208
 EXPECTED_DIVERGENT = 30
 EXPECTED_ALIAS_ROWS = 0
 EXPECTED_GO_KEYS = 276
 EXPECTED_GO_DOTTED = 121
 EXPECTED_GO_BARE = 155
-EXPECTED_ROW_PATHS = 206
+EXPECTED_ROW_PATHS = 208
 EXPECTED_RESOLUTIONS = 41
 
 # --- curated Go frp v0.72.0 spellings: dotted json paths + bare json field names ---
@@ -624,6 +624,8 @@ ROW_GO_PATHS = {
     (18, 'tls.cert_file'): 'go:metricsServer.tls.certFile',
     (18, 'tls.key_file'): 'go:metricsServer.tls.keyFile',
     (18, 'tls.use_system_ca'): 'divergent',
+    (18, 'tls.trusted_ca_file'): 'go:metricsServer.tls.trustedCaFile',
+    (18, 'tls.server_name'): 'go:metricsServer.tls.serverName',
     (8, 'server_port'): 'go:serverPort',
     (8, 'transport_protocol'): 'go:protocol',
     (8, 'token'): 'go:auth.token',
