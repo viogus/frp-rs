@@ -2,7 +2,7 @@
 # docs-go-column.sh — fixture checks for the `Go frp Equivalent` column of docs/config.md.
 #
 # Why this exists: docs/config.md's opening paragraph used to claim "Every field maps 1:1 to a
-# Go frp v0.71.0 equivalent", but nothing measured that column. Two rows had already rotted by
+# Go frp v0.72.0 equivalent", but nothing measured that column. Two rows had already rotted by
 # hand: PR #448 fixed a row naming a Go spelling `frps` does not accept, and PR #455 found a
 # second row naming a Go field `frps` does not read. A reader who trusts the column cannot tell
 # a mapped row from a divergence, and a wrong spelling is invisible to every other guard in the
@@ -50,7 +50,7 @@
 #
 # A data row passes when its Go cell is
 #   go         the `json` path `ROW_GO_PATHS` records for that row, and that path is in `GO`
-#   qualified  `` `tok` (start|end|nested) `` with `tok` the recorded Go frp v0.71.0 spelling
+#   qualified  `` `tok` (start|end|nested) `` with `tok` the recorded Go frp v0.72.0 spelling
 #   divergent  the recorded em-dash divergence marker (`—`, `` `—` ``, optionally with prose)
 #   extension  an em-dash marker naming a spelling the recorded key set proves Go does not have
 #   nontoken   one of the three documented non-token shapes: `**Required.**`,
@@ -176,7 +176,7 @@ EXPECTED_GO_BARE = 155
 EXPECTED_ROW_PATHS = 206
 EXPECTED_RESOLUTIONS = 41
 
-# --- curated Go frp v0.71.0 spellings: dotted json paths + bare json field names ---
+# --- curated Go frp v0.72.0 spellings: dotted json paths + bare json field names ---
 GO = {
     "additionalEndpointParams",
     "additionalScopes",
@@ -456,7 +456,7 @@ GO = {
     "wireProtocol",
 }
 
-# --- accepted doc spellings that are NOT Go frp v0.71.0 json keys -------------------
+# --- accepted doc spellings that are NOT Go frp v0.72.0 json keys -------------------
 # Empty by design: the M-1 round recorded 41 of these, and the M-1 residue asked for every
 # one of them to be repointed to its true Go path or recorded in docs/config.md as an extension.
 # Both happened (see `ALIAS_RESOLUTION` below and the markers in the document), so no accepted
@@ -465,11 +465,11 @@ GO = {
 ALIASES = {}
 
 # --- the 41 recorded aliases, resolved ----------------------------------------------
-# old doc spelling -> ('repoint:<the Go v0.71.0 json path it should have named>'
+# old doc spelling -> ('repoint:<the Go v0.72.0 json path it should have named>'
 #                     | 'extension', [(table ordinal, field), …] the rows that carried it)
 # `repoint` means the field does have a Go key and the document now names it: the path must be
 # in `GO`, and every recorded row's cell in `ROW_GO_PATHS` must be exactly that path — not just
-# some row's. `extension` means no Go v0.71.0 json key carries that name at all, and the rows
+# some row's. `extension` means no Go v0.72.0 json key carries that name at all, and the rows
 # that carried the old spelling must be exactly the rows carrying the extension marker naming
 # it. Both halves are checked mechanically against the recorded key set.
 ALIAS_RESOLUTION = {
@@ -621,9 +621,9 @@ ROW_GO_PATHS = {
     (18, 'user'): 'go:metricsServer.user',
     (18, 'password'): 'go:metricsServer.password',
     (18, 'pprof_enable'): 'go:metricsServer.pprofEnable',
-    (18, 'tls_cert_file'): 'go:metricsServer.tls.certFile',
-    (18, 'tls_key_file'): 'go:metricsServer.tls.keyFile',
-    (18, 'use_system_ca'): 'divergent',
+    (18, 'tls.cert_file'): 'go:metricsServer.tls.certFile',
+    (18, 'tls.key_file'): 'go:metricsServer.tls.keyFile',
+    (18, 'tls.use_system_ca'): 'divergent',
     (8, 'server_port'): 'go:serverPort',
     (8, 'transport_protocol'): 'go:protocol',
     (8, 'token'): 'go:auth.token',
@@ -807,14 +807,14 @@ for ln, table, field, cell in rows:
     if m:
         tok = m.group(1)
         if tok in GO:
-            classified.append((ln, field, cell, 'go', '`%s` is a Go frp v0.71.0 json spelling' % tok, tok))
+            classified.append((ln, field, cell, 'go', '`%s` is a Go frp v0.72.0 json spelling' % tok, tok))
         elif tok in ALIASES:
             classified.append((ln, field, cell, 'alias',
-                               '`%s` is a recorded doc spelling, not a Go frp v0.71.0 json key (%s)'
+                               '`%s` is a recorded doc spelling, not a Go frp v0.72.0 json key (%s)'
                                % (tok, ALIASES[tok]), tok))
         else:
             classified.append((ln, field, cell, 'unknown',
-                               'Go cell `%s` is not a Go frp v0.71.0 json spelling, a recorded doc '
+                               'Go cell `%s` is not a Go frp v0.72.0 json spelling, a recorded doc '
                                'alias, a divergence marker or a documented non-token shape' % short(tok), tok))
         continue
     q = QUAL.match(cell)
@@ -822,11 +822,11 @@ for ln, table, field, cell in rows:
         tok, shape = q.group(1), q.group(2)
         if tok in GO:
             classified.append((ln, field, cell, 'qualified',
-                               'Go cell `%s` (%s) names the Go frp v0.71.0 json spelling `%s`'
+                               'Go cell `%s` (%s) names the Go frp v0.72.0 json spelling `%s`'
                                % (tok, shape, tok), tok))
         else:
             classified.append((ln, field, cell, 'unknown',
-                               'Go cell `%s` (%s) is not a Go frp v0.71.0 json spelling' % (tok, shape), tok))
+                               'Go cell `%s` (%s) is not a Go frp v0.72.0 json spelling' % (tok, shape), tok))
         continue
     if DIVERGENT.match(cell):
         classified.append((ln, field, cell, 'divergent',
@@ -837,7 +837,7 @@ for ln, table, field, cell in rows:
                            '%s carries the documented non-token shape %s' % (field, cell), None))
         continue
     classified.append((ln, field, cell, 'unknown',
-                       'Go cell %s is not a Go frp v0.71.0 json spelling, a recorded doc alias, '
+                       'Go cell %s is not a Go frp v0.72.0 json spelling, a recorded doc alias, '
                        'a divergence marker or a documented non-token shape (%s)'
                        % (short(cell) if cell else '<empty>', field), None))
 
@@ -909,7 +909,7 @@ for tok in sorted(ALIAS_RESOLUTION):
     res, res_rows = ALIAS_RESOLUTION[tok]
     problems = []
     if tok in GO:
-        problems.append('`%s` is a Go v0.71.0 key, so it needed no resolution' % tok)
+        problems.append('`%s` is a Go v0.72.0 key, so it needed no resolution' % tok)
     if tok in doc_tokens:
         problems.append('the document still carries `%s` as a row cell' % tok)
     if res.startswith('repoint:'):
@@ -958,7 +958,7 @@ def expected_failure(exp, cell, tok):
     if exp.startswith('extension:'):
         spelling = exp[len('extension:'):]
         if spelling in GO:
-            return 'the recorded extension spelling `%s` is a Go v0.71.0 key' % spelling
+            return 'the recorded extension spelling `%s` is a Go v0.72.0 key' % spelling
         if not DIVERGENT.match(cell):
             return 'expected a divergence marker naming `%s`, found %s' % (spelling, short(cell))
         if spelling not in cell:
@@ -1076,7 +1076,7 @@ done <<<"$report"
 M1="$WORK/m1.md"
 if mutate_go_cell "$PRISTINE" "$M1" 22 '`websocketPort`' && grep -Fq '`websocketPort`' "$M1"; then
   expect_red 'M1 (websocket_port reworded to the Go spelling `websocketPort`): docs/config.md:22 reds' \
-    "$M1" 'bad docs/config.md:22' '`websocketPort` is not a Go frp v0.71.0'
+    "$M1" 'bad docs/config.md:22' '`websocketPort` is not a Go frp v0.72.0'
 else
   bad 'M1 mutation did not apply — anchor missing, the check would be vacuous'
 fi
@@ -1084,7 +1084,7 @@ fi
 M2="$WORK/m2.md"
 if mutate_go_cell "$PRISTINE" "$M2" 25 '`tlsEnable`' && grep -Fq '`tlsEnable`' "$M2"; then
   expect_red 'M2 (tls_enable reworded to the Go spelling `tlsEnable`): docs/config.md:25 reds' \
-    "$M2" 'bad docs/config.md:25' '`tlsEnable` is not a Go frp v0.71.0'
+    "$M2" 'bad docs/config.md:25' '`tlsEnable` is not a Go frp v0.72.0'
 else
   bad 'M2 mutation did not apply — anchor missing, the check would be vacuous'
 fi
@@ -1092,7 +1092,7 @@ fi
 M3="$WORK/m3.md"
 if mutate_go_cell "$PRISTINE" "$M3" 14 '`bindAddress`' && grep -Fq '`bindAddress`' "$M3"; then
   expect_red 'M3 (a curated token misspelled, `bindAddr` -> `bindAddress`): docs/config.md:14 reds' \
-    "$M3" 'bad docs/config.md:14' '`bindAddress` is not a Go frp v0.71.0'
+    "$M3" 'bad docs/config.md:14' '`bindAddress` is not a Go frp v0.72.0'
 else
   bad 'M3 mutation did not apply — anchor missing, the check would be vacuous'
 fi
@@ -1120,8 +1120,8 @@ fi
 
 M7="$WORK/m7.md"
 if mutate_go_cell "$PRISTINE" "$M7" 15 '`kcpPort`' && grep -Fq '`kcpPort`' "$M7"; then
-  expect_red 'M7 (`kcpPort` is not a Go v0.71.0 spelling): docs/config.md:15 reds membership' \
-    "$M7" 'bad docs/config.md:15' '`kcpPort` is not a Go frp v0.71.0'
+  expect_red 'M7 (`kcpPort` is not a Go v0.72.0 spelling): docs/config.md:15 reds membership' \
+    "$M7" 'bad docs/config.md:15' '`kcpPort` is not a Go frp v0.72.0'
 else
   bad 'M7 mutation did not apply — anchor missing, the check would be vacuous'
 fi

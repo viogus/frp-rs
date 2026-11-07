@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# docs-go-column-derive-go-keys.sh — re-derive the Go frp v0.71.0 json key set
+# docs-go-column-derive-go-keys.sh — re-derive the Go frp v0.72.0 json key set
 # recorded at scripts/tests/docs-go-column-go-keys.txt.
 #
 # The gate itself (scripts/tests/docs-go-column.sh) is offline: it diffs its
@@ -21,7 +21,7 @@
 # Accept set (the artifact's shape): every dotted `json` path reachable from
 # ServerConfig, ClientConfig and the *ProxyConfig / *VisitorConfig /
 # *PluginOptions structs (embedded structs followed, `json:"-"` ignored), plus
-# every bare `json` field name in those files — 108 + 153 = 261 spellings.
+# every bare `json` field name in those files — 121 + 155 = 276 spellings.
 #
 # Modes
 #   --print   print the derived key set, one per line (default)
@@ -96,7 +96,7 @@ if [ -z "$source_dir" ] && [ "$do_fetch" = 1 ]; then
 fi
 
 if [ -z "$source_kind" ]; then
-  printf 'SKIP  no Go frp v0.71.0 source; pass --source DIR, set GO_FRP_CONFIG_V1_DIR, or use --fetch\n'
+  printf 'SKIP  no Go frp v0.72.0 source; pass --source DIR, set GO_FRP_CONFIG_V1_DIR, or use --fetch\n'
   exit 0
 fi
 if [ ! -d "$source_dir" ]; then
