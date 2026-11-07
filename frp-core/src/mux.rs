@@ -207,7 +207,7 @@ pub fn idle_dead_timeout_from_secs(secs: i64) -> Option<Duration> {
 /// bytes (data, PING or PONG frames) since the last keepalive check.
 #[cfg(feature = "tcp-mux")]
 #[derive(Default)]
-struct ActivityState {
+pub(crate) struct ActivityState {
     saw_read: AtomicBool,
 }
 
@@ -232,25 +232,25 @@ impl ActivityState {
 /// [`write_stall_watchdog`] is the enforcement half.
 #[cfg(feature = "tcp-mux")]
 #[derive(Default)]
-struct WriteStall {
+pub(crate) struct WriteStall {
     blocked_since: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 #[cfg(feature = "tcp-mux")]
 impl WriteStall {
     /// The transport accepted nothing for this write.
-    fn pending(&self) {
+    pub(crate) fn pending(&self) {
         let mut guard = self.blocked_since.lock().unwrap_or_else(|e| e.into_inner());
         guard.get_or_insert_with(tokio::time::Instant::now);
     }
 
     /// Bytes moved: the transport is not stalled.
-    fn progress(&self) {
+    pub(crate) fn progress(&self) {
         *self.blocked_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// How long the transport has been stalled, if it is.
-    fn stalled_for(&self) -> Option<Duration> {
+    pub(crate) fn stalled_for(&self) -> Option<Duration> {
         self.blocked_since
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -261,7 +261,7 @@ impl WriteStall {
 /// Wraps the yamux socket so inbound I/O (including internal PING/PONG)
 /// can be observed without inspecting yamux's private RTT state.
 #[cfg(feature = "tcp-mux")]
-struct ActivityIo<T> {
+pub(crate) struct ActivityIo<T> {
     inner: T,
     state: Arc<ActivityState>,
     stall: Arc<WriteStall>,
@@ -269,7 +269,7 @@ struct ActivityIo<T> {
 
 #[cfg(feature = "tcp-mux")]
 impl<T> ActivityIo<T> {
-    fn new(inner: T, state: Arc<ActivityState>, stall: Arc<WriteStall>) -> Self {
+    pub(crate) fn new(inner: T, state: Arc<ActivityState>, stall: Arc<WriteStall>) -> Self {
         Self {
             inner,
             state,
@@ -363,7 +363,7 @@ fn idle_dead_bound(keepalive: Duration, idle_dead_timeout: Option<Duration>) -> 
 /// `Send`; this loop drops the guard before awaiting, which keeps the driver
 /// futures `Send`.
 #[cfg(feature = "tcp-mux")]
-async fn wait_force_close(rx: &mut tokio::sync::watch::Receiver<bool>) {
+pub(crate) async fn wait_force_close(rx: &mut tokio::sync::watch::Receiver<bool>) {
     loop {
         let closed = *rx.borrow_and_update();
         if closed {
@@ -390,7 +390,7 @@ async fn wait_force_close(rx: &mut tokio::sync::watch::Receiver<bool>) {
 /// ([`MuxShutdown`]), so the driver wakes and drops the connection, failing
 /// every stream on it.
 #[cfg(feature = "tcp-mux")]
-fn write_stall_watchdog(
+pub(crate) fn write_stall_watchdog(
     stall: Arc<WriteStall>,
     deadline: Duration,
     closer: tokio::sync::watch::Sender<bool>,
