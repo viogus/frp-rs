@@ -1601,6 +1601,64 @@ mod tests {
         );
     }
 
+    /// The deadline must never fire on a session that is merely **idle**: a
+    /// stall is marked only by a write that returned `Pending`, so a quiet
+    /// session has no timestamp to age out. Pinned because the failure mode
+    /// would be a session torn down by its own watchdog while both ends are
+    /// healthy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_session_outlives_the_write_deadline() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mux_cfg = TcpMuxConfig {
+            write_deadline: Duration::from_millis(200),
+            keepalive_interval: Duration::from_secs(30),
+            idle_dead_timeout: None,
+            ..Default::default()
+        };
+
+        let client = tokio::spawn({
+            let mux_cfg = mux_cfg.clone();
+            async move {
+                let (mut control, session) = client_mux(client_io, &mux_cfg).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut control, b"c").await?;
+                tokio::io::AsyncWriteExt::flush(&mut control).await?;
+                Ok::<_, crate::Error>((control, session))
+            }
+        });
+        let (mut control, _incoming) = server_mux(
+            server_io,
+            &mux_cfg,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("server_mux");
+        let (_client_control, _session) = client.await.expect("client task").expect("client_mux");
+
+        // Drain the control byte the client wrote during the handshake.
+        let mut one = [0u8; 1];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::io::AsyncReadExt::read_exact(&mut control, &mut one),
+        )
+        .await
+        .expect("handshake byte")
+        .expect("read handshake byte");
+
+        // Well past the 200 ms deadline, with no traffic at all: the next read
+        // must simply stay pending, i.e. the watchdog must not have closed it.
+        let still_open = tokio::time::timeout(Duration::from_millis(800), async {
+            let mut buf = [0u8; 1];
+            tokio::io::AsyncReadExt::read(&mut control, &mut buf)
+                .await
+                .is_ok()
+        })
+        .await;
+        assert!(
+            still_open.is_err(),
+            "an idle session must not be closed by the write-deadline watchdog"
+        );
+    }
+
     /// The queue is filled without yielding (the driver cannot run while the
     /// test task executes synchronously), refusal is checked, then the
     /// driver's next keepalive I/O pass drains the channel — the queued
