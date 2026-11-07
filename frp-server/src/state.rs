@@ -449,6 +449,10 @@ pub struct PoolStats {
 #[derive(Debug, Clone)]
 pub struct ControlTx {
     pub tx: mpsc::Sender<InternalMsg>,
+    /// Closes this control's yamux session **now** when a later login with the
+    /// same `run_id` supersedes it (Go frp v0.72.0 `#5596`). `None` when the
+    /// control did not arrive over tcp_mux, or in a build without it.
+    pub mux_shutdown: Option<frp_core::mux::MuxShutdown>,
     pub client_addr: Option<SocketAddr>,
     pub login_time: Instant,
     /// Absolute Unix epoch timestamp of login, for dashboard v2 API.
@@ -2083,6 +2087,7 @@ mod tests {
             run_id.to_string(),
             ControlTx {
                 tx,
+                mux_shutdown: None,
                 client_addr: None,
                 login_time: Instant::now(),
                 login_time_unix: 0,

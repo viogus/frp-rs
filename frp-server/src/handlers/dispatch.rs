@@ -1447,6 +1447,7 @@ mod nat_hole_visitor_bounded_send_tests {
             "run-1".to_string(),
             crate::state::ControlTx {
                 tx: ctl_tx.clone(),
+                mux_shutdown: None,
                 client_addr: None,
                 login_time: std::time::Instant::now(),
                 login_time_unix: 0,
