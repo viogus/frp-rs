@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=581 weak=127 ambiguous=2 excluded=101 foreign_reported=1151 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=3bba75bff7059b91 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=581 weak=127 ambiguous=2 excluded=101 foreign_reported=1152 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=3bba75bff7059b91 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2376	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2376	1524
@@ -40,18 +40,18 @@
 .github/workflows/release.yml	174	-	7114fd8d158867fe	-	continuation	frp-core/src/config/loader.rs	174	618
 .github/workflows/release.yml	222	-	f1db6bc806bab9cb	-	continuation	frp-core/src/config/loader.rs	222	618
 .github/workflows/release.yml	225	-	7114fd8d158867fe	-	continuation	frp-core/src/config/loader.rs	225	618
-docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1094
-docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1095
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1115
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1116
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1123
-docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1124
-docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1078
-docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1079
-docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1108
+docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1096
+docs/config.md	14	-	c0a6027d52a52c4f	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:14	1097
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1117
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1118
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1125
+docs/config.md	15	-	bd7b47a2b734b52a	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:15	1126
+docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1080
+docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1081
+docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	1110
 docs/config.md	22	-	b75447a0ef6cda20	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:22	64
-docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1086
-docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1087
+docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1088
+docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	1089
 docs/config.md	25	-	628fa5d96339c307	-	absolute	scripts/tests/docs-go-column.sh	docs/config.md:25	64
 docs/config.md	671	-	6ab008a0707cd783	-	absolute	docs/developing.md	docs/config.md:671	4083
 docs/deployment.md	900	-	4459a65e565615ca	-	absolute	frp-core/src/config/tests.rs	docs/deployment.md:900	13150
