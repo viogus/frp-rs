@@ -1083,8 +1083,9 @@ pub async fn xtcp_p2p_connect_yamux(
     let (stream_tx, stream_rx) = tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
     let (driver_drop_tx, mut driver_drop_rx) = watch::channel(());
     // The stalled-write watchdog closes through this channel; the driver's
-    // select below breaks on it. One sender stays with the driver for its
-    // lifetime, so a sender-drop never reads as "close".
+    // select below breaks on it. The watchdog holds the sender for as long as
+    // it runs, and `wait_force_close` parks when every sender is gone, so a
+    // sender-drop never reads as "close".
     let (stall_close_tx, mut stall_close_rx) = watch::channel(false);
     let _stall_watchdog = crate::mux::write_stall_watchdog(
         stall,
