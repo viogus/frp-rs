@@ -413,7 +413,12 @@ pub async fn xtcp_p2p_connect_yamux_session(
         inner: kcp_stream,
         last_read_ms: last_read_ms.clone(),
     };
-    let compat_stream = kcp_stream.compat();
+    // Write deadline (Go frp v0.72.0 `#5595`): record when this transport
+    // stops accepting bytes so the watchdog below can fail the session
+    // instead of parking it. Same mechanism as `frp-core/src/mux.rs`.
+    let activity = std::sync::Arc::new(crate::mux::ActivityState::default());
+    let stall = std::sync::Arc::new(crate::mux::WriteStall::default());
+    let compat_stream = crate::mux::ActivityIo::new(kcp_stream, activity, stall.clone()).compat();
 
     // 3. Create the yamux Connection. Go frp v0.71 sets
     //    KeepAliveInterval=10s and MaxStreamWindowSize=6MB in the XTCP path
@@ -468,6 +473,8 @@ pub async fn xtcp_p2p_connect_yamux_session(
         MAX_TUNNEL_STREAMS,
         tick_ms,
         last_read_ms,
+        stall,
+        crate::mux::DEFAULT_WRITE_DEADLINE,
     ))
 }
 
@@ -629,6 +636,8 @@ fn spawn_tunnel_driver<T>(
     max_streams: usize,
     tick_ms: u64,
     idle_watch: Arc<AtomicU64>,
+    stall: Arc<crate::mux::WriteStall>,
+    write_deadline: Duration,
 ) -> XtcpTunnelSession
 where
     T: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + Send + 'static,
@@ -642,6 +651,13 @@ where
     >(MAX_PENDING_OPEN_REQUESTS);
     let (inbound_tx, inbound_rx) = mpsc::channel::<Box<dyn P2pStream>>(MAX_INBOUND_QUEUE);
     let (driver_drop_tx, mut driver_drop_rx) = watch::channel(());
+    // The stalled-write watchdog closes through this channel; the driver's
+    // select below breaks on it. The watchdog holds the sender for as long as
+    // it runs, and `wait_force_close` parks when every sender is gone, so a
+    // sender-drop never reads as "close".
+    let (stall_close_tx, mut stall_close_rx) = watch::channel(false);
+    let _stall_watchdog =
+        crate::mux::write_stall_watchdog(stall, write_deadline, stall_close_tx.clone());
     let alive = Arc::new(AtomicBool::new(true));
     let bg_alive = alive.clone();
     // Mirror of the connection's live stream-map count (see `max_streams`
@@ -749,6 +765,11 @@ where
             // `open_wake` arm below).
             let mut had_activity = false;
             let result = tokio::select! {
+                biased;
+                _ = crate::mux::wait_force_close(&mut stall_close_rx) => {
+                    tracing::warn!("XTCP tunnel yamux: write deadline exceeded; closing the session");
+                    break;
+                }
                 _ = driver_drop_rx.changed() => break,
                 // Open-request wake (round-13): an open_stream queued between
                 // polls must be served now, not at the next (possibly 1s)
@@ -1239,6 +1260,8 @@ mod tests {
             CAP,
             10,
             Arc::new(AtomicU64::new(now_epoch_ms())),
+            Arc::new(crate::mux::WriteStall::default()),
+            crate::mux::DEFAULT_WRITE_DEADLINE,
         );
 
         let mut streams: Vec<Box<dyn P2pStream>> = Vec::new();
@@ -1296,6 +1319,8 @@ mod tests {
             MAX_TUNNEL_STREAMS,
             10,
             Arc::new(AtomicU64::new(now_epoch_ms())),
+            Arc::new(crate::mux::WriteStall::default()),
+            crate::mux::DEFAULT_WRITE_DEADLINE,
         );
 
         let mut streams: Vec<Box<dyn P2pStream>> = Vec::with_capacity(MAX_TUNNEL_STREAMS);
@@ -1326,5 +1351,45 @@ mod tests {
         assert!(session.is_alive(), "session must survive repeated cap hits");
 
         session.close().await;
+    }
+
+    /// The XTCP tunnel's yamux session must also honour the write deadline
+    /// (Go frp v0.72.0 `#5595`): a transport that stops accepting bytes tears
+    /// the session down instead of parking it. The stall is marked directly
+    /// (the mechanism is the same `WriteStall` the control/data mux uses and
+    /// is unit-tested there); what this pins is the *wiring* — the driver's
+    /// `biased` select arm and its exit.
+    #[tokio::test]
+    async fn a_stalled_tunnel_transport_tears_the_session_down() {
+        const CAP: usize = 4;
+        let (driver_io, _peer_io) = tokio::io::duplex(65536);
+        let mut cfg = yamux::Config::default();
+        cfg.set_max_num_streams(CAP);
+        let conn = yamux::Connection::new(driver_io.compat(), cfg, yamux::Mode::Client);
+        let stall = Arc::new(crate::mux::WriteStall::default());
+        let session = spawn_tunnel_driver(
+            conn,
+            false,
+            CAP,
+            10,
+            Arc::new(AtomicU64::new(now_epoch_ms())),
+            stall.clone(),
+            Duration::from_millis(200),
+        );
+
+        // No bytes have moved for 200 ms? Only if the transport reported a
+        // `Pending` write; mark it as the wrapper would.
+        stall.pending();
+
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            while session.is_alive() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            closed.is_ok(),
+            "a stalled XTCP tunnel transport must be torn down at the write deadline, not parked"
+        );
     }
 }

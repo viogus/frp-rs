@@ -351,40 +351,38 @@ The port's one terminal state, `ConnectionState::Closed`, returns
 polling a closed connection would indeed spin. There are **four** live poll
 sites under `tcp-mux`, and all four treat that as terminal:
 
-- the server acceptor (`frp-core/src/mux.rs:730-740`) — `break` on
-  `Some(Err(e))`/`None`, and the poll is wrapped in `timeout(keepalive, ..)`;
-- the client driver (`frp-core/src/mux.rs:950-970`) — same, inside a `select!`
-  whose other branch is a synchronous single poll (never parks);
-- the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1107`/`:1113`, terminal at
-  `:1133-1156`) — tick-bounded (`:1104`);
-- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:781`/`:841`/`:934`,
-  terminal at `:1014-1021`) — timeout-bounded (`:942`).
+- the server acceptor (`frp-core/src/mux.rs:776` is its `select!`; terminal at
+  `:870`/`:874`) — `break` on `Some(Err(e))`/`None`, and the poll is wrapped in
+  `timeout(keepalive, ..)`;
+- the client driver (`frp-core/src/mux.rs:1119`/`:1124`) — same, inside a
+  `select!` whose other branch is a synchronous single poll (never parks);
+- the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1126`/`:1132`) — tick-bounded;
+- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:801`/`:954`, terminal at
+  `:1034`/`:1038`) — timeout-bounded.
 
 So a `Ready`-forever terminal state has no caller that can keep polling it.
 
-### Blocked write: the port still has the **pre-fix** behaviour
+### Blocked write: enforced **above** the port, not inside it
 
 `Active::poll` drives writes through `poll_ready_unpin` / `start_send_unpin` /
 `poll_flush_unpin` (`vendor/yamux/src/connection.rs:468-500`) and, when the
 transport is not writable, falls through to `return Poll::Pending`
-(`:613`) after the socket registered its waker. That is *parking*, not
-spinning — but parking is exactly what Go's v0.3.0 changed: before the bump,
-*"the caller timed out while the session stayed blocked but alive until a
-keepalive ping also timed out"*; after it, the write **fails at the transport
-and the session is torn down**. This port has **no write deadline at all**:
-`grep -rn "write_timeout\|WriteTimeout\|write deadline" vendor/yamux/src/` is
-empty, and `Config` (`vendor/yamux/src/lib.rs:100-116`) carries no timeout
-field. The only bound in frp-rs is the caller's keepalive / dead-session reaper
-(`frp-core/src/mux.rs`'s `idle_dead_bound`, ~30 s floor to ~90 s), so a stream
-write blocked on a stalled WebSocket parks the session for that window — the
-same shape Go called a bug.
+(`:613`) after the socket registered its waker. The crate itself still has **no
+write deadline** — `grep -rn "write_timeout\|WriteTimeout\|write deadline"
+vendor/yamux/src/` is empty and `Config` (`vendor/yamux/src/lib.rs:100-116`) has
+no timeout field — and it is deliberately runtime-agnostic, so a timer cannot
+live there without a new dependency.
 
-**Status: open, and filed as debt** (`TODO.md`, "the vendored `yamux` has no
-write deadline"). Closing it means either enforcing a deadline inside the
-vendored write path (a sixth frp-rs patch, needing a timer — the crate is
-runtime-agnostic today) or bounding the callers' writes, with a test that
-blocks `AsyncWrite::poll_flush` and asserts the session is torn down rather than
-parked.
+frp-rs therefore enforces the deadline **above** the crate, in
+`frp-core/src/mux.rs`: `ActivityIo` marks a `WriteStall` on the first
+`poll_write`/`poll_flush` that returns `Pending` and clears it on any progress,
+and `write_stall_watchdog` closes the session through the same force-close
+channel the supersession path uses once
+`TcpMuxConfig::write_deadline` (10 s by default, Go's
+`ConnectionWriteTimeout`) has elapsed. It covers all four surfaces — the
+control/data mux on both sides and both XTCP planes — and `0` disables it for
+the mux. That is the Go v0.3.0 behaviour (a stalled write fails the session);
+the difference is only where the deadline lives.
 
 ### Not measured
 

@@ -1038,7 +1038,12 @@ pub async fn xtcp_p2p_connect_yamux(
     .await?;
 
     // 2. Compat KCP stream to futures traits for yamux.
-    let compat_stream = kcp_stream.compat();
+    // Write deadline (Go frp v0.72.0 `#5595`): record when this transport
+    // stops accepting bytes so the watchdog below can fail the session
+    // instead of parking it. Same mechanism as `frp-core/src/mux.rs`.
+    let activity = std::sync::Arc::new(crate::mux::ActivityState::default());
+    let stall = std::sync::Arc::new(crate::mux::WriteStall::default());
+    let compat_stream = crate::mux::ActivityIo::new(kcp_stream, activity, stall.clone()).compat();
 
     // 3. Create yamux Connection behind a tokio Mutex so lock
     //    contention yields instead of blocking the worker thread.
@@ -1077,6 +1082,16 @@ pub async fn xtcp_p2p_connect_yamux(
     let bg_conn = conn.clone();
     let (stream_tx, stream_rx) = tokio::sync::oneshot::channel::<Result<yamux::Stream, String>>();
     let (driver_drop_tx, mut driver_drop_rx) = watch::channel(());
+    // The stalled-write watchdog closes through this channel; the driver's
+    // select below breaks on it. The watchdog holds the sender for as long as
+    // it runs, and `wait_force_close` parks when every sender is gone, so a
+    // sender-drop never reads as "close".
+    let (stall_close_tx, mut stall_close_rx) = watch::channel(false);
+    let _stall_watchdog = crate::mux::write_stall_watchdog(
+        stall,
+        crate::mux::DEFAULT_WRITE_DEADLINE,
+        stall_close_tx.clone(),
+    );
 
     tokio::spawn(async move {
         let keepalive = Duration::from_millis(tick_ms);
@@ -1100,6 +1115,11 @@ pub async fn xtcp_p2p_connect_yamux(
             // guarantees the wakeup cannot be missed: the sender-drop
             // releases every registered receiver waker.
             let result = tokio::select! {
+                biased;
+                _ = crate::mux::wait_force_close(&mut stall_close_rx) => {
+                    tracing::warn!(conv, "XTCP P2P yamux: write deadline exceeded; closing the session");
+                    break;
+                }
                 _ = driver_drop_rx.changed() => break,
                 r = tokio::time::timeout(
                     keepalive,
