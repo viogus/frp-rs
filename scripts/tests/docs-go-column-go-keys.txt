@@ -1,4 +1,4 @@
-# Go frp v0.71.0 `pkg/config/v1` json key set — recorded derivation artifact.
+# Go frp v0.72.0 `pkg/config/v1` json key set — recorded derivation artifact.
 #
 # Gate: scripts/tests/docs-go-column.sh diffs the embedded GO table against this
 # file, so a transcription error in either reds instead of ratifying itself.
@@ -6,9 +6,9 @@
 #   bash scripts/tests/docs-go-column-derive-go-keys.sh --check
 #   bash scripts/tests/docs-go-column-derive-go-keys.sh --write
 #
-# Tag:     v0.71.0 (annotated tag object
-#          40adeed73b51e7ee1766d7cfb15d02ba9431ba2b)
-# Commit:  4a23aa181c1d7e28eecaa8216024ed753b9d27c8
+# Tag:     v0.72.0 (annotated tag object
+#          367964fb75e8431a7246ed8d8bdb9f0b23dbe981)
+# Commit:  bafec21abce5f91ae4a05b4bd19c55543c263128
 # Files:   pkg/config/v1/{server,client,common,proxy,visitor,proxy_plugin,
 #          visitor_plugin,value_source,api,store,decode}.go
 # Roots:   ServerConfig, ClientConfig, every *ProxyConfig / *VisitorConfig /
@@ -156,6 +156,18 @@ maxPortsPerClient
 maxRetriesAnHour
 metadatas
 method
+metricsServer
+metricsServer.addr
+metricsServer.password
+metricsServer.port
+metricsServer.pprofEnable
+metricsServer.tls
+metricsServer.tls.certFile
+metricsServer.tls.keyFile
+metricsServer.tls.serverName
+metricsServer.tls.trustedCaFile
+metricsServer.tls.useSystemCa
+metricsServer.user
 minRetryInterval
 multiplexer
 name
@@ -247,6 +259,7 @@ transport.tls.force
 transport.tls.keyFile
 transport.tls.serverName
 transport.tls.trustedCaFile
+transport.tls.useSystemCa
 transport.useCompression
 transport.useEncryption
 transport.wireProtocol
@@ -256,6 +269,7 @@ udpPacketSize
 unixPath
 useCompression
 useEncryption
+useSystemCa
 user
 userConnTimeout
 username
@@ -279,5 +293,6 @@ webServer.tls.certFile
 webServer.tls.keyFile
 webServer.tls.serverName
 webServer.tls.trustedCaFile
+webServer.tls.useSystemCa
 webServer.user
 wireProtocol

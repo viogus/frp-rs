@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# docs-go-column-derive-go-keys.sh — re-derive the Go frp v0.71.0 json key set
+# docs-go-column-derive-go-keys.sh — re-derive the Go frp v0.72.0 json key set
 # recorded at scripts/tests/docs-go-column-go-keys.txt.
 #
 # The gate itself (scripts/tests/docs-go-column.sh) is offline: it diffs its
@@ -12,16 +12,16 @@
 #   bash scripts/tests/docs-go-column-derive-go-keys.sh \
 #        --source ~/go/src/github.com/fatedier/frp/pkg/config/v1 --check
 #
-# Pinned source: Go frp tag `v0.71.0` is annotated object
-# 40adeed73b51e7ee1766d7cfb15d02ba9431ba2b, pointing at commit
-# 4a23aa181c1d7e28eecaa8216024ed753b9d27c8; `--fetch` pulls the
+# Pinned source: Go frp tag `v0.72.0` is annotated object
+# 367964fb75e8431a7246ed8d8bdb9f0b23dbe981, pointing at commit
+# bafec21abce5f91ae4a05b4bd19c55543c263128; `--fetch` pulls the
 # pkg/config/v1 files listed in the artifact's provenance header from
 # cdn.jsdelivr.net at that commit.
 #
 # Accept set (the artifact's shape): every dotted `json` path reachable from
 # ServerConfig, ClientConfig and the *ProxyConfig / *VisitorConfig /
 # *PluginOptions structs (embedded structs followed, `json:"-"` ignored), plus
-# every bare `json` field name in those files — 108 + 153 = 261 spellings.
+# every bare `json` field name in those files — 121 + 155 = 276 spellings.
 #
 # Modes
 #   --print   print the derived key set, one per line (default)
@@ -42,8 +42,8 @@ set -uo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 ARTIFACT="$REPO_ROOT/scripts/tests/docs-go-column-go-keys.txt"
-PIN_COMMIT=4a23aa181c1d7e28eecaa8216024ed753b9d27c8
-PIN_OBJECT=40adeed73b51e7ee1766d7cfb15d02ba9431ba2b
+PIN_COMMIT=bafec21abce5f91ae4a05b4bd19c55543c263128
+PIN_OBJECT=367964fb75e8431a7246ed8d8bdb9f0b23dbe981
 FILES="server client common proxy visitor proxy_plugin visitor_plugin value_source api store decode"
 
 mode=print
@@ -96,7 +96,7 @@ if [ -z "$source_dir" ] && [ "$do_fetch" = 1 ]; then
 fi
 
 if [ -z "$source_kind" ]; then
-  printf 'SKIP  no Go frp v0.71.0 source; pass --source DIR, set GO_FRP_CONFIG_V1_DIR, or use --fetch\n'
+  printf 'SKIP  no Go frp v0.72.0 source; pass --source DIR, set GO_FRP_CONFIG_V1_DIR, or use --fetch\n'
   exit 0
 fi
 if [ ! -d "$source_dir" ]; then
