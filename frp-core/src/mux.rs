@@ -380,12 +380,30 @@ impl IncomingStreams {
     /// outliving the handle), while [`MuxShutdown::close`] is the supersession
     /// signal — Go closes a replaced control's session from the *new* session,
     /// and this is its equivalent.
-    #[cfg(feature = "tcp-mux")]
     pub fn shutdown_handle(&self) -> MuxShutdown {
-        MuxShutdown {
-            tx: self.force_close_tx.clone(),
+        #[cfg(feature = "tcp-mux")]
+        {
+            MuxShutdown {
+                tx: self.force_close_tx.clone(),
+            }
+        }
+        #[cfg(not(feature = "tcp-mux"))]
+        {
+            MuxShutdown
         }
     }
+}
+
+/// Inert twin of [`MuxShutdown`] for builds without `tcp-mux` (mirrors
+/// [`YamuxStream`]'s stub): there is no yamux session to close.
+#[cfg(not(feature = "tcp-mux"))]
+#[derive(Clone, Debug)]
+pub struct MuxShutdown;
+
+#[cfg(not(feature = "tcp-mux"))]
+impl MuxShutdown {
+    /// No-op: this build has no yamux transport.
+    pub fn close(&self) {}
 }
 
 /// Explicit "close this yamux session now" handle (Go frp v0.72.0 `#5596`).
@@ -401,7 +419,6 @@ pub struct MuxShutdown {
     tx: tokio::sync::watch::Sender<bool>,
 }
 
-#[cfg(feature = "tcp-mux")]
 #[cfg(feature = "tcp-mux")]
 impl std::fmt::Debug for MuxShutdown {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -589,6 +606,14 @@ where
     // Explicit supersession close (independent of the drop above: a drop must
     // keep meaning "stop accepting", which several callers rely on).
     let (force_close_tx, mut force_close_rx) = tokio::sync::watch::channel(false);
+    // The acceptor keeps one sender alive for its own lifetime. Without it,
+    // dropping the LAST external sender (an `IncomingStreams` whose session is
+    // *not* a registered control — the STCP visitor path — or a `MuxShutdown`
+    // after its `ControlTx` is removed) would close the watch channel, and
+    // `wait_for` would then return `Err` — indistinguishable from `close()`.
+    // Holding it makes sender-drop invisible: the arm completes only on a real
+    // `true`.
+    let _force_close_keeper = force_close_tx.clone();
 
     // Spawn background task: accept yamux streams and drive connection I/O.
     //
@@ -604,6 +629,7 @@ where
     let dead_after = idle_dead_bound(keepalive, mux_cfg.idle_dead_timeout);
     let mut consecutive_idle = 0u32;
     tokio::task::spawn(async move {
+        let _force_close_keeper = _force_close_keeper;
         loop {
             // Wake on the explicit supersession close *as well as* on the
             // keepalive tick. `biased` so a close already signalled wins.
@@ -1250,6 +1276,60 @@ mod tests {
         );
         // Keeping the receiver alive until here is the point of the test.
         drop(incoming);
+    }
+
+    /// The counterpart property: dropping the accept handle must **not** close
+    /// the session. Several callers drop it and keep relaying — the STCP
+    /// visitor path is the one that caught the first attempt at this fix
+    /// (`stcp_e2e::test_stcp_e2e_relay_tcp_mux`), because there is no
+    /// `ControlTx` holding a `MuxShutdown` clone for a visitor session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_incoming_streams_does_not_close_the_session() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mux_cfg = TcpMuxConfig {
+            keepalive_interval: Duration::from_secs(30),
+            idle_dead_timeout: None,
+            ..Default::default()
+        };
+
+        let client = tokio::spawn({
+            let mux_cfg = mux_cfg.clone();
+            async move {
+                let (mut control, session) = client_mux(client_io, &mux_cfg).await?;
+                tokio::io::AsyncWriteExt::write_all(&mut control, b"c").await?;
+                tokio::io::AsyncWriteExt::flush(&mut control).await?;
+                Ok::<_, crate::Error>((control, session))
+            }
+        });
+        let (mut control, incoming) = server_mux(
+            server_io,
+            &mux_cfg,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("server_mux");
+        let (_client_control, _session) = client.await.expect("client task").expect("client_mux");
+
+        // Drop the accept handle only (no MuxShutdown anywhere).
+        drop(incoming);
+
+        // The session must stay open well past the probe window (keepalive is
+        // 30 s, so a close here would only come from the drop).
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buf = [0u8; 64];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut control, &mut buf[..]).await {
+                    Ok(0) => return,
+                    Ok(_) => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+        .await;
+        assert!(
+            closed.is_err(),
+            "dropping the accept handle alone must not close the session"
+        );
     }
 
     /// The queue is filled without yielding (the driver cannot run while the
