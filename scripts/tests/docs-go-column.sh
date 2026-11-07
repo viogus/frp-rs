@@ -33,8 +33,8 @@
 #                (and the inventory reds on an unused entry).
 #
 # Provenance of the recorded key set
-#   Go frp v0.71.0. The annotated tag `v0.71.0` is object 40adeed73b51e7ee1766d7cfb15d02ba9431ba2b,
-#   which points at commit 4a23aa181c1d7e28eecaa8216024ed753b9d27c8.
+#   Go frp v0.72.0. The annotated tag `v0.72.0` is object 367964fb75e8431a7246ed8d8bdb9f0b23dbe981,
+#   which points at commit bafec21abce5f91ae4a05b4bd19c55543c263128.
 #   Source files read: pkg/config/v1/{server,client,common,proxy,visitor,proxy_plugin,
 #   visitor_plugin,value_source,api,store,decode}.go.
 #   `pkg/config/v1/decode.go` carries no alias or legacy table — it dispatches on the `type` key
@@ -42,7 +42,9 @@
 #   Accept set = every dotted `json` path reachable from `ServerConfig`, `ClientConfig` and the
 #   `*ProxyConfig` / `*VisitorConfig` / `*PluginOptions` structs (embedded structs followed,
 #   `json:"-"` ignored), plus every bare `json` field name in the `pkg/config/v1` config structs:
-#   108 dotted paths + 153 bare names = 261 distinct spellings (the two sets are disjoint).
+#   121 dotted paths + 155 bare names = 276 distinct spellings (the two sets are disjoint) —
+#   measured on Go frp **v0.72.0** (the `metricsServer.*`, `transport.tls.useSystemCa` and
+#   `webServer.tls.useSystemCa` keys are the additions over v0.71.0's 261).
 #   Re-derive and diff the artifact:
 #     bash scripts/tests/docs-go-column-derive-go-keys.sh --fetch --check
 #
@@ -67,8 +69,8 @@
 # changing has to be recorded here in the same commit instead of passing silently.
 #
 # Scenarios
-#   1  the row-by-row scan of `$DOCS_CONFIG` (default docs/config.md): 17 Go-column tables,
-#      196 data rows, 28 divergence markers, 0 alias rows, the key-set artifact diff, the 41
+#   1  the row-by-row scan of `$DOCS_CONFIG` (default docs/config.md): 18 Go-column tables,
+#      206 data rows, 30 divergence markers, 0 alias rows, the key-set artifact diff, the 41
 #      alias resolutions, one check per data row and one per pinned row.
 #   2  seven mutations of a copy of the repository's own docs/config.md, each of which must red —
 #      M1 reword the `websocket_port` divergence to `websocketPort`, M2 reword `tls_enable` to
@@ -164,14 +166,14 @@ import sys
 
 HDR = "| Field | Type | Default | Go frp Equivalent | Description |"
 GO_ARTIFACT = sys.argv[2]
-EXPECTED_TABLES = 17
-EXPECTED_ROWS = 196
-EXPECTED_DIVERGENT = 28
+EXPECTED_TABLES = 18
+EXPECTED_ROWS = 206
+EXPECTED_DIVERGENT = 30
 EXPECTED_ALIAS_ROWS = 0
-EXPECTED_GO_KEYS = 261
-EXPECTED_GO_DOTTED = 108
-EXPECTED_GO_BARE = 153
-EXPECTED_ROW_PATHS = 196
+EXPECTED_GO_KEYS = 276
+EXPECTED_GO_DOTTED = 121
+EXPECTED_GO_BARE = 155
+EXPECTED_ROW_PATHS = 206
 EXPECTED_RESOLUTIONS = 41
 
 # --- curated Go frp v0.71.0 spellings: dotted json paths + bare json field names ---
@@ -403,6 +405,21 @@ GO = {
     "transport.tls.keyFile",
     "transport.tls.serverName",
     "transport.tls.trustedCaFile",
+    "transport.tls.useSystemCa",
+    "useSystemCa",
+    "webServer.tls.useSystemCa",
+    "metricsServer",
+    "metricsServer.addr",
+    "metricsServer.password",
+    "metricsServer.port",
+    "metricsServer.pprofEnable",
+    "metricsServer.tls",
+    "metricsServer.tls.certFile",
+    "metricsServer.tls.keyFile",
+    "metricsServer.tls.serverName",
+    "metricsServer.tls.trustedCaFile",
+    "metricsServer.tls.useSystemCa",
+    "metricsServer.user",
     "transport.useCompression",
     "transport.useEncryption",
     "transport.wireProtocol",
@@ -528,6 +545,7 @@ ROW_GO_PATHS = {
     (1, 'tls_cert_file'): 'go:transport.tls.certFile',
     (1, 'tls_key_file'): 'go:transport.tls.keyFile',
     (1, 'tls_ca_file'): 'go:transport.tls.trustedCaFile',
+    (1, 'tls_use_system_ca'): 'divergent',
     (1, 'allow_port_start'): 'qualified:allowPorts:start',
     (1, 'allow_port_end'): 'qualified:allowPorts:end',
     (1, 'allow_ports'): 'go:allowPorts',
@@ -595,6 +613,17 @@ ROW_GO_PATHS = {
     (7, 'enable_control'): 'extension:enableControl',
     # table 8
     (8, 'server_addr'): 'go:serverAddr',
+    (8, 'tls_use_system_ca'): 'go:transport.tls.useSystemCa',
+
+    # table 18 — [metricsServer]
+    (18, 'addr'): 'go:metricsServer.addr',
+    (18, 'port'): 'go:metricsServer.port',
+    (18, 'user'): 'go:metricsServer.user',
+    (18, 'password'): 'go:metricsServer.password',
+    (18, 'pprof_enable'): 'go:metricsServer.pprofEnable',
+    (18, 'tls_cert_file'): 'go:metricsServer.tls.certFile',
+    (18, 'tls_key_file'): 'go:metricsServer.tls.keyFile',
+    (18, 'use_system_ca'): 'divergent',
     (8, 'server_port'): 'go:serverPort',
     (8, 'transport_protocol'): 'go:protocol',
     (8, 'token'): 'go:auth.token',
@@ -851,8 +880,8 @@ else:
                 'only in the artifact: %s)'
          % (', '.join('`%s`' % k for k in only_go[:4]) or '-',
             ', '.join('`%s`' % k for k in only_art[:4]) or '-'))
-for needle, what in (('40adeed73b51e7ee1766d7cfb15d02ba9431ba2b', 'tag object'),
-                     ('4a23aa181c1d7e28eecaa8216024ed753b9d27c8', 'commit')):
+for needle, what in (('367964fb75e8431a7246ed8d8bdb9f0b23dbe981', 'tag object'),
+                     ('bafec21abce5f91ae4a05b4bd19c55543c263128', 'commit')):
     if any(needle in line for line in artifact_raw):
         emit('ok', 'the artifact records the pinned Go %s %s' % (what, needle))
     else:

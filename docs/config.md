@@ -27,6 +27,7 @@ that field corresponds to, or a `—` marker recording that frp-rs extends or di
 | `tls_cert_file` | `string` | `""` | `transport.tls.certFile` | Path to TLS certificate PEM file. |
 | `tls_key_file` | `string` | `""` | `transport.tls.keyFile` | Path to TLS private key PEM file. |
 | `tls_ca_file` | `string` | `""` | `transport.tls.trustedCaFile` | Path to CA certificate PEM file for mutual TLS client verification. Empty = no mTLS. Also accepted flat as `tls_trusted_ca_file` (the Go legacy spelling frp-rs renames at load). |
+| `tls_use_system_ca` | `bool` | `false` | `—` (Go frp v0.72.0 carries the key on the server struct and **rejects** it: `transport.tls.useSystemCa is only supported in frpc transport.tls`, and frp-rs emits the same message) | Go frp v0.72.0's client-only switch. A **server** config that sets it is refused at load with Go's own message (`transport.tls.useSystemCa is only supported in frpc transport.tls`); the field exists so the key produces that error instead of an unknown-field error. |
 | `allow_port_start` | `u16` | `1` | `allowPorts` (start) | Start of auto-assigned port range. Used when `allow_ports` is empty. |
 | `allow_port_end` | `u16` | `65535` | `allowPorts` (end) | End of auto-assigned port range (inclusive). Used when `allow_ports` is empty. |
 | `allow_ports` | `string` | `""` | `allowPorts` | Comma-separated port ranges, e.g. `"10000-20000,30000-40000"`. Each range is inclusive on both ends. When non-empty, takes precedence over `allow_port_start`/`allow_port_end`. |
@@ -300,6 +301,7 @@ enable_control = true
 | `tls_cert_file` | `string` | `""` | `transport.tls.certFile` | Client TLS certificate PEM file (for mTLS). |
 | `tls_key_file` | `string` | `""` | `transport.tls.keyFile` | Client TLS private key PEM file (for mTLS). |
 | `tls_ca_file` | `string` | `""` | `transport.tls.trustedCaFile` | CA certificate PEM file for verifying the server's TLS certificate. |
+| `tls_use_system_ca` | `bool` | `false` | `transport.tls.useSystemCa` | Verify the server certificate against the host trust store (Go frp v0.72.0). With `tls_ca_file` also set, both trust sources are honoured: the platform store first, the file's roots second (Go's documented macOS/Windows fallback). Requires `tls_enable` unless `transport.protocol = "wss"`. |
 | `tls_server_name` | `string` | `""` | `transport.tls.serverName` | Server name for TLS SNI. Empty = use `server_addr`. |
 | `disable_custom_tls_first_byte` | `bool` | `true` | `disableCustomTLSFirstByte` | When true, the client skips the Go frp protocol marker byte (`0x17`) and starts TLS directly. Set this when connecting to a non-frp TLS endpoint. |
 | `login_fail_exit` | `bool` | `true` | `loginFailExit` | When true, the client exits on login failure. When false, it keeps retrying. |
@@ -1073,3 +1075,26 @@ Per-connection events (`Bridging user conn…`, `bridge completed`) log at
 **`debug`**, not `info` — a busy proxy would otherwise emit a line per
 connection into the default output. Enable them with `RUST_LOG=debug` or
 `log.level = "debug"`.
+
+---
+
+## Metrics Server (`[metricsServer]`)
+
+Go frp **v0.72.0** added a listener dedicated to health checks, metrics and
+(opt-in) profiling, separate from the dashboard/admin API: a monitoring sidecar
+reads `/healthz` and `/metrics` without dashboard access (`/healthz` stays
+anonymous; the rest requires the credentials below). Disabled unless `port` is
+set. The listener is compiled in the `dashboard` tier on `frps` and the `admin`
+tier on `frpc`; a build without that tier accepts the section and warns that the
+port is not served.
+
+| Field | Type | Default | Go frp Equivalent | Description |
+|-------|------|---------|-------------------|-------------|
+| `addr` | `string` | `"127.0.0.1"` | `metricsServer.addr` | Bind address. Go's `Complete()` fills `127.0.0.1`. |
+| `port` | `u16` | `0` | `metricsServer.port` | Listen port. `0` disables the listener. |
+| `user` | `string` | `""` | `metricsServer.user` | Basic Auth user for `/metrics` and the profiling routes; `/healthz` stays anonymous. A half-configured pair (only one of user/password) is **enforced**, as in Go — not skipped. |
+| `password` | `string` | `""` | `metricsServer.password` | Basic Auth password (see `user`). |
+| `pprof_enable` | `bool` | `false` | `metricsServer.pprofEnable` | Register the profiling routes. When false they are **not mounted** (404, as in Go); when true they answer the dashboard's documented placeholders (index 200, profiles 501). |
+| `tls_cert_file` | `string` | `""` | `metricsServer.tls.certFile` | TLS certificate for this listener. The `tls` block's **presence** enables TLS, and then both files are required (Go's `*TLSConfig`); an empty `tls = {}` is a config error. |
+| `tls_key_file` | `string` | `""` | `metricsServer.tls.keyFile` | TLS private key (same rule as `tls_cert_file`). |
+| `use_system_ca` | `bool` | `false` | `—` (Go frp v0.72.0 carries the key and **rejects** it: `metricsServer.tls.useSystemCa is only supported in frpc transport.tls`) | Refused at load with Go's message. |
