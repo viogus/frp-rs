@@ -321,6 +321,77 @@ caller would see the gate fire 256 streams early. frp never calls
 `on_drop_stream` and does decrement — so the counter is exact for every
 reachable transition. `drop_active` resets it to 0.
 
+## Audit: Go frp v0.72.0's yamux bump (`#5595`) against this port
+
+Go frp v0.72.0's release notes record: *"Updated yamux to fix a 100% CPU busy
+loop after a session shuts down and a session close that could hang when the
+underlying connection (for example WebSocket) blocks on a write, which could
+also delay reconnection."* The bump is frp-go commit **`967a7505`**
+(`deps: bump fatedier/yamux to v0.3.0 (#5595)`); the fix itself lives in
+`fatedier/yamux` v0.3.0, whose changelog names **four** lifecycle problems:
+
+1. *a read or write blocked on a shutting-down session returns instead of
+   spinning*;
+2. the stream close lifecycle is safe to retry;
+3. failed stream opens release their tracking state;
+4. `ConnectionWriteTimeout` is now enforced as a **write deadline on the
+   underlying transport** instead of only bounding how long a caller waits for
+   its own frame.
+
+frp-rs uses the **Rust** `yamux` 0.14.1 port, so the commit cannot be applied.
+What follows is the reachability answer per symptom, and it is not uniform:
+(1) and (2) cannot occur here, but (4) — the blocked-write half — **can**, and
+this audit records that gap rather than closing over it.
+
+### Busy loop after shutdown: no reachable path
+
+The port's one terminal state, `ConnectionState::Closed`, returns
+`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:219`) or
+`Poll::Ready(Err(ConnectionError::Closed))` (`:162`) — a caller that keeps
+polling a closed connection would indeed spin. There are **four** live poll
+sites under `tcp-mux`, and all four treat that as terminal:
+
+- the server acceptor (`frp-core/src/mux.rs:730-740`) — `break` on
+  `Some(Err(e))`/`None`, and the poll is wrapped in `timeout(keepalive, ..)`;
+- the client driver (`frp-core/src/mux.rs:950-970`) — same, inside a `select!`
+  whose other branch is a synchronous single poll (never parks);
+- the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1107`/`:1113`, terminal at
+  `:1133-1156`) — tick-bounded (`:1104`);
+- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:781`/`:841`/`:934`,
+  terminal at `:1014-1021`) — timeout-bounded (`:942`).
+
+So a `Ready`-forever terminal state has no caller that can keep polling it.
+
+### Blocked write: the port still has the **pre-fix** behaviour
+
+`Active::poll` drives writes through `poll_ready_unpin` / `start_send_unpin` /
+`poll_flush_unpin` (`vendor/yamux/src/connection.rs:468-500`) and, when the
+transport is not writable, falls through to `return Poll::Pending`
+(`:613`) after the socket registered its waker. That is *parking*, not
+spinning — but parking is exactly what Go's v0.3.0 changed: before the bump,
+*"the caller timed out while the session stayed blocked but alive until a
+keepalive ping also timed out"*; after it, the write **fails at the transport
+and the session is torn down**. This port has **no write deadline at all**:
+`grep -rn "write_timeout\|WriteTimeout\|write deadline" vendor/yamux/src/` is
+empty, and `Config` (`vendor/yamux/src/lib.rs:100-116`) carries no timeout
+field. The only bound in frp-rs is the caller's keepalive / dead-session reaper
+(`frp-core/src/mux.rs`'s `idle_dead_bound`, ~30 s floor to ~90 s), so a stream
+write blocked on a stalled WebSocket parks the session for that window — the
+same shape Go called a bug.
+
+**Status: open, and filed as debt** (`TODO.md`, "the vendored `yamux` has no
+write deadline"). Closing it means either enforcing a deadline inside the
+vendored write path (a sixth frp-rs patch, needing a timer — the crate is
+runtime-agnostic today) or bounding the callers' writes, with a test that
+blocks `AsyncWrite::poll_flush` and asserts the session is torn down rather than
+parked.
+
+### Not measured
+
+This is a code-path audit: neither Go symptom was reproduced here, because the
+busy-loop argument is a reachability one (no caller can spin) and the
+blocked-write finding is a *missing* mechanism (no deadline exists to test).
+
 ## Minor deviations (not patches)
 
 - `frame::header::internal_error()` / `Frame::internal_error()` (GoAway

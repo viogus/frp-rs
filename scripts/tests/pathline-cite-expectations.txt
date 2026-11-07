@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=592 weak=129 ambiguous=2 excluded=101 foreign_reported=1154 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=ba8405dce3e320a3 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=608 weak=134 ambiguous=2 excluded=101 foreign_reported=1154 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=36b6f831e7a50c06 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2376	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2376	1524
@@ -336,10 +336,21 @@ frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_complet
 frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:443	832
 frp-core/src/logging.rs	467	-	e46b9fc201aa016b	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:467	833
 frp-core/src/msg.rs	694	699	2d3748ed9d43c0a1	981b6bd3b6da21de	absolute	frp-core/tests/protocol_round14.rs	frp-core/src/msg.rs:694-699	198
+frp-core/src/mux.rs	730	740	e6e173e9879e8709	29576b54e255e3c9	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:730-740	354
+frp-core/src/mux.rs	950	970	d10b36aa74a59bcf	d10b36aa74a59bcf	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:950-970	356
 frp-core/src/transport/mod.rs	2267	-	019e0dbb9b972bfb	-	absolute	frp-core/src/transport/mod.rs	transport/mod.rs:2267	3354
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2437
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	frp-core/src/config/tests.rs	frp-core/src/unsafe_features.rs:10	13139
+frp-core/src/xtcp_p2p.rs	1104	-	0a754b2809c116e3	-	shorthand	vendor/yamux/README-FRP-RS.md	:1104	359
+frp-core/src/xtcp_p2p.rs	1107	-	7e07997fd990e28a	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/xtcp_p2p.rs:1107	358
+frp-core/src/xtcp_p2p.rs	1113	-	5ea86580ef6ac688	-	shorthand	vendor/yamux/README-FRP-RS.md	:1113	358
+frp-core/src/xtcp_p2p.rs	1133	1156	857e576080f584f8	d10b36aa74a59bcf	shorthand	vendor/yamux/README-FRP-RS.md	:1133-1156	359
+frp-core/src/xtcp_session.rs	1014	1021	857e576080f584f8	d10b36aa74a59bcf	shorthand	vendor/yamux/README-FRP-RS.md	:1014-1021	361
 frp-core/src/xtcp_session.rs	47	-	948dba0a9cf1976c	-	absolute	frp-core/tests/xtcp_p2p.rs	frp-core/src/xtcp_session.rs:47	19
+frp-core/src/xtcp_session.rs	781	-	87e4157a9854f066	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/xtcp_session.rs:781	360
+frp-core/src/xtcp_session.rs	841	-	59d756e5123cbb88	-	shorthand	vendor/yamux/README-FRP-RS.md	:841	360
+frp-core/src/xtcp_session.rs	934	-	5c134a99fe5b9bac	-	shorthand	vendor/yamux/README-FRP-RS.md	:934	360
+frp-core/src/xtcp_session.rs	942	-	6dd713eab10dd780	-	shorthand	vendor/yamux/README-FRP-RS.md	:942	361
 frp-server/Cargo.toml	45	-	7fd8440b0bf7bf6c	-	absolute	docs/developing.md	frp-server/Cargo.toml:45	4030
 frp-server/Cargo.toml	46	-	5f892a3adab944b5	-	absolute	docs/developing.md	frp-server/Cargo.toml:46	4029
 frp-server/Cargo.toml	47	-	517eb8fa69c9ff42	-	absolute	docs/developing.md	frp-server/Cargo.toml:47	4027
@@ -612,3 +623,8 @@ scripts/tests/rss-soak-run-dir.sh	57	-	b73144f48f56d3ae	-	absolute	scripts/frp-s
 scripts/tests/rss-soak-run-dir.sh	93	-	4aba9fd2ed383d4a	-	absolute	scripts/frp-stress/baselines/README.md	scripts/tests/rss-soak-run-dir.sh:93	125
 vendor/rustls/README-FRP-RS.md	112	-	061ba1967b15cb2c	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:112	2475
 vendor/rustls/README-FRP-RS.md	66	-	da2f3d4cfb7eb930	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:66	2472
+vendor/yamux/src/connection.rs	162	-	01846589e610cd4d	-	shorthand	vendor/yamux/README-FRP-RS.md	:162	350
+vendor/yamux/src/connection.rs	219	-	fe141fed83051941	-	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/connection.rs:219	349
+vendor/yamux/src/connection.rs	468	500	2092f8f4694cd2d1	e3b0c44298fc1c14	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/connection.rs:468-500	368
+vendor/yamux/src/connection.rs	613	-	a298fbfa5961f940	-	shorthand	vendor/yamux/README-FRP-RS.md	:613	370
+vendor/yamux/src/lib.rs	100	116	a6121a1bfd7e24d6	d10b36aa74a59bcf	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/lib.rs:100-116	376
