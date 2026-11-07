@@ -840,6 +840,52 @@ user. Hole punching is UDP-based: both sides run Go-style `MakeHole` probing
 
 ---
 
+## HTTP VHost and tcpmux Connection Handoff
+
+Go frp v0.72.0 fixed a *"pending connection left open when a route listener is
+removed during connection handoff"* (`#5592`). frp-rs has no listener-held
+pending connection to leak, and this section records why, because the property
+is structural rather than tested.
+
+**There is one handoff, and it moves the stream.** `frp-server/src/vhost.rs:709`
+looks the route's `run_id` up in `run_id_to_ctl_tx`, and `:723` sends
+`InternalMsg::ProxyUserConn { user_conn: wrap(stream), .. }`. The stream is
+**moved** into the message: after that call the vhost task no longer holds a
+copy, so there is no "listener still owns it" state for a removal to strand.
+The three ways the send can end all close the connection or transfer it:
+
+- delivered — the message (and the stream) now belongs to the control handler's
+  `select!` loop (`docs/architecture.md` § [Server Control Plane](#server-control-plane-the-internalmsg-channel)),
+  which either bridges it or drops it during cleanup;
+- channel closed (`Ok(Err(_))`) — the message is returned in the error and
+  dropped with its stream, so the client observes a close;
+- `CTL_SEND_TIMEOUT` (`frp-server/src/state.rs:312`, 15 s) — the `send` future is
+  dropped, taking the message and its stream with it, so the client observes a
+  close rather than waiting on a read timeout.
+
+A route whose control is already gone never reaches the send at all:
+`frp-server/src/vhost.rs:765` writes Go's `NotFoundResponse` and returns,
+dropping the stream. The tcpmux handoff has the same shape one function over —
+`frp-server/src/tcpmux.rs:665` looks up, `:680` sends the same moved
+`ProxyUserConn`, and `:714` answers `NotFoundResponse` when the control is gone.
+
+**What removal does, and does not, touch.** Unregistering a proxy removes the
+route from `vhost_manager`/tcpmux state; it does not reach into a connection
+that has already been handed off, because nothing in the listener keeps a
+reference to it. A connection that is *between* accept and the handoff is held
+only by the vhost task's own stack frame, and every path out of that frame
+(write, send, timeout, error) consumes or drops it. This is the opposite of
+Go's bug, where the listener kept the pending connection in a structure that
+outlived the removal.
+
+**Not covered:** no test removes a vhost or tcpmux listener *while* a handoff is
+in flight and asserts the client is closed — the race needs an unregister
+interleaved with a forward, which the current integration harness does not
+drive. The claim above is therefore a code-path audit (the same evidence
+`TODO.md`'s item asked for), not a measurement; a future test could pin it by
+unregistering the route after the client connects but before its request head
+is complete.
+
 ## Invariants
 
 The rules an agent or contributor must not break (interface contracts, wire
