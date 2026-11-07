@@ -1324,8 +1324,8 @@ jobs:
           # the tree, so a scan that stops finding cites prints a smaller number
           # and reds; lowering the declared total has to move both literals, and
           # `bash scripts/tests/todo-cite-guard.sh` prints the number to paste.
-          guard_cites=101
-          guard_cites_floor=101
+          guard_cites=608
+          guard_cites_floor=608
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=9974898a07a2bc438f05a915b816f753fcbfbbc5942da206cf02d636cc719b42
+          guard_data_pin=0bc0ed58a67851968a1cd85ffedf7db76ef356f6ac31ad63e7b8bbdb1283a9d0
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'

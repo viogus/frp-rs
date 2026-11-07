@@ -321,67 +321,76 @@ caller would see the gate fire 256 streams early. frp never calls
 `on_drop_stream` and does decrement — so the counter is exact for every
 reachable transition. `drop_active` resets it to 0.
 
-## Audit: Go frp v0.72.0's yamux fixes (`#5595`) against this port
+## Audit: Go frp v0.72.0's yamux bump (`#5595`) against this port
 
 Go frp v0.72.0's release notes record: *"Updated yamux to fix a 100% CPU busy
 loop after a session shuts down and a session close that could hang when the
 underlying connection (for example WebSocket) blocks on a write, which could
-also delay reconnection."* The fix landed in `fatedier/yamux` **v0.3.0** (Go,
-commit `967a750`). frp-rs does not use that library — this directory is the
-**Rust** `yamux` 0.14.1 port — so the Go commit cannot be applied, and the
-question is whether the two *symptoms* are reachable here. They are not, for
-reasons that are checkable in this tree:
+also delay reconnection."* The bump is frp-go commit **`967a7505`**
+(`deps: bump fatedier/yamux to v0.3.0 (#5595)`); the fix itself lives in
+`fatedier/yamux` v0.3.0, whose changelog names **four** lifecycle problems:
 
-**1. The close-hang symptom has no reachable code path: nothing calls
-`poll_close`.** A tree-wide grep for `poll_close` outside `vendor/yamux` finds
-no caller — neither `frp-core/src/mux.rs` (`server_mux`, `client_mux`) nor any
-transport helper closes a yamux connection gracefully. Both paths **drop** the
-`Connection` when they are done, and the `Drop` impl
-(`vendor/yamux/src/connection.rs:270-279`) only drops streams: it performs no
-I/O, so a blocked underlying write cannot stall it. The graceful path that can
-block (`ConnectionState::Closing` → `Closing::poll` → `poll_flush`, reached only
-through `poll_close`, `vendor/yamux/src/connection.rs:227-268`) is therefore
-unreachable in frp-rs. This is a deliberate difference from Go, where the
-session is closed explicitly.
+1. *a read or write blocked on a shutting-down session returns instead of
+   spinning*;
+2. the stream close lifecycle is safe to retry;
+3. failed stream opens release their tracking state;
+4. `ConnectionWriteTimeout` is now enforced as a **write deadline on the
+   underlying transport** instead of only bounding how long a caller waits for
+   its own frame.
 
-**2. The busy-loop symptom needs a caller that keeps polling a terminal
-connection; both frp-rs call sites stop.** The port's state machine
-(`vendor/yamux/src/connection.rs:280-300`) has one terminal state, `Closed`,
-whose polls return `Ready(None)` / `Ready(Err(ConnectionError::Closed))` — a
-*caller* that polls again would indeed get an immediate `Ready` every time, i.e.
-a spin. Neither caller does:
+frp-rs uses the **Rust** `yamux` 0.14.1 port, so the commit cannot be applied.
+What follows is the reachability answer per symptom, and it is not uniform:
+(1) and (2) cannot occur here, but (4) — the blocked-write half — **can**, and
+this audit records that gap rather than closing over it.
 
-- the server acceptor (`frp-core/src/mux.rs:730-740`) `break`s on `Some(Err(e))`
-  and on `None`, and its poll is wrapped in `timeout(keepalive, ..)`, so even a
-  pathological immediate `Ready` ends the task on that iteration;
-- the client driver (`frp-core/src/mux.rs:950-970`) does the same on
-  `Some(Err(e))`/`None`, and its poll sits inside a `select!` whose other branch
-  is a synchronous single poll (never parks), so a closed connection exits the
-  driver rather than spinning it.
+### Busy loop after shutdown: no reachable path
 
-**3. A blocked write parks rather than spins.** Writes go through
-`Active::poll`'s `poll_ready_unpin` / `start_send_unpin` / `poll_flush_unpin`
-(`vendor/yamux/src/connection.rs:468-500`): a full socket returns `Pending` from
-`poll_ready_unpin` (or from the flush), which registers the socket's waker and
-parks the task. The queued frames are finite — `start_send` consumes one frame
-per iteration and the queues are bounded by the yamux protocol's own windows —
-so the loop makes progress or parks.
+The port's one terminal state, `ConnectionState::Closed`, returns
+`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:219`) or
+`Poll::Ready(Err(ConnectionError::Closed))` (`:162`) — a caller that keeps
+polling a closed connection would indeed spin. There are **four** live poll
+sites under `tcp-mux`, and all four treat that as terminal:
 
-**Residual risk this audit does not remove.** The `Closing` path is *dead* code
-in frp-rs rather than *absent*: if a future caller started using `poll_close`
-(e.g. to flush a goodbye frame before dropping the socket), the Go symptom's
-shape — a close waiting on a write to a WebSocket whose peer stopped reading —
-could reappear, and its only bound would be whatever timeout the new caller
-added. Any future use of `poll_close` should be wrapped in a deadline, and the
-per-connection tasks in `frp-core/src/mux.rs` are the place to check.
+- the server acceptor (`frp-core/src/mux.rs:730-740`) — `break` on
+  `Some(Err(e))`/`None`, and the poll is wrapped in `timeout(keepalive, ..)`;
+- the client driver (`frp-core/src/mux.rs:950-970`) — same, inside a `select!`
+  whose other branch is a synchronous single poll (never parks);
+- the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1107`/`:1113`, terminal at
+  `:1133-1156`) — tick-bounded (`:1104`);
+- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:781`/`:841`/`:934`,
+  terminal at `:1014-1021`) — timeout-bounded (`:942`).
 
-**Not measured:** this is a code-path audit, not a reproduction. Neither symptom
-was reproduced against the vendored crate (the Go report's WebSocket-blocked
-write was not re-created here), because the reachability argument above is what
-decides it: a path with no caller and a caller with no spin cannot exhibit the
-symptoms. If a future change adds a `poll_close` caller, the honest next step is
-a regression test that blocks `AsyncWrite::poll_flush` and asserts the close is
-bounded.
+So a `Ready`-forever terminal state has no caller that can keep polling it.
+
+### Blocked write: the port still has the **pre-fix** behaviour
+
+`Active::poll` drives writes through `poll_ready_unpin` / `start_send_unpin` /
+`poll_flush_unpin` (`vendor/yamux/src/connection.rs:468-500`) and, when the
+transport is not writable, falls through to `return Poll::Pending`
+(`:613`) after the socket registered its waker. That is *parking*, not
+spinning — but parking is exactly what Go's v0.3.0 changed: before the bump,
+*"the caller timed out while the session stayed blocked but alive until a
+keepalive ping also timed out"*; after it, the write **fails at the transport
+and the session is torn down**. This port has **no write deadline at all**:
+`grep -rn "write_timeout\|WriteTimeout\|write deadline" vendor/yamux/src/` is
+empty, and `Config` (`vendor/yamux/src/lib.rs:100-116`) carries no timeout
+field. The only bound in frp-rs is the caller's keepalive / dead-session reaper
+(`frp-core/src/mux.rs`'s `idle_dead_bound`, ~30 s floor to ~90 s), so a stream
+write blocked on a stalled WebSocket parks the session for that window — the
+same shape Go called a bug.
+
+**Status: open, and filed as debt** (`TODO.md`, "the vendored `yamux` has no
+write deadline"). Closing it means either enforcing a deadline inside the
+vendored write path (a sixth frp-rs patch, needing a timer — the crate is
+runtime-agnostic today) or bounding the callers' writes, with a test that
+blocks `AsyncWrite::poll_flush` and asserts the session is torn down rather than
+parked.
+
+### Not measured
+
+This is a code-path audit: neither Go symptom was reproduced here, because the
+busy-loop argument is a reachability one (no caller can spin) and the
+blocked-write finding is a *missing* mechanism (no deadline exists to test).
 
 ## Minor deviations (not patches)
 
