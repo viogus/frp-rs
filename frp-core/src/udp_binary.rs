@@ -515,7 +515,7 @@ pub fn decode_udp_packet_binary(body: &[u8]) -> Result<UDPPacket, String> {
 }
 
 /// Decode a UDPPacket from an owned binary codec body. For large datagrams
-/// (payload ≥ [`crate::buffer_pool::BUFFER_SIZE`]) ownership of the buffer is
+/// (payload ≥ [`TAKE_PAYLOAD_THRESHOLD`]) ownership of the buffer is
 /// taken: the packet's `content` IS the input buffer (payload memmoved to the
 /// front, buffer truncated to the payload), so the per-packet allocation +
 /// copy of [`decode_udp_packet_binary`] is avoided and the caller's scratch is
@@ -709,7 +709,7 @@ fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
 ///
 /// Deliberately **not** `buffer_pool::BUFFER_SIZE`: the UDP read buffer is a
 /// pool buffer whose size is a bridge/transport knob (`FRP_BRIDGE_BUF_KB`,
-/// 64 KiB by default), so keying this decision off it let a link-MTU knob
+/// 32 KiB by default), so keying this decision off it let a link-MTU knob
 /// silently change the codec's allocation strategy — at a 64 KiB pool no
 /// legal UDP payload can reach the take path, and the zero-copy branch became
 /// dead code. The trade-off this pins is UDP-local: below the threshold the
@@ -1134,7 +1134,7 @@ mod tests {
 
     #[test]
     fn owned_decode_matches_slice_decode_and_consumes_buffer() {
-        // Typical packet (payload < BUFFER_SIZE): copied out, caller's
+        // Typical packet (payload < TAKE_PAYLOAD_THRESHOLD): copied out, caller's
         // scratch buffer left intact so the read loop reuses it (the pool is
         // untouched — review finding M2).
         let pkt = sample_packet();

@@ -18,9 +18,13 @@ use std::sync::LazyLock;
 ///
 /// Default: 32 KiB (32768), matching Go frp's `io.Copy` buffer and keeping the
 /// per-bridge footprint at two 32 KiB buffers. This size is **also** the yamux
-/// data-frame payload: `mux.rs` derives `split_send_size` from it, so one
-/// bridge chunk becomes exactly one frame — no second 12-byte frame header, no
-/// second window-credit round trip, no second waker hand-off per chunk.
+/// data-frame payload: `mux.rs` derives `split_send_size` from it, so in the
+/// steady state one full bridge chunk travels as one frame — no second
+/// 12-byte frame header, no second window-credit round trip, no second waker
+/// hand-off per chunk. (Short chunks, a partly consumed send window, and the
+/// encrypted path's separate IV write can still produce a second frame.) The
+/// derived split is capped at 64 KiB, the largest frame the WebSocket
+/// transport accepts.
 ///
 /// Raising this to 64 KiB is the one tuning knob with a measured data-plane
 /// win: on the mux path it is worth ~15% strictly ping-pong and ~10% less CPU
@@ -39,7 +43,7 @@ use std::sync::LazyLock;
 ///
 /// This buffer size is used by the encrypted/compressed bridge data
 /// path (`bridge.rs`), the V2 frame read path (`protocol.rs`), and —
-/// via `copy_bidirectional_with_sizes` — the plain (unencrypted)
+/// via `copy_pooled`/`relay_plain_pooled` — the plain (unencrypted)
 /// bridge path, so `FRP_BRIDGE_BUF_KB` applies uniformly.
 pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_BUF_KB")

@@ -806,7 +806,7 @@ pub async fn read_msg_v2_udp_binary_socket<R: AsyncReadExt + Unpin>(
                 |e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()),
             )? {
                 Some(packet) => {
-                    // Large datagram (≥ BUFFER_SIZE): the decoder moved the
+                    // Large datagram (≥ TAKE_PAYLOAD_THRESHOLD): the decoder moved the
                     // buffer into the packet's content Vec (same ownership
                     // semantics as the message-form decoder, round-7 M2) —
                     // refill from the pool for the next read.

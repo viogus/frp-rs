@@ -424,10 +424,31 @@ pub(crate) fn write_stall_watchdog(
     })
 }
 
+/// Largest yamux data-frame payload the derived split may produce.
+///
+/// The WebSocket transport rejects, on read, any frame whose payload exceeds
+/// `MAX_WS_FRAME_PAYLOAD` — the 64 KiB V2 message cap plus 128 bytes of AEAD
+/// slack (`frp-core/src/transport/websocket.rs:27`). A yamux data frame is
+/// `split_send_size` body bytes plus its 12-byte header (65548 of the 65664
+/// allowed), so 64 KiB fits and anything larger does not. The cap matters
+/// because one oversized frame is refused by the *peer's* transport, which
+/// takes down the whole mux session — control channel and every proxy on it —
+/// not just the bridge that produced it, and because the refusal is
+/// asymmetric: Go's WS reader has no such limit, so only Go→Rust would fail.
+const MAX_MUX_FRAME_PAYLOAD: usize = 64 * 1024;
+
+/// yamux data-frame payload for a given bridge copy-buffer size: the buffer
+/// itself, capped so a frame always fits the WebSocket transport.
+#[cfg(feature = "tcp-mux")]
+fn mux_split_size(buffer_size: usize) -> usize {
+    buffer_size.min(MAX_MUX_FRAME_PAYLOAD)
+}
+
 #[cfg(feature = "tcp-mux")]
 fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     let mut cfg = Config::default();
-    // Match Go frp's hashicorp/yamux settings for compatibility:
+    // Match Go frp's yamux settings (fatedier/yamux, the fork Go frp pins)
+    // for compatibility:
     // Go frp sets MaxStreamWindowSize = 6 MB per stream and MaxStreams
     // = 0 (unlimited). yamux-rs 0.14 hardcodes the initial per-stream
     // window at 256 KiB (DEFAULT_CREDIT) and grows it via BDP
@@ -476,22 +497,28 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // `DEFAULT_CREDIT` (256 KiB) for its first round-trip — at 100 ms RTT
     // ~20 Mbit/s per stream. Nothing here overrides it (see the
     // `yamux_config_carries_window_growth_seed_rtt` test).
-    // One yamux data frame per bridge chunk: `split_send_size` is the
-    // bridge's copy buffer (`FRP_BRIDGE_BUF_KB`, 32 KiB by default), so a
-    // copy chunk is neither split into two frames nor padded. Frame count is
-    // what costs here — each extra frame is another 12-byte header, another
-    // window-credit check and another waker round trip on the receiving
-    // task. It must be derived rather than hardcoded: with a fixed 32 KiB
-    // split, raising the buffer to 64 KiB was level with the default (the
-    // chunk then travelled as two frames), which is what made the knob inert
-    // before this. Deriving it is worth ~15% on the mux path at
-    // `FRP_BRIDGE_BUF_KB=64` (measurements:
+    // A full bridge chunk travels as one yamux data frame in the steady
+    // state: `split_send_size` is the bridge's copy buffer
+    // (`FRP_BRIDGE_BUF_KB`, 32 KiB by default) — not padded, and not split
+    // further unless the send window is short (a partly consumed window
+    // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:408-409`)
+    // or the chunk is short (compression shrinks it, encryption writes the
+    // IV first). Frame count is what costs here — each extra frame is
+    // another 12-byte header, another window-credit check and another waker
+    // round trip on the receiving task. It must be derived rather than
+    // hardcoded: with a fixed 32 KiB split, raising the buffer to 64 KiB was
+    // level with the default (the chunk then travelled as two frames), which
+    // is what made the knob inert before this. Deriving it is worth ~15% on
+    // the mux path at `FRP_BRIDGE_BUF_KB=64` (measurements:
     // `docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`). Go frp's
-    // yamux fork (fatedier/yamux v0.3.0) writes `min(send_window, len(b))` per
-    // call with no small-frame constant, so any size this knob allows
-    // (4 KiB-1 MiB) is wire-legal: frames never exceed the peer's receive
-    // window because the sender takes `min(window, split)`.
-    cfg.set_split_send_size(*crate::buffer_pool::BUFFER_SIZE);
+    // yamux fork (fatedier/yamux v0.3.0, `stream.go:281`) writes
+    // `max = min(window, uint32(len(b)))` per call with no small-frame
+    // constant, so a frame up to the peer's advertised window is legal on
+    // the wire; the sender takes `min(window, split)` anyway.
+    //
+    // Capped at 64 KiB (see `MAX_MUX_FRAME_PAYLOAD`): the WebSocket transport
+    // cannot carry a bigger frame, and a rejected frame kills the session.
+    cfg.set_split_send_size(mux_split_size(*crate::buffer_pool::BUFFER_SIZE));
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // Keepalive is instead implemented via timeout-based poll loops in
     // server_mux and client_mux background tasks.
@@ -1342,6 +1369,23 @@ mod tests {
             "tcp-mux streams must be able to grow their receive window during \
              the first round-trip (100 ms seed), not only after the first \
              ping/pong sample lands"
+        );
+    }
+
+    /// The derived split must track the bridge buffer (that is what makes the
+    /// knob mean something) but never exceed what the WebSocket transport can
+    /// carry: `FRP_BRIDGE_BUF_KB=128` over `ws` + `tcp_mux` used to make the
+    /// peer reject the frame and kill the whole session.
+    #[test]
+    fn mux_split_size_follows_the_buffer_and_stays_within_the_ws_frame_limit() {
+        assert_eq!(mux_split_size(32 * 1024), 32 * 1024);
+        assert_eq!(mux_split_size(64 * 1024), 64 * 1024);
+        assert_eq!(mux_split_size(1024 * 1024), MAX_MUX_FRAME_PAYLOAD);
+        // `MAX_WS_FRAME_PAYLOAD` is the V2 cap plus 128 bytes of AEAD slack,
+        // and a yamux data frame is this payload plus a 12-byte header.
+        assert!(
+            MAX_MUX_FRAME_PAYLOAD + 12 <= crate::protocol::V2_MAX_FRAME_PAYLOAD as usize + 128,
+            "a frame at MAX_MUX_FRAME_PAYLOAD must fit the WebSocket transport"
         );
     }
 
