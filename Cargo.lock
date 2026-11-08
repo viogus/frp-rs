@@ -1246,7 +1246,6 @@ dependencies = [
  "anyhow",
  "frp-core",
  "libc",
- "serde",
  "serde_json",
  "tokio",
  "tracing",
