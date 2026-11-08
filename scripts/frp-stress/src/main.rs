@@ -11,7 +11,8 @@ mod scenarios;
 #[derive(Parser)]
 #[command(name = "frp-stress", about = "frp-rs stress testing framework")]
 struct Cli {
-    /// Scenario to run (memory, connections, throughput, longevity, burst, mixed, all)
+    /// Scenario to run (memory, connections, throughput, longevity, burst, mixed,
+    /// udp, udp-echo, all)
     #[arg(short, long, default_value = "all")]
     scenario: String,
 
@@ -83,6 +84,10 @@ struct Cli {
     /// Message size in bytes for latency probes
     #[arg(long, default_value = "64")]
     msg_bytes: usize,
+
+    /// Datagram size in bytes for the udp scenarios
+    #[arg(long, default_value = "1024")]
+    udp_packet_size: usize,
 }
 
 #[tokio::main]
@@ -104,6 +109,8 @@ async fn main() -> Result<()> {
         "burst" => scenarios::burst::run(&cli).await?,
         "mixed" => scenarios::mixed::run(&cli).await?,
         "echo" => scenarios::echo::run(&cli).await?,
+        "udp" => scenarios::udp::run(&cli).await?,
+        "udp-echo" => scenarios::udp::run_echo(&cli).await?,
         "latency" => scenarios::latency::run(&cli).await?,
         "all" => scenarios::run_all(&cli).await?,
         _ => anyhow::bail!("unknown scenario: {}", cli.scenario),
