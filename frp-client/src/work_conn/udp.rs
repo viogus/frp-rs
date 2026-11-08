@@ -150,26 +150,26 @@ pub(super) const UDP_SESSION_CAP: usize = 1024;
 /// the writer by one packet; a miss is a scheduling race, not a lost
 /// steady-state buffer — this window reuses it instead of allocating a fresh
 /// Vec per datagram. An absent spare still falls through to the alloc after
-/// at most this delay. It must stay a *race* window: every buffer the writer
-/// returns is used (see `next_payload`), so if this wait is ever hot again
-/// the caller is rejecting hand-backs, not the writer being slow.
+/// at most this delay. It must stay a *race* window: a buffer that comes back
+/// is never rejected for being small (see `next_payload`), so if this wait is
+/// hot again the caller is dropping hand-backs, not the writer being slow.
 const UDP_SPARE_RETURN_WAIT: Duration = Duration::from_millis(1);
 
 /// Build the buffer handed to the writer for one datagram, reusing the one
 /// the writer returned for the previous packet when it is usable.
 ///
-/// The rule that matters is that a hand-back is **never rejected**. The
-/// writer returns the buffer of the datagram it just encoded, and that buffer
-/// is regularly smaller than the recv window — an uncompressed fallback of
-/// exactly the datagram length, or the compression scratch of a smaller
-/// compressed frame. Comparing `capacity()` against the window and dropping
-/// the buffer on a miss therefore sent *every later* datagram back through
-/// the bounded wait in `run_udp_session`: one 1 ms timer per packet on the
-/// reply path, measured as ~2.6 ms with timer rounding (914 datagrams/s at
-/// 512 B on the reference host, versus the ~7.9k the same client reached
-/// once the buffer matched the datagram size; see
-/// `docs/archive/notes/2026-11-08-udp-spare-reuse.md`). So: accept whatever
-/// comes back, and allocate at the window size only when it cannot be used.
+/// The rule that matters is that a hand-back is never discarded for being
+/// smaller than the recv window. The writer returns the buffer of the
+/// datagram it just encoded, which can be an uncompressed buffer of exactly
+/// the datagram length or the compression scratch of a smaller compressed
+/// frame. Comparing `capacity()` against the window and *rejecting* such a
+/// buffer sent every later datagram back through the bounded wait in
+/// `run_udp_session`: one 1 ms timer per packet, which cost 8.7x throughput
+/// on the reply path before it was fixed (mechanism and measurements:
+/// `docs/archive/notes/2026-11-08-udp-spare-reuse.md`). So a small hand-back
+/// is replaced by one window-sized allocation rather than rejected, and the
+/// alloc fallback goes through this function too, so what it produces is
+/// usable next time.
 ///
 /// Wire output is unaffected — `src` is copied verbatim either way; only
 /// allocation behaviour differs. `window` is `udp_packet_size`, which is also
@@ -1077,8 +1077,10 @@ mod tests {
     /// The defect this module exists to pin: the alloc fallback used to hand
     /// back a buffer of exactly the datagram length, which the old capacity
     /// gate then rejected, sending every later datagram through the bounded
-    /// wait. Driving the fallback *into* the next call is the assertion that a
-    /// re-introduced call-site gate cannot survive.
+    /// wait. Driving the fallback *into* the next call is what a call-site
+    /// mutation has to survive (identity, not just capacity: a tightened
+    /// `capacity() > window` gate allocates a fresh window-sized buffer, so
+    /// capacity alone would not notice).
     #[test]
     fn fallback_output_is_reused_by_the_next_datagram() {
         let first = next_payload(None, &[7u8; 512], WINDOW);
@@ -1087,15 +1089,15 @@ mod tests {
             "fallback must allocate at the window, got {}",
             first.capacity()
         );
-        let cap = first.capacity();
+        let ptr = first.as_ptr();
 
         let second = next_payload(Some(first), &[8u8; 512], WINDOW);
 
         assert_eq!(second, vec![8u8; 512]);
         assert_eq!(
-            second.capacity(),
-            cap,
-            "a usable hand-back must keep its allocation"
+            second.as_ptr(),
+            ptr,
+            "a usable hand-back must be reused, not reallocated"
         );
     }
 
@@ -1145,11 +1147,12 @@ mod tests {
     }
 
     /// `window` is clamped, so a zero-configured `udpPacketSize` cannot produce
-    /// a zero-capacity buffer that would then fail its own fast-path check.
+    /// a zero-capacity buffer. The empty source is what makes the clamp
+    /// observable: a non-empty `src` grows capacity regardless.
     #[test]
     fn zero_window_is_clamped_to_one() {
-        let payload = next_payload(None, &[6u8], 0);
-        assert_eq!(payload, vec![6u8]);
+        let payload = next_payload(None, &[], 0);
+        assert!(payload.is_empty());
         assert!(payload.capacity() >= 1);
     }
 }

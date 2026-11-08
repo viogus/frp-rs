@@ -6,7 +6,8 @@
 ## 1. Symptom
 
 A strict ping-pong UDP load through frps + frpc (`scripts/frp-stress --scenario
-udp`, 4 flows) measured **919 pps** at 1 KiB datagrams for the Rust client where
+udp`, 4 flows) measured **919 pps** at 512-byte datagrams for the Rust client (990 pps at
+1 KiB) where
 the Go client on the identical server and config measured **10,126 pps**. The server
 side was not the problem, and neither was the transport — a mixed-binary matrix
 at 512 B / 4 flows isolated it to one process:
@@ -80,8 +81,13 @@ when the writer genuinely has not returned a buffer yet.
 
 Two notes on the shape. The helper is synchronous and takes `Option<Vec<u8>>`
 rather than being called three ways at the call site, so a test can drive the
-fallback's output back in as the next spare — that is what pins the defect, and
-it fails if a capacity gate is ever re-added at the call site. `window` is not
+fallback's output back in as the next spare; that pins the helper's contract
+(a reject-and-reallocate helper fails `fallback_output_is_reused_by_the_next_datagram`,
+which asserts buffer identity rather than capacity, because a tightened
+`capacity() > window` gate would still produce a window-sized buffer). It does
+**not** cover the `ret_rx`/timeout selection in `run_udp_session` — a capacity
+guard re-added on that `match` arm is invisible to every test here, so that arm
+is the place to look first if the 1 ms wait is ever hot again. `window` is not
 `spare`-dependent: the recv buffer (`buf`) is `udp_packet_size` long and is the
 only recv target, so the payload buffer never has to be larger than the window
 for correctness.
