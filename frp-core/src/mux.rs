@@ -476,12 +476,21 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // `DEFAULT_CREDIT` (256 KiB) for its first round-trip — at 100 ms RTT
     // ~20 Mbit/s per stream. Nothing here overrides it (see the
     // `yamux_config_carries_window_growth_seed_rtt` test).
-    // 32 KiB data frames (yamux-rs default 16 KiB): halves the frame
-    // count for the bridge's 64 KiB chunks, i.e. halves per-frame
-    // header writes/reads and waker round trips. Go's hashicorp yamux
-    // splits only at the stream window (6 MiB), so 32 KiB is still
-    // conservative and wire-legal (frame body <= receive window).
-    cfg.set_split_send_size(32 * 1024);
+    // One yamux data frame per bridge chunk: `split_send_size` is the
+    // bridge's copy buffer (`FRP_BRIDGE_BUF_KB`, 32 KiB by default), so a
+    // copy chunk is neither split into two frames nor padded. Frame count is
+    // what costs here — each extra frame is another 12-byte header, another
+    // window-credit check and another waker round trip on the receiving
+    // task. It must be derived rather than hardcoded: with a fixed 32 KiB
+    // split, raising the buffer to 64 KiB was level with the default (the
+    // chunk then travelled as two frames), which is what made the knob inert
+    // before this. Deriving it is worth ~15% on the mux path at
+    // `FRP_BRIDGE_BUF_KB=64` (measurements:
+    // `docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`). Go's
+    // hashicorp yamux splits only at the stream window (6 MiB), so any size
+    // this knob allows (4 KiB-1 MiB) is wire-legal: frames never exceed the
+    // peer's receive window because the sender takes `min(window, split)`.
+    cfg.set_split_send_size(*crate::buffer_pool::BUFFER_SIZE);
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // Keepalive is instead implemented via timeout-based poll loops in
     // server_mux and client_mux background tasks.

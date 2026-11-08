@@ -584,9 +584,9 @@ pub fn decode_udp_packet_binary_socket_owned(
 #[derive(Debug)]
 pub struct SocketUdpPacket {
     /// UDP payload (ownership semantics of
-    /// [`decode_udp_packet_binary_owned`]: payloads ≥ the pool buffer take
-    /// the caller's buffer, which is left empty — refill before the next
-    /// read).
+    /// [`decode_udp_packet_binary_owned`]: payloads ≥
+    /// [`TAKE_PAYLOAD_THRESHOLD`] take the caller's buffer, which is left
+    /// empty — refill before the next read).
     pub content: Vec<u8>,
     /// Decoded local address when flagged. No current terminal reader uses
     /// it (the proxy's own bound address is loop-invariant config), kept
@@ -704,18 +704,33 @@ fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
     })
 }
 
+/// Payload size at or above which a decoded datagram takes the caller's read
+/// buffer instead of being copied out of it.
+///
+/// Deliberately **not** `buffer_pool::BUFFER_SIZE`: the UDP read buffer is a
+/// pool buffer whose size is a bridge/transport knob (`FRP_BRIDGE_BUF_KB`,
+/// 64 KiB by default), so keying this decision off it let a link-MTU knob
+/// silently change the codec's allocation strategy — at a 64 KiB pool no
+/// legal UDP payload can reach the take path, and the zero-copy branch became
+/// dead code. The trade-off this pins is UDP-local: below the threshold the
+/// caller keeps its buffer and pays one payload copy; at or above it the
+/// payload *is* the buffer (one memmove, no allocation) and the caller refills
+/// from the pool. It must stay below the 65507-byte UDP payload ceiling for
+/// the take path to be reachable at all.
+pub const TAKE_PAYLOAD_THRESHOLD: usize = 32 * 1024;
+
 /// Copy-or-take the payload out of a decoded body.
 ///
 /// Steady-state path (review finding M2): copy the payload out and keep
-/// `body` in the caller's loop — no per-packet 32 KiB pool-buffer churn
-/// (one small payload copy remains; large datagrams move the buffer into
-/// the packet instead of copying). Only for payloads ≥ the pool buffer is
+/// `body` in the caller's loop — no per-packet pool-buffer churn (one small
+/// payload copy remains; large datagrams move the buffer into the packet
+/// instead of copying). Only for payloads ≥ [`TAKE_PAYLOAD_THRESHOLD`] is
 /// the buffer moved into the packet; that buffer then never returns to the
 /// pool, so the pool drains at most one buffer per large datagram —
 /// acceptable, they are the rare case (UDP payloads are typically ≤
 /// 1.5 KiB MTU-sized).
 fn take_or_copy_payload(body: &mut Vec<u8>, payload_len: usize, payload_offset: usize) -> Vec<u8> {
-    if payload_len < *crate::buffer_pool::BUFFER_SIZE {
+    if payload_len < TAKE_PAYLOAD_THRESHOLD {
         body[payload_offset..payload_offset + payload_len].to_vec()
     } else {
         // The trailing-bytes check guarantees `payload_offset + payload_len
@@ -1136,10 +1151,10 @@ mod tests {
             "small payload must leave the caller's buffer intact"
         );
 
-        // Large datagram (payload ≥ BUFFER_SIZE): the packet content IS the
+        // Large datagram (payload ≥ `TAKE_PAYLOAD_THRESHOLD`): the packet content IS the
         // caller's buffer — ownership moved out, caller must refill.
         let big = UDPPacket {
-            content: vec![0xabu8; *crate::buffer_pool::BUFFER_SIZE],
+            content: vec![0xabu8; TAKE_PAYLOAD_THRESHOLD],
             local_addr: None,
             remote_addr: Some(UdpAddr {
                 ip: "127.0.0.1".into(),
@@ -1547,7 +1562,9 @@ mod tests {
 
     #[test]
     fn socket_decode_large_payload_consumes_buffer() {
-        let big_len = *crate::buffer_pool::BUFFER_SIZE;
+        // `TAKE_PAYLOAD_THRESHOLD` is a legal UDP payload; a pool-sized one
+        // (64 KiB) is above the 65507-byte protocol ceiling.
+        let big_len = TAKE_PAYLOAD_THRESHOLD;
         let mut body = Vec::new();
         encode_udp_packet_binary_socket_addr(
             &vec![0xabu8; big_len],

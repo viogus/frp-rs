@@ -414,8 +414,8 @@ round trip.
 `StartWorkConn` with proxy metadata (encryption flag, compression flag), the
 server writes any pre-read bytes (from HTTP VHost parsing) and then bridges the
 user connection to the work connection using either
-`tokio::io::copy_bidirectional_with_sizes` with the 32 KiB `BUFFER_SIZE` (plain,
-overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
+`tokio::io::copy_bidirectional_with_sizes` with the 32 KiB default
+`BUFFER_SIZE` (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
 + Snappy, streaming — a single random 16-byte IV followed by continuous
 ciphertext, no per-frame length prefix). The client-side plain relay mirrors this
 (`relay_plain_fast` with `splice(2)` on Linux, `copy_bidirectional_with_sizes`
@@ -667,7 +667,12 @@ changes.
   bridge copies with `copy_bidirectional_with_sizes(a, b, *BUFFER_SIZE,
   *BUFFER_SIZE)`, so `BUFFER_SIZE` applies to the plain path too; the
   encrypted/compressed path uses the `PoolGuard` buffer pool (also
-  `BUFFER_SIZE`).
+  `BUFFER_SIZE`). The value also sizes the yamux data frame
+  (`mux.rs` sets `split_send_size` from it), so one bridge chunk is exactly one
+  frame; raising it to 64 KiB is worth ~15% on tcpMux and ~3% plain, at one
+  extra 32 KiB per direction per bridge (measurements and the reason the default
+  stays at Go parity:
+  [`docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`](archive/notes/2026-11-08-bridge-buffer-frame-match.md)).
 
 ### Transport status
 
