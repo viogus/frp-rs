@@ -847,8 +847,9 @@ bash scripts/compat-test.sh --test rust-to-rust-mytcp-plain --verbose
   `cargo check --workspace --no-default-features --features tiny` and
   `--features micro`. If your type touches an optional feature, the workspace must
   still compile in both tiers, which normally means `#[cfg]`-gating your code.
-  `Tests (unit)`, `Tests (server integration)` and `Tests (client integration)`
-  run the suites in 2.5; a test file left ungated is checked by all of them.
+  `Tests (unit)`, `Tests (frp-client, no features)`,
+  `Tests (server integration)` and `Tests (client integration)` run the suites
+  in 2.5; a test file left ungated is checked by all of them.
 - `.github/workflows/xtcp-compat.yml` runs the XTCP pairwise matrix daily on a
   VPS. Only relevant if your type uses NAT traversal.
 - A change to the transport or the wire protocol — not just a proxy type — also
@@ -1125,9 +1126,9 @@ targets are whole-file-cfg'd *empty* here — `kcp.rs` and `xtcp_p2p.rs` (`kcp`)
 That step is compile-only: it type-checks the test targets but does not link or
 run them, so it cannot see a missing `#[cfg]` on a test or bench that still
 *compiles*. The runtime half lives in the test lanes: `Tests (unit)` runs the
-no-features command for `frp-core` and for `frp-client`, and
-`Tests (server integration)` runs it for `frp-server`; the two sibling steps are
-spelled out below. For `frp-core`, in the same no-features configuration:
+no-features command for `frp-core`, `Tests (frp-client, no features)` runs it for
+`frp-client`, and `Tests (server integration)` runs it for `frp-server`; the
+sibling steps are spelled out below. For `frp-core`, in the same no-features configuration:
 
 ```bash
 cargo test -p frp-core --no-default-features --all-targets
@@ -1164,8 +1165,10 @@ tests and both are `ignore`-marked (`frp-core/src/buffer_pool.rs:54`,
 The same runtime class was live in the sibling crates and now has two sibling
 runtime steps.
 
-`frp-client`'s is in the `Tests (unit)` lane, because its test targets need no
-`frps`/`frpc` binary — they drive in-process services:
+`frp-client`'s is its own lane, `Tests (frp-client, no features)` — split out
+of `Tests (unit)` so a ten-minute cold compile of a second feature set overlaps
+the other unit steps — because its test targets need no `frps`/`frpc` binary;
+they drive in-process services:
 
 ```bash
 cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
