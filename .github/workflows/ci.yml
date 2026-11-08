@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=ea0e7e38a9bd13f6c6a18e79e89be26b0183c88617fd3879c9229e9c95366ddd
+          guard_data_pin=a1b507268bdee844fa40a66dd2baa9ab6cc7600393050c7f7672ca8b45b38a5a
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -1903,6 +1903,8 @@ jobs:
     # count derived from the file a lane checks would stay green if that file's
     # tests were removed altogether.
     env:
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
       # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
       # 16 → 19 with the typed exit-code classification: +3 server-side pins
       # (`unresolvable_token_source_exits_3_where_go_exits_1`,
@@ -3613,6 +3615,14 @@ jobs:
     # 27-minute critical path while those steps only need ~11. As its own
     # job it overlaps them: same image, same pinned toolchain, same cache
     # key, same command, same assertions.
+    env:
+      # Test binaries are linked, never shipped, so their DWARF is pure cost:
+      # every test lane links 50+ binaries that a cold cache has to produce.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
+      # (a failing test still reports its message and assertion, just not a
+      # source line) — re-measure before widening it further.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -3947,6 +3957,14 @@ jobs:
     # the cargo cache (a second saver would race the write + double the
     # ~5 GB post-run upload).
     timeout-minutes: 40
+    env:
+      # Test binaries are linked, never shipped, so their DWARF is pure cost:
+      # every test lane links 50+ binaries that a cold cache has to produce.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
+      # (a failing test still reports its message and assertion, just not a
+      # source line) — re-measure before widening it further.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
@@ -4100,6 +4118,14 @@ jobs:
     # Serialised, the two put the lane on the workflow's critical path; in
     # parallel the floor becomes `Tests (client integration)` (~15.5m) and the
     # same work is asserted, unchanged.
+    env:
+      # Test binaries are linked, never shipped, so their DWARF is pure cost:
+      # every test lane links 50+ binaries that a cold cache has to produce.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
+      # (a failing test still reports its message and assertion, just not a
+      # source line) — re-measure before widening it further.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -4189,6 +4215,14 @@ jobs:
     name: Tests (client integration)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Test binaries are linked, never shipped, so their DWARF is pure cost:
+      # every test lane links 50+ binaries that a cold cache has to produce.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
+      # (a failing test still reports its message and assertion, just not a
+      # source line) — re-measure before widening it further.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
