@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# frp-rs throughput baseline: sweep bridge-config matrix, record MB/s per config.
+# frp-rs throughput baseline: sweep bridge-config matrix, record MiB/s per config.
 #   plain | encrypt | compress | encrypt+compress | mux | tls
 # Usage: bash scripts/throughput-baseline.sh [duration_s] [streams]
 # Output: ${OUT:-scripts/frp-stress/baselines/throughput-<hostname>.jsonl}
@@ -9,7 +9,7 @@
 #   A/B that alternates binaries must save each run or point OUT elsewhere.
 #
 # Numbers are host-specific. Regenerate before a Phase 2 change and diff after;
-# any config dropping >5% MB/s rejects the change.
+# any config dropping >5% MiB/s rejects the change.
 # =============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
