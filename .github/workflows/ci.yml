@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=f50516068eb0adc5ff990b51c2547bf7200ce4dedc4d59d41ae1fd8174e020c4
+          guard_data_pin=a0731ef45adeb5f2ee7e19877ae05aaaf6ffc0eda7478ace3a25f1ebbf2c6dd2
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -3598,6 +3598,30 @@ jobs:
             exit 1
           fi
           echo "frpc tiny CLI exit-code guard ok: $n tests listed (expected $FRPC_TINY_CLI_TESTS), 0 failed"
+  tests-frp-client-nofeatures:
+    name: Tests (frp-client, no features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Split out of `tests-unit` on measurement. The command below is the
+    # job's whole cost on its own — 12m50s on run 42470560656, of which
+    # ~10m20s is the cold compile of a second feature set (the first
+    # `Running unittests` line lands ten minutes after the step starts) —
+    # and serialising it after the other unit steps put `Tests (unit)` on a
+    # 27-minute critical path while those steps only need ~11. As its own
+    # job it overlaps them: same image, same pinned toolchain, same cache
+    # key, same command, same assertions.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup toolchain install --no-self-update
       - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
         # The `verify` lane's `cargo check -p frp-client --no-default-features
         # --all-targets` is compile-only: it type-checks the test targets but
@@ -3618,9 +3642,10 @@ jobs:
         # `--no-default-features --features websocket`, and 7 passed / 0 failed
         # with default features — so no test was lost.
         #
-        # It lives in the unit lane because frp-client's test targets need no
-        # frps/frpc binary: they drive in-process services (nothing under
-        # frp-client/ references FRPS_BIN/FRPC_BIN), so no env is set here.
+        # It has its own job so it overlaps the other unit steps; frp-client's
+        # test targets need no frps/frpc binary (they drive in-process services
+        # and nothing under frp-client/ references FRPS_BIN/FRPC_BIN), so no env
+        # is set here.
         #
         # Caveat, measured on macOS arm64 and NOT on the runner: this whole
         # command also fails one pre-existing, timing/platform-sensitive lib
@@ -3648,7 +3673,10 @@ jobs:
         # Wall clock, macOS arm64 warm build: 1m12s to 3m07s on four runs (the
         # shortest aborted at the first failing lib target). `--no-fail-fast`
         # keeps every later target running when an unrelated lib test fails.
+        # On the ubuntu runner it is cold: 12m50s, of which ~10m20s is the
+        # compile and ~2m30s the tests, which is why it is its own job.
         run: cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
+
   # The release-profile CLI lane. `cargo test --release -p frps --test
   # cli_exit_codes` used to be red in every release build (41 passed / 3 failed)
   # because three pins drive `#[cfg(debug_assertions)]` hooks in
