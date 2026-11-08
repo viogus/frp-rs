@@ -2,7 +2,10 @@
 # =============================================================================
 # frp-rs latency baseline: steady-state RTT + connection-setup percentiles.
 # Usage: bash scripts/latency-baseline.sh [samples]
-# Output: scripts/frp-stress/baselines/latency-<hostname>.jsonl
+# Output: ${OUT:-scripts/frp-stress/baselines/latency-<hostname>.jsonl}
+#   Override with OUT=/tmp/ab.jsonl to keep a run out of the committed
+#   per-host baseline — every run rewrites (truncates) its output file, so an
+#   A/B that alternates binaries must save each run or point OUT elsewhere.
 #
 # Numbers are host-specific. Regenerate before an L-item change and diff after;
 # any config whose p99 regresses rejects the change. The nodelay win shows up
@@ -22,7 +25,7 @@ FRPS_PORT=18000
 REMOTE_PORT=18001
 ECHO_PORT=18002
 TOKEN="latency-token"
-OUT="scripts/frp-stress/baselines/latency-$(hostname -s).jsonl"
+OUT="${OUT:-scripts/frp-stress/baselines/latency-$(hostname -s).jsonl}"
 
 echo "=== Building the frp-stress harness ==="
 (cd scripts/frp-stress && cargo build --release 2>&1 | tail -2)

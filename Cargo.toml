@@ -141,9 +141,16 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
-# Throughput/latency-first build: same LTO/strip/abort discipline as
-# `release`, but with -O3 instead of -Oz for the hot data plane. Binary is
-# a few hundred KB larger; use `cargo build --profile release-perf`.
+# Throughput-first build: same LTO/strip/abort discipline as `release`, but
+# `opt-level = 3` instead of `"z"` for the hot data plane. Opt-in only:
+# measured +84.5% frps / +83.5% frpc size (5.41 -> 9.98 MB / 4.55 -> 8.35 MB,
+# decimal MB, macOS arm64, 2026-11-08) for up to ~40% more data-plane
+# throughput - +19-27% on the 1-stream encrypted/compressed rows, +40%
+# `encrypt` / +30% `compress` means at 4 streams, and no gain on one 4-stream
+# `encrypt_compress` pair. Latency: one unrepeated pair, direction only. Size
+# is this project's differentiator, so use this only for throughput-first
+# deployments (`cargo build --profile release-perf`). Measurement, method and
+# caveats: docs/archive/notes/2026-11-08-release-perf-ab.md
 [profile.release-perf]
 inherits = "release"
 opt-level = 3

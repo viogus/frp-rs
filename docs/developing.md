@@ -1350,6 +1350,21 @@ After `cargo build --release`, further compress with UPX:
 upx --best --lzma target/release/frps target/release/frpc
 ```
 
+#### Throughput-first alternative
+
+`[profile.release-perf]` inherits `release` — same fat LTO, one codegen unit,
+stripped, `panic = "abort"` — and only raises `opt-level` to `3`. Measured on
+macOS arm64 it costs roughly +85% binary size for at most ~40% more data-plane
+throughput: the 1-stream encrypted/compressed rows gain 19-27%, the 4-stream
+means are +40% `encrypt`, +30% `compress` and +23% unencrypted `plain`, while
+`tls` gains ~6% and one 4-stream `encrypt_compress` pair is slightly negative.
+The win is not codec-specific — it is broad in the data-plane copy/buffer/
+framing code (which is why the unencrypted row gains too). Latency was not
+resolved either way by a single unrepeated pair. Because size is this project's
+differentiator the profile stays **opt-in** — it is for throughput-first
+deployments, not a better default. Measurement, method and caveats:
+[`docs/archive/notes/2026-11-08-release-perf-ab.md`](archive/notes/2026-11-08-release-perf-ab.md).
+
 ## 4. Debugging
 
 ### RUST_LOG Levels
