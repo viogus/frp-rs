@@ -1678,9 +1678,10 @@ the child it spawned). The CI lane that reads this ordering is the
 `cargo test -p frp-server --features dashboard -j 1` step.
 
 The guard is compiled **only** when the test target has the `dashboard` feature
-(`#[cfg(feature = "dashboard")]`): the no-features runtime step in that same CI
-job resolves the same `FRPS_BIN` for tests that need no dashboard, so it must
-not require the listener. The check costs one `read` and byte scan of the
+(`#[cfg(feature = "dashboard")]`): the no-features runtime step — `Tests
+(frp-server, no features)`, split out of that job so a cold compile of the
+second feature set overlaps the other lanes — resolves the same `FRPS_BIN` for
+tests that need no dashboard, so it must not require the listener. The check costs one `read` and byte scan of the
 resolved artifact (measured 28.83 ms for the 81,444,248-byte dashboard
 artifact), cached per test-binary process.
 

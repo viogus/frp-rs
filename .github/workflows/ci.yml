@@ -17,9 +17,12 @@ env:
 # restore-only, so parallel lanes never race the cache write); on a warm
 # cache the wall time drops to the slowest tests lane (e2e-runtime-bound).
 # The tests job itself is further split into unit / server-integration /
-# client-integration: each runs on its own runner, so the wall clock is the
-# max of the three instead of a single job paying compile + full `-j 1` e2e
-# serially (which timed out at 35m on cold caches). On a cache miss every
+# client-integration, plus two lanes split out of those on measurement
+# (frp-client's no-features suite out of unit, frp-server's out of
+# server-integration — each was a serialised cold compile of a second feature
+# set): every one runs on its own runner, so the wall clock is the max of them
+# instead of a single job paying compile + full `-j 1` e2e serially (which
+# timed out at 35m on cold caches). On a cache miss every
 # lane pays its own cold dep compile, so a split run is slower in total CPU
 # than the old single job — acceptable, misses are rare and wall clock wins.
 jobs:
@@ -1769,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=888a83216f91da5a1aeb5d69ff2852628730121553ce2278bb1b53402fad9f76
+          guard_data_pin=00eee1354d82e55466353d0bb87d51b1cd49fc18641a11e2a03d1588d7e62459
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2541,8 +2544,8 @@ jobs:
         # does not link or run them, so it cannot see a runtime failure in a
         # test or bench that still compiles. This step is the runtime half **for
         # frp-core**; the sibling runtime steps are `Run frp-client's tests with
-        # no features` (this lane, below) and `Run frp-server's tests with no
-        # features` (the Tests (server integration) lane, which already builds
+        # no features` (`Tests (frp-client, no features)`) and `Run frp-server's
+        # tests with no features` (`Tests (frp-server, no features)`, which builds
         # the frps binary the oidc_integration tests spawn).
         #
         # For frp-core this step is the only gate for two measured classes:
@@ -4181,6 +4184,7 @@ jobs:
         run: cargo test -p frp-server --no-default-features --all-targets -j 1 --no-fail-fast
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
+          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
 
   tests-client:
     name: Tests (client integration)
@@ -4609,7 +4613,14 @@ jobs:
   build:
     name: Build (release)
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    needs: [lint, tests-unit, tests-server, tests-client, verify]
+    needs:
+      - lint
+      - tests-unit
+      - tests-frp-client-nofeatures
+      - tests-server
+      - tests-server-nofeatures
+      - tests-client
+      - verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
