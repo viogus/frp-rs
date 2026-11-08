@@ -848,8 +848,9 @@ bash scripts/compat-test.sh --test rust-to-rust-mytcp-plain --verbose
   `--features micro`. If your type touches an optional feature, the workspace must
   still compile in both tiers, which normally means `#[cfg]`-gating your code.
   `Tests (unit)`, `Tests (frp-client, no features)`,
-  `Tests (server integration)` and `Tests (client integration)` run the suites
-  in 2.5; a test file left ungated is checked by all of them.
+  `Tests (server integration)`, `Tests (frp-server, no features)` and
+  `Tests (client integration)` run the suites in 2.5; a test file left ungated is
+  checked by all of them.
 - `.github/workflows/xtcp-compat.yml` runs the XTCP pairwise matrix daily on a
   VPS. Only relevant if your type uses NAT traversal.
 - A change to the transport or the wire protocol — not just a proxy type — also
@@ -1127,7 +1128,7 @@ That step is compile-only: it type-checks the test targets but does not link or
 run them, so it cannot see a missing `#[cfg]` on a test or bench that still
 *compiles*. The runtime half lives in the test lanes: `Tests (unit)` runs the
 no-features command for `frp-core`, `Tests (frp-client, no features)` runs it for
-`frp-client`, and `Tests (server integration)` runs it for `frp-server`; the
+`frp-client`, and `Tests (frp-server, no features)` runs it for `frp-server`; the
 sibling steps are spelled out below. For `frp-core`, in the same no-features configuration:
 
 ```bash
@@ -1174,11 +1175,13 @@ they drive in-process services:
 cargo test -p frp-client --no-default-features --all-targets -j 1 --no-fail-fast
 ```
 
-`frp-server`'s is in the `Tests (server integration)` lane, because its five
-`oidc_integration.rs` tests spawn `frps` and fail environmentally without one
-(`failed to start frps: Os { code: 2, kind: NotFound }`,
-`frp-server/tests/common/mod.rs`); that lane already builds the binary and sets
-`FRPS_BIN`/`FRPC_BIN`:
+`frp-server`'s is its own lane, `Tests (frp-server, no features)` — split out of
+`Tests (server integration)` on the same measurement as the frp-client one: a
+6m38s step whose compile the restored default-feature cache cannot satisfy —
+because its five `oidc_integration.rs` tests spawn `frps` and fail
+environmentally without one (`failed to start frps: Os { code: 2, kind:
+NotFound }`, `frp-server/tests/common/mod.rs`), so the lane builds the binary and
+sets `FRPS_BIN`/`FRPC_BIN` itself:
 
 ```bash
 cargo test -p frp-server --no-default-features --all-targets -j 1 --no-fail-fast
@@ -1675,9 +1678,10 @@ the child it spawned). The CI lane that reads this ordering is the
 `cargo test -p frp-server --features dashboard -j 1` step.
 
 The guard is compiled **only** when the test target has the `dashboard` feature
-(`#[cfg(feature = "dashboard")]`): the no-features runtime step in that same CI
-job resolves the same `FRPS_BIN` for tests that need no dashboard, so it must
-not require the listener. The check costs one `read` and byte scan of the
+(`#[cfg(feature = "dashboard")]`): the no-features runtime step — `Tests
+(frp-server, no features)`, split out of that job so a cold compile of the
+second feature set overlaps the other lanes — resolves the same `FRPS_BIN` for
+tests that need no dashboard, so it must not require the listener. The check costs one `read` and byte scan of the
 resolved artifact (measured 28.83 ms for the 81,444,248-byte dashboard
 artifact), cached per test-binary process.
 

@@ -17,9 +17,12 @@ env:
 # restore-only, so parallel lanes never race the cache write); on a warm
 # cache the wall time drops to the slowest tests lane (e2e-runtime-bound).
 # The tests job itself is further split into unit / server-integration /
-# client-integration: each runs on its own runner, so the wall clock is the
-# max of the three instead of a single job paying compile + full `-j 1` e2e
-# serially (which timed out at 35m on cold caches). On a cache miss every
+# client-integration, plus two lanes split out of those on measurement
+# (frp-client's no-features suite out of unit, frp-server's out of
+# server-integration — each was a serialised cold compile of a second feature
+# set): every one runs on its own runner, so the wall clock is the max of them
+# instead of a single job paying compile + full `-j 1` e2e serially (which
+# timed out at 35m on cold caches). On a cache miss every
 # lane pays its own cold dep compile, so a split run is slower in total CPU
 # than the old single job — acceptable, misses are rare and wall clock wins.
 jobs:
@@ -1769,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=a0731ef45adeb5f2ee7e19877ae05aaaf6ffc0eda7478ace3a25f1ebbf2c6dd2
+          guard_data_pin=ea0e7e38a9bd13f6c6a18e79e89be26b0183c88617fd3879c9229e9c95366ddd
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2541,8 +2544,8 @@ jobs:
         # does not link or run them, so it cannot see a runtime failure in a
         # test or bench that still compiles. This step is the runtime half **for
         # frp-core**; the sibling runtime steps are `Run frp-client's tests with
-        # no features` (this lane, below) and `Run frp-server's tests with no
-        # features` (the Tests (server integration) lane, which already builds
+        # no features` (`Tests (frp-client, no features)`) and `Run frp-server's
+        # tests with no features` (`Tests (frp-server, no features)`, which builds
         # the frps binary the oidc_integration tests spawn).
         #
         # For frp-core this step is the only gate for two measured classes:
@@ -4085,6 +4088,40 @@ jobs:
             exit 1
           fi
           echo "frp-server vhost::tests guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
+
+  tests-server-nofeatures:
+    name: Tests (frp-server, no features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Split out of `Tests (server integration)` on measurement. On run
+    # 42512057158 that job was 21m19s: 11m49s of dashboard+integration tests
+    # and 6m38s of this step — a fresh compile of the no-features graph plus
+    # its suite, because the restored cache holds the default-feature build.
+    # Serialised, the two put the lane on the workflow's critical path; in
+    # parallel the floor becomes `Tests (client integration)` (~15.5m) and the
+    # same work is asserted, unchanged.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup toolchain install --no-self-update
+      # Same two builds as the lane this step came from, so the binaries the
+      # suite spawns are identical.
+      - name: Build frpc (server integration tests spawn it as the bridge end)
+        run: cargo build --bin frpc
+      - name: Build frps with dashboard feature
+        run: cargo build --bin frps --features dashboard
       - name: Run frp-server's tests with no features (runtime half of frp-server's tier gate)
         # The `verify` lane's `cargo check -p frp-server --no-default-features
         # --all-targets` is compile-only, so it cannot see a missing #[cfg] on a
@@ -4575,7 +4612,14 @@ jobs:
   build:
     name: Build (release)
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
-    needs: [lint, tests-unit, tests-server, tests-client, verify]
+    needs:
+      - lint
+      - tests-unit
+      - tests-frp-client-nofeatures
+      - tests-server
+      - tests-server-nofeatures
+      - tests-client
+      - verify
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
