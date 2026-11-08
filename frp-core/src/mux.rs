@@ -435,6 +435,7 @@ pub(crate) fn write_stall_watchdog(
 /// takes down the whole mux session — control channel and every proxy on it —
 /// not just the bridge that produced it, and because the refusal is
 /// asymmetric: Go's WS reader has no such limit, so only Go→Rust would fail.
+#[cfg(feature = "tcp-mux")]
 const MAX_MUX_FRAME_PAYLOAD: usize = 64 * 1024;
 
 /// yamux data-frame payload for a given bridge copy-buffer size: the buffer
