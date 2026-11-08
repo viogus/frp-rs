@@ -1,12 +1,14 @@
 # Throughput baselines
 
 `throughput-<hostname>.jsonl` records MiB/s per bridge configuration,
-measured as `bytes / 1024 / 1024 / seconds` (the JSON key is still `mbps`, and
-it has always been MiB/s — the printed unit used to say MB/s),
-produced by `scripts/throughput-baseline.sh`. Each run rewrites
-(truncates) that file; pass `OUT=/tmp/ab.jsonl` to keep an A/B run — for
-example `release` vs `--profile release-perf` — out of the committed
-per-host baseline. Numbers are **host-specific**
+measured as `bytes / 1024 / 1024 / seconds` and produced by
+`scripts/throughput-baseline.sh`. `bytes` counts **both directions** — each round
+trip writes a chunk and reads its echo — so a row is about 2x the one-way
+payload rate. The JSON key is still `mbps` and has always been MiB/s; only the
+printed unit used to say MB/s. Each run rewrites (truncates) that file; pass
+`OUT=/tmp/ab.jsonl` to keep an A/B run — for example `release` vs
+`--profile release-perf` — out of the committed per-host baseline. Numbers are
+**host-specific**
 (CPU, kernel, NIC) — compare a change only against a baseline captured on
 the SAME host. Regenerate the baseline before starting a Phase 2 change,
 then re-run after and diff: any config dropping >5% MiB/s rejects the change.

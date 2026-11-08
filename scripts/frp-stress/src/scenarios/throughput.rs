@@ -104,9 +104,10 @@ pub async fn run(cli: &Cli) -> Result<()> {
     }
     let total_bytes = total.load(Ordering::Relaxed);
 
-    // MiB/s, not MB/s: the divisor is 1024^2. The JSON key stays `mbps` and the
-    // CLI flag stays `--mbps` so committed baselines, `protocol-matrix.sh`'s jq
-    // reads and the soak's caps keep working — only the printed unit is honest.
+    // MiB/s, not MB/s: the divisor is 1024^2. The JSON key stays `mbps`, the
+    // tracing field stays `mbps=` (ab-matrix.sh greps for it) and the CLI flag
+    // stays `--mbps` so committed baselines, `protocol-matrix.sh`'s jq reads and
+    // the soak's caps keep working — only the printed unit is honest.
     let mibps = (total_bytes as f64 / (1024.0 * 1024.0)) / cli.duration as f64;
     tracing::info!(
         label = %cli.label,
