@@ -38,8 +38,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=a1b507268bdee844fa40a66dd2baa9ab6cc7600393050c7f7672ca8b45b38a5a
+          guard_data_pin=1b274fb1dd8398326f5e588ef5737fbddf96a644411cff835e988b034946fd4b
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -1903,8 +1903,6 @@ jobs:
     # count derived from the file a lane checks would stay green if that file's
     # tests were removed altogether.
     env:
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
       # frps/tests/cli_exit_codes.rs — "Run frps CLI tests (config-failure exit codes)"
       # 16 → 19 with the typed exit-code classification: +3 server-side pins
       # (`unresolvable_token_source_exits_3_where_go_exits_1`,
@@ -2164,6 +2162,11 @@ jobs:
       # legitimate count from a test deleted together with its literal. This
       # independent literal is the second edit a delete-plus-lower has to move.
       FRPC_CLI_TESTS_FLOOR: "111"
+      # Test binaries are linked, never shipped, so their DWARF is pure cost.
+      # The full rationale, and how to get a backtrace back for a CI-only
+      # failure, sits with the sibling lanes below (`CARGO_PROFILE_DEV_DEBUG`).
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
     steps:
       - uses: actions/checkout@v4
       - uses: actions/cache/restore@v4
@@ -2172,8 +2175,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -3618,9 +3621,12 @@ jobs:
     env:
       # Test binaries are linked, never shipped, so their DWARF is pure cost:
       # every test lane links 50+ binaries that a cold cache has to produce.
-      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
-      # (a failing test still reports its message and assertion, just not a
-      # source line) — re-measure before widening it further.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob.
+      # What is lost is only a backtrace's source lines: a panic still prints
+      # its `file:line:col`, because that comes from compile-time `Location`
+      # metadata, not from DWARF. Locally `cargo test` keeps full debuginfo;
+      # to get the frames back for a CI-only failure, re-run the lane with
+      # `CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_TEST_DEBUG=2`.
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
@@ -3631,8 +3637,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
         run: rustup toolchain install --no-self-update
       - name: Run frp-client's tests with no features (runtime half of frp-client's tier gate)
@@ -3960,9 +3966,12 @@ jobs:
     env:
       # Test binaries are linked, never shipped, so their DWARF is pure cost:
       # every test lane links 50+ binaries that a cold cache has to produce.
-      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
-      # (a failing test still reports its message and assertion, just not a
-      # source line) — re-measure before widening it further.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob.
+      # What is lost is only a backtrace's source lines: a panic still prints
+      # its `file:line:col`, because that comes from compile-time `Location`
+      # metadata, not from DWARF. Locally `cargo test` keeps full debuginfo;
+      # to get the frames back for a CI-only failure, re-run the lane with
+      # `CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_TEST_DEBUG=2`.
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
@@ -3973,8 +3982,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -4121,9 +4130,12 @@ jobs:
     env:
       # Test binaries are linked, never shipped, so their DWARF is pure cost:
       # every test lane links 50+ binaries that a cold cache has to produce.
-      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
-      # (a failing test still reports its message and assertion, just not a
-      # source line) — re-measure before widening it further.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob.
+      # What is lost is only a backtrace's source lines: a panic still prints
+      # its `file:line:col`, because that comes from compile-time `Location`
+      # metadata, not from DWARF. Locally `cargo test` keeps full debuginfo;
+      # to get the frames back for a CI-only failure, re-run the lane with
+      # `CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_TEST_DEBUG=2`.
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
@@ -4134,8 +4146,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -4218,9 +4230,12 @@ jobs:
     env:
       # Test binaries are linked, never shipped, so their DWARF is pure cost:
       # every test lane links 50+ binaries that a cold cache has to produce.
-      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob
-      # (a failing test still reports its message and assertion, just not a
-      # source line) — re-measure before widening it further.
+      # Dropping debuginfo from the dev/test profiles is a CI wall-clock knob.
+      # What is lost is only a backtrace's source lines: a panic still prints
+      # its `file:line:col`, because that comes from compile-time `Location`
+      # metadata, not from DWARF. Locally `cargo test` keeps full debuginfo;
+      # to get the frames back for a CI-only failure, re-run the lane with
+      # `CARGO_PROFILE_DEV_DEBUG=2 CARGO_PROFILE_TEST_DEBUG=2`.
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
     steps:
@@ -4231,8 +4246,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -4319,8 +4334,8 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-nodesc-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -4665,7 +4680,7 @@ jobs:
             ~/.cargo/git/
             target/
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
@@ -4705,7 +4720,7 @@ jobs:
             ~/.cargo/registry/
             ~/.cargo/git/
           key: ${{ runner.os }}-cargo-security-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-nodesc-
       # Compiler from `rust-toolchain.toml` at the repo root (see
       # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
       # argument resolves that file's channel; the image's `stable` does not satisfy
