@@ -7,7 +7,7 @@ larger" — an unverified guess that turned out to be wrong by roughly 10x.
 **Decision:** **Keep `release-perf` opt-in.** +84.5% `frps` / +83.5% `frpc` size
 is not a marginal cost for a project whose differentiator is binary size. It is
 a throughput-first build, not a better default.
-**Head commit:** `602910a5`
+**Measured tree:** `602910a5` (branch tip; the commits after it are docs-only)
 **Toolchain:** rustc 1.98.1 `48a229cea` (2026-09-01)
 
 ## 1. Question
@@ -45,8 +45,8 @@ deleted.
 - Per-run values are reported below rather than a median, so the run-to-run
   spread is visible.
 - Rate unit: the harness computes `mbps` as bytes / 1024² / s, i.e. **MiB/s**.
-  It printed "MB/s" when these runs were taken; the label was corrected
-  afterwards (`eea1ab38`). All throughput figures below use the harness's own
+  It printed "MB/s" when these runs were taken; the label was corrected in a
+  separate change (`fix/mibps-label`). All throughput figures below use the harness's own
   unit; ratios (the actual result) are unaffected.
 
 ## 3. Size
@@ -67,7 +67,7 @@ Sizes are decimal MB (5,411,744 B = 5.16 MiB), the convention CLAUDE.md's
 | config | release #1 | release #2 | release-perf #1 | release-perf #2 |
 |---|---|---|---|---|
 | `plain` | 370.0 | 332.8 | 394.3 | 398.3 |
-| `encrypt` | 213.2 | 208.9 | 257.2 | 253.1 |
+| `encrypt` | 213.2 | 209.0 | 257.2 | 253.1 |
 | `compress` | 282.3 | 275.7 | 335.7 | 350.3 |
 | `encrypt_compress` | 272.2 | 277.2 | 335.1 | 343.6 |
 | `mux` | 296.5 | 292.6 | 296.9 | 317.1 |

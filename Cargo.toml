@@ -145,7 +145,7 @@ panic = "abort"
 # `opt-level = 3` instead of `"z"` for the hot data plane. Opt-in only:
 # measured +84.5% frps / +83.5% frpc size (5.41 -> 9.98 MB / 4.55 -> 8.35 MB,
 # decimal MB, macOS arm64, 2026-11-08) for up to ~40% more data-plane
-# throughput - +19-27% on the 1-stream encrypted/compressed rows, +40%
+# throughput on 4-stream means (pairs to +43%) - +19-27% on the 1-stream encrypted/compressed rows, +40%
 # `encrypt` / +30% `compress` means at 4 streams, and no gain on one 4-stream
 # `encrypt_compress` pair. Latency: one unrepeated pair, direction only. Size
 # is this project's differentiator, so use this only for throughput-first
