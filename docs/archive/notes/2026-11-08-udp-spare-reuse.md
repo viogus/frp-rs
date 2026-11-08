@@ -121,6 +121,25 @@ timer is gone. That residual is a different question: it is per-datagram work
 inside the session task (shard lookup, mpsc hop, one syscall pair), not a
 fixed delay, and it is the next candidate rather than an open bug.
 
+### Where the residual goes: tcpMux doubles the per-datagram CPU
+
+Measured after the fix, one flow, 512-byte datagrams, 8 s, CPU read from
+`ps -o cputime=` on both proxies before and after the load (`/tmp/udp-cpu2.sh`):
+
+| build | `transport.tcpMux` | pps | CPU s frps / frpc | µs CPU per datagram (frps / frpc) |
+|---|---|---|---|---|
+| frp-rs (this fix) | true | 3,274 | 3.1 / 3.1 | 117.6 / 118.7 |
+| frp-rs (this fix) | false | **4,400** | 2.0 / 2.0 | **57.7 / 56.0** |
+| Go v0.72.0 | true | 4,143 | 3.9 / 3.8 | 116.5 / 115.3 |
+
+Three things follow. The single-flow ceiling also recovered from 240 pps (the
+timer) to 3,274 pps. mux is the residual cost, not the session bookkeeping: it
+halves throughput and doubles per-datagram CPU while `go-go` pays the same
+~116 µs with its own yamux. And a Rust bridge *without* mux (4,400 pps,
+57 µs) already beats Go with mux, so the yamux write path — not the UDP relay
+— is where the remaining gap lives; that is a separate mux-side change and
+needs its own measurement before anyone touches it.
+
 ## 7. Reproduce
 
 ```bash
