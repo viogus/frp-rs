@@ -24,7 +24,7 @@ windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_IpHelper"
 # serde_json is only used by integration tests (frp-vnet/tests/), not by the
 # library itself — dev-only so the library build stays lean. `serde` is not
 # listed: the message types live in `frp-core` (re-exported by
-# `frp-vnet/src/msg.rs`) and the tests never name `serde` directly, only
-# `serde_json::to_string` / `from_str`.
+# `frp-vnet/src/msg.rs`) and the tests never name `serde` directly — only
+# `serde_json` (`to_string`, `from_str`, `to_vec`).
 [dev-dependencies]
 serde_json = { workspace = true }
