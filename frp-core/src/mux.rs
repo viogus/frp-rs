@@ -486,10 +486,11 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // chunk then travelled as two frames), which is what made the knob inert
     // before this. Deriving it is worth ~15% on the mux path at
     // `FRP_BRIDGE_BUF_KB=64` (measurements:
-    // `docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`). Go's
-    // hashicorp yamux splits only at the stream window (6 MiB), so any size
-    // this knob allows (4 KiB-1 MiB) is wire-legal: frames never exceed the
-    // peer's receive window because the sender takes `min(window, split)`.
+    // `docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`). Go frp's
+    // yamux fork (fatedier/yamux v0.3.0) writes `min(send_window, len(b))` per
+    // call with no small-frame constant, so any size this knob allows
+    // (4 KiB-1 MiB) is wire-legal: frames never exceed the peer's receive
+    // window because the sender takes `min(window, split)`.
     cfg.set_split_send_size(*crate::buffer_pool::BUFFER_SIZE);
     // NOTE: yamux 0.14.0 does not expose set_keepalive_interval on Config.
     // Keepalive is instead implemented via timeout-based poll loops in

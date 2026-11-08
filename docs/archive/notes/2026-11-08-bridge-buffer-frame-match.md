@@ -19,7 +19,7 @@ was named after.
 
 ## 2. Cause
 
-`frp-core/src/mux.rs:484`:
+`frp-core/src/mux.rs:493`:
 
 ```rust
 cfg.set_split_send_size(32 * 1024);
@@ -40,8 +40,10 @@ cfg.set_split_send_size(*crate::buffer_pool::BUFFER_SIZE);
 
 Safe at every value the knob accepts (4 KiB-1 MiB): the sender takes
 `min(stream window, split_send_size)`, so a frame can never exceed the peer's
-advertised window, and Go's hashicorp yamux splits only at its own window
-boundary — it has no small-frame assumption. `set_split_send_size` does no
+advertised window. Go frp's yamux fork (fatedier/yamux v0.3.0, not hashicorp —
+`go.mod`) writes `max = min(window, len(b))` per call with no small-frame
+constant, so a 1 MiB frame is legal on the wire; the only bound is the
+configured stream window (6 MiB by default). `set_split_send_size` does no
 validation of its own (`vendor/yamux/src/lib.rs:254-256`), which is why the
 knob's 4 KiB floor is what keeps a zero out.
 
