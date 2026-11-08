@@ -10,7 +10,7 @@ the SAME host. Regenerate the baseline before starting a Phase 2 change,
 then re-run after and diff: any config dropping >5% MB/s rejects the change.
 
 `mux` deserves a caveat: its rate is concurrency-shaped (0.80x `plain` at one
-stream, 0.66x at eight) and a single session plateaus near 490-520 MiB/s from
+stream, 0.66x at eight) and a single session plateaus near 485-520 MiB/s from
 four streams up — see
 `docs/archive/notes/2026-11-08-mux-throughput-scaling.md`.
 

@@ -30,7 +30,7 @@ re-derive them.
   on this host moves by up to ~1.4x between runs in the same day (§3) and 7.5x
   across the archive (§7), so only same-window ratios are meaningful.
 - Rates count **both directions**: each loopback round trip is 64 KiB written
-  plus 64 KiB echoed back (`scripts/frp-stress/src/scenarios/throughput.rs:92-93`
+  plus 64 KiB echoed back (`scripts/frp-stress/src/scenarios/throughput.rs:77-78`
   adds `PAYLOAD_SIZE * 2`), so a "486 MiB/s" cell is ~243 MiB/s of one-way
   payload.
 - CPU is `ps -o cputime` for the two frp processes at the end of each run.
@@ -50,7 +50,7 @@ Reading:
 
 - **The penalty is not a constant percentage.** It is ~20% at one stream and
   ~34% at eight, because `plain` keeps scaling with streams and `mux` does not.
-- **`mux` plateaus at ~490-520 MiB/s** between 4 and 8 streams while its CPU
+- **`mux` plateaus at ~485-520 MiB/s** between 4 and 8 streams while its CPU
   spend continues to rise (22.9 s → 27.2 s per 10 s wall). It is not
   CPU-saturated: 2.3-2.7 of 8 cores. `plain` reaches 3.0-3.8 cores and 780 MiB/s.
 - At low concurrency `mux` costs *more* CPU per byte than `plain` (10.8 vs 9.6 s
@@ -104,9 +104,9 @@ experiment was inert** and the conclusion is withdrawn:
 
 - The bridge never hands yamux 64 KiB. `copy_pooled` writes a
   `frp-core/src/buffer_pool.rs` buffer, and `BUFFER_SIZE` defaults to **32768**
-  (`frp-core/src/buffer_pool.rs:27-36`); 64 KiB is the *harness payload*, not a
+  (`frp-core/src/buffer_pool.rs:27-34`); 64 KiB is the *harness payload*, not a
   bridge chunk.
-- `cfg.set_split_send_size(32 * 1024)` (`frp-core/src/mux.rs:484`) therefore
+- `cfg.set_split_send_size(32 * 1024)` (`frp-core/src/mux.rs:486`) therefore
   already emits exactly **one** frame per 32 KiB write, and 64 KiB emits one
   frame too (`k = min(len, split_send_size)`). Both arms had identical wire
   behaviour, so the measured +0.7% was noise.
@@ -117,10 +117,10 @@ Re-run as a 2x2 over {bridge buffer 32/64 KiB} x {split 32/64 KiB} — buffer vi
 
 | arm | buffer | split | frames per 64 KiB | r1 | r2 | r3 | mean |
 |---|---|---|---|---|---|---|---|
-| A | 32 KiB | 32 KiB | — (two 32 KiB writes, 1 frame each) | 479.85 | 424.00 | 410.85 | 438.2 |
+| A | 32 KiB | 32 KiB | 2 (two 32 KiB writes) | 479.85 | 424.00 | 410.85 | 438.2 |
 | B | 64 KiB | 32 KiB | 2 | 461.33 | 418.02 | 420.01 | 433.1 |
 | C | 64 KiB | 64 KiB | 1 | 505.07 | 484.46 | 481.03 | 490.2 |
-| D | 32 KiB | 64 KiB | — (same wire as A) | 428.00 | 415.67 | 408.43 | 417.4 |
+| D | 32 KiB | 64 KiB | 2 (same wire as A) | 428.00 | 415.67 | 408.43 | 417.4 |
 
 Mean CPU-seconds per 12 s run (frps / frpc): A 13.65/14.27, B 13.27/13.58,
 C 12.36/12.61, D 13.66/14.22.
@@ -130,16 +130,17 @@ Reading:
 - **C beats B in every rep** (+9.5%, +15.9%, +14.5%; mean +13.2%) with ~7% less
   CPU. At a fixed 64 KiB chunk, one frame instead of two *is* the win — the
   original hypothesis was right, the experiment was wrong.
-- **A vs D is inert** (-4.8%, the same noise band as the withdrawn experiment),
+- **D vs A is inert** (-4.8%, the same noise band as the withdrawn experiment),
   confirming `split_send_size` does nothing below the buffer size.
 - **B vs A is flat** (-1.2%): enlarging chunks while keeping 2 frames buys
   nothing, so the gain needs both halves of the change.
 - C vs the shipped A is +11.9% at 4 streams.
 
-Not landed here: it raises the idle pool floor (128 x 64 KiB = 8 MiB vs 4 MiB,
-`frp-core/src/buffer_pool.rs:39-44`), touches the plain and encrypted paths too
-(`BUFFER_SIZE` is shared), and needs frp-rs<->Go mux interop re-checked, since it
-changes the yamux frame size on the wire. Follow-up: land as a two-knob change
+Not landed here: it raises the retained-buffer ceiling (128 x 64 KiB = 8 MiB vs
+4 MiB, `frp-core/src/buffer_pool.rs:36-48`) and costs +64 KiB per live bridge
+(unpriced); it touches the plain and encrypted paths too (`BUFFER_SIZE` is
+shared); and it needs frp-rs<->Go mux interop re-checked, since it changes the
+yamux frame size on the wire. Follow-up: land as a two-knob change
 behind the existing env defaults, then run `scripts/compat-test.sh` and
 `scripts/protocol-matrix.sh`.
 
@@ -204,5 +205,5 @@ measures the 6 bridge rows at one stream count only, so it cannot show the §2
 curve.
 
 For §5, the same bring-up with `FRP_BRIDGE_BUF_KB=64` on both frp processes and a
-`frp-core/src/mux.rs:484` rebuild at `64 * 1024` gives the C arm; `=32` / `32 *
+`frp-core/src/mux.rs:486` rebuild at `64 * 1024` gives the C arm; `=32` / `32 *
 1024` gives A.
