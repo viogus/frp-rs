@@ -6,6 +6,7 @@ pub mod longevity;
 pub mod memory;
 pub mod mixed;
 pub mod throughput;
+pub mod udp;
 
 use crate::Cli;
 use anyhow::Result;
