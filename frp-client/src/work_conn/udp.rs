@@ -149,9 +149,31 @@ pub(super) const UDP_SESSION_CAP: usize = 1024;
 /// still encoding (P1). Under a reply burst the session recv loop can outrun
 /// the writer by one packet; a miss is a scheduling race, not a lost
 /// steady-state buffer — this window reuses it instead of allocating a fresh
-/// Vec per datagram. Absent/oversized spares still fall through to the alloc
-/// after at most this delay.
+/// Vec per datagram. An absent spare still falls through to the alloc after
+/// at most this delay.
 const UDP_SPARE_RETURN_WAIT: Duration = Duration::from_millis(1);
+
+/// Take a buffer the writer handed back and refill it with `src`, growing it
+/// once if it cannot hold a full `min_cap`-sized datagram.
+///
+/// The growth is what makes the reuse real. A buffer that came from the
+/// alloc fallback (`Vec::with_capacity(udp_packet_size.max(n))`, below) or
+/// from a compressed writer hand-back can be smaller than the recv window;
+/// comparing `capacity()` against the window and dropping the buffer on a
+/// miss returned EVERY later spare to the bounded wait above — one 1 ms
+/// timer per datagram on the reply path. Measured with 512 B datagrams at
+/// the default `udpPacketSize = 1500` (`scripts/frp-stress --scenario udp`,
+/// 4 flows, Go frps to isolate the client): 914 pps before, 7,927 pps after,
+/// with `udpPacketSize = 512` already reaching 7,927 — the config-size
+/// workaround was compensating for exactly this check.
+fn reuse_spare(mut spare: Vec<u8>, src: &[u8], min_cap: usize) -> Vec<u8> {
+    if spare.capacity() < min_cap {
+        spare = Vec::with_capacity(min_cap);
+    }
+    spare.clear();
+    spare.extend_from_slice(src);
+    spare
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn run_udp_session(
@@ -188,36 +210,28 @@ async fn run_udp_session(
                         // no shard-lock acquire, no hash lookup.
                         last_active.store(now_epoch_ms(), Ordering::Relaxed);
                         // P1: reuse a buffer the writer returned (try_recv —
-                        // no spare is not an error), but only when it is big
-                        // enough for the next datagram: the writer may hand
-                        // back a small compressed buffer, and recv_from into
-                        // an undersized buffer would TRUNCATE the packet.
-                        // A too-small spare is dropped and the steady-state
-                        // buffer is copied as before.
+                        // no spare is not an error). `reuse_spare` grows an
+                        // undersized hand-back (a compressed buffer, or the
+                        // alloc fallback below) instead of rejecting it, so
+                        // the steady-state path never re-enters the bounded
+                        // wait once the writer has returned one buffer.
+                        let min_cap = udp_packet_size.max(n).max(1);
                         let payload = match ret_rx.try_recv() {
-                            Ok(mut spare) if spare.capacity() >= udp_packet_size.max(1) => {
-                                spare.clear();
-                                spare.extend_from_slice(&buf[..n]);
-                                spare
-                            }
-                            // No usable spare waiting: the writer returns a
-                            // buffer only after wire-encoding the packet that
+                            Ok(spare) => reuse_spare(spare, &buf[..n], min_cap),
+                            // No spare waiting: the writer returns a buffer
+                            // only after wire-encoding the packet that
                             // carried it, so under a reply burst this miss is
                             // a race with the writer — wait out a bounded
                             // scheduling quantum for its return before paying
-                            // a fresh per-datagram alloc. Oversized/absent
-                            // spares fall straight through.
+                            // a fresh per-datagram alloc.
                             _ => match tokio::time::timeout(UDP_SPARE_RETURN_WAIT, ret_rx.recv())
                                 .await
                             {
-                                Ok(Some(mut spare))
-                                    if spare.capacity() >= udp_packet_size.max(1) =>
-                                {
-                                    spare.clear();
-                                    spare.extend_from_slice(&buf[..n]);
-                                    spare
-                                }
-                                _ => buf[..n].to_vec(),
+                                Ok(Some(spare)) => reuse_spare(spare, &buf[..n], min_cap),
+                                // Fallback: allocate at the full window so the
+                                // buffer this datagram hands back satisfies
+                                // `reuse_spare`'s fast path from then on.
+                                _ => reuse_spare(Vec::new(), &buf[..n], min_cap),
                             },
                         };
                         if tx.send((remote, payload, ret_tx.clone())).await.is_err() {
@@ -1039,5 +1053,56 @@ pub(super) async fn run_udp_work_conn(
             let _ = cancel_tx.send(true);
             let _ = tokio::time::timeout(Duration::from_millis(100), &mut reader).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reuse_spare;
+
+    #[test]
+    fn undersized_spare_grows_to_the_window_and_is_reused() {
+        // A buffer handed back by the alloc fallback has capacity == the
+        // datagram length; gating on the recv window used to reject it, which
+        // is what sent every later datagram through the bounded wait.
+        let spare = vec![0u8; 512];
+        assert_eq!(spare.capacity(), 512);
+
+        let reused = reuse_spare(spare, &[7u8; 512], 1500);
+
+        assert_eq!(reused, vec![7u8; 512]);
+        assert!(
+            reused.capacity() >= 1500,
+            "spare must grow to the recv window, got {}",
+            reused.capacity()
+        );
+    }
+
+    #[test]
+    fn oversized_spare_keeps_its_allocation_and_drops_stale_bytes() {
+        let mut spare = Vec::with_capacity(4096);
+        spare.extend_from_slice(&[0u8; 4096]);
+        let cap = spare.capacity();
+
+        let reused = reuse_spare(spare, &[1u8, 2, 3], 1500);
+
+        assert_eq!(reused, vec![1u8, 2, 3]);
+        assert_eq!(reused.capacity(), cap, "a large spare must not reallocate");
+    }
+
+    #[test]
+    fn empty_source_yields_an_empty_buffer() {
+        let reused = reuse_spare(Vec::new(), &[], 64);
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= 64);
+    }
+
+    #[test]
+    fn jumbo_datagram_raises_the_floor_past_the_window() {
+        // `min_cap` is the window or the datagram, whichever is larger, so a
+        // datagram bigger than `udpPacketSize` is never truncated later.
+        let reused = reuse_spare(Vec::new(), &[9u8; 9000], 1500);
+        assert_eq!(reused.len(), 9000);
+        assert!(reused.capacity() >= 9000);
     }
 }
