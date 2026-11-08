@@ -351,10 +351,10 @@ The port's one terminal state, `ConnectionState::Closed`, returns
 polling a closed connection would indeed spin. There are **four** live poll
 sites under `tcp-mux`, and all four treat that as terminal:
 
-- the server acceptor (`frp-core/src/mux.rs:813` is its `select!`; terminal at
-  `:908`/`:911`) — `break` on `Some(Err(e))`/`None`, and the poll is wrapped in
+- the server acceptor (`frp-core/src/mux.rs:814` is its `select!`; terminal at
+  `:908`/`:912`) — `break` on `Some(Err(e))`/`None`, and the poll is wrapped in
   `timeout(keepalive, ..)`;
-- the client driver (`frp-core/src/mux.rs:1142`/`:1148`) — same, inside a
+- the client driver (`frp-core/src/mux.rs:1143`/`:1148`) — same, inside a
   `select!` whose other branch is a synchronous single poll (never parks);
 - the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1126`/`:1132`) — tick-bounded;
 - the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:801`/`:954`, terminal at
