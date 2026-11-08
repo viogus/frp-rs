@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=00eee1354d82e55466353d0bb87d51b1cd49fc18641a11e2a03d1588d7e62459
+          guard_data_pin=ea0e7e38a9bd13f6c6a18e79e89be26b0183c88617fd3879c9229e9c95366ddd
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -4088,7 +4088,6 @@ jobs:
             exit 1
           fi
           echo "frp-server vhost::tests guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
-          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
 
   tests-server-nofeatures:
     name: Tests (frp-server, no features)
