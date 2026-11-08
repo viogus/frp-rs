@@ -1,7 +1,10 @@
 # Throughput baselines
 
 `throughput-<hostname>.jsonl` records MB/s per bridge configuration,
-produced by `scripts/throughput-baseline.sh`. Numbers are **host-specific**
+produced by `scripts/throughput-baseline.sh`. Each run rewrites
+(truncates) that file; pass `OUT=/tmp/ab.jsonl` to keep an A/B run — for
+example `release` vs `--profile release-perf` — out of the committed
+per-host baseline. Numbers are **host-specific**
 (CPU, kernel, NIC) — compare a change only against a baseline captured on
 the SAME host. Regenerate the baseline before starting a Phase 2 change,
 then re-run after and diff: any config dropping >5% MB/s rejects the change.

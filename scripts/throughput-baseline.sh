@@ -3,7 +3,10 @@
 # frp-rs throughput baseline: sweep bridge-config matrix, record MB/s per config.
 #   plain | encrypt | compress | encrypt+compress | mux | tls
 # Usage: bash scripts/throughput-baseline.sh [duration_s] [streams]
-# Output: scripts/frp-stress/baselines/throughput-<hostname>.jsonl
+# Output: ${OUT:-scripts/frp-stress/baselines/throughput-<hostname>.jsonl}
+#   Override with OUT=/tmp/ab.jsonl to keep a run out of the committed
+#   per-host baseline — every run rewrites (truncates) its output file, so an
+#   A/B that alternates binaries must save each run or point OUT elsewhere.
 #
 # Numbers are host-specific. Regenerate before a Phase 2 change and diff after;
 # any config dropping >5% MB/s rejects the change.
@@ -23,7 +26,7 @@ FRPS_PORT=18000
 REMOTE_PORT=18001
 ECHO_PORT=18002
 TOKEN="baseline-token"
-OUT="scripts/frp-stress/baselines/throughput-$(hostname -s).jsonl"
+OUT="${OUT:-scripts/frp-stress/baselines/throughput-$(hostname -s).jsonl}"
 CA_CERT=/tmp/baseline-ca.crt
 CA_KEY=/tmp/baseline-ca.key
 CERT=/tmp/baseline-srv.crt
