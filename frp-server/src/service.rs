@@ -1521,7 +1521,7 @@ mod tests {
     /// silent in every shipped build (dashboard off) — the two directions the
     /// real-binary rows in `frps/tests/warn_delivery.rs` cover. The
     /// `dashboard`-off half runs in the default-feature `-p frp-server` lanes
-    /// (`.github/workflows/ci.yml:2376` `--features vnet --lib`, `:4145`
+    /// (`.github/workflows/ci.yml:2376` `--features vnet --lib`, `:4180`
     /// `--no-default-features --all-targets -j 1`; `ssh` is on in the first and
     /// off in the second, covering the `ssh_tunnel_gateway.bind_port` twin too)
     /// and the `dashboard`-on half in the unfiltered `:3976`

@@ -1769,7 +1769,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=a0731ef45adeb5f2ee7e19877ae05aaaf6ffc0eda7478ace3a25f1ebbf2c6dd2
+          guard_data_pin=888a83216f91da5a1aeb5d69ff2852628730121553ce2278bb1b53402fad9f76
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -4085,6 +4085,41 @@ jobs:
             exit 1
           fi
           echo "frp-server vhost::tests guard ok: $n tests listed (expected $expected, floor $expected_floor), 0 failed"
+          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
+
+  tests-server-nofeatures:
+    name: Tests (frp-server, no features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Split out of `Tests (server integration)` on measurement. On run
+    # 42512057158 that job was 21m19s: 11m49s of dashboard+integration tests
+    # and 6m38s of this step — a fresh compile of the no-features graph plus
+    # its suite, because the restored cache holds the default-feature build.
+    # Serialised, the two put the lane on the workflow's critical path; in
+    # parallel the floor becomes `Tests (client integration)` (~15.5m) and the
+    # same work is asserted, unchanged.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      # Compiler from `rust-toolchain.toml` at the repo root (see
+      # `docs/developing.md` § Toolchain pinning). `rustup toolchain install` with no
+      # argument resolves that file's channel; the image's `stable` does not satisfy
+      # a version pin, so this installs a second copy — the cost of the pin.
+      - name: Install pinned Rust toolchain (`rust-toolchain.toml`)
+        run: rustup toolchain install --no-self-update
+      # Same two builds as the lane this step came from, so the binaries the
+      # suite spawns are identical.
+      - name: Build frpc (server integration tests spawn it as the bridge end)
+        run: cargo build --bin frpc
+      - name: Build frps with dashboard feature
+        run: cargo build --bin frps --features dashboard
       - name: Run frp-server's tests with no features (runtime half of frp-server's tier gate)
         # The `verify` lane's `cargo check -p frp-server --no-default-features
         # --all-targets` is compile-only, so it cannot see a missing #[cfg] on a
@@ -4146,7 +4181,6 @@ jobs:
         run: cargo test -p frp-server --no-default-features --all-targets -j 1 --no-fail-fast
         env:
           FRPS_BIN: ${{ github.workspace }}/target/debug/frps
-          FRPC_BIN: ${{ github.workspace }}/target/debug/frpc
 
   tests-client:
     name: Tests (client integration)
