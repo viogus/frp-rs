@@ -44,9 +44,10 @@ deleted.
   pair (`steady`, `setup_cold`, `setup_warm`).
 - Per-run values are reported below rather than a median, so the run-to-run
   spread is visible.
-- Rate unit: the harness computes `mbps` as bytes / 1024² / s, i.e. **MiB/s**,
-  although this repo labels it MB/s. All throughput figures below use the
-  harness's own unit; ratios (the actual result) are unaffected.
+- Rate unit: the harness computes `mbps` as bytes / 1024² / s, i.e. **MiB/s**.
+  It printed "MB/s" when these runs were taken; the label was corrected
+  afterwards (`eea1ab38`). All throughput figures below use the harness's own
+  unit; ratios (the actual result) are unaffected.
 
 ## 3. Size
 
@@ -61,7 +62,7 @@ Sizes are decimal MB (5,411,744 B = 5.16 MiB), the convention CLAUDE.md's
 "~5.3 MB" figure uses. `opt-level = 2` is +71.1% / +72.6% — 9.26 MB, only
 0.72 MB (7%) below `-O3`, so it is not a cheaper middle ground.
 
-## 4. Throughput — 1 stream x 10 s (MB/s)
+## 4. Throughput — 1 stream x 10 s (MiB/s)
 
 | config | release #1 | release #2 | release-perf #1 | release-perf #2 |
 |---|---|---|---|---|
@@ -72,7 +73,7 @@ Sizes are decimal MB (5,411,744 B = 5.16 MiB), the convention CLAUDE.md's
 | `mux` | 296.5 | 292.6 | 296.9 | 317.1 |
 | `tls` | 373.3 | 370.6 | 395.4 | 374.0 |
 
-## 5. Throughput — 4 streams x 20 s (MB/s)
+## 5. Throughput — 4 streams x 20 s (MiB/s)
 
 | config | release #1 | release #2 | release-perf #1 | release-perf #2 |
 |---|---|---|---|---|
