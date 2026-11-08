@@ -44,8 +44,8 @@ pub use stream::{Packet, State, Stream};
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 /// Capacity of the connection-scoped send-side body-buffer pool (frp-rs
-/// patch). At most one `Vec` per in-flight data frame is retained; with the
-/// 16 KiB split-send default that bounds the pool at ~256 KiB per connection.
+/// patch). At most one `Vec` per in-flight data frame is retained: ~512 KiB
+/// per connection at frp-rs' 32 KiB default split, ~1 MiB at its 64 KiB cap.
 /// The pool is a cache only — a full pool just allocates fresh.
 const BODY_POOL_CAP: usize = 16;
 

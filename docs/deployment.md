@@ -1127,6 +1127,18 @@ For memory-constrained or high-fan-out servers, the per-connection bridge buffer
 defaults to 32 KiB (matching Go frp) and can be tuned via the `FRP_BRIDGE_BUF_KB`
 environment variable (range 4–1024).
 
+That knob now also sizes the tcpMux data frame, so a full bridge chunk travels
+as one yamux frame in the steady state — except that the split is capped at
+64 KiB, the largest frame the WebSocket transport accepts (an oversized frame
+is rejected by the peer and kills the whole mux session, not just one bridge).
+On loopback, 64 KiB measured ~15% more strict ping-pong throughput on tcpMux
+(~3% on plain TCP) and ~10% less CPU per byte, for one extra 32 KiB per
+direction per live bridge plus the yamux body pool (up to 16 frames at the new
+size) (`FRP_BRIDGE_BUF_KB=64`).
+The default stays at 32 KiB because that cost is per connection and unmeasured
+at high fan-out:
+[`docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`](archive/notes/2026-11-08-bridge-buffer-frame-match.md).
+
 **Heartbeat intervals:**
 
 ```toml

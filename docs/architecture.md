@@ -414,8 +414,8 @@ round trip.
 `StartWorkConn` with proxy metadata (encryption flag, compression flag), the
 server writes any pre-read bytes (from HTTP VHost parsing) and then bridges the
 user connection to the work connection using either
-`tokio::io::copy_bidirectional_with_sizes` with the 32 KiB `BUFFER_SIZE` (plain,
-overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
+`tokio::io::copy_bidirectional_with_sizes` with the 32 KiB default
+`BUFFER_SIZE` (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
 + Snappy, streaming — a single random 16-byte IV followed by continuous
 ciphertext, no per-frame length prefix). The client-side plain relay mirrors this
 (`relay_plain_fast` with `splice(2)` on Linux, `copy_bidirectional_with_sizes`
@@ -664,10 +664,18 @@ changes.
 - **Bridge buffer size**: `frp_core::buffer_pool::BUFFER_SIZE` defaults to
   **32 KiB** (matching Go frp's `io.Copy`; it was 64 KiB — halved for
   per-connection footprint). Override with `FRP_BRIDGE_BUF_KB` (4–1024). The plain
-  bridge copies with `copy_bidirectional_with_sizes(a, b, *BUFFER_SIZE,
-  *BUFFER_SIZE)`, so `BUFFER_SIZE` applies to the plain path too; the
+  bridge copies through `relay_plain_pooled` (which loops on `copy_pooled`),
+  so `BUFFER_SIZE` applies to the plain path too; the
   encrypted/compressed path uses the `PoolGuard` buffer pool (also
-  `BUFFER_SIZE`).
+  `BUFFER_SIZE`). The value also sizes the yamux data frame
+  (`mux.rs` sets `split_send_size` from it), so in the steady state one full
+  bridge chunk is one frame; the split is capped at 64 KiB because a larger
+  frame cannot cross the WebSocket transport, and a rejected frame kills the
+  whole mux session. Raising the buffer to 64 KiB is worth ~15% on tcpMux and
+  ~3% plain, at one extra 32 KiB per direction per bridge plus the yamux body
+  pool (up to 16 frames at the new size) (measurements and the reason the default
+  stays at Go parity:
+  [`docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`](archive/notes/2026-11-08-bridge-buffer-frame-match.md)).
 
 ### Transport status
 

@@ -1,8 +1,8 @@
 //! Simple buffer pool to reduce per-connection allocation pressure.
 //!
-//! The bridge module allocates 32KB read buffers per direction per bridge
-//! call. Under high proxy connection churn, this creates sustained allocator
-//! pressure. This pool recycles those buffers.
+//! The bridge module allocates bridge-sized read buffers per direction per
+//! bridge call. Under high proxy connection churn, this creates sustained
+//! allocator pressure. This pool recycles those buffers.
 //!
 //! Thread-safe (crossbeam lock-free `ArrayQueue` — the bridge acquires one
 //! guard per connection (reused across all chunks of that bridge), and
@@ -16,13 +16,34 @@ use std::sync::LazyLock;
 
 /// Pooled buffer size in bytes.
 ///
-/// Default: 32 KiB (32768), matching Go frp's `io.Copy` buffer size.
+/// Default: 32 KiB (32768), matching Go frp's `io.Copy` buffer and keeping the
+/// per-bridge footprint at two 32 KiB buffers. This size is **also** the yamux
+/// data-frame payload: `mux.rs` derives `split_send_size` from it, so in the
+/// steady state one full bridge chunk travels as one frame — no second
+/// 12-byte frame header, no second window-credit round trip, no second waker
+/// hand-off per chunk. (Short chunks, a partly consumed send window, and the
+/// encrypted path's separate IV write can still produce a second frame.) The
+/// derived split is capped at 64 KiB, the largest frame the WebSocket
+/// transport accepts.
+///
+/// Raising this to 64 KiB is the one tuning knob with a measured data-plane
+/// win: on the mux path it is worth ~15% strictly ping-pong and ~10% less CPU
+/// per byte, and ~3% on plain TCP (measurements:
+/// `docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`). The gain is
+/// the frame/payload match, not the buffer size on its own — a 64 KiB buffer
+/// against a fixed 32 KiB frame split is level with the default. The price is per-bridge
+/// memory: the plain and encrypted paths each hold one buffer per direction,
+/// so the default costs 2x32 KiB per bridge and 64 KiB per bridge costs
+/// 2x64 KiB. The default therefore stays at Go parity; operators who want the
+/// mux win set `FRP_BRIDGE_BUF_KB=64`, which is why the split has to follow
+/// this value (a hardcoded 32 KiB split made the knob do nothing).
+///
 /// Override via env `FRP_BRIDGE_BUF_KB` (valid range: 4–1024 KB,
 /// i.e. 4 KiB – 1 MiB). Read once at process start via `LazyLock`.
 ///
 /// This buffer size is used by the encrypted/compressed bridge data
 /// path (`bridge.rs`), the V2 frame read path (`protocol.rs`), and —
-/// via `copy_bidirectional_with_sizes` — the plain (unencrypted)
+/// via `copy_pooled`/`relay_plain_pooled` — the plain (unencrypted)
 /// bridge path, so `FRP_BRIDGE_BUF_KB` applies uniformly.
 pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_BUF_KB")
@@ -37,7 +58,9 @@ pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
 ///
 /// Default 128 (4 MiB of 32 KiB buffers); override via `FRP_BRIDGE_POOL_MAX`
 /// (capped at 4096). 32 was too small under high connection churn — excess
-/// buffers were dropped and re-allocated.
+/// buffers were dropped and re-allocated. The retained bytes therefore scale
+/// with `FRP_BRIDGE_BUF_KB`: the default ceiling is 4 MiB, and a 1 MiB buffer
+/// size reaches 128 MiB at the same buffer count.
 static MAX_POOLED_BUFFERS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_POOL_MAX")
         .ok()
@@ -115,7 +138,7 @@ impl PoolGuard {
         // Only stretch a freshly allocated (len 0) buffer up to BUFFER_SIZE.
         // Recycled buffers already have length BUFFER_SIZE. We use an
         // uninitialized `set_len` instead of `resize(.., 0)` so the pool-miss
-        // path skips a 32 KiB memset: `read()` immediately overwrites the
+        // path skips a pool-sized memset: `read()` immediately overwrites the
         // whole slice and callers only observe the `[..n]` prefix, so stale
         // bytes are never read (same argument as the V2 UDP read path's
         // `set_len` in `protocol.rs::read_msg_v2_with_udp_codec`). The

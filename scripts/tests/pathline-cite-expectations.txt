@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=608 weak=136 ambiguous=2 excluded=101 foreign_reported=1154 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=d72b4a2909292918 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=610 weak=135 ambiguous=2 excluded=101 foreign_reported=1155 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=bd13755319506797 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2376	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2376	1524
@@ -156,7 +156,7 @@ frp-core/src/bridge.rs	67	-	0d7fed4728ed765b	-	absolute	frp-core/benches/crypto_
 frp-core/src/bridge.rs	76	80	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-core/benches/crypto_bridge.rs	:76-80	55
 frp-core/src/bridge.rs	86	-	cc814c422d3534ae	-	continuation	frp-core/benches/crypto_bridge.rs	86	55
 frp-core/src/bridge.rs	95	99	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-core/benches/crypto_bridge.rs	:95-99	56
-frp-core/src/buffer_pool.rs	54	-	46c29247ea6ef70e	-	absolute	docs/developing.md	frp-core/src/buffer_pool.rs:54	1161
+frp-core/src/buffer_pool.rs	54	-	d74f11653a161834	-	absolute	docs/developing.md	frp-core/src/buffer_pool.rs:54	1161
 frp-core/src/cli.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:1223	2460
 frp-core/src/cli.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli.rs:3157	266
 frp-core/src/cli.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli.rs:5090-5097	705
@@ -336,13 +336,14 @@ frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_complet
 frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:443	832
 frp-core/src/logging.rs	467	-	e46b9fc201aa016b	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:467	833
 frp-core/src/msg.rs	694	699	2d3748ed9d43c0a1	981b6bd3b6da21de	absolute	frp-core/tests/protocol_round14.rs	frp-core/src/msg.rs:694-699	198
-frp-core/src/mux.rs	1119	-	e6e173e9879e8709	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:1119	357
-frp-core/src/mux.rs	1124	-	00fd77d6b376df8a	-	shorthand	vendor/yamux/README-FRP-RS.md	:1124	357
-frp-core/src/mux.rs	776	-	0f68b8c7fd8369f9	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:776	354
-frp-core/src/mux.rs	870	-	e6e173e9879e8709	-	shorthand	vendor/yamux/README-FRP-RS.md	:870	355
-frp-core/src/mux.rs	874	-	00fd77d6b376df8a	-	shorthand	vendor/yamux/README-FRP-RS.md	:874	355
+frp-core/src/mux.rs	1143	-	87e4157a9854f066	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:1143	357
+frp-core/src/mux.rs	1148	-	7c87f29371148fd1	-	shorthand	vendor/yamux/README-FRP-RS.md	:1148	357
+frp-core/src/mux.rs	814	-	0f68b8c7fd8369f9	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:814	354
+frp-core/src/mux.rs	908	-	e6e173e9879e8709	-	shorthand	vendor/yamux/README-FRP-RS.md	:908	355
+frp-core/src/mux.rs	912	-	00fd77d6b376df8a	-	shorthand	vendor/yamux/README-FRP-RS.md	:912	355
 frp-core/src/transport/mod.rs	2267	-	019e0dbb9b972bfb	-	absolute	frp-core/src/transport/mod.rs	transport/mod.rs:2267	3354
-frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2452
+frp-core/src/transport/websocket.rs	27	-	335ce8b465db301e	-	absolute	frp-core/src/mux.rs	frp-core/src/transport/websocket.rs:27	431
+frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2437
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	frp-core/src/config/tests.rs	frp-core/src/unsafe_features.rs:10	13139
 frp-core/src/xtcp_p2p.rs	1126	-	0cd02529945984d1	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/xtcp_p2p.rs:1126	359
 frp-core/src/xtcp_p2p.rs	1132	-	84029c34a2cc41f1	-	shorthand	vendor/yamux/README-FRP-RS.md	:1132	359
@@ -479,14 +480,14 @@ frp-server/src/ssh_gateway/args.rs	335	469	47052f2fbf3be8c7	358ba3f2223784d8	abs
 frp-server/src/ssh_gateway/args.rs	373	-	5a0b431903afdf69	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:373	248
 frp-server/src/ssh_gateway/args.rs	692	-	4b95694ba039dbe2	-	absolute	frp-core/src/cli.rs	frp-server/src/ssh_gateway/args.rs:692	4770
 frp-server/src/ssh_gateway/args.rs	711	-	456f77076adffbd3	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:711	238
-frp-server/src/state.rs	312	-	3d951b591cc4db05	-	absolute	docs/architecture.md	frp-server/src/state.rs:312	871
+frp-server/src/state.rs	312	-	3d951b591cc4db05	-	absolute	docs/architecture.md	frp-server/src/state.rs:312	879
 frp-server/src/state.rs	344	-	e92677c5aa9585e3	-	absolute	docs/developing.md	frp-server/src/state.rs:344	408
 frp-server/src/state.rs	599	-	90c207d777b9c9d7	-	absolute	frp-client/src/service/session.rs	state.rs:599	87
 frp-server/src/tcpmux.rs	34	-	ddf64e37a6476ed7	-	absolute	docs/developing.md	frp-server/src/tcpmux.rs:34	340
 frp-server/src/tcpmux.rs	34	-	ddf64e37a6476ed7	-	absolute	docs/developing.md	frp-server/src/tcpmux.rs:34	425
-frp-server/src/tcpmux.rs	665	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:665	858
-frp-server/src/tcpmux.rs	680	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:680	858
-frp-server/src/tcpmux.rs	714	-	eeda7a21f4350fd6	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:714	878
+frp-server/src/tcpmux.rs	665	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:665	866
+frp-server/src/tcpmux.rs	680	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:680	866
+frp-server/src/tcpmux.rs	714	-	eeda7a21f4350fd6	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:714	886
 frp-server/src/vhost.rs	128	-	752b2da5acdbe137	-	absolute	docs/config.md	frp-server/src/vhost.rs:128	37
 frp-server/src/vhost.rs	128	-	752b2da5acdbe137	-	absolute	frp-core/src/cli.rs	frp-server/src/vhost.rs:128	598
 frp-server/src/vhost.rs	184	-	0002a5e2948a13c7	-	shorthand	docs/config.md	:184	37
@@ -495,12 +496,12 @@ frp-server/src/vhost.rs	204	214	fe64fdd023dd4187	69e9dba33d2ed8ae	absolute	frp-s
 frp-server/src/vhost.rs	28	-	671ed1b494803e29	-	absolute	docs/developing.md	frp-server/src/vhost.rs:28	4047
 frp-server/src/vhost.rs	353	-	8334d6b28e600491	-	absolute	frp-server/src/vhost_h2c.rs	vhost.rs:353	164
 frp-server/src/vhost.rs	368	-	e3c89ee2c87fb1d3	-	shorthand	frp-server/src/vhost_h2c.rs	:368	164
-frp-server/src/vhost.rs	709	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:709	852
+frp-server/src/vhost.rs	709	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:709	860
 frp-server/src/vhost.rs	721	727	06314547b2cc0d82	2e51f44992222aad	absolute	frp-server/src/vhost_h2c.rs	vhost.rs:721-727	387
-frp-server/src/vhost.rs	723	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:723	853
-frp-server/src/vhost.rs	765	-	3f73f969262b4297	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:765	876
-frp-server/src/vhost/https.rs	157	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost/https.rs:157	857
-frp-server/src/vhost/https.rs	171	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:171	857
+frp-server/src/vhost.rs	723	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:723	861
+frp-server/src/vhost.rs	765	-	3f73f969262b4297	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:765	884
+frp-server/src/vhost/https.rs	157	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost/https.rs:157	865
+frp-server/src/vhost/https.rs	171	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:171	865
 frp-server/src/vhost/https.rs	25	-	11314c6e379da4e8	-	absolute	frp-server/tests/vhost_https_sni.rs	frp-server/src/vhost/https.rs:25	14
 frp-server/src/vhost/https.rs	268	-	681cccdd32848bbf	-	absolute	frp-server/src/service.rs	frp-server/src/vhost/https.rs:268	65
 frp-server/src/vhost/https.rs	268	-	681cccdd32848bbf	-	absolute	frp-server/tests/vhost_https_sni.rs	frp-server/src/vhost/https.rs:268	15
@@ -509,8 +510,8 @@ frp-server/src/vhost/https.rs	68	-	942981dd3bae1997	-	absolute	frp-server/src/vh
 frp-server/src/vhost/router.rs	262	-	251d634ce68ced5e	-	absolute	docs/developing.md	frp-server/src/vhost/router.rs:262	339
 frp-server/src/vhost/router.rs	262	-	251d634ce68ced5e	-	absolute	docs/developing.md	frp-server/src/vhost/router.rs:262	432
 frp-server/src/vhost/tests.rs	252	-	4e534f384740e0d0	-	absolute	frp-core/src/cli.rs	frp-server/src/vhost/tests.rs:252	596
-frp-server/src/vhost_h2c.rs	363	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost_h2c.rs:363	859
-frp-server/src/vhost_h2c.rs	393	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:393	859
+frp-server/src/vhost_h2c.rs	363	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost_h2c.rs:363	867
+frp-server/src/vhost_h2c.rs	393	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:393	867
 frp-server/tests/common/mod.rs	135	-	bb2ec6dfccd8bb19	-	shorthand	docs/developing.md	:135	619
 frp-server/tests/common/mod.rs	22	-	575a0ae30262fd7e	-	absolute	docs/developing.md	frp-server/tests/common/mod.rs:22	619
 frp-server/tests/common/mod.rs	394	-	7f05826a6d63e68e	-	shorthand	docs/developing.md	:394	621
@@ -627,4 +628,5 @@ vendor/yamux/src/connection.rs	162	-	01846589e610cd4d	-	shorthand	vendor/yamux/R
 vendor/yamux/src/connection.rs	219	-	fe141fed83051941	-	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/connection.rs:219	349
 vendor/yamux/src/connection.rs	468	500	2092f8f4694cd2d1	e3b0c44298fc1c14	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/connection.rs:468-500	368
 vendor/yamux/src/connection.rs	613	-	a298fbfa5961f940	-	shorthand	vendor/yamux/README-FRP-RS.md	:613	370
+vendor/yamux/src/connection/stream.rs	408	409	8847dffa3adf3289	7bc51246578e3270	absolute	frp-core/src/mux.rs	vendor/yamux/src/connection/stream.rs:408-409	505
 vendor/yamux/src/lib.rs	100	116	a6121a1bfd7e24d6	d10b36aa74a59bcf	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/lib.rs:100-116	372

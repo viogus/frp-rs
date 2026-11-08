@@ -738,10 +738,11 @@ pub async fn read_msg_v2_with_udp_codec<R: AsyncReadExt + Unpin>(
         // untouched and the steady-state read path is zero-alloc (round-7
         // audit M2 follow-up: the unconditional refill drained one pool
         // buffer per packet — the pool was exhausted after 128 packets and
-        // every packet cost a fresh 32 KiB malloc + free). Large datagrams
-        // (≥ BUFFER_SIZE): the decoder moved the buffer into the packet's
-        // content Vec (a plain Vec, freed to the allocator on drop — it
-        // never returns to the pool), so refill from the pool here.
+        // every packet cost a fresh pool-sized malloc + free). Large datagrams
+        // (≥ `udp_binary::TAKE_PAYLOAD_THRESHOLD`): the decoder moved the
+        // buffer into the packet's content Vec (a plain Vec, freed to the
+        // allocator on drop — it never returns to the pool), so refill from
+        // the pool here.
         if scratch.is_empty() {
             *scratch = crate::buffer_pool::BUFFER_POOL.acquire();
         }
@@ -805,7 +806,7 @@ pub async fn read_msg_v2_udp_binary_socket<R: AsyncReadExt + Unpin>(
                 |e| crate::Error::Protocol(format!("decode binary UDP packet: {e}").into()),
             )? {
                 Some(packet) => {
-                    // Large datagram (≥ BUFFER_SIZE): the decoder moved the
+                    // Large datagram (≥ TAKE_PAYLOAD_THRESHOLD): the decoder moved the
                     // buffer into the packet's content Vec (same ownership
                     // semantics as the message-form decoder, round-7 M2) —
                     // refill from the pool for the next read.

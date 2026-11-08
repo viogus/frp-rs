@@ -48,9 +48,9 @@ pub(crate) struct Io<T> {
     /// dropped (best-effort pool — a pool must not grow its stored buffers
     /// arbitrarily large, or reuse would pin oversized allocations). Using
     /// the CONFIG value (not `DEFAULT_SPLIT_SEND_SIZE`) matters: frp-rs sets
-    /// `split_send_size = 32KiB`, so bodies of that size must qualify for
-    /// reuse — the DEFAULT (16KiB) gate silently disabled the send pool,
-    /// leaving one fresh `Vec` alloc + zeroing per 32KiB chunk.
+    /// `split_send_size` to its bridge buffer (32KiB default, 64KiB cap), so
+    /// bodies of that size must qualify for reuse — the DEFAULT (16KiB) gate
+    /// silently disabled the send pool, leaving one fresh `Vec` per chunk.
     split_send_size: usize,
 }
 
