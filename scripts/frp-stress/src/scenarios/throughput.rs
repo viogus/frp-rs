@@ -104,15 +104,19 @@ pub async fn run(cli: &Cli) -> Result<()> {
     }
     let total_bytes = total.load(Ordering::Relaxed);
 
-    let mbps = (total_bytes as f64 / (1024.0 * 1024.0)) / cli.duration as f64;
+    // MiB/s, not MB/s: the divisor is 1024^2. The JSON key stays `mbps`, the
+    // tracing field stays `mbps=` (ab-matrix.sh greps for it) and the CLI flag
+    // stays `--mbps` so committed baselines, `protocol-matrix.sh`'s jq reads and
+    // the soak's caps keep working — only the printed unit is honest.
+    let mibps = (total_bytes as f64 / (1024.0 * 1024.0)) / cli.duration as f64;
     tracing::info!(
         label = %cli.label,
         total_bytes = %total_bytes,
-        mbps = %mbps,
-        "Throughput [{}]: {} total bytes, {:.2} MB/s",
+        mbps = %mibps,
+        "Throughput [{}]: {} total bytes, {:.2} MiB/s",
         cli.label,
         total_bytes,
-        mbps
+        mibps
     );
 
     // Record the row (including 0-byte failures) before any bail, so callers
@@ -125,7 +129,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
             "mbps_cap_per_stream": cli.mbps,
             "total_bytes": total_bytes,
             "failed_streams": failed_streams,
-            "mbps": mbps,
+            "mbps": mibps,
         });
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true);
@@ -158,8 +162,8 @@ pub async fn run(cli: &Cli) -> Result<()> {
         );
     }
 
-    if !cli.no_floor && mbps < 1.0 {
-        anyhow::bail!("Throughput too low: {:.2} MB/s (minimum 1.0 MB/s)", mbps);
+    if !cli.no_floor && mibps < 1.0 {
+        anyhow::bail!("Throughput too low: {:.2} MiB/s (minimum 1.0 MiB/s)", mibps);
     }
     Ok(())
 }

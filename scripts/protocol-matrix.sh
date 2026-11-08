@@ -290,7 +290,7 @@ run_row() {
     done
     if [[ "$ok" == "pass" ]]; then
         PASS=$((PASS + 1))
-        log "PASS $name: $mbps MB/s"
+        log "PASS $name: $mbps MiB/s"
     else
         kill_row_processes
         fail_row "$name" "zero throughput (mbps=$mbps)"
