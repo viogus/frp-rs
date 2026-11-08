@@ -6,8 +6,8 @@
 ## 1. Symptom
 
 A strict ping-pong UDP load through frps + frpc (`scripts/frp-stress --scenario
-udp`, 4 flows, 1 KiB datagrams) measured **919 pps** for the Rust client where the
-Go client on the identical server and config measured **10,126 pps**. The server
+udp`, 4 flows) measured **919 pps** at 1 KiB datagrams for the Rust client where
+the Go client on the identical server and config measured **10,126 pps**. The server
 side was not the problem, and neither was the transport — a mixed-binary matrix
 at 512 B / 4 flows isolated it to one process:
 
@@ -70,12 +70,21 @@ value that made an internal check pass.
 
 ## 4. Fix
 
-`reuse_spare(spare, src, min_cap)` grows an undersized hand-back once
-(`Vec::with_capacity(min_cap)`, `min_cap = udp_packet_size.max(n)`) instead of
-rejecting it, and the alloc fallback now also allocates at the full window, so
-the buffer it hands back satisfies the fast path from the second datagram on.
-The bounded wait stays, now only reachable when the writer genuinely has not
-returned a buffer yet.
+`next_payload(spare: Option<Vec<u8>>, src: &[u8], window)` is now the whole
+decision: it accepts any hand-back whose capacity covers `window`
+(`udp_packet_size`, clamped to >= 1) and otherwise replaces it with one
+`Vec::with_capacity(window)`, then copies `src` in. Nothing is ever *rejected*,
+and the alloc fallback goes through the same function, so the buffer it hands
+back is usable by the next datagram. The bounded wait stays, now reachable only
+when the writer genuinely has not returned a buffer yet.
+
+Two notes on the shape. The helper is synchronous and takes `Option<Vec<u8>>`
+rather than being called three ways at the call site, so a test can drive the
+fallback's output back in as the next spare — that is what pins the defect, and
+it fails if a capacity gate is ever re-added at the call site. `window` is not
+`spare`-dependent: the recv buffer (`buf`) is `udp_packet_size` long and is the
+only recv target, so the payload buffer never has to be larger than the window
+for correctness.
 
 ## 5. Result
 
@@ -91,6 +100,13 @@ Go frps (isolates the client), 4 flows, 6 s:
 | 512 B, 8 flows | — | **8,784** |
 
 With a Rust frps as well: 6,941 pps at 512 B — the server side costs ~12% on top.
+
+Load sensitivity matters for reading these: the pre-fix path is **timer-bound**, so
+its rate barely moves with host load, while the fixed path is **CPU-bound** and
+moves with it. Interleaved old/new on a host at load average 5-17 gave
+914 / 923 / 930 for the old build against 3,732 / 6,831 / 7,629 for the fixed one
+in the same window — the 7.9k figure is a quiet-host sample, and comparisons must
+be same-window.
 
 ## 6. What is left
 
