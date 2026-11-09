@@ -1,0 +1,43 @@
+# Throughput floors for `scripts/protocol-matrix.sh --floors`.
+#
+# Each line pins one matrix row to either an absolute MiB/s number (`row=42`)
+# or — preferred — a fraction of the same run's `tcp-plain` rate
+# (`row=ratio:0.06`). Every row is measured back-to-back on one machine with
+# the same 5 s / 1-stream window, so the ratio between two transports survives
+# the host-to-host capacity differences that make an absolute number fragile
+# on a shared CI runner.
+#
+# What this gate is for: a row that still bridges bytes but at a fraction of
+# its previous rate. That is not hypothetical — KCP spent its whole life at
+# 20.7 MiB/s (63 MiB/s after the FEC multiply tables landed in #596) while this
+# matrix ran green in CI, because a row only had to be above zero.
+#
+# How the numbers were chosen (macOS arm64 M2, 2026-11-09, commit 7240e159),
+# one full matrix run on an idle machine — MiB/s, and the ratio to tcp-plain:
+#   tcp-plain 527.1 (1.000) · tcp-tls 364.2 (0.691) · tcp-tls-mux 285.5 (0.542)
+#   ws-plain 297.9 (0.565) · ws-tls 220.7 (0.419) · ws-tls-mux 180.4 (0.342)
+#   wss 221.0 (0.419) · kcp-plain 65.5 (0.124) · kcp-tls 66.4 (0.126)
+#   kcp-tls-mux 54.5 (0.103) · quic 86.3 (0.164)
+# Each ratio floor sits roughly 2.5x below the measured ratio (KCP: 0.124 →
+# 0.05), which leaves room for a slower runner while still reddening the ~3x
+# KCP regression that motivated the gate: before #596 the matrix measured
+# kcp-plain at 22.25 MiB/s against tcp-plain 526.9, a ratio of 0.042, and the
+# ping-pong harness that isolated the cause measured the same binary at
+# 20.7 MiB/s, a ratio of 0.039. Both are below the 0.045 floor.
+#
+# Re-tuning: the CI job uploads `protocol-matrix-rates.json`; take the new rate
+# from it and keep the same ~2.5x headroom. A floor that starts firing on a
+# healthy run is a floor that is too high, not a machine that is too slow — the
+# row's own `mbps > 0` check still guards connectivity, this file only guards
+# rate.
+tcp-plain=60
+tcp-tls=ratio:0.25
+tcp-tls-mux=ratio:0.25
+ws-plain=ratio:0.20
+ws-tls=ratio:0.15
+ws-tls-mux=ratio:0.12
+wss=ratio:0.15
+kcp-plain=ratio:0.05
+kcp-tls=ratio:0.05
+kcp-tls-mux=ratio:0.045
+quic=ratio:0.05

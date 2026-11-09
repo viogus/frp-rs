@@ -88,8 +88,12 @@ Packet count is not the limiter.
 No harness ships for this shape, so the numbers came from a throwaway
 ping-pong client: N threads, each sending 64 KiB and reading the 64 KiB echo
 through the proxy port for D seconds. `frp-stress`'s `throughput` scenario is
-not usable over KCP here — every run failed with `early eof` while the same
-64 KiB exchange succeeds over a plain socket through the same tunnel, so the
+not usable over KCP *with the throwaway configs below* — every run failed with
+`early eof` while the same 64 KiB exchange succeeds over a plain socket through
+the same tunnel. (Correction, 2026-11-09 evening: `scripts/protocol-matrix.sh`
+measures the same scenario over KCP without trouble at 65 MiB/s, so the failure
+is a property of this note's hand-written configs, not of the scenario. The
+matrix's config is the one to copy.) So the
 scenario's own handshake is the suspect, not the KCP data path.
 
 ## Limits

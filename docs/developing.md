@@ -1457,7 +1457,7 @@ single easiest mistake to make in this repository.
 | Gate | What it establishes |
 |---|---|
 | `scripts/compat-test.sh` — 86 scenarios + 17 XTCP pairwise, vs Go frp v0.72.0 | Wire and behavioural parity with the reference implementation |
-| `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination |
+| `scripts/protocol-matrix.sh` — 11 transport rows | Data actually moves through frps+frpc for every transport / encryption / mux combination, and each row stays above its throughput floor |
 | Daily `xtcp-compat.yml` on a VPS | XTCP hole punching against Go frpc across a real NAT |
 
 Every count in that table is re-measured from the scripts by `bash

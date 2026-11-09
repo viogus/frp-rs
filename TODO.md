@@ -12856,3 +12856,40 @@ other.
   **Done-when:** the XTCP planes enforce the same deadline (wrap their transport in `ActivityIo` and close through their own driver's shutdown path, with `TcpMuxConfig::write_deadline` or an explicit value), pinned by a test that stalls the XTCP transport's writes and asserts the session is torn down inside the deadline rather than parked.
 
   **Done (2026-11-07).** Both planes now wrap their transport in the same `ActivityIo`/`WriteStall` the control/data mux uses — `frp-core/src/xtcp_p2p.rs` (P2P stream before `.compat()`) and `frp-core/src/xtcp_session.rs` (`ReadActivity`-wrapped KCP stream) — and each driver's `select!` gained a `biased` arm on the force-close channel that `write_stall_watchdog` fires at the deadline (10 s by default, `crate::mux::DEFAULT_WRITE_DEADLINE`; the tunnel driver takes it as a parameter so tests can shorten it). The watchdog and the `wait_force_close` semantics are the ones already pinned by the mux tests; the new `a_stalled_tunnel_transport_tears_the_session_down` pins the **wiring** — marked stall + 200 ms deadline ⇒ `session.is_alive()` flips false inside 2 s, red at the 2 s bound with the select arm removed.
+
+## P2 — structural (throughput-floor follow-ups)
+
+Filed by the protocol-matrix throughput-floor change (`scripts/protocol-matrix.floors`);
+kept out of the main P2 list so that adding them does not renumber every later
+`TODO.md:<n>` cite (see the item below).
+
+- [ ] **`apply_floors` has no fixture, and the CI wiring is unpinned.**
+  Evidence: the throughput-floor gate added with `scripts/protocol-matrix.floors`
+  is enforced by a python checker inside `scripts/protocol-matrix.sh`
+  (`apply_floors`). `scripts/tests/` has no fixture for it — the only matrix
+  coverage, `scripts/tests/compat-port-ownership.sh`, sources the file for
+  `wait_for_listen` and greps three fixed strings, which catches syntax breakage
+  but not a semantic one. Two regressions are therefore invisible: renaming an
+  emitter token (`BELOW|`) turns the gate off (now partly covered by the
+  `unrecognised checker output` arm), and deleting `--floors` from
+  `.github/workflows/compat.yml` leaves CI permanently green with no other
+  signal, because no gate reads that file for these strings.
+  **Done-when:** a `scripts/tests/protocol-matrix-floors.sh` that sources the
+  script and asserts — below-floor, unknown-row, unfloored-row, unparseable-line,
+  undecodable-file, and no-verdict-output all exit non-zero, and one clean run
+  exits zero — plus a `grep -Fq -- '--floors scripts/protocol-matrix.floors'`
+  assertion wired into the same step, with the usual sha256 pin in `ci.yml`.
+
+- [ ] **The matrix's `tcp-plain` floor cannot fire in CI.**
+  Evidence: `tcp-plain=60` in `scripts/protocol-matrix.floors` against 527 MiB/s
+  measured on the reference host, an 8.8x slack. Every other floor is
+  `ratio × tcp-plain`, so a regression in a *shared* path (bridge copy loop,
+  work-conn setup) can cost up to 8.8x before the base row reddens, and it drags
+  every dependent floor down with it — at `tcp-plain=61` the `kcp-plain` floor
+  becomes 3.05 MiB/s, which a simultaneous 2.5x KCP regression would still clear.
+  The runner's own capacity is the reason the number is loose, which is exactly
+  why it should be anchored on measured CI data rather than on this host.
+  **Done-when:** the `protocol-matrix-rates` artifact from a few `compat` runs on
+  the CI runner class is used to set `tcp-plain` to ~2.5x below the runner's own
+  measured rate, and the floors file records that derivation (the same rule the
+  ratio floors already follow).
