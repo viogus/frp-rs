@@ -1160,7 +1160,7 @@ so it is absent in the no-features configuration; the `verify` lane compiles the
 group with default features (`cargo bench --workspace --no-run`) but runs no
 benchmark. The
 `--all-targets` flag drops the doctest target, which for `frp-core` contains 2
-tests and both are `ignore`-marked (`frp-core/src/buffer_pool.rs:54`,
+tests and both are `ignore`-marked (`frp-core/src/buffer_pool.rs:79`,
 `frp-core/src/feature_gate.rs:9`), so nothing is lost.
 
 The same runtime class was live in the sibling crates and now has two sibling

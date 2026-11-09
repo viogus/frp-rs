@@ -1,3 +1,14 @@
+> **Still current (re-checked 2026-11-10).** §6 argues the default should stay
+> at 32 KiB. A 64 KiB default measured +12% on tcpMux but ~40% slower on `ws`
+> without `tcpMux` on macOS, so it stays a knob — see
+> [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](2026-11-10-mux-frame-cost.md).
+> §1–§7 still stand: the derivation, the frame/payload match and the split
+> cap are unchanged. §8's explanation of why `ws-tls-mux` was unaffected is
+> **wrong** — TLS sits *below* WS (`frp-core/src/transport/mod.rs` wraps the
+> TLS stream, then runs WS over it), so both configurations reassemble full
+> frames — and the 2026-11-10 table shows `ws-tls` and `wss` regressing with
+> the plain rows; only the observation in §8's table stands, not its mechanism.
+
 # Bridge buffer size: the knob did not reach the yamux frame
 
 **Date:** 2026-11-08. **Host:** macOS arm64 (Apple M2), rustc 1.98.1, load
@@ -115,8 +126,12 @@ and §5 cannot bound that cost.
 
 What would flip it: a fan-out memory baseline (the `scripts/memory-baseline.sh`
 axis) at a few hundred to a thousand concurrent bridges, showing the extra
-32 KiB per direction per bridge against the +15% mux throughput. Until then the
-win is an operator choice with a documented number behind it, not a new
+32 KiB per direction per bridge against the +15% mux throughput **and** a
+WebSocket data-path check — the 2026-11-10 measurements found that a 64 KiB
+frame costs the non-mux `ws`/`wss` rows ~40% on macOS
+([`docs/archive/notes/2026-11-10-mux-frame-cost.md`](2026-11-10-mux-frame-cost.md)),
+so a memory baseline alone would no longer be sufficient. Until both clear,
+the win is an operator choice with a documented number behind it, not a new
 default.
 
 ## 7. Verification
