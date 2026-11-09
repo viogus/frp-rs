@@ -618,7 +618,7 @@ For a server-side test that speaks the raw V1 protocol, the harness is
 `frp-server/tests/common/mod.rs`: `register_tcp_proxy`, `open_tcp_proxy_bridge`
 and `pump_tcp_bridge` (`frp-server/tests/common/mod.rs:22`, `:81`, `:135`) drive
 the control channel and the work connection directly, and `start_test_server`
-(`:394`) boots frps in-process. Use it when the interesting behaviour is in
+(`:608`) boots frps in-process. Use it when the interesting behaviour is in
 registration, not in the client.
 
 **What you must add, and what review will ask for.** The round-trip test proves
@@ -1630,6 +1630,25 @@ Follow these conventions:
 4. **Avoid port conflicts**: use port `0` for auto-allocation or pick unique ports
 5. **Clean up**: ensure spawned tasks/processes are killed on test completion
 6. **Wait on a deadline, not an attempt count**: a readiness/retry loop should poll against a wall-clock deadline (`Instant::now() + timeout`) rather than a fixed `for _ in 0..N` plus sleep — the attempt count is a hidden, load-dependent time budget that flakes on CI — and it must report the last error on exhaustion, not a bare `expect`.
+
+### Loopback-intercepting network extensions (macOS)
+
+Observed here with Surge: a transparent-proxy network extension that intercepts
+loopback TCP holds writes **from the accepted socket to the connecting socket**
+— tens of ms from 512 B, ~1 s by 4 KiB — and discards the payload when the
+sender closes before that hold expires. Pure `std::net` and pure Python
+reproductions, the size sweep, the Unix-domain-socket and direction controls,
+and this host's `systemextensionsctl list` are in
+[`docs/archive/notes/2026-11-09-loopback-intercept.md`](archive/notes/2026-11-09-loopback-intercept.md).
+Tests that push real traffic through a bridge then fail with
+`user reads response: early eof`, although the relay copied and shut down both
+directions correctly. The two live-traffic pins call
+`common::loopback_tcp_probe` (`frp-server/tests/common/mod.rs`), which classifies
+the host as `Ok` / `Intercepted` / `Broken`: `Intercepted` shrinks their
+`work -> user` payload to 512 B so the traffic assertions still run for real,
+and `Broken` (the probe could not run: bind, connect, socket setup or read
+error) panics with its own message instead of passing vacuously. Neither path
+skips.
 
 ### The `dashboard` lane: build ordering (read this before running it)
 

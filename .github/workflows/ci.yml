@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=5f8c4e70ce869559a0fd99cc56e262f9d48f22be418c5d21cacd8a917eb009a5
+          guard_data_pin=072b6b15b9a18a18c0c50ff88317908d2bc5448ff6548fbe09740be8c5f17e7a
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -4023,8 +4023,8 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          expected=2
-          expected_floor=2
+          expected=3
+          expected_floor=3
           log=/tmp/frp-server-ws-dedicated-port.$$.log
           run_status=0
           cargo test -p frp-server --features dashboard --test transport_e2e_websocket_port --color never 2>&1 | tee "$log" || run_status=$?
