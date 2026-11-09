@@ -122,8 +122,12 @@ and §5 cannot bound that cost.
 
 What would flip it: a fan-out memory baseline (the `scripts/memory-baseline.sh`
 axis) at a few hundred to a thousand concurrent bridges, showing the extra
-32 KiB per direction per bridge against the +15% mux throughput. Until then the
-win is an operator choice with a documented number behind it, not a new
+32 KiB per direction per bridge against the +15% mux throughput **and** a
+WebSocket data-path check — the 2026-11-10 measurements found that a 64 KiB
+frame costs the non-mux `ws`/`wss` rows ~40% on macOS
+([`docs/archive/notes/2026-11-10-mux-frame-cost.md`](2026-11-10-mux-frame-cost.md)),
+so a memory baseline alone would no longer be sufficient. Until both clear,
+the win is an operator choice with a documented number behind it, not a new
 default.
 
 ## 7. Verification

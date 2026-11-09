@@ -42,7 +42,7 @@ single `poll_write_vectored([&header[..], &body[..]])`, with partial-progress
 and `written == 0` handling and the body returned to the pool on completion,
 plus `poll_write_vectored`/`is_write_vectored` forwarding through
 `frp-core/src/mux.rs` (`Compat` does not forward vectored writes —
-`tokio-util-0.7.18/src/compat.rs:312-331`), measured **1241 / 1337 MiB/s**
+`tokio-util-0.7.20/src/compat.rs:291-310`), measured **1241 / 1337 MiB/s**
 (1 flow / 4 flows) against a 1213 / 1340 baseline: inside noise.
 
 ## 4. One copy instead of two — no gain
@@ -99,8 +99,9 @@ Suspected mechanism, **not verified**: without yamux the bridge writes the
 whole chunk to `WsByteStream`, which copies and masks it into `write_buf`
 (`frp-core/src/transport/websocket.rs::build_frame_into`) and then writes the
 frame; a 64 KiB frame on macOS loopback takes more partial-write rounds, and
-each round returns `Pending` with a self-wake (`websocket.rs:966-990`,
-`websocket.rs:1046-1057`), so the per-byte cost grows with frame size there.
+each round returns `Pending` with a self-wake (`websocket.rs:1010-1011` on the
+copy path, `websocket.rs:1057-1059` on the drain path), so the per-byte cost
+grows with frame size there.
 
 Cost of the knob when used: 2x64 KiB of buffer per live bridge instead of
 2x32 KiB, and the pool ceiling doubles from 4 MiB to 8 MiB per process
