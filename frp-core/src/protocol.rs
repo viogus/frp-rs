@@ -447,8 +447,12 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     // bytes are unchanged because the header is still followed contiguously
     // by the same payload.
     if !writer.is_write_vectored() {
-        // UDP-sized frames (the hot path) fit the stack buffer; larger
-        // frames pay one scratch allocation for the merge.
+        // Merge, then write once. `total` includes the 8-byte header: at
+        // most 256 B copies into a stack buffer (no allocation), above that
+        // into one temporary heap buffer. Either buffer goes out through a
+        // single `write_all`. The vectored path below is unchanged: each
+        // poll passes the two original iovecs to `write_vectored` — no copy
+        // and no allocation — retrying from the first unwritten byte.
         const MERGE_STACK_MAX: usize = 256;
         let total = header.len() + payload.len();
         if total <= MERGE_STACK_MAX {
@@ -1469,9 +1473,10 @@ mod tests {
         );
     }
 
-    /// A transport whose writes consume nothing: the writev loop must bail
-    /// out with an error instead of spinning forever. The duplex is held
-    /// (never read) only as a concrete `AsyncWrite` carrier.
+    /// A non-vectored transport whose writes consume nothing: the merged
+    /// `write_all` path must surface a `WriteZero` error instead of looping.
+    /// The duplex is held (never read) only as a concrete `AsyncWrite`
+    /// carrier.
     #[allow(dead_code)] // held for its type only, never read
     struct ZeroWriter(tokio::io::DuplexStream);
 
@@ -1549,31 +1554,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_v1_v2_frames_write_once_on_non_vectored_transport() {
-        // V2, stack-merge arm (header + payload <= 256 B).
-        for payload in [&b"hello v2 world"[..], &[7u8; 300][..]] {
-            let (writer, mut reader) = duplex(4096);
-            let mut counter = SingleWriteCounter {
-                inner: writer,
-                writes: 0,
-            };
-            write_v2_frame_raw(&mut counter, 16, 0, payload)
-                .await
-                .expect("write V2 frame");
-            let writes = counter.writes;
-            drop(counter);
-            assert_eq!(
-                writes,
-                1,
-                "V2 frame of payload {} must be one write",
-                payload.len()
-            );
-            let (ft, _, data) = read_v2_frame_raw(&mut reader).await.expect("read V2 frame");
-            assert_eq!(ft, 16);
-            assert_eq!(data, payload, "merged V2 wire bytes must be unchanged");
-        }
+    async fn test_v2_frame_stack_merge_writes_once_on_non_vectored_transport() {
+        // 8-byte header + 13-byte payload = 21 B, inside the 256 B stack
+        // buffer: the merge allocates nothing.
+        let payload = &b"hello v2 world"[..];
+        let (writer, mut reader) = duplex(4096);
+        let mut counter = SingleWriteCounter {
+            inner: writer,
+            writes: 0,
+        };
+        write_v2_frame_raw(&mut counter, 16, 0, payload)
+            .await
+            .expect("write V2 frame");
+        let writes = counter.writes;
+        drop(counter);
+        assert_eq!(
+            writes,
+            1,
+            "stack-merged V2 frame of payload {} must be one write",
+            payload.len()
+        );
+        let (ft, _, data) = read_v2_frame_raw(&mut reader).await.expect("read V2 frame");
+        assert_eq!(ft, 16);
+        assert_eq!(data, payload, "merged V2 wire bytes must be unchanged");
+    }
 
-        // V1 JSON frame.
+    #[tokio::test]
+    async fn test_v2_frame_heap_merge_writes_once_on_non_vectored_transport() {
+        // 8-byte header + 300-byte payload = 308 B, above the 256 B stack
+        // buffer: the merge allocates one temporary heap buffer, then writes
+        // it as a single call.
+        let payload = &[7u8; 300][..];
+        let (writer, mut reader) = duplex(4096);
+        let mut counter = SingleWriteCounter {
+            inner: writer,
+            writes: 0,
+        };
+        write_v2_frame_raw(&mut counter, 16, 0, payload)
+            .await
+            .expect("write V2 frame");
+        let writes = counter.writes;
+        drop(counter);
+        assert_eq!(
+            writes,
+            1,
+            "heap-merged V2 frame of payload {} must be one write",
+            payload.len()
+        );
+        let (ft, _, data) = read_v2_frame_raw(&mut reader).await.expect("read V2 frame");
+        assert_eq!(ft, 16);
+        assert_eq!(data, payload, "merged V2 wire bytes must be unchanged");
+    }
+
+    #[tokio::test]
+    async fn test_v1_frame_writes_once_on_non_vectored_transport() {
         let (writer, mut reader) = duplex(4096);
         let mut counter = SingleWriteCounter {
             inner: writer,
@@ -1592,6 +1626,76 @@ mod tests {
         let (ty, data) = read_v1_frame(&mut reader).await.expect("read V1 frame");
         assert_eq!(ty, msg.v1_type_byte());
         assert_eq!(data, serde_json::to_vec(&msg).expect("serialize reference"));
+    }
+
+    /// A vectored transport that accepts zero bytes per `write_vectored`
+    /// call. The writev loop's `n == 0` guard must turn that into an error; a
+    /// regression to an unguarded retry loop would spin inside one poll and
+    /// hang the suite instead of failing it.
+    struct ZeroVectoredWriter {
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for ZeroVectoredWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _bufs: &[std::io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            Poll::Ready(Ok(0))
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_v1_frame_vectored_zero_progress_errors() {
+        use futures_util::FutureExt;
+
+        let msg = FrpMessage::Ping(msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        });
+        let mut writer = ZeroVectoredWriter { writes: 0 };
+        // `now_or_never` polls once and returns `None` for a pending future:
+        // a write that parks instead of settling fails the assertion rather
+        // than hanging the suite.
+        let result = write_v1_frame(&mut writer, &msg)
+            .now_or_never()
+            .expect("zero-progress writev must settle, not park");
+        assert!(
+            result.is_err(),
+            "a vectored writer that accepts 0 bytes must error out, not lose bytes"
+        );
+        assert_eq!(
+            writer.writes, 1,
+            "the n == 0 guard must reject the first zero-progress writev"
+        );
     }
 
     #[tokio::test]
