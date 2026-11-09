@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpSocket;
 use tokio::task::JoinHandle;
@@ -164,6 +164,220 @@ pub async fn pump_tcp_bridge(
         .expect("user reads response");
     assert_eq!(echoed, response, "user conn response must be byte-exact");
     // Both conns drop here, fully closed.
+}
+
+/// Bytes the loopback probe writes from the *accepted* socket.
+const LOOPBACK_PROBE_BYTES: usize = 8 * 1024;
+/// Wall-clock budget for those bytes to arrive. An unaffected loopback moves
+/// 8 KiB in well under a millisecond; the intercepted direction holds it ~1 s
+/// (measured: 991-1003 ms, whether the payload is later delivered or dropped —
+/// `docs/archive/notes/2026-11-09-loopback-intercept.md`). 500 ms sits an order
+/// of magnitude away from both, and a false `Intercepted` only shrinks the
+/// live-traffic payload, so the budget errs tight.
+const LOOPBACK_PROBE_BUDGET: Duration = Duration::from_millis(500);
+
+/// Bytes the live-traffic pins push `work -> user` on an unaffected host.
+#[allow(dead_code)]
+pub const WORK_TO_USER_BYTES: u64 = 67_891;
+/// The same pins' `work -> user` count on a host that intercepts loopback TCP:
+/// small enough to clear the intercepted direction before the sender closes
+/// (measured: 512 B arrives in ~60 ms; 4 KiB is dropped 2 times out of 3).
+#[allow(dead_code)]
+pub const INTERCEPTED_WORK_TO_USER_BYTES: u64 = 512;
+
+/// One-shot result of [`loopback_tcp_probe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopbackProbe {
+    /// Loopback delivered the full probe write inside [`LOOPBACK_PROBE_BUDGET`].
+    Ok,
+    /// This host intercepts loopback TCP: a large accepted-side write was
+    /// truncated, delivered short, or held past the budget. Byte-level
+    /// symptom — the live-traffic pins shrink their response, they do not skip.
+    Intercepted(String),
+    /// Loopback TCP could not be exercised at all (bind/connect/setup failed).
+    /// Not an interception symptom: the caller must fail loudly rather than
+    /// adapt, because no traffic assertion can run on such a host.
+    Broken(String),
+}
+
+/// What the probe's read side saw, before [`classify_loopback_probe`] turns it
+/// into a [`LoopbackProbe`]. Split out so the classification is unit-testable
+/// without a real loopback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProbeReadOutcome {
+    /// All [`LOOPBACK_PROBE_BYTES`] arrived, this long after the first read.
+    Complete { arrived_after: Duration },
+    /// EOF before the full write arrived — the sender closed while the
+    /// intercepted direction still held the payload.
+    EarlyEof { got: usize, after: Duration },
+    /// No further bytes arrived inside the budget.
+    TimedOut { got: usize, after: Duration },
+    /// Loopback TCP could not be exercised (bind/connect/setup/writer failure).
+    Broken { stage: &'static str, error: String },
+    /// A read failed with something other than a timeout.
+    ReadError { got: usize, error: String },
+}
+
+/// Map the raw probe observation to the host classification. Only byte-level
+/// symptoms (late arrival, early EOF, short read, timeout) count as
+/// [`LoopbackProbe::Intercepted`]; setup failures are [`LoopbackProbe::Broken`]
+/// so a sandbox with no usable loopback fails the test instead of passing it
+/// with a shrunken payload.
+fn classify_loopback_probe(outcome: ProbeReadOutcome) -> LoopbackProbe {
+    let budget = LOOPBACK_PROBE_BUDGET;
+    match outcome {
+        ProbeReadOutcome::Complete { arrived_after } if arrived_after <= budget => {
+            LoopbackProbe::Ok
+        }
+        ProbeReadOutcome::Complete { arrived_after } => LoopbackProbe::Intercepted(format!(
+            "{LOOPBACK_PROBE_BYTES} bytes arrived only after {arrived_after:?} (budget {budget:?})"
+        )),
+        ProbeReadOutcome::EarlyEof { got, after } => LoopbackProbe::Intercepted(format!(
+            "early eof after {got} of {LOOPBACK_PROBE_BYTES} bytes at {after:?}"
+        )),
+        ProbeReadOutcome::TimedOut { got, after } => LoopbackProbe::Intercepted(format!(
+            "read timed out with {got} of {LOOPBACK_PROBE_BYTES} bytes at {after:?}"
+        )),
+        ProbeReadOutcome::Broken { stage, error } => {
+            LoopbackProbe::Broken(format!("{stage} failed: {error}"))
+        }
+        ProbeReadOutcome::ReadError { got, error } => {
+            LoopbackProbe::Broken(format!("read error after {got} bytes: {error}"))
+        }
+    }
+}
+
+/// One-shot probe of this host's loopback TCP: an `8 KiB` write from the
+/// **accepted** socket must reach the connecting side intact inside
+/// [`LOOPBACK_PROBE_BUDGET`].
+///
+/// A loopback-intercepting network extension (Surge and similar
+/// transparent-proxy filters) stalls exactly that direction by ~1 s — and drops
+/// the payload when the sender closes first — so the live-traffic tests fail
+/// with `user reads response: early eof` although the relay copied every byte.
+/// See `docs/archive/notes/2026-11-09-loopback-intercept.md`. Cached per test
+/// binary: the probe costs one connection, not one per test.
+#[allow(dead_code)]
+pub fn loopback_tcp_probe() -> &'static LoopbackProbe {
+    static PROBE: OnceLock<LoopbackProbe> = OnceLock::new();
+    PROBE.get_or_init(run_loopback_tcp_probe)
+}
+
+/// `work -> user` byte count for the live-traffic pins: [`WORK_TO_USER_BYTES`]
+/// on an unaffected host, [`INTERCEPTED_WORK_TO_USER_BYTES`] when this host
+/// intercepts loopback TCP. Panics on [`LoopbackProbe::Broken`]: the pins need a
+/// real loopback relay, and a skip would read as a pass with zero assertions.
+#[allow(dead_code)]
+pub fn work_to_user_bytes() -> u64 {
+    match loopback_tcp_probe() {
+        LoopbackProbe::Ok => {
+            eprintln!(
+                "live-traffic pin: loopback probe Ok, pumping {WORK_TO_USER_BYTES} bytes \
+                 work -> user"
+            );
+            WORK_TO_USER_BYTES
+        }
+        LoopbackProbe::Intercepted(why) => {
+            eprintln!(
+                "live-traffic pin: loopback probe Intercepted ({why}); pumping \
+                 {INTERCEPTED_WORK_TO_USER_BYTES} bytes work -> user instead of \
+                 {WORK_TO_USER_BYTES} so the traffic assertions still run. See \
+                 docs/archive/notes/2026-11-09-loopback-intercept.md."
+            );
+            INTERCEPTED_WORK_TO_USER_BYTES
+        }
+        LoopbackProbe::Broken(why) => panic!(
+            "loopback TCP is unusable on this host ({why}); the live-traffic pins need a real \
+             loopback relay and must not pass vacuously"
+        ),
+    }
+}
+
+fn run_loopback_tcp_probe() -> LoopbackProbe {
+    use std::io::{ErrorKind, Read, Write};
+
+    fn broken(stage: &'static str, error: impl std::fmt::Display) -> LoopbackProbe {
+        classify_loopback_probe(ProbeReadOutcome::Broken {
+            stage,
+            error: error.to_string(),
+        })
+    }
+
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(listener) => listener,
+        Err(e) => return broken("bind 127.0.0.1:0", e),
+    };
+    let addr = match listener.local_addr() {
+        Ok(addr) => addr,
+        Err(e) => return broken("loopback local_addr", e),
+    };
+    // Connect before spawning the writer: a connect/setup failure must not
+    // leave a thread parked in `accept()` forever.
+    let mut client = match std::net::TcpStream::connect(addr) {
+        Ok(client) => client,
+        Err(e) => return broken("connect loopback", e),
+    };
+    if let Err(e) = client.set_read_timeout(Some(LOOPBACK_PROBE_BUDGET)) {
+        return broken("set_read_timeout", e);
+    }
+
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        let (mut srv, _) = listener.accept()?;
+        srv.set_nodelay(true)?;
+        srv.write_all(&[0x5Au8; LOOPBACK_PROBE_BYTES])?;
+        srv.shutdown(std::net::Shutdown::Write)?;
+        Ok(()) // drop = close, with the payload possibly still in flight
+    });
+
+    let started = std::time::Instant::now();
+    let mut got = 0usize;
+    let mut buf = [0u8; 4096];
+    let outcome = loop {
+        match client.read(&mut buf) {
+            Ok(0) => {
+                break ProbeReadOutcome::EarlyEof {
+                    got,
+                    after: started.elapsed(),
+                }
+            }
+            Ok(n) => {
+                got += n;
+                if got >= LOOPBACK_PROBE_BYTES {
+                    // The budget covers arrival, not the thread join: measure
+                    // the instant the last byte was read.
+                    break ProbeReadOutcome::Complete {
+                        arrived_after: started.elapsed(),
+                    };
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                break ProbeReadOutcome::TimedOut {
+                    got,
+                    after: started.elapsed(),
+                }
+            }
+            Err(e) => {
+                break ProbeReadOutcome::ReadError {
+                    got,
+                    error: e.to_string(),
+                }
+            }
+        }
+    };
+
+    // Release a writer still blocked in `write_all` (the client stopped
+    // reading after a timeout) before joining it.
+    let _ = client.shutdown(std::net::Shutdown::Both);
+    drop(client);
+    let writer_outcome = writer.join();
+
+    match (outcome, writer_outcome) {
+        // The full write arrived, so the writer must also have succeeded; a
+        // failure here is a real host problem, not an interception symptom.
+        (ProbeReadOutcome::Complete { .. }, Ok(Err(e))) => broken("accepted-side write", e),
+        (ProbeReadOutcome::Complete { .. }, Err(_)) => broken("probe writer thread", "panicked"),
+        (outcome, _) => classify_loopback_probe(outcome),
+    }
 }
 
 /// Go frp `NotFoundResponse` (`pkg/util/vhost/resource.go`) — the 404 body
@@ -1103,4 +1317,62 @@ pub async fn wait_http_ok(url: &str, timeout: Duration) -> Result<(), String> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Err(format!("{url} not healthy after {timeout:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The classification table must map every read outcome the probe can
+    /// produce onto the right verdict — in particular `ReadError` to `Broken`,
+    /// which is what stops a failed probe from being mistaken for an
+    /// intercepting host. What this does *not* cover is the probe itself: a
+    /// stubbed `run_loopback_tcp_probe` would still satisfy this test.
+    #[test]
+    fn loopback_probe_classifies_every_read_outcome() {
+        assert_eq!(
+            classify_loopback_probe(ProbeReadOutcome::Complete {
+                arrived_after: Duration::from_micros(200),
+            }),
+            LoopbackProbe::Ok
+        );
+        assert_eq!(
+            classify_loopback_probe(ProbeReadOutcome::ReadError {
+                got: 0,
+                error: "Connection reset by peer (os error 54)".into(),
+            }),
+            LoopbackProbe::Broken(
+                "read error after 0 bytes: Connection reset by peer (os error 54)".to_string()
+            )
+        );
+        assert!(matches!(
+            classify_loopback_probe(ProbeReadOutcome::Complete {
+                arrived_after: LOOPBACK_PROBE_BUDGET + Duration::from_millis(100),
+            }),
+            LoopbackProbe::Intercepted(_)
+        ));
+        assert!(matches!(
+            classify_loopback_probe(ProbeReadOutcome::EarlyEof {
+                got: 512,
+                after: Duration::from_secs(1),
+            }),
+            LoopbackProbe::Intercepted(_)
+        ));
+        assert!(matches!(
+            classify_loopback_probe(ProbeReadOutcome::TimedOut {
+                got: 0,
+                after: LOOPBACK_PROBE_BUDGET,
+            }),
+            LoopbackProbe::Intercepted(_)
+        ));
+        assert_eq!(
+            classify_loopback_probe(ProbeReadOutcome::Broken {
+                stage: "connect loopback",
+                error: "Connection refused (os error 61)".into(),
+            }),
+            LoopbackProbe::Broken(
+                "connect loopback failed: Connection refused (os error 61)".into()
+            )
+        );
+    }
 }

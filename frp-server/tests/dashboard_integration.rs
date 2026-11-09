@@ -1120,6 +1120,10 @@ async fn http_get_vhost(vhost: std::net::SocketAddr, host: &str) -> String {
 /// and the exact byte counts. Conns counters are NOT part of Go's traffic
 /// model (they live on the proxy stats endpoints as curConns), so the old
 /// frp-rs scalar shape (bytes_in/bytes_out/current_conns/total_conns) is gone.
+///
+/// The `work -> user` byte count comes from [`common::work_to_user_bytes`]: on a
+/// host whose loopback intercepts large accepted-side writes it shrinks to
+/// `512` so the counters are still asserted for real instead of skipped.
 #[tokio::test]
 async fn test_dashboard_proxy_traffic_live() {
     let bind_port = common::allocate_port();
@@ -1175,7 +1179,7 @@ async fn test_dashboard_proxy_traffic_live() {
     // Pump exact payloads through the live bridge, then poll for the day
     // buckets. The relay records traffic only after both conns close.
     let user_to_work: u64 = 123_457;
-    let work_to_user: u64 = 67_891;
+    let work_to_user: u64 = common::work_to_user_bytes();
     let (user, work) = common::open_tcp_proxy_bridge(addr, remote_port, &mut ctl, &run_id).await;
     common::pump_tcp_bridge(user, work, user_to_work as usize, work_to_user as usize).await;
 
