@@ -112,8 +112,8 @@ pub struct Fec {
     /// shard — ~80 rounds per output byte for kcp-go's 10+3 group). Every
     /// coefficient in `encode_matrix` is fixed at construction, so the 256
     /// possible products can be pre-computed once and the hot loop becomes a
-    /// table lookup plus XOR. Measured on the KCP transport (512 B-64 KiB
-    /// ping-pong, single flow): 20.8 → 36.2 MiB/s.
+    /// table lookup plus XOR. Measured on the KCP transport (64 KiB
+    /// ping-pong, single flow): 20.8 → 62.7 MiB/s.
     mul_tables: Vec<u8>,
 }
 
@@ -218,6 +218,9 @@ impl Fec {
         for i in 0..self.parity_shards {
             let mut parity = vec![0u8; block_size];
             for (data_idx, inp) in input.iter().enumerate() {
+                // Rows are equal-length by contract; `zip` would treat a short
+                // row as zero-extended, so fail loudly on a caller bug instead.
+                debug_assert_eq!(inp.len(), block_size, "FEC shards must be equal length");
                 let table = self.mul_table(i, data_idx);
                 for (p, &b) in parity.iter_mut().zip(inp.iter()) {
                     *p ^= table[b as usize];
@@ -243,6 +246,8 @@ impl Fec {
         for i in 0..self.parity_shards {
             let mut parity = vec![0u8; block_size];
             for (data_idx, inp) in input.iter().enumerate() {
+                // See `encode`: the rows must be equal length.
+                debug_assert_eq!(inp.len(), block_size, "FEC shards must be equal length");
                 let table = self.mul_table(i, data_idx);
                 for (p, &b) in parity.iter_mut().zip(inp.iter()) {
                     *p ^= table[b as usize];
@@ -681,6 +686,11 @@ mod tests {
     fn mul_tables_match_bitwise_field_multiply() {
         for (data, parity) in [(10, 3), (4, 2), (1, 1), (256, 1)] {
             let fec = Fec::new(data, parity);
+            assert_eq!(
+                fec.mul_tables.len(),
+                fec.encode_matrix.len() * data * 256,
+                "table length must cover every parity x data coefficient"
+            );
             for i in 0..parity.min(fec.encode_matrix.len()) {
                 for j in 0..data {
                     let table = fec.mul_table(i, j);
@@ -695,6 +705,15 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A disabled codec (0 shards) builds no tables and encodes nothing.
+    #[test]
+    fn disabled_codec_builds_no_tables() {
+        let fec = Fec::new(0, 0);
+        assert!(fec.mul_tables.is_empty());
+        assert!(fec.encode_matrix.is_empty());
+        assert!(!fec.enabled());
     }
 
     /// The table-driven encode must be byte-identical to the reference

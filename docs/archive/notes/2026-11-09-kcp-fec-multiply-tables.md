@@ -60,9 +60,10 @@ KCP tunnel, frps + frpc on loopback, 5 s per sample:
 | 4 flows, no `tcpMux` | 40.2 MiB/s | 86.6 MiB/s | 2.15× |
 | 1 flow, `tcpMux` on | 22.3 MiB/s | 61.1 MiB/s | 2.7× |
 
-CPU time is unchanged (≈6.2 s per side over 5 s wall): the same cores now move
-three times the bytes, so the multiply really was the dominant cost rather
-than a scheduling artefact.
+CPU time is essentially unchanged: 5.9 s / 6.1 s per side over a 5 s sample
+before, 6.4 s / 6.3 s after (frps / frpc). The same cores now move three times
+the bytes, so the multiply really was the dominant cost rather than a
+scheduling artefact.
 
 MTU control (before the change, FEC on): 1350 → 20.8 MiB/s, 1400 → 20.7 MiB/s.
 Packet count is not the limiter.
@@ -74,7 +75,11 @@ Packet count is not the limiter.
   256 byte values, four shard shapes), `encode_parity_matches_bitwise_reference`
   (four shapes including 1350- and 1299-byte blocks) and
   `reconstruct_recovers_data_shards_on_both_paths` (64/16/300-byte blocks, so
-  both decode paths run).
+  both decode paths run) and `disabled_codec_builds_no_tables`.
+- `scripts/compat-test.sh` was **not** run locally: Go frp v0.72.0's KCP client
+  does not complete a dial on this host (it logs `try to connect to server...`
+  and stalls while the Rust client works over the same port), so no Go KCP
+  scenario can execute here. CI's `compat.yml` KCP scenarios are the gate.
 - `cargo fmt --all -- --check` and
   `cargo clippy -p frp-core --all-targets --all-features` clean.
 
