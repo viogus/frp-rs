@@ -1,6 +1,8 @@
 # Inline yamux writes: removing the connection-driver round trip
 
-Status: experiment, `exp/yamux-inline-write`. Nothing here is landed.
+Status: the inline-write experiment (§1-§8) is **not landed** — `exp/yamux-inline-write`
+was archived after it measured neutral. §9 records a *different*, landed change
+(one write per frame, PR #594), which is the figure the README cites.
 
 ## 1. What we are chasing
 
@@ -21,9 +23,9 @@ normal — the question here is only whether frp-rs pays more than it must.
 
 Two independent measurements, both on one 512 B datagram through a Go frps:
 
-**a. A minimal yamux ping-pong** (`frp-core/examples/yamux_pp.rs`, two tasks,
-one stream, loopback TCP): raw TCP 39.96 µs/msg, yamux 64.46 µs/msg — yamux's
-own floor is **24.5 µs/msg**.
+**a. A minimal yamux ping-pong** (a throwaway `examples/yamux_pp.rs` bench,
+two tasks, one stream, loopback TCP — not committed): raw TCP 39.96 µs/msg,
+yamux 64.46 µs/msg — yamux's own floor is **24.5 µs/msg**.
 
 **b. The real client path**, instrumented with `eprintln` timestamps
 (`P1` session recv → `P4` session → writer-channel send → `P2` writer recv →
@@ -175,9 +177,9 @@ measured on its own; step 5 is the stop/go gate.
    `close`, `read_after_close`), workspace tests, compat 86, matrix 11,
    `scripts/stress-test.sh`, then two reviews, one adversarial.
 
-Known unfinished scaffolding: `frp-core/examples/yamux_pp_task.rs` (two-task
-variant) deadlocks — do not use it as evidence; fix it only if it is needed for
-step 5, otherwise rely on the product measurement.
+Known unfinished scaffolding: a two-task variant of that bench
+(`yamux_pp_task.rs`, also not committed) deadlocks — do not use it as evidence;
+fix it only if it is needed for step 5, otherwise rely on the product measurement.
 
 ## 9. Superseded: §2's "coalescing is falsified"
 

@@ -9,8 +9,9 @@
 #
 # What this gate is for: a row that still bridges bytes but at a fraction of
 # its previous rate. That is not hypothetical — KCP spent its whole life at
-# 20.7 MiB/s (63 MiB/s after the FEC multiply tables landed in #596) while this
-# matrix ran green in CI, because a row only had to be above zero.
+# 20.7 MiB/s on the ping-pong bench (65.5 MiB/s in the matrix after the FEC
+# multiply tables landed in #596) while this matrix ran green in CI, because a
+# row only had to be above zero.
 #
 # How the numbers were chosen (macOS arm64 M2, 2026-11-09, commit 7240e159),
 # one full matrix run on an idle machine — MiB/s, and the ratio to tcp-plain:
