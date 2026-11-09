@@ -156,7 +156,7 @@ frp-core/src/bridge.rs	67	-	0d7fed4728ed765b	-	absolute	frp-core/benches/crypto_
 frp-core/src/bridge.rs	76	80	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-core/benches/crypto_bridge.rs	:76-80	55
 frp-core/src/bridge.rs	86	-	cc814c422d3534ae	-	continuation	frp-core/benches/crypto_bridge.rs	86	55
 frp-core/src/bridge.rs	95	99	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-core/benches/crypto_bridge.rs	:95-99	56
-frp-core/src/buffer_pool.rs	78	-	46c29247ea6ef70e	-	absolute	docs/developing.md	frp-core/src/buffer_pool.rs:78	1163
+frp-core/src/buffer_pool.rs	79	-	46c29247ea6ef70e	-	absolute	docs/developing.md	frp-core/src/buffer_pool.rs:79	1163
 frp-core/src/cli.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli.rs:1223	2460
 frp-core/src/cli.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli.rs:3157	266
 frp-core/src/cli.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli.rs:5090-5097	705

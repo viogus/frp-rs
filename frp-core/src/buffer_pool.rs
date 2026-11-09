@@ -23,15 +23,16 @@ use std::sync::LazyLock;
 /// 12-byte frame header, no second window-credit round trip, no second waker
 /// hand-off per chunk. (Short chunks, a partly consumed send window, and the
 /// encrypted path's separate IV write can still produce a second frame.) The
-/// derived split is capped at 64 KiB, the largest frame the WebSocket
-/// transport accepts.
+/// derived split is capped at 64 KiB, which leaves the 12-byte frame header
+/// inside the WebSocket transport's 65664-byte read limit (65548 of 65664 at
+/// 64 KiB).
 ///
-/// A 64 KiB default is **not** adopted even though it is 12% faster on the
-/// mux path: on macOS it costs the non-mux WebSocket rows ~40-45% (measured
-/// 301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`, via
+/// A 64 KiB default is **not** adopted even though it is 12% faster on
+/// tcpMux at 4 flows: on macOS it costs the non-mux WebSocket rows ~40-45%
+/// (measured 301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`, via
 /// `scripts/protocol-matrix.sh` with `FRP_BRIDGE_BUF_KB` as the only
 /// difference), while the mux rows are flat or slightly better and plain tcp
-/// gains ~12%. Since `ws`/`wss` without `tcpMux` is a supported configuration,
+/// is flat (+0.7%). Since `ws`/`wss` without `tcpMux` is a supported configuration,
 /// the default stays at Go parity and the knob carries the tradeoff:
 /// `FRP_BRIDGE_BUF_KB=64` is worth +12% on tcpMux (1348 -> 1513 MiB/s at 4
 /// flows on a 4-vCPU Linux container), +6% at one flow, +11% on tcp-tls, at

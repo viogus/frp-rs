@@ -2,8 +2,12 @@
 > at 32 KiB. A 64 KiB default measured +12% on tcpMux but ~40% slower on `ws`
 > without `tcpMux` on macOS, so it stays a knob — see
 > [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](2026-11-10-mux-frame-cost.md).
-> Everything here — the derivation, the frame/payload match, the WebSocket
-> cap — still stands.
+> §1–§7 still stand: the derivation, the frame/payload match and the split
+> cap are unchanged. §8's explanation of why `ws-tls-mux` was unaffected is
+> **wrong** — TLS sits *below* WS (`frp-core/src/transport/mod.rs` wraps the
+> TLS stream, then runs WS over it), so both configurations reassemble full
+> frames — and the 2026-11-10 table shows `ws-tls` and `wss` regressing with
+> the plain rows; only the observation in §8's table stands, not its mechanism.
 
 # Bridge buffer size: the knob did not reach the yamux frame
 

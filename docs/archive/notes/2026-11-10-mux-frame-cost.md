@@ -25,13 +25,19 @@ time, because `tcpMux` is on by default.
 
 ## 2. The cost model
 
-Throughput plateaus at the same *frame* rate at 1 and 4 flows (~40–44k
-frames/s), so a fixed per-frame cost dominates: comparing the mux path with the
-non-mux path on the same binary, one MiB costs 0.774 ms with mux and 0.380 ms
-without it — 0.394 ms per MiB, i.e. **≈12 µs of fixed cost per 32 KiB frame**.
-That is the order of a loopback `write` plus the peer's wakeup, which is why
-none of the three experiments below (each of which removed *work*, not
-*round trips*) changed anything.
+Comparing the mux path with the non-mux path on the same binary at the same
+frame size, one MiB costs 0.759 ms with mux and 0.389 ms without it — a
+**0.370 ms/MiB mux overhead, i.e. ≈11.6 µs per 32 KiB frame**. That part is
+what §3–§4 tried to remove (work, not round trips) and did not.
+
+The per-frame time itself is *not* mostly fixed. Dividing each row by its own
+frame count: 32 KiB at 1348.5 MiB/s is 43,152 frames/s ⇒ **23.2 µs/frame**;
+64 KiB at 1512.8 MiB/s is 24,205 frames/s ⇒ **41.3 µs/frame**. Doubling the
+payload raised the per-frame cost by 78% for 100% more bytes, which fits
+`F ≈ 5 µs fixed + ~0.55 µs/KiB`, i.e. **most of the cost is per byte**. A truly
+fixed 12 µs that "dominated" would have predicted +35% at 64 KiB, not the
+measured +12%. Frame size is therefore a lever, not a ceiling — which is
+exactly the size of the win §5 shows.
 
 ## 3. Single `writev` per yamux frame — no gain
 
@@ -41,8 +47,9 @@ one `Frame { header, header_offset, buffer, body_offset }` state and issuing a
 single `poll_write_vectored([&header[..], &body[..]])`, with partial-progress
 and `written == 0` handling and the body returned to the pool on completion,
 plus `poll_write_vectored`/`is_write_vectored` forwarding through
-`frp-core/src/mux.rs` (`Compat` does not forward vectored writes —
-`tokio-util-0.7.20/src/compat.rs:291-310`), measured **1241 / 1337 MiB/s**
+`frp-core/src/mux.rs`: tokio-util's `Compat` adapter (pinned 0.7.20 in
+`Cargo.lock`) defines no `poll_write_vectored`/`is_write_vectored`, so the
+trait defaults apply and the writer looks non-vectored, measured **1241 / 1337 MiB/s**
 (1 flow / 4 flows) against a 1213 / 1340 baseline: inside noise.
 
 ## 4. One copy instead of two — no gain
@@ -90,18 +97,20 @@ macOS host, the same binaries and `FRP_BRIDGE_BUF_KB` as the only difference:
 The loss is confined to the WebSocket rows that do **not** run through yamux,
 and it reproduced in three runs and with `FRP_BRIDGE_BUF_KB` alone (no rebuild).
 `ws`/`wss` without `tcpMux` is a supported configuration, so a 64 KiB default
-would trade a 12% mux win for a 45% WebSocket loss. Worth noting the container
-told the opposite story for the mux-over-ws row, where 64 KiB measured 726 →
-964 MiB/s — the macOS regression is in the non-mux WebSocket write path, not in
-the frame size itself.
+would trade a 12% mux win for a 45% WebSocket loss.
 
-Suspected mechanism, **not verified**: without yamux the bridge writes the
-whole chunk to `WsByteStream`, which copies and masks it into `write_buf`
-(`frp-core/src/transport/websocket.rs::build_frame_into`) and then writes the
-frame; a 64 KiB frame on macOS loopback takes more partial-write rounds, and
-each round returns `Pending` with a self-wake (`websocket.rs:1010-1011` on the
-copy path, `websocket.rs:1057-1059` on the drain path), so the per-byte cost
-grows with frame size there.
+**The asymmetry is unexplained, and the obvious suspect does not survive it.**
+Under yamux, `ws-tls-mux` pushes the same 64 KiB WebSocket frames through the
+same `WsByteStream` writer (a 65548-byte frame once the yamux header is
+included) and measured −2.5%; the container measured that row *faster* at
+64 KiB (726 → 964 MiB/s). So "big WS frames are slow on macOS" is false as
+stated. What differs without `tcpMux` is the writer's concurrency and
+backpressure: no yamux connection task sits between the bridge and the socket,
+so each bridge task writes the whole frame itself and re-arms
+(`frp-core/src/transport/websocket.rs:997` builds the masked client frame;
+`:1010-1011` and `:1057-1059` are the self-wake/Pending paths). That is a
+candidate, not a mechanism — it needs a run with the writer instrumented, and
+is recorded here as open.
 
 Cost of the knob when used: 2x64 KiB of buffer per live bridge instead of
 2x32 KiB, and the pool ceiling doubles from 4 MiB to 8 MiB per process
@@ -114,16 +123,21 @@ directly on the caller's task when the connection write lock is free, falling
 back to the channel, with flush waiters woken by the driver. On this benchmark
 it measured 4 flows **1274.9** against a 1400 baseline: no better, and it cost
 a page of concurrency reasoning. Keeping the queue means a single writer and
-therefore a single serialization point per session; removing it does not pay
-because the limit is the round trip, not the hand-off.
+therefore a single serialization point per session; removing it does not pay,
+because at that frame size the hand-off was not the constraint (§2: only ~5 µs
+of the 23 µs frame is fixed cost).
 
 ## 7. What is left
 
-frp-rs is still ~15% behind Go frp on the mux path (1513 vs 1773 MiB/s at 4
-flows) and ~17% behind on the plain path. Nothing measured above explains it:
-copies, syscalls and the channel hop are each worth ~0. A CPU profile of both
-processes during a 4-flow run is the next step — the `profiling` feature can
-dump one — and until that lands, treat the remainder as unexplained rather
+frp-rs is still behind Go frp on the mux path at the **shipped** 32 KiB
+default — 1348.5 vs 1773 MiB/s at 4 flows, **23.9%** — and the 64 KiB knob
+narrows that to ~15% (1513 vs 1773). On the plain path it is ~17% behind, and
+the worst unexplained row in §1 is single-flow `ws` (Go 1199 vs 726 MiB/s,
+**−39%**), which is also the row the 64 KiB knob makes worse on macOS (§5).
+Nothing measured above explains the remainder: copies, syscalls and the channel
+hop are each worth ~0. A profile of both processes during a 4-flow run is the
+next step — the `profiling` feature can dump one — and until that lands, treat
+the remainder as unexplained rather
 than as a known defect.
 
 ## 8. Reproduce
@@ -143,8 +157,13 @@ The Rust binaries are built from this tree inside `rust:alpine`:
 ```bash
 docker run --rm -v $PWD:/src -v /Users/cdf/kcpbench:/w --platform linux/arm64 \
   -w /src rust:alpine sh -c \
-  'RUSTUP_TOOLCHAIN=1.99.1 CARGO_TARGET_DIR=/w/rsbuild cargo build --locked --release -p frps -p frpc'
+  'CARGO_TARGET_DIR=/w/rsbuild cargo build --locked --release -p frps -p frpc'
 ```
+
+The `rust:alpine` image ships a newer compiler than `rust-toolchain.toml` pins
+(1.99.1 was used for these runs; the tree pins 1.98.1), so the numbers carry
+that one-minor-version caveat. Use the pinned channel when re-measuring for a
+release.
 
 `protoab.sh` honours `FRP_BRIDGE_BUF_KB` and `MUX`, which is how §5's table was
 produced from one binary pair. The rates are MiB/s (the harness divides by

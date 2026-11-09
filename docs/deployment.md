@@ -1129,11 +1129,13 @@ environment variable (range 4–1024).
 
 That knob now also sizes the tcpMux data frame, so a full bridge chunk travels
 as one yamux frame in the steady state — except that the split is capped at
-64 KiB, the largest frame the WebSocket transport accepts (an oversized frame
-is rejected by the peer and kills the whole mux session, not just one bridge).
-Because the mux data path pays a roughly fixed ~12 µs per frame (socket write
-plus the peer's wakeup), bytes per frame set the throughput ceiling: on a
-4-vCPU Linux container, 64 KiB frames measured +12% on tcpMux at 4 streams
+64 KiB, which leaves the 12-byte header inside the WebSocket reader's
+65664-byte limit (an oversized frame is rejected by the peer and kills the
+whole mux session, not just one bridge).
+The mux data path costs ≈11.6 µs more per 32 KiB frame than the plain path, but
+only ~5 µs of a frame's ~23 µs is fixed cost — the rest scales with bytes — so
+frame size is a lever, not a ceiling: on a 4-vCPU Linux container, 64 KiB
+frames measured +12% on tcpMux at 4 streams
 (1348 → 1513 MiB/s), +6% at one stream and +11% on tcp-tls, at 2x64 KiB of
 buffer per live bridge instead of 2x32 KiB and a doubled pool ceiling.
 But on macOS the same setting costs the **non-mux** WebSocket rows ~40–45%
