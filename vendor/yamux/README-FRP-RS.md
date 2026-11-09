@@ -388,28 +388,28 @@ this audit records that gap rather than closing over it.
 ### Busy loop after shutdown: no reachable path
 
 The port's one terminal state, `ConnectionState::Closed`, returns
-`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:219`) or
-`Poll::Ready(Err(ConnectionError::Closed))` (`:162`) — a caller that keeps
+`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:243`) or
+`Poll::Ready(Err(ConnectionError::Closed))` (`:186`) — a caller that keeps
 polling a closed connection would indeed spin. There are **four** live poll
 sites under `tcp-mux`, and all four treat that as terminal:
 
 - the server acceptor (`frp-core/src/mux.rs:814` is its `select!`; terminal at
   `:908`/`:912`) — `break` on `Some(Err(e))`/`None`, and the poll is wrapped in
   `timeout(keepalive, ..)`;
-- the client driver (`frp-core/src/mux.rs:1143`/`:1148`) — same, inside a
+- the client driver (`frp-core/src/mux.rs:1144`/`:1149`) — same, inside a
   `select!` whose other branch is a synchronous single poll (never parks);
 - the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1126`/`:1132`) — tick-bounded;
-- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:801`/`:954`, terminal at
-  `:1034`/`:1038`) — timeout-bounded.
+- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:804`/`:957`, terminal at
+  `:1037`/`:1041`) — timeout-bounded.
 
 So a `Ready`-forever terminal state has no caller that can keep polling it.
 
 ### Blocked write: enforced **above** the port, not inside it
 
 `Active::poll` drives writes through `poll_ready_unpin` / `start_send_unpin` /
-`poll_flush_unpin` (`vendor/yamux/src/connection.rs:468-500`) and, when the
+`poll_flush_unpin` (`vendor/yamux/src/connection.rs:630-639`) and, when the
 transport is not writable, falls through to `return Poll::Pending`
-(`:613`) after the socket registered its waker. The crate itself still has **no
+(`:720`) after the socket registered its waker. The crate itself still has **no
 write deadline** — `grep -rn "write_timeout\|WriteTimeout\|write deadline"
 vendor/yamux/src/` is empty and `Config` (`vendor/yamux/src/lib.rs:100-116`) has
 no timeout field — and it is deliberately runtime-agnostic, so a timer cannot
