@@ -178,3 +178,23 @@ measured on its own; step 5 is the stop/go gate.
 Known unfinished scaffolding: `frp-core/examples/yamux_pp_task.rs` (two-task
 variant) deadlocks — do not use it as evidence; fix it only if it is needed for
 step 5, otherwise rely on the product measurement.
+
+## 9. Superseded: §2's "coalescing is falsified"
+
+§2 listed header/payload coalescing as falsified on 3,327 → 3,474 pps. That
+measurement was taken on the old two-write code, at ~3.3k pps on a loaded host,
+with a single binary and no V2 path — it was inside noise and reached the wrong
+conclusion. Re-measured after `fc5f592d` (PR #594) with three interleaved runs
+per arm, 512 B datagrams:
+
+| path | before | after | delta |
+|---|---|---|---|
+| Rust↔Rust (V2), 4 flows | 6,794 | 9,936 | +46% |
+| Rust↔Rust (V2), 1 flow | 3,259 | 3,812 | +17% |
+| Go→Rust (V1 JSON), 4 flows | 7,711 | 9,710 | +26% |
+| Go→Rust (V1 JSON), 1 flow | 3,609 | 3,936 | +9% |
+
+The mechanism is the one §2 dismissed: every non-vectored transport (yamux,
+KCP, WebSocket, cipher) turned one protocol frame into two frames and two
+socket writes. The task-hop story in §3-§4 is still correct as far as it goes,
+but the jump it targeted was never the dominant term.
