@@ -199,6 +199,9 @@ mod tests {
         );
         futures::executor::block_on(async { poll_fn(|cx| closing.poll_unpin(cx)).await.unwrap() });
         assert!(closing.pending_frames.is_empty());
+        // The split halves hold the `&mut socket` borrow until `Closing` is
+        // dropped.
+        drop(closing);
         assert!(socket.closed);
         assert_eq!(socket.written, expected_written);
     }

@@ -14,7 +14,11 @@ use super::{
 };
 use crate::connection::Id;
 use crossbeam_queue::ArrayQueue;
-use futures::{prelude::*, ready};
+use futures::{
+    io::{ReadHalf, WriteHalf},
+    prelude::*,
+    ready, Sink,
+};
 use std::{
     fmt, io,
     pin::Pin,
@@ -29,19 +33,47 @@ use std::{
 /// Chosen based on intuition in past iterations.
 const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 
-/// A [`Stream`] and writer of [`Frame`] values.
+/// The read half of a connection's I/O: frame decoding plus the read-side
+/// body-pool bookkeeping.
+///
+/// frp-rs patch: the read and write halves are separate types so the write
+/// half can be moved behind a lock and driven by whoever owns a stream (see
+/// `frame::Writer`). Reads stay with the connection driver.
 #[derive(Debug)]
-pub(crate) struct Io<T> {
+pub(crate) struct Reader<R> {
     id: Id,
-    io: T,
+    io: R,
     read_state: ReadState,
-    write_state: WriteState,
     /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
     /// A fully written data-frame body is returned here (WriteState::Body
     /// completion) and `Stream::poll_write` draws from it on the send path;
     /// read bodies are drawn at ReadState::Body init and returned once the
     /// chunk is fully consumed in `Stream::poll_read`, removing the
     /// per-chunk `Vec` allocation + zero-fill in both directions.
+    body_pool: Arc<ArrayQueue<Vec<u8>>>,
+}
+
+impl<R: AsyncRead + Unpin> Reader<R> {
+    pub(crate) fn new(id: Id, io: R, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
+        Reader {
+            id,
+            io,
+            read_state: ReadState::Init,
+            body_pool,
+        }
+    }
+}
+
+/// The write half of a connection's I/O: frame encoding and the body-pool
+/// return path.
+#[derive(Debug)]
+pub(crate) struct Writer<W> {
+    id: Id,
+    io: W,
+    write_state: WriteState,
+    /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
+    /// A fully written data-frame body is returned here (WriteState::Body
+    /// completion) and `Stream::poll_write` draws from it on the send path.
     body_pool: Arc<ArrayQueue<Vec<u8>>>,
     /// frp-rs patch: the configured send-split size. A fully-written body at
     /// or below this size is returned to `body_pool`; larger buffers are
@@ -54,6 +86,42 @@ pub(crate) struct Io<T> {
     split_send_size: usize,
 }
 
+impl<W: AsyncWrite + Unpin> Writer<W> {
+    pub(crate) fn new(
+        id: Id,
+        io: W,
+        body_pool: Arc<ArrayQueue<Vec<u8>>>,
+        split_send_size: usize,
+    ) -> Self {
+        Writer {
+            id,
+            io,
+            write_state: WriteState::Init,
+            body_pool,
+            split_send_size,
+        }
+    }
+}
+
+/// A [`Stream`] and writer of [`Frame`] values over a single I/O object.
+///
+/// Thin façade over [`Reader`] and [`Writer`] for the `Connection::new` path;
+/// the socket is split with [`AsyncReadExt::split`]. The split halves are only
+/// ever polled from the same task here, so the split's internal lock is never
+/// contended.
+pub(crate) struct Io<T> {
+    reader: Reader<ReadHalf<T>>,
+    writer: Writer<WriteHalf<T>>,
+}
+
+impl<T> fmt::Debug for Io<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // The split halves only render their socket when `T: Debug`; the
+        // connection id is the useful part.
+        write!(f, "Io({})", self.reader.id)
+    }
+}
+
 impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
     pub(crate) fn new(
         id: Id,
@@ -61,14 +129,39 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
         body_pool: Arc<ArrayQueue<Vec<u8>>>,
         split_send_size: usize,
     ) -> Self {
+        let (read, write) = io.split();
         Io {
-            id,
-            io,
-            read_state: ReadState::Init,
-            write_state: WriteState::Init,
-            body_pool,
-            split_send_size,
+            reader: Reader::new(id, read, body_pool.clone()),
+            writer: Writer::new(id, write, body_pool, split_send_size),
         }
+    }
+}
+
+impl<T: AsyncRead + Unpin> Stream for Io<T> {
+    type Item = Result<Frame<()>, FrameDecodeError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().reader).poll_next(cx)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().writer).poll_ready(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, f: Frame<()>) -> Result<(), Self::Error> {
+        Pin::new(&mut self.get_mut().writer).start_send(f)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Pin::new(&mut self.get_mut().writer).poll_close(cx)
     }
 }
 
@@ -107,7 +200,7 @@ impl fmt::Debug for WriteState {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
+impl<W: AsyncWrite + Unpin> Sink<Frame<()>> for Writer<W> {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -242,7 +335,7 @@ enum ReadState {
     },
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
+impl<R: AsyncRead + Unpin> Stream for Reader<R> {
     type Item = Result<Frame<()>, FrameDecodeError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -441,20 +534,23 @@ mod tests {
         fn property(f: Frame<()>) -> bool {
             futures::executor::block_on(async move {
                 let id = crate::connection::Id::next();
-                let mut io = Io::new(
+                let pool = Arc::new(ArrayQueue::new(1));
+                let mut writer = Writer::new(
                     id,
-                    futures::io::Cursor::new(Vec::new()),
-                    Arc::new(ArrayQueue::new(1)),
+                    Vec::new(),
+                    pool.clone(),
                     crate::DEFAULT_SPLIT_SEND_SIZE,
                 );
-                if io.send(f.clone()).await.is_err() {
+                if writer.send(f.clone()).await.is_err() {
                     return false;
                 }
-                if io.flush().await.is_err() {
+                if writer.flush().await.is_err() {
                     return false;
                 }
-                io.io.set_position(0);
-                if let Ok(Some(x)) = io.try_next().await {
+                let written = writer.io;
+                let mut reader =
+                    Reader::new(id, futures::io::Cursor::new(written), pool);
+                if let Ok(Some(x)) = reader.try_next().await {
                     x == f
                 } else {
                     false
