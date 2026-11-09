@@ -20,7 +20,8 @@ putting the old file back.
 That is not a promise, it is a CI gate: `scripts/compat-test.sh` runs **86
 scenarios plus a 17-case XTCP pairwise matrix against the real Go frp release**, in
 both directions and including V2, on every push; `scripts/protocol-matrix.sh`
-asserts that all 11 transport rows actually move bytes. No other frp
+asserts that all 11 transport rows actually move bytes and stay above a per-row
+throughput floor (`scripts/protocol-matrix.floors`). No other frp
 reimplementation offers a rollback-safe swap with evidence behind it.
 
 #### 2. It runs where a 17 MB binary does not fit

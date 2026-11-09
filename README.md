@@ -35,7 +35,7 @@ version number is deliberately not independent (see
   `scripts/compat-test.sh` runs 86 scenarios plus a 17-case XTCP pairwise matrix
   against the **real Go frp v0.72.0 release** in both directions on every push, and
   `scripts/protocol-matrix.sh` asserts that all 11 transport rows actually move
-  bytes. Each of those counts is re-measured by `scripts/repo-health.sh`, which
+  bytes and stay above a per-row throughput floor. Each of those counts is re-measured by `scripts/repo-health.sh`, which
   fails if this line drifts.
 - **3.5× smaller and 2.7× lighter** at the default tier, and 1.9 MB of frps plus
   2.1 MB of frpc at `micro` — small enough for OpenWrt routers, IoT devices and

@@ -147,6 +147,56 @@ jobs:
           echo "selector --debug gate ok: the selected scenario ran, traced, and was reported once"
 
       - name: Protocol connectivity matrix
+        # Throughput floors, not just "bytes moved": `scripts/protocol-matrix.floors`
+        # pins every non-base row to a fraction of this run's own tcp-plain
+        # rate, so a transport collapsing (KCP once ran at a third of its own
+        # rate for the project's whole life while this step stayed green) is
+        # visible, while host-to-host MiB/s drift does not.
+        #
+        # Report-only here: a shared runner is not a stable host. One run
+        # measured tcp-plain at 18.0 MiB/s and wss at 315.3 MiB/s in the same
+        # five-second windows, and the three KCP rows spanned 3.05-22.5, so a
+        # 3x regression cannot be separated from that noise. The per-row verdict
+        # still prints, and the rates file is archived and rendered below; use
+        # `--floors` (enforce) on a quiet host, or once the base floor is
+        # re-derived from these artifacts (TODO.md).
         run: |
           cargo build --release --manifest-path scripts/frp-stress/Cargo.toml
-          bash scripts/protocol-matrix.sh
+          bash scripts/protocol-matrix.sh \
+            --floors-report scripts/protocol-matrix.floors \
+            --rates-json "${RUNNER_TEMP}/protocol-matrix-rates.json"
+
+      - name: Protocol matrix rates
+        if: always()
+        run: |
+          rates="${RUNNER_TEMP}/protocol-matrix-rates.json"
+          if [ ! -f "$rates" ]; then
+            echo "::warning::no rates file at $rates (the run failed before measuring, or could not write it)"
+            exit 0
+          fi
+          {
+            echo "### Protocol matrix throughput"
+            echo
+            echo "Floors are checked in report-only mode on shared CI runners; the"
+            echo "\`compat\` log carries the per-row verdict."
+            echo
+            echo "| row | MiB/s |"
+            echo "| --- | ---: |"
+            python3 - "$rates" <<'PY'
+          import json
+          import sys
+
+          rows = json.load(open(sys.argv[1], encoding="utf-8"))["rows"]
+          for name, rate in rows.items():
+              print(f"| `{name}` | {rate:.2f} |")
+          PY
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload protocol matrix rates
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: protocol-matrix-rates
+          path: ${{ runner.temp }}/protocol-matrix-rates.json
+          if-no-files-found: ignore
+          retention-days: 30

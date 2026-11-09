@@ -9,10 +9,34 @@
 #
 # Usage:
 #   bash scripts/protocol-matrix.sh [--verbose] [--keep-tmp]
+#                                 [--floors <file> | --floors-report <file>]
+#                                 [--rates-json <file>]
 #   FRPS_BIN=/path/to/frps FRPC_BIN=/path/to/frpc bash scripts/protocol-matrix.sh
 #
 # Defaults to the local release binaries. TLS rows use the committed
 # frp-core/tests/certs. Exit code is non-zero if any row fails.
+#
+# `--rates-json <file>` writes every row's measured rate as a small JSON
+# document (`{"rows": {...}, "unit": "MiB/s"}`), so a CI job can archive it
+# and a later run can be diffed against it.
+#
+# `--floors-report <file>` runs the same check and prints the verdict without
+# failing the run; use it on a host whose variance you have not characterized.
+#
+# `--floors <file>` turns the matrix into a throughput check. The file holds
+# one `row=floor` line per row (comments and blank lines allowed); a floor is
+# either an absolute MiB/s number (`kcp-plain=20`) or a fraction of this run's
+# own `tcp-plain` rate (`kcp-plain=ratio:0.06`). The relative form is the one to
+# prefer on shared CI runners: absolute MiB/s varies with the host, while the
+# ratio between two transports measured back-to-back on the same runner does
+# not, and a transport collapsing — a 3x KCP regression is what this exists for
+# — moves the ratio. Rows missing from the file are not gated; a floor naming a
+# row this run did not execute is an error, so a typo cannot silently weaken
+# the gate.
+#
+# The matrix does not build anything: it measures whatever FRPS_BIN/FRPC_BIN
+# point at. Rebuild before trusting a number — a stale `target/release` once
+# reported a FEC fix as doing nothing.
 #
 # `--keep-tmp` (or FRP_MATRIX_KEEP_TMP=1) leaves the per-row frps.log/frpc.log
 # in place; without it the EXIT trap removes $TEST_DIR, so the log paths that a
@@ -48,6 +72,14 @@ source "$PROJECT_DIR/scripts/lib/compat-port-ownership.sh"
 PASS=0
 FAIL=0
 FAILURES=()
+# Measured rates, one `name=rate` string per row in run order, and the names of
+# every row the run attempted (a floor may name a row that failed before it was
+# measured; that is a row failure, not a floors-file typo).
+RATES=()
+ALL_ROWS=()
+FLOORS_FILE=""
+FLOORS_ENFORCE=true
+RATES_JSON=""
 
 log() { echo "[matrix] $*"; }
 vlog() { $VERBOSE && echo "[matrix] $*" || true; }
@@ -135,6 +167,7 @@ start_echo() {
 # run_row <name> <proto> <tls:on|off> <mux:on|off>
 run_row() {
     local name="$1" proto="$2" tls="$3" mux="$4"
+    ALL_ROWS+=("$name")
     local base
     base=$((19000 + 4 * (PASS + FAIL))) # disjoint 4-port block per row
     local srv_port=$((base))
@@ -279,8 +312,12 @@ run_row() {
     # without masking a genuine stall (a real stall stays at zero across all
     # attempts).
     for attempt in 1 2 3; do
+        # --json-truncate: the file is reused across attempts, and without it
+        # attempt 2 appends a second object, so json.load raises `Extra data`
+        # and every retry is reported as another zero — the retry loop could
+        # never succeed, and a row that recovered on attempt 2 was still red.
         "$STRESS_BIN" --scenario throughput --port "$proxy_port" --duration 5 --streams 1 \
-            --label "$name" --no-floor --json-out "$json" >/dev/null 2>&1
+            --label "$name" --no-floor --json-out "$json" --json-truncate >/dev/null 2>&1
         mbps=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1]))['mbps'])" "$json" 2>/dev/null || echo 0)
         # Bash cannot compare floats — python decides.
         ok=$(python3 -c "import json,sys; print('pass' if json.load(open(sys.argv[1]))['mbps'] > 0 else 'fail')" "$json" 2>/dev/null || echo fail)
@@ -290,6 +327,7 @@ run_row() {
     done
     if [[ "$ok" == "pass" ]]; then
         PASS=$((PASS + 1))
+        RATES+=("$name=$mbps")
         log "PASS $name: $mbps MiB/s"
     else
         kill_row_processes
@@ -301,6 +339,223 @@ run_row() {
     # No `sleep 0.5` afterwards: kill_row_processes now waits for the pids to die.
     kill_row_processes
     rm -f "$row_dir/frpc.pid" "$row_dir/frps.pid" "$TEST_DIR/echo-$echo_port.pid"
+}
+
+print_rates() {
+    local rate
+    ((${#RATES[@]} > 0)) || return 0
+    echo
+    echo "=== protocol matrix: measured throughput (MiB/s, 5 s window, 1 stream) ==="
+    for rate in "${RATES[@]}"; do
+        printf '[matrix] %-14s %s\n' "${rate%%=*}" "${rate#*=}"
+    done
+}
+
+write_rates_json() {
+    local out="$1"
+    [[ -n "$out" ]] || return 0
+    # `"${RATES[@]:-}"` rather than `"${RATES[@]}"`: on bash 3.2 (macOS) an
+    # empty array under `set -u` is an unbound variable, and this runs on the
+    # all-rows-failed path where the diagnosis matters most.
+    python3 - "$out" "${RATES[@]:-}" <<'PY'
+import json
+import os
+import sys
+
+out = sys.argv[1]
+rows = {}
+for item in sys.argv[2:]:
+    if not item:
+        continue
+    name, _, value = item.partition("=")
+    rows[name] = float(value)
+
+doc = {
+    "rows": rows,
+    "unit": "MiB/s",
+    "window_s": 5,
+    "streams": 1,
+    "commit": os.environ.get("GITHUB_SHA", ""),
+}
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(doc, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+PY
+}
+
+# Compare every measured row against the floors file. Floors are advisory in
+# the sense that a floor failing does not undo the row's traffic check, but it
+# does fail the run: a transport that still moves bytes while sitting at a
+# fraction of its previous rate is exactly the regression class this gate
+# exists for, and "mbps > 0" cannot see it.
+# $2 = yes to fail the run, no to report only (the CI runner is too noisy to
+# gate on until its variance is characterized — see the flag's comment in main).
+apply_floors() {
+    local floors="$1" enforce="${2:-yes}" out status name detail
+    local checked=0 below=0
+    if [[ ! -f "$floors" ]]; then
+        FAIL=$((FAIL + 1))
+        FAILURES+=("floors: file not found: $floors")
+        log "FAIL floors: file not found: $floors"
+        return
+    fi
+    # The checker prints one line per verdict and a final `checked|N|M`. The
+    # terminator is what makes the gate fail-CLOSED: an empty or truncated
+    # verdict stream (a decode error on the floors file, a missing python3, a
+    # crash after half the rows) used to produce zero `BELOW|` lines, which the
+    # loop below reads exactly like "every floor passed". A gate that vanishes
+    # when its checker breaks is a decoration, so the absence of the terminator
+    # is itself a failure.
+    out=$(MATRIX_ROWS="${ALL_ROWS[*]:-}" python3 - "$floors" "${RATES[@]:-}" <<'PY'
+import os
+import sys
+
+floors_path = sys.argv[1]
+rows_in_matrix = set(os.environ.get("MATRIX_ROWS", "").split())
+rates = {}
+bad = 0
+checked = 0
+below = 0
+
+# Skipping empty entries matters: an empty RATES array still expands to one
+# empty argument under `set -u`, and float("") used to abort the whole check
+# with a traceback (which the caller's `|| true` then swallowed).
+for item in sys.argv[2:]:
+    if not item:
+        continue
+    name, _, value = item.partition("=")
+    try:
+        rates[name] = float(value)
+    except ValueError:
+        print(f"ERROR||unparseable rate entry from the matrix: {item}")
+        bad += 1
+
+base = rates.get("tcp-plain")
+floored = set()
+
+with open(floors_path, encoding="utf-8") as fh:
+    for raw in fh:
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if "=" not in line:
+            print(f"ERROR||unparseable floor line: {line}")
+            bad += 1
+            continue
+        name, spec = (part.strip() for part in line.split("=", 1))
+        floored.add(name)
+        if name not in rates:
+            if rows_in_matrix and name not in rows_in_matrix:
+                print(f"ERROR||floor names row '{name}', which is not a matrix row")
+                bad += 1
+            else:
+                # In the matrix but never measured: the row failed its own
+                # traffic check and already failed the run. Counting it twice
+                # would confuse the failure list, and a NOTE keeps the gap
+                # visible without inventing a second cause.
+                print(f"NOTE|{name}|not measured (the row failed before its rate was recorded)")
+            continue
+        got = rates[name]
+        if spec.startswith("ratio:"):
+            try:
+                frac = float(spec.split(":", 1)[1])
+            except ValueError:
+                print(f"ERROR||unparseable ratio floor for {name}: {spec}")
+                bad += 1
+                continue
+            if not base or base <= 0:
+                print(f"ERROR||ratio floor for {name} needs a positive tcp-plain rate")
+                bad += 1
+                continue
+            need = frac * base
+            what = f"{frac:g}x tcp-plain = {need:.1f}"
+        else:
+            try:
+                need = float(spec)
+            except ValueError:
+                print(f"ERROR||unparseable floor for {name}: {spec}")
+                bad += 1
+                continue
+            what = f"{need:.1f} absolute"
+        checked += 1
+        if got >= need:
+            print(f"ok|{name}|{got:.1f} MiB/s (floor {what})")
+        else:
+            print(f"BELOW|{name}|{got:.1f} MiB/s (floor {what})")
+            below += 1
+            bad += 1
+
+# A row added to the matrix without a floor is gated only by `mbps > 0`,
+# silently and forever. Treat that as a failure: it is a one-line fix, and the
+# alternative is a gate whose coverage shrinks without anyone noticing.
+for name in sorted(rows_in_matrix - floored):
+    print(f"UNFLOORED|{name}|the matrix row has no floor in {os.path.basename(floors_path)}")
+    bad += 1
+
+print(f"checked|{checked}|{below}")
+sys.exit(1 if bad else 0)
+PY
+) || true
+    while IFS='|' read -r status name detail; do
+        [[ -n "$name$detail" ]] || continue
+        case "$status" in
+            ok)
+                checked=$((checked + 1))
+                vlog "  floor ok $name: $detail"
+                ;;
+            NOTE) vlog "  floor skipped $name: $detail" ;;
+            BELOW)
+                checked=$((checked + 1))
+                below=$((below + 1))
+                if [[ "$enforce" == "yes" ]]; then
+                    FAIL=$((FAIL + 1))
+                    FAILURES+=("$name: throughput below floor, $detail")
+                    log "FAIL $name: throughput below floor — $detail"
+                else
+                    log "WARN $name: throughput below floor (report only) — $detail"
+                fi
+                ;;
+            UNFLOORED)
+                if [[ "$enforce" == "yes" ]]; then
+                    FAIL=$((FAIL + 1))
+                    FAILURES+=("$name: no throughput floor ($detail)")
+                    log "FAIL $name: no throughput floor — $detail"
+                else
+                    log "WARN $name: no throughput floor (report only) — $detail"
+                fi
+                ;;
+            checked) ;;
+            ERROR)
+                if [[ "$enforce" == "yes" ]]; then
+                    FAIL=$((FAIL + 1))
+                    FAILURES+=("floors: $detail")
+                    log "FAIL floors: $detail"
+                else
+                    log "WARN floors (report only): $detail"
+                fi
+                ;;
+            *)
+                if [[ "$enforce" == "yes" ]]; then
+                    FAIL=$((FAIL + 1))
+                    FAILURES+=("floors: unrecognised checker output: $status|$name|$detail")
+                    log "FAIL floors: unrecognised checker output: $status|$name|$detail"
+                else
+                    log "WARN floors (report only): unrecognised checker output: $status|$name|$detail"
+                fi
+                ;;
+        esac
+    done <<<"$out"
+    if ((checked == 0)); then
+        if [[ "$enforce" == "yes" ]]; then
+            FAIL=$((FAIL + 1))
+            FAILURES+=("floors: the checker produced no verdict for any row")
+            log "FAIL floors: the checker produced no verdict for any row (empty or truncated output) — refusing to report a pass"
+            return
+        fi
+        log "WARN floors (report only): the checker produced no verdict for any row (empty or truncated output)"
+        return
+    fi
+    log "floors: $checked checked, $below below ($([[ "$enforce" == yes ]] && echo enforced || echo report only))"
 }
 
 fail_row() {
@@ -324,13 +579,36 @@ main() {
     # source time) so `scripts/tests/compat-port-ownership.sh` can source this
     # file to drive `wait_for_listen` without parsing the fixture's argv or
     # arming a cleanup trap against the fixture's directory.
-    local arg
-    for arg in "$@"; do
-        case "$arg" in
+    while (($#)); do
+        case "$1" in
             --verbose) VERBOSE=true ;;
             --keep-tmp) KEEP_TMP=true ;;
-            *) echo "protocol-matrix: unknown argument: $arg" >&2; exit 2 ;;
+            --floors | --floors-report | --rates-json)
+                [[ $# -ge 2 && -n "$2" ]] || {
+                    echo "protocol-matrix: $1 needs a path" >&2
+                    exit 2
+                }
+                case "$1" in
+                    --floors) FLOORS_FILE="$2" ;;
+                    --floors-report)
+                        # Same check, reported not enforced. The shared CI runner
+                        # is not a stable enough host to gate on yet: one run
+                        # measured tcp-plain at 18.0 MiB/s and wss at 315.3, and
+                        # the three KCP rows spanned 3.05-22.5, so a 3x
+                        # regression is indistinguishable from that noise. Gate
+                        # locally (or on a quiet runner) with --floors; CI
+                        # publishes the table and the verdict until TODO.md's
+                        # "matrix tcp-plain floor" item is closed.
+                        FLOORS_FILE="$2"
+                        FLOORS_ENFORCE=false
+                        ;;
+                    *) RATES_JSON="$2" ;;
+                esac
+                shift
+                ;;
+            *) echo "protocol-matrix: unknown argument: $1" >&2; exit 2 ;;
         esac
+        shift
     done
     trap cleanup EXIT
 
@@ -356,8 +634,12 @@ main() {
     run_row "kcp-tls-mux"  kcp        on    on
     run_row "quic"         quic       on    off
 
+    print_rates
+    write_rates_json "$RATES_JSON"
+    [[ -n "$FLOORS_FILE" ]] && apply_floors "$FLOORS_FILE" "$([[ "$FLOORS_ENFORCE" == true ]] && echo yes || echo no)"
+
     echo
-    echo "=== protocol matrix: $PASS passed, $FAIL failed ==="
+    echo "=== protocol matrix: $PASS row(s) passed, $FAIL failure(s) ==="
     for f in "${FAILURES[@]:-}"; do
         [[ -n "$f" ]] && echo "  FAIL: $f"
     done
