@@ -63,6 +63,32 @@ cannot write: it copies the body into a pooled buffer and hands a
 same channel design, which is why it pays a similar tax — but its goroutine
 wake is cheaper than a task wake plus a full driver poll.
 
+### Clean re-measurement (atomics, no per-packet I/O)
+
+`YPROBE` accumulates `start_send → flush ready` into atomics and prints every
+5000 frames. 512 B, 1 flow, 10 s, Go frps + Rust frpc, 3,313 pps:
+
+```
+YPROBE n=65000 flush_mean_us=29.1 enc_mean_us=0.0
+```
+
+**29.1 µs per yamux frame**, ~2 frames per datagram ⇒ ~58 µs of the ~135 µs a
+muxed datagram costs. `enc_mean_us=0.0` is an artifact of the probe's own
+ordering (the flush hook zeroes the shared timestamp that the encode hook
+measures against), not a measurement of encode.
+
+### The decisive comparison
+
+In the bench the caller **is** the driver: it calls `poll_next_inbound` and
+`stream.poll_write` from the same task, so a frame never waits for another task
+to be woken. There the whole yamux tax is **24.5 µs/msg**. Under frp the tax is
+**83 µs** (135 µs mux vs 52 µs no-mux). Same crate, same codec, same socket —
+the difference is that in frp the writing task and the connection driver are
+different tasks, so every frame pays a wake plus a full driver poll.
+
+That is the whole case for option 2, and it sets the target: 52 + ~25 ≈ **77 µs
+per datagram**, i.e. 6,781 → ~9.5-10k pps at 4 flows.
+
 ## 4. Design
 
 Split the connection's I/O by direction so the owner of a stream can write
