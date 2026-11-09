@@ -640,7 +640,10 @@ fn spawn_tunnel_driver<T>(
     write_deadline: Duration,
 ) -> XtcpTunnelSession
 where
-    T: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + Send + 'static,
+    // Only the read half: yamux's `Connection` type parameter is the read
+    // half of the socket (frp-rs patch — data-frame writes are done by the
+    // streams themselves through the connection's shared write lock).
+    T: futures_util::AsyncRead + Unpin + Send + 'static,
 {
     use futures_util::future::poll_fn;
     use std::task::Poll;

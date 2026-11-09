@@ -14,12 +14,9 @@ use super::{
 };
 use crate::connection::Id;
 use crossbeam_queue::ArrayQueue;
-use futures::{
-    io::{ReadHalf, WriteHalf},
-    prelude::*,
-    ready, Sink,
-};
+use futures::{prelude::*, ready, Sink};
 use std::{
+    collections::VecDeque,
     fmt, io,
     pin::Pin,
     sync::Arc,
@@ -64,13 +61,25 @@ impl<R: AsyncRead + Unpin> Reader<R> {
     }
 }
 
-/// The write half of a connection's I/O: frame encoding and the body-pool
-/// return path.
+/// The write half of a connection's I/O: frame encoding, the body-pool
+/// return path, and the outbound frame queues.
+///
+/// frp-rs patch: frames are queued in two priorities and written by whoever
+/// holds the connection's write lock — inline by the `Stream` that produced a
+/// data frame, otherwise by the connection driver. Control frames (pong,
+/// GoAway, stream resets, window updates) always precede queued data frames.
+/// Only one frame is ever in flight (`WriteState`): a frame's header and body
+/// must reach the socket contiguously, so a new frame is only started once the
+/// previous one is fully written.
 #[derive(Debug)]
 pub(crate) struct Writer<W> {
     id: Id,
     io: W,
     write_state: WriteState,
+    /// Control frames, drained before `queue`.
+    control: VecDeque<Frame<()>>,
+    /// Data (and stream-close) frames, in submission order.
+    queue: VecDeque<Frame<()>>,
     /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
     /// A fully written data-frame body is returned here (WriteState::Body
     /// completion) and `Stream::poll_write` draws from it on the send path.
@@ -97,71 +106,56 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             id,
             io,
             write_state: WriteState::Init,
+            control: VecDeque::new(),
+            queue: VecDeque::new(),
             body_pool,
             split_send_size,
         }
     }
-}
 
-/// A [`Stream`] and writer of [`Frame`] values over a single I/O object.
-///
-/// Thin façade over [`Reader`] and [`Writer`] for the `Connection::new` path;
-/// the socket is split with [`AsyncReadExt::split`]. The split halves are only
-/// ever polled from the same task here, so the split's internal lock is never
-/// contended.
-pub(crate) struct Io<T> {
-    reader: Reader<ReadHalf<T>>,
-    writer: Writer<WriteHalf<T>>,
-}
-
-impl<T> fmt::Debug for Io<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // The split halves only render their socket when `T: Debug`; the
-        // connection id is the useful part.
-        write!(f, "Io({})", self.reader.id)
+    /// Queue a control frame (pong, GoAway, stream reset, window update).
+    /// Control frames are written before any queued data frame.
+    pub(crate) fn push_control(&mut self, frame: Frame<()>) {
+        self.control.push_back(frame);
     }
-}
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
-    pub(crate) fn new(
-        id: Id,
-        io: T,
-        body_pool: Arc<ArrayQueue<Vec<u8>>>,
-        split_send_size: usize,
-    ) -> Self {
-        let (read, write) = io.split();
-        Io {
-            reader: Reader::new(id, read, body_pool.clone()),
-            writer: Writer::new(id, write, body_pool, split_send_size),
+    /// Queue a data or stream-close frame, after any control frame.
+    pub(crate) fn push_data(&mut self, frame: Frame<()>) {
+        self.queue.push_back(frame);
+    }
+
+    /// Whether a new frame can be started right away: nothing is in flight
+    /// and nothing is queued.
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self.write_state, WriteState::Init)
+            && self.control.is_empty()
+            && self.queue.is_empty()
+    }
+
+    /// Write every queued frame, control queue first, then flush.
+    ///
+    /// Returns `Pending` only when the socket is backpressured; the caller's
+    /// waker is then registered with the socket and the unwritten frames stay
+    /// queued (at most one of them is in flight), so the next holder of the
+    /// writer finishes the job. `Ready` therefore means both queues are empty
+    /// and the socket has been flushed.
+    pub(crate) fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            // `start_send` requires `poll_ready` to have returned `Ready`;
+            // starting a frame while another one is in flight would splice
+            // the two frames' bytes together on the wire.
+            if matches!(self.write_state, WriteState::Init) {
+                match self.control.pop_front().or_else(|| self.queue.pop_front()) {
+                    Some(frame) => Pin::new(&mut *self).start_send(frame)?,
+                    // Nothing queued: write whatever is in flight and flush.
+                    None => {
+                        ready!(Pin::new(&mut *self).poll_flush(cx))?;
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+            }
+            ready!(Pin::new(&mut *self).poll_ready(cx))?;
         }
-    }
-}
-
-impl<T: AsyncRead + Unpin> Stream for Io<T> {
-    type Item = Result<Frame<()>, FrameDecodeError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().reader).poll_next(cx)
-    }
-}
-
-impl<T: AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
-    type Error = io::Error;
-
-    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.get_mut().writer).poll_ready(cx)
-    }
-
-    fn start_send(self: Pin<&mut Self>, f: Frame<()>) -> Result<(), Self::Error> {
-        Pin::new(&mut self.get_mut().writer).start_send(f)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
-    }
-
-    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.get_mut().writer).poll_close(cx)
     }
 }
 

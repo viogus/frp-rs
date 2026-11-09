@@ -16,7 +16,7 @@ use header::{Data, GoAway, Header, Ping, StreamId, WindowUpdate};
 use std::{convert::TryInto, num::TryFromIntError};
 
 pub use io::FrameDecodeError;
-pub(crate) use io::Io;
+pub(crate) use io::{Reader, Writer};
 
 /// A Yamux message frame consisting of header and body.
 #[derive(Clone, Debug, PartialEq, Eq)]

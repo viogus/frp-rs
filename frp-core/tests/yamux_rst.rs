@@ -137,8 +137,12 @@ fn cap_syn(sid: u32) -> [u8; 12] {
     h
 }
 
-/// Server connection type used by the backpressure tests below.
-type CapConn = yamux::Connection<tokio_util::compat::Compat<tokio::io::DuplexStream>>;
+/// Server connection type used by the backpressure tests below. The type
+/// parameter is yamux's read half (frp-rs patch: the write half is
+/// type-erased behind the connection's write lock).
+type CapConn = yamux::Connection<
+    futures_util::io::ReadHalf<tokio_util::compat::Compat<tokio::io::DuplexStream>>,
+>;
 
 /// Poll the server connection until `target` inbound streams are admitted
 /// (panics on connection error/EOF or an admission stall).

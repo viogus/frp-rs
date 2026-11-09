@@ -303,6 +303,48 @@ When bumping yamux upstream: re-apply the `body_pool` field threading
 (`poll_write`, `WriteState::Body` completion, `ReadState::Body` init,
 `poll_read` consumed-chunk return), or carry the patch upstream.
 
+## Patch: write path split into read half + shared writer (inline stream writes)
+
+Why: on the frp data plane every data frame was written by the
+connection driver, so `Stream::poll_write` handed each frame to the
+driver task through an mpsc channel and the driver had to be woken —
+measured at 29.1 µs per frame, the bulk of the 83 µs per-packet mux tax.
+The frame must instead reach the socket from the task that produced it.
+
+### What changed
+
+- `frame::Io` (`src/frame/io.rs`) is split into `Reader<R>` (read state
+  machine) and `Writer<W>` (write state machine). `Writer` additionally
+  owns the frame queues: a control queue (ping/pong/goaway/reset/window
+  update, written first) and a data queue, plus `poll_drain`, which
+  writes queued frames one at a time — a frame's header and body must
+  reach the socket contiguously — and flushes when the queues are empty.
+- `Connection::new(socket)` splits the socket
+  (`futures::AsyncReadExt::split`) and delegates to
+  `Connection::new_split(read, write, cfg, mode)`. `Connection<T>`'s
+  type parameter is the read half; the write half is type-erased
+  (`Box<dyn AsyncWrite + Unpin + Send>`) so `Stream` and `Closing` need
+  no socket type parameter and frp's `YamuxStream = Compat<Stream>`
+  stays as it is.
+- The writer is shared as an `Arc<ConnWriter>` between the driver and
+  every stream. `ConnWriter` is a `tokio::sync::Mutex<frame::Writer>`
+  plus the owner-wake handshake: the driver registers its waker on every
+  poll and sets `owner_wants_lock` when it fails to take the lock; the
+  lock holder releases *then* wakes it (waking while still holding would
+  be answered by another failed `try_lock`, i.e. a lost wakeup).
+- New dependency: `tokio = { version = "1", default-features = false,
+  features = ["sync"] }` (`Cargo.toml`) — `tokio::sync::Mutex` only. No
+  runtime, no `net`, no `time`; tokio is already in the frp dependency
+  graph, so no crate enters the build.
+- `Connection`'s driver and `Closing` both write through that lock, so
+  there is exactly one writer on the wire.
+
+### Upgrade note
+
+This patch replaces `frame::Io` wholesale and changes `Connection::new`'s
+signature surface (`new_split`) — carry it upstream rather than
+re-applying it as hunks on a yamux bump.
+
 ## Patch: exact outbound-ACK backlog counter (O(1) instead of O(N) scan)
 
 Upstream's `ack_backlog()` scans the whole stream map on every

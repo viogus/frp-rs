@@ -28,17 +28,11 @@ use std::sync::{
     Arc,
 };
 #[cfg(feature = "tcp-mux")]
-use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::compat::{
+    Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
+};
 #[cfg(feature = "tcp-mux")]
 use tracing::{debug, warn};
-
-/// Type-erased yamux socket: futures-util AsyncRead/AsyncWrite (yamux's
-/// trait set, not tokio's) + Send. Lets YamuxSession hold the Connection
-/// non-generically so callers can store it in plain structs.
-#[cfg(feature = "tcp-mux")]
-trait MuxSocket: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + Send {}
-#[cfg(feature = "tcp-mux")]
-impl<T: futures_util::AsyncRead + futures_util::AsyncWrite + Unpin + Send> MuxSocket for T {}
 
 #[cfg(feature = "tcp-mux")]
 use yamux::{Config, Connection, Mode, Stream};
@@ -746,9 +740,15 @@ where
 {
     let activity = Arc::new(ActivityState::default());
     let stall = Arc::new(WriteStall::default());
-    let compat = ActivityIo::new(stream, activity.clone(), stall.clone()).compat();
     let yamux_cfg = yamux_config(mux_cfg);
-    let mut conn = Connection::new(compat, yamux_cfg, Mode::Server);
+    // frp-rs patch: yamux writes a data frame from the task that produced it
+    // (`Stream::poll_write`) rather than through the driver, so the socket is
+    // split here and the halves handed over separately. `ActivityIo` holds its
+    // `Arc`s, so both halves keep reporting activity/write-progress.
+    let io = ActivityIo::new(stream, activity.clone(), stall.clone());
+    let (read, write) = tokio::io::split(io);
+    let mut conn =
+        Connection::new_split(read.compat(), write.compat_write(), yamux_cfg, Mode::Server);
 
     // Accept the first stream — this is the control channel. Bounded by
     // the caller's accept deadline: without it, a client that completes
@@ -968,11 +968,12 @@ where
     // driver free to keep polling poll_next_inbound (processing ACK frames)
     // while an open is in flight — a caller holding the lock to poll the
     // connection would stall those ACK reads and add measurable setup latency.
-    let mut conn: Connection<Box<dyn MuxSocket>> = Connection::new(
-        Box::new(ActivityIo::new(stream, activity.clone(), stall.clone()).compat()),
-        yamux_cfg,
-        Mode::Client,
-    );
+    // frp-rs patch: the socket is split so yamux can write a data frame from
+    // the task that produced it (`Stream::poll_write`); see `server_mux`.
+    let io = ActivityIo::new(stream, activity.clone(), stall.clone());
+    let (read, write) = tokio::io::split(io);
+    let mut conn =
+        Connection::new_split(read.compat(), write.compat_write(), yamux_cfg, Mode::Client);
 
     // Open the first stream — this is the control channel.
     let control = poll_fn(|cx| conn.poll_new_outbound(cx))
@@ -1771,7 +1772,7 @@ mod tests {
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let mut conn: Connection<Box<dyn MuxSocket>> = Connection::new(
+        let mut conn = Connection::new(
             Box::new(
                 ActivityIo::new(
                     stream,

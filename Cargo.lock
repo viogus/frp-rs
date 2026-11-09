@@ -4621,6 +4621,7 @@ dependencies = [
  "parking_lot",
  "pin-project",
  "static_assertions",
+ "tokio",
  "web-time",
 ]
 

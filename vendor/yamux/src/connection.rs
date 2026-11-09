@@ -17,7 +17,7 @@ mod closing;
 mod rtt;
 mod stream;
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::tagged_stream::TaggedStream;
 use crate::{
@@ -30,13 +30,16 @@ use crate::{Result, MAX_ACK_BACKLOG};
 use cleanup::Cleanup;
 use closing::Closing;
 use crossbeam_queue::ArrayQueue;
+use futures::io::ReadHalf;
 use futures::stream::SelectAll;
-use futures::{channel::mpsc, future::Either, prelude::*, sink::SinkExt, stream::Fuse};
+use futures::task::AtomicWaker;
+use futures::{channel::mpsc, future::Either, prelude::*, stream::Fuse};
 use nohash_hasher::IntMap;
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::task::{Context, Waker};
 use std::{fmt, sync::Arc, task::Poll};
+use tokio::sync::Mutex as WriteMutex;
 
 pub use stream::{Packet, State, Stream};
 
@@ -101,11 +104,32 @@ pub struct Connection<T> {
     inner: ConnectionState<T>,
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Connection<T> {
+impl<T: AsyncRead + AsyncWrite + Unpin + Send + 'static> Connection<ReadHalf<T>> {
     pub fn new(socket: T, cfg: Config, mode: Mode) -> Self {
+        let (read, write) = socket.split();
+        Self::new_split(read, write, cfg, mode)
+    }
+}
+
+impl<T: AsyncRead + Unpin> Connection<T> {
+    /// Create a `Connection` from already-split I/O halves.
+    ///
+    /// frp-rs patch: the write half is type-erased (`Send + 'static` is
+    /// required for that) and shared with every `Stream` behind the
+    /// connection's write lock, so a stream can write its own data frame from
+    /// the caller's task. Taking the halves separately (rather than the whole
+    /// socket) lets a caller keep transport-level bookkeeping on both halves,
+    /// e.g. frp's activity/stall wrapper around a `tokio::io::split`.
+    pub fn new_split(
+        read: T,
+        write: impl AsyncWrite + Unpin + Send + 'static,
+        cfg: Config,
+        mode: Mode,
+    ) -> Self {
         Self {
             inner: ConnectionState::Active(Active::new(
-                socket,
+                read,
+                Box::new(write),
                 cfg,
                 mode,
                 Arc::new(ArrayQueue::new(BODY_POOL_CAP)),
@@ -279,11 +303,15 @@ impl<T> Drop for Connection<T> {
     }
 }
 
+// `Active` is the live connection (read state machine + stream map); the
+// other variants are small and short-lived, so boxing it to shrink the enum
+// would add a pointer chase on the hot poll path.
+#[allow(clippy::large_enum_variant)]
 enum ConnectionState<T> {
     /// The connection is alive and healthy.
     Active(Active<T>),
     /// Our user requested to shutdown the connection, we are working on it.
-    Closing(Closing<T>),
+    Closing(Closing),
     /// An error occurred and we are cleaning up our resources.
     Cleanup(Cleanup),
     /// The connection is closed.
@@ -304,12 +332,133 @@ impl<T> fmt::Debug for ConnectionState<T> {
     }
 }
 
+/// The write half of the socket, type-erased so [`Stream`] and [`Closing`]
+/// need no socket type parameter.
+pub(crate) type WriteBox = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// The connection's write side, shared by the driver and every [`Stream`].
+///
+/// frp-rs patch: a data frame is written by the stream that produced it, in
+/// the caller's task, instead of being handed to the driver — that removes a
+/// cross-task wake per frame. The lock
+///
+/// - keeps a single writer on the wire: frame bytes must not interleave;
+/// - orders control frames ahead of data frames (`frame::Writer`);
+/// - hands a frame the current writer could not finish (socket backpressure)
+///   to whoever takes the lock next.
+///
+/// Lock order: this lock first, then a stream's `Shared` mutex. Nothing takes
+/// them in the opposite order.
+pub(crate) struct ConnWriter {
+    inner: WriteMutex<frame::Writer<WriteBox>>,
+    /// Waker of the connection *owner* — the driver task, or the [`Closing`]
+    /// future after the driver gave the connection up. Registered on every
+    /// owner poll, so a contended lock cannot lose it.
+    owner_waker: AtomicWaker,
+    /// Set while the owner wants the lock and does not have it. The lock
+    /// holder wakes it on release; without this the owner's frames would sit
+    /// until some unrelated event woke the driver.
+    owner_wants_lock: AtomicBool,
+}
+
+impl ConnWriter {
+    fn new(
+        id: Id,
+        io: WriteBox,
+        body_pool: Arc<ArrayQueue<Vec<u8>>>,
+        split_send_size: usize,
+    ) -> Self {
+        ConnWriter {
+            inner: WriteMutex::new(frame::Writer::new(id, io, body_pool, split_send_size)),
+            owner_waker: AtomicWaker::new(),
+            owner_wants_lock: AtomicBool::new(false),
+        }
+    }
+
+    /// Take the write lock on behalf of the connection owner, registering its
+    /// waker. `None` means a `Stream` holds the lock; the owner is woken when
+    /// that stream releases it.
+    pub(crate) fn lock_owner(&self, cx: &mut Context<'_>) -> Option<WriteGuard<'_>> {
+        self.owner_waker.register(cx.waker());
+        let guard = match self.inner.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Publish the request *before* re-checking: a holder that
+                // released the lock between the failed `try_lock` and the
+                // store would not see the flag, and a holder that still holds
+                // it now will see it on release.
+                self.owner_wants_lock.store(true, Ordering::Release);
+                match self.inner.try_lock() {
+                    Ok(guard) => {
+                        self.owner_wants_lock.store(false, Ordering::Release);
+                        guard
+                    }
+                    Err(_) => return None,
+                }
+            }
+        };
+        self.owner_wants_lock.store(false, Ordering::Release);
+        Some(WriteGuard {
+            guard: Some(guard),
+            owner: self,
+        })
+    }
+
+    /// Wake the owner if it asked for the lock while we held it. Called by
+    /// [`WriteGuard`] *after* the lock is released.
+    fn wake_owner_if_wanted(&self) {
+        if self.owner_wants_lock.swap(false, Ordering::AcqRel) {
+            self.owner_waker.wake();
+        }
+    }
+}
+
+/// A held [`ConnWriter`] lock. Dropping it releases the lock and then wakes
+/// the connection owner if it was waiting for it.
+pub(crate) struct WriteGuard<'a> {
+    /// `Option` so `drop` can release the lock before waking the owner (a wake
+    /// sent while the lock is still held would be answered by another failed
+    /// `try_lock`, i.e. a lost wakeup).
+    guard: Option<tokio::sync::MutexGuard<'a, frame::Writer<WriteBox>>>,
+    owner: &'a ConnWriter,
+}
+
+impl std::ops::Deref for WriteGuard<'_> {
+    type Target = frame::Writer<WriteBox>;
+
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("write guard is only cleared when dropping")
+    }
+}
+
+impl std::ops::DerefMut for WriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("write guard is only cleared when dropping")
+    }
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        self.owner.wake_owner_if_wanted();
+    }
+}
+
 /// The active state of [`Connection`].
 struct Active<T> {
     id: Id,
     mode: Mode,
     config: Arc<Config>,
-    socket: Fuse<frame::Io<T>>,
+    /// The read half of the socket: inbound frames are decoded here, in the
+    /// connection driver's task.
+    socket: Fuse<frame::Reader<T>>,
+    /// The write half, shared with every [`Stream`] of this connection (see
+    /// [`ConnWriter`]).
+    writer: Arc<ConnWriter>,
     next_id: u32,
 
     streams: IntMap<StreamId, Arc<Mutex<stream::Shared>>>,
@@ -416,17 +565,30 @@ impl<T> fmt::Display for Active<T> {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
-    /// Create a new `Connection` from the given I/O resource.
-    fn new(socket: T, cfg: Config, mode: Mode, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
+impl<T: AsyncRead + Unpin> Active<T> {
+    /// Create a new `Connection` from the given I/O halves.
+    fn new(
+        read: T,
+        write: WriteBox,
+        cfg: Config,
+        mode: Mode,
+        body_pool: Arc<ArrayQueue<Vec<u8>>>,
+    ) -> Self {
         let id = Id::next();
         log::debug!("new connection: {id} ({mode:?})");
-        let socket = frame::Io::new(id, socket, body_pool.clone(), cfg.split_send_size).fuse();
+        let writer = Arc::new(ConnWriter::new(
+            id,
+            write,
+            body_pool.clone(),
+            cfg.split_send_size,
+        ));
+        let socket = frame::Reader::new(id, read, body_pool.clone()).fuse();
         Active {
             id,
             mode,
             config: Arc::new(cfg),
             socket,
+            writer,
             streams: IntMap::default(),
             stream_receivers: SelectAll::default(),
             no_streams_waker: None,
@@ -446,14 +608,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
     }
 
     /// Gracefully close the connection to the remote.
-    fn close(self) -> Closing<T> {
+    fn close(self) -> Closing {
         let pending_frames = self
             .pending_read_frame
             .into_iter()
             .chain(self.pending_reset_frames)
             .chain(self.pending_write_frame)
             .collect::<VecDeque<Frame<()>>>();
-        Closing::new(self.stream_receivers, pending_frames, self.socket)
+        Closing::new(self.stream_receivers, pending_frames, self.writer)
     }
 
     /// Cleanup all our resources.
@@ -467,67 +629,12 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
     fn poll(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream>> {
         loop {
-            if self.socket.poll_ready_unpin(cx).is_ready() {
-                // Note `next_ping` does not register a waker and thus if not called regularly (idle
-                // connection) no ping is sent. This is deliberate as an idle connection does not
-                // need RTT measurements to increase its stream receive window.
-                if let Some(frame) = self.rtt.next_ping() {
-                    self.socket.start_send_unpin(frame.into())?;
-                    continue;
-                }
-
-                // Privilege pending `Pong` and `GoAway` `Frame`s
-                // over `Frame`s from the receivers. frp-rs patch: queued
-                // per-stream RSTs drain one per loop iteration (FIFO via
-                // `pop_front`); the `continue` re-enters the writable check,
-                // so the whole queue goes out within one poll round when the
-                // socket stays writable — no extra wake mechanism.
-                if let Some(frame) = self
-                    .pending_read_frame
-                    .take()
-                    .or_else(|| self.pending_reset_frames.pop_front())
-                    .or_else(|| self.pending_write_frame.take())
-                {
-                    self.socket.start_send_unpin(frame)?;
-                    continue;
-                }
-            }
-
-            match self.socket.poll_flush_unpin(cx)? {
-                Poll::Ready(()) => {}
-                Poll::Pending => {}
-            }
-
-            if self.pending_write_frame.is_none() {
-                match self.stream_receivers.poll_next_unpin(cx) {
-                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
-                        log::trace!(
-                            "{}/{}: sending: {}",
-                            self.id,
-                            frame.header().stream_id(),
-                            frame.header()
-                        );
-                        self.pending_write_frame.replace(frame.into());
-                        continue;
-                    }
-                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
-                        log::trace!("{}/{}: sending close", self.id, id);
-                        self.pending_write_frame
-                            .replace(Frame::close_stream(id, ack).into());
-                        continue;
-                    }
-                    Poll::Ready(Some((id, None))) => {
-                        if let Some(frame) = self.on_drop_stream(id) {
-                            log::trace!("{}/{}: sending: {}", self.id, id, frame.header());
-                            self.pending_write_frame.replace(frame);
-                        };
-                        continue;
-                    }
-                    Poll::Ready(None) => {
-                        self.no_streams_waker = Some(cx.waker().clone());
-                    }
-                    Poll::Pending => {}
-                }
+            // frp-rs patch: the write side is driven through the shared write
+            // lock (a `Stream` may be writing a data frame inline right now).
+            // Backpressure or a contended lock does not skip the read branch
+            // below — inbound frames keep being processed either way.
+            if let Poll::Ready(Err(e)) = self.poll_writes(cx) {
+                return Poll::Ready(Err(e));
             }
 
             // The read gate only guards `pending_read_frame` (pongs/GoAways):
@@ -611,6 +718,109 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Active<T> {
 
             // If we make it this far, at least one of the above must have registered a waker.
             return Poll::Pending;
+        }
+    }
+
+    /// Write everything the driver owes the wire, then stage at most one frame
+    /// from the stream receivers.
+    ///
+    /// Frames the driver must emit live in three places, in this priority
+    /// order (unchanged from the pre-split driver): an RTT ping, a pending
+    /// `Pong`/`GoAway`, queued per-stream `RST`s, and one `StreamCommand`.
+    /// They are moved into the shared writer's queues and written while this
+    /// driver holds the write lock.
+    ///
+    /// Returns `Pending` when the socket is backpressured or a `Stream` holds
+    /// the write lock; either way the caller keeps driving the read half.
+    fn poll_writes(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let writer = self.writer.clone();
+        let Some(mut w) = writer.lock_owner(cx) else {
+            return Poll::Pending;
+        };
+
+        loop {
+            // Only move frames into the writer while it can start one right
+            // away. Besides keeping the queues shallow, this preserves two
+            // pre-split behaviours: `next_ping` is not called on an
+            // un-writable socket (an idle connection sends no pings), and a
+            // pending `Pong` stays in `pending_read_frame` while the wire is
+            // busy, which keeps the read gate below closed (pings are
+            // answered one at a time instead of piling up).
+            if w.is_idle() {
+                // Note `next_ping` does not register a waker and thus if not called regularly (idle
+                // connection) no ping is sent. This is deliberate as an idle connection does not
+                // need RTT measurements to increase its stream receive window.
+                if let Some(frame) = self.rtt.next_ping() {
+                    w.push_control(frame.into());
+                }
+
+                // Privilege pending `Pong` and `GoAway` `Frame`s
+                // over `Frame`s from the receivers. frp-rs patch: queued
+                // per-stream RSTs drain into the writer's control queue as a
+                // whole (FIFO, one `RST` per stream).
+                if let Some(frame) = self.pending_read_frame.take() {
+                    w.push_control(frame);
+                }
+                for frame in self.pending_reset_frames.drain(..) {
+                    w.push_control(frame);
+                }
+                if let Some(frame) = self.pending_write_frame.take() {
+                    w.push_data(frame);
+                }
+            }
+
+            match w.poll_drain(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                Poll::Pending => return Poll::Pending,
+            }
+
+            // Stage the next command only once the wire is clear, so the
+            // bounded per-stream channel keeps applying backpressure instead
+            // of letting the writer's queues grow.
+            if self.pending_write_frame.is_none() {
+                match self.stream_receivers.poll_next_unpin(cx) {
+                    Poll::Ready(Some((_, Some(StreamCommand::SendFrame(frame))))) => {
+                        log::trace!(
+                            "{}/{}: sending: {}",
+                            self.id,
+                            frame.header().stream_id(),
+                            frame.header()
+                        );
+                        self.pending_write_frame.replace(frame.into());
+                        continue;
+                    }
+                    Poll::Ready(Some((id, Some(StreamCommand::CloseStream { ack })))) => {
+                        log::trace!("{}/{}: sending close", self.id, id);
+                        self.pending_write_frame
+                            .replace(Frame::close_stream(id, ack).into());
+                        continue;
+                    }
+                    Poll::Ready(Some((id, None))) => {
+                        if let Some(frame) = self.on_drop_stream(id) {
+                            log::trace!("{}/{}: sending: {}", self.id, id, frame.header());
+                            self.pending_write_frame.replace(frame);
+                        };
+                        continue;
+                    }
+                    Poll::Ready(None) => {
+                        self.no_streams_waker = Some(cx.waker().clone());
+                    }
+                    Poll::Pending => {}
+                }
+            }
+
+            // Frames the writer could not take (it was not idle when the loop
+            // started) must not be left behind: nothing else would wake this
+            // driver to write them.
+            if self.pending_read_frame.is_some()
+                || !self.pending_reset_frames.is_empty()
+                || self.pending_write_frame.is_some()
+            {
+                continue;
+            }
+
+            return Poll::Ready(Ok(()));
         }
     }
 
