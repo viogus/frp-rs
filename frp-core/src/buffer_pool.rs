@@ -26,17 +26,18 @@ use std::sync::LazyLock;
 /// derived split is capped at 64 KiB, the largest frame the WebSocket
 /// transport accepts.
 ///
-/// Raising this to 64 KiB is the one tuning knob with a measured data-plane
-/// win: on the mux path it is worth ~15% strictly ping-pong and ~10% less CPU
-/// per byte, and ~3% on plain TCP (measurements:
-/// `docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`). The gain is
-/// the frame/payload match, not the buffer size on its own — a 64 KiB buffer
-/// against a fixed 32 KiB frame split is level with the default. The price is per-bridge
-/// memory: the plain and encrypted paths each hold one buffer per direction,
-/// so the default costs 2x32 KiB per bridge and 64 KiB per bridge costs
-/// 2x64 KiB. The default therefore stays at Go parity; operators who want the
-/// mux win set `FRP_BRIDGE_BUF_KB=64`, which is why the split has to follow
-/// this value (a hardcoded 32 KiB split made the knob do nothing).
+/// A 64 KiB default is **not** adopted even though it is 12% faster on the
+/// mux path: on macOS it costs the non-mux WebSocket rows ~40-45% (measured
+/// 301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`, via
+/// `scripts/protocol-matrix.sh` with `FRP_BRIDGE_BUF_KB` as the only
+/// difference), while the mux rows are flat or slightly better and plain tcp
+/// gains ~12%. Since `ws`/`wss` without `tcpMux` is a supported configuration,
+/// the default stays at Go parity and the knob carries the tradeoff:
+/// `FRP_BRIDGE_BUF_KB=64` is worth +12% on tcpMux (1348 -> 1513 MiB/s at 4
+/// flows on a 4-vCPU Linux container), +6% at one flow, +11% on tcp-tls, at
+/// 2x64 KiB of buffer per live bridge instead of 2x32 KiB. Measurements, the
+/// cost model and the three structural alternatives that changed nothing:
+/// `docs/archive/notes/2026-11-10-mux-frame-cost.md`.
 ///
 /// Override via env `FRP_BRIDGE_BUF_KB` (valid range: 4–1024 KB,
 /// i.e. 4 KiB – 1 MiB). Read once at process start via `LazyLock`.

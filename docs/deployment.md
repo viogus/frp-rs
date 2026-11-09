@@ -1131,13 +1131,16 @@ That knob now also sizes the tcpMux data frame, so a full bridge chunk travels
 as one yamux frame in the steady state — except that the split is capped at
 64 KiB, the largest frame the WebSocket transport accepts (an oversized frame
 is rejected by the peer and kills the whole mux session, not just one bridge).
-On loopback, 64 KiB measured ~15% more strict ping-pong throughput on tcpMux
-(~3% on plain TCP) and ~10% less CPU per byte, for one extra 32 KiB per
-direction per live bridge plus the yamux body pool (up to 16 frames at the new
-size) (`FRP_BRIDGE_BUF_KB=64`).
-The default stays at 32 KiB because that cost is per connection and unmeasured
-at high fan-out:
-[`docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`](archive/notes/2026-11-08-bridge-buffer-frame-match.md).
+Because the mux data path pays a roughly fixed ~12 µs per frame (socket write
+plus the peer's wakeup), bytes per frame set the throughput ceiling: on a
+4-vCPU Linux container, 64 KiB frames measured +12% on tcpMux at 4 streams
+(1348 → 1513 MiB/s), +6% at one stream and +11% on tcp-tls, at 2x64 KiB of
+buffer per live bridge instead of 2x32 KiB and a doubled pool ceiling.
+But on macOS the same setting costs the **non-mux** WebSocket rows ~40–45%
+(`ws` 301 → 165 MiB/s, `wss` 226 → 134), so 64 KiB is a knob for tcp/tcp-tls
+deployments rather than the default; leave `tcpMux` on if you raise it.
+Measurements and the frame-cost model:
+[`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md).
 
 **Heartbeat intervals:**
 

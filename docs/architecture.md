@@ -662,20 +662,23 @@ changes.
   and ignored (a failed socket option must not kill a connection). KCP sets its
   own nodelay; QUIC/UDP are excluded. Wire-invisible.
 - **Bridge buffer size**: `frp_core::buffer_pool::BUFFER_SIZE` defaults to
-  **32 KiB** (matching Go frp's `io.Copy`; it was 64 KiB — halved for
-  per-connection footprint). Override with `FRP_BRIDGE_BUF_KB` (4–1024). The plain
-  bridge copies through `relay_plain_pooled` (which loops on `copy_pooled`),
-  so `BUFFER_SIZE` applies to the plain path too; the
+  **32 KiB** (matching Go frp's `io.Copy`). Override with `FRP_BRIDGE_BUF_KB`
+  (4–1024). The plain bridge copies through `relay_plain_pooled` (which loops on
+  `copy_pooled`), so `BUFFER_SIZE` applies to the plain path too; the
   encrypted/compressed path uses the `PoolGuard` buffer pool (also
   `BUFFER_SIZE`). The value also sizes the yamux data frame
   (`mux.rs` sets `split_send_size` from it), so in the steady state one full
   bridge chunk is one frame; the split is capped at 64 KiB because a larger
   frame cannot cross the WebSocket transport, and a rejected frame kills the
-  whole mux session. Raising the buffer to 64 KiB is worth ~15% on tcpMux and
-  ~3% plain, at one extra 32 KiB per direction per bridge plus the yamux body
-  pool (up to 16 frames at the new size) (measurements and the reason the default
-  stays at Go parity:
-  [`docs/archive/notes/2026-11-08-bridge-buffer-frame-match.md`](archive/notes/2026-11-08-bridge-buffer-frame-match.md)).
+  whole mux session. Raising the buffer to 64 KiB is the one knob with a
+  measured data-plane win on the mux path (+12% on tcpMux at 4 flows, +6% at
+  one, +11% on tcp-tls, from 2x64 KiB per bridge instead of 2x32 KiB) — but it
+  also costs the non-mux WebSocket rows ~40–45% on macOS (`ws` 301 → 165 MiB/s,
+  `wss` 226 → 134), which is why the default stays at Go parity and the knob
+  carries the tradeoff. The cost model — a roughly fixed ~12 µs per frame, so
+  bytes per frame set the ceiling — and three structural alternatives that
+  measured at zero gain are in
+  [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md).
 
 ### Transport status
 

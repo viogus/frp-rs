@@ -1,3 +1,10 @@
+> **Still current (re-checked 2026-11-10).** §6 argues the default should stay
+> at 32 KiB. A 64 KiB default measured +12% on tcpMux but ~40% slower on `ws`
+> without `tcpMux` on macOS, so it stays a knob — see
+> [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](2026-11-10-mux-frame-cost.md).
+> Everything here — the derivation, the frame/payload match, the WebSocket
+> cap — still stands.
+
 # Bridge buffer size: the knob did not reach the yamux frame
 
 **Date:** 2026-11-08. **Host:** macOS arm64 (Apple M2), rustc 1.98.1, load
