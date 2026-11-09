@@ -4,8 +4,8 @@ Measured 2026-11-09 on macOS 26.2 (arm64, Apple M2), loopback, release build.
 
 ## Symptom
 
-The protocol matrix has always reported KCP roughly an order of magnitude
-below TCP (`kcp-plain` 22.25 MiB/s against `tcp-plain` 526.90 MiB/s, same run,
+The protocol matrix has always reported KCP somewhat over 20× below TCP
+(`kcp-plain` 22.25 MiB/s against `tcp-plain` 526.90 MiB/s, same run,
 same host, same harness). Two questions followed: is that KCP's own
 acknowledgement overhead, or is something in frp-rs doing avoidable work?
 
@@ -70,18 +70,19 @@ Packet count is not the limiter.
 
 ## Go frp, measured (same harness, same container)
 
-Earlier drafts of this note said no Go number was obtainable. That is a property
-of this macOS host, not of Go frp, and it had two separable causes:
+Earlier drafts of this note said no Go number was obtainable. That was a setup
+error plus a darwin-specific client hang, not a property of Go frp, and the two
+causes are separable:
 
 1. **A config default, not a bug.** A Go `frps` serves KCP with
    `transport.tcpMux = true` by default. A Go `frpc` configured with
-   `tcpMux = false` never completes a KCP login (the same mismatch fails over TCP
-   with `connect to server error: EOF`), which reads like "KCP does not connect".
+   `tcpMux = false` never completes a KCP login (the same mismatch also fails
+   at login over TCP), which reads like "KCP does not connect".
 2. **A darwin client hang.** With `tcpMux` matched, the v0.72.0 darwin `frpc`
-   still parks before login: `SIGQUIT` puts the main goroutine in `select` at
-   `client/connector.go:247`, while a bare `kcp-go` v5.6.73 echo over the same
-   port completes. The Linux build of the same release connects in under a
-   second.
+   still parks before login: `SIGQUIT` shows the client goroutine parked in
+   `select` (the reported frame is in `client/connector.go`), while a bare
+   `kcp-go` echo over the same port completes. The Linux build of the same
+   release connects in under a second.
 
 So both implementations were measured in `debian:bookworm-slim`
 (`--platform linux/arm64`, same host), both at v0.72.0, one harness:
@@ -95,13 +96,19 @@ So both implementations were measured in `debian:bookworm-slim`
 
 "Stream" is a client writing 256 MiB through the proxy to a sink that only reads,
 so it measures the path ceiling; "ping-pong" is one 64 KiB write followed by a
-64 KiB read, so it measures the cost of a round trip. The ping-pong gap is a
-*shape* difference, not extra work: Go's stream row moves 121 MiB/s through the
-same code, so its ~14 ms round trip is where it flushes, not what it computes.
-The stream row is the honest headline — **+23%** — and it is consistent with the
-table above removing a cost Go never had: `kcp-go` delegates FEC to
-`klauspost/reedsolomon`, which ships NEON/SSE assembly, so parity was the goal
-here rather than a win.
+64 KiB read, so it measures the cost of a round trip.
+
+The ping-pong gap is a per-round-trip queueing cost, not per-byte compute: Go's
+stream row moves 121 MiB/s through the same code, while the ping-pong row implies
+~14 ms per 64 KiB round trip against ~0.96 ms for frp-rs. Which side's flush or
+scheduling dominates was **not isolated** — both run the same aggressive KCP
+parameters (`nodelay`, `interval` 20) — and the harness only moves 64 KiB, so a
+small-payload RTT test is open work rather than something this row answers.
+
+The honest headline is the single-flow stream row — **+23%**; the 4-flow row is
++16.9% (one sample per arm). Both are consistent with the table above removing a
+cost Go never had: `kcp-go` delegates FEC to `klauspost/reedsolomon`, which ships
+NEON/SSE assembly, so parity was the goal here rather than a win.
 
 Absolute figures are container-bound and must not be compared with the macOS
 rows above: the same container measured frp-rs at 65.4 MiB/s ping-pong where
@@ -119,7 +126,8 @@ meaningful.
 - `scripts/compat-test.sh` was **not** run locally: on this macOS host a Go frp
   v0.72.0 KCP client does not complete a dial (see the section above for the two
   causes — a `tcpMux` default mismatch, then a darwin client hang), so no Go KCP
-  scenario can execute here. CI's `compat.yml` KCP scenarios are the gate.
+  scenario can execute *natively* here. CI's `compat.yml` KCP scenarios are the
+  gate.
 - `cargo fmt --all -- --check` and
   `cargo clippy -p frp-core --all-targets --all-features` clean.
 
