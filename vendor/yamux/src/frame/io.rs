@@ -14,8 +14,9 @@ use super::{
 };
 use crate::connection::Id;
 use crossbeam_queue::ArrayQueue;
-use futures::{prelude::*, ready};
+use futures::{prelude::*, ready, Sink};
 use std::{
+    collections::VecDeque,
     fmt, io,
     pin::Pin,
     sync::Arc,
@@ -29,19 +30,59 @@ use std::{
 /// Chosen based on intuition in past iterations.
 const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 
-/// A [`Stream`] and writer of [`Frame`] values.
+/// The read half of a connection's I/O: frame decoding plus the read-side
+/// body-pool bookkeeping.
+///
+/// frp-rs patch: the read and write halves are separate types so the write
+/// half can be moved behind a lock and driven by whoever owns a stream (see
+/// `frame::Writer`). Reads stay with the connection driver.
 #[derive(Debug)]
-pub(crate) struct Io<T> {
+pub(crate) struct Reader<R> {
     id: Id,
-    io: T,
+    io: R,
     read_state: ReadState,
-    write_state: WriteState,
     /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
     /// A fully written data-frame body is returned here (WriteState::Body
     /// completion) and `Stream::poll_write` draws from it on the send path;
     /// read bodies are drawn at ReadState::Body init and returned once the
     /// chunk is fully consumed in `Stream::poll_read`, removing the
     /// per-chunk `Vec` allocation + zero-fill in both directions.
+    body_pool: Arc<ArrayQueue<Vec<u8>>>,
+}
+
+impl<R: AsyncRead + Unpin> Reader<R> {
+    pub(crate) fn new(id: Id, io: R, body_pool: Arc<ArrayQueue<Vec<u8>>>) -> Self {
+        Reader {
+            id,
+            io,
+            read_state: ReadState::Init,
+            body_pool,
+        }
+    }
+}
+
+/// The write half of a connection's I/O: frame encoding, the body-pool
+/// return path, and the outbound frame queues.
+///
+/// frp-rs patch: frames are queued in two priorities and written by whoever
+/// holds the connection's write lock — inline by the `Stream` that produced a
+/// data frame, otherwise by the connection driver. Control frames (pong,
+/// GoAway, stream resets, window updates) always precede queued data frames.
+/// Only one frame is ever in flight (`WriteState`): a frame's header and body
+/// must reach the socket contiguously, so a new frame is only started once the
+/// previous one is fully written.
+#[derive(Debug)]
+pub(crate) struct Writer<W> {
+    id: Id,
+    io: W,
+    write_state: WriteState,
+    /// Control frames, drained before `queue`.
+    control: VecDeque<Frame<()>>,
+    /// Data (and stream-close) frames, in submission order.
+    queue: VecDeque<Frame<()>>,
+    /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
+    /// A fully written data-frame body is returned here (WriteState::Body
+    /// completion) and `Stream::poll_write` draws from it on the send path.
     body_pool: Arc<ArrayQueue<Vec<u8>>>,
     /// frp-rs patch: the configured send-split size. A fully-written body at
     /// or below this size is returned to `body_pool`; larger buffers are
@@ -54,20 +95,66 @@ pub(crate) struct Io<T> {
     split_send_size: usize,
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Io<T> {
+impl<W: AsyncWrite + Unpin> Writer<W> {
     pub(crate) fn new(
         id: Id,
-        io: T,
+        io: W,
         body_pool: Arc<ArrayQueue<Vec<u8>>>,
         split_send_size: usize,
     ) -> Self {
-        Io {
+        Writer {
             id,
             io,
-            read_state: ReadState::Init,
             write_state: WriteState::Init,
+            control: VecDeque::new(),
+            queue: VecDeque::new(),
             body_pool,
             split_send_size,
+        }
+    }
+
+    /// Queue a control frame (pong, GoAway, stream reset, window update).
+    /// Control frames are written before any queued data frame.
+    pub(crate) fn push_control(&mut self, frame: Frame<()>) {
+        self.control.push_back(frame);
+    }
+
+    /// Queue a data or stream-close frame, after any control frame.
+    pub(crate) fn push_data(&mut self, frame: Frame<()>) {
+        self.queue.push_back(frame);
+    }
+
+    /// Whether a new frame can be started right away: nothing is in flight
+    /// and nothing is queued.
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self.write_state, WriteState::Init)
+            && self.control.is_empty()
+            && self.queue.is_empty()
+    }
+
+    /// Write every queued frame, control queue first, then flush.
+    ///
+    /// Returns `Pending` only when the socket is backpressured; the caller's
+    /// waker is then registered with the socket and the unwritten frames stay
+    /// queued (at most one of them is in flight), so the next holder of the
+    /// writer finishes the job. `Ready` therefore means both queues are empty
+    /// and the socket has been flushed.
+    pub(crate) fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        loop {
+            // `start_send` requires `poll_ready` to have returned `Ready`;
+            // starting a frame while another one is in flight would splice
+            // the two frames' bytes together on the wire.
+            if matches!(self.write_state, WriteState::Init) {
+                match self.control.pop_front().or_else(|| self.queue.pop_front()) {
+                    Some(frame) => Pin::new(&mut *self).start_send(frame)?,
+                    // Nothing queued: write whatever is in flight and flush.
+                    None => {
+                        ready!(Pin::new(&mut *self).poll_flush(cx))?;
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+            }
+            ready!(Pin::new(&mut *self).poll_ready(cx))?;
         }
     }
 }
@@ -107,7 +194,7 @@ impl fmt::Debug for WriteState {
     }
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Sink<Frame<()>> for Io<T> {
+impl<W: AsyncWrite + Unpin> Sink<Frame<()>> for Writer<W> {
     type Error = io::Error;
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -242,7 +329,7 @@ enum ReadState {
     },
 }
 
-impl<T: AsyncRead + AsyncWrite + Unpin> Stream for Io<T> {
+impl<R: AsyncRead + Unpin> Stream for Reader<R> {
     type Item = Result<Frame<()>, FrameDecodeError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
@@ -441,20 +528,23 @@ mod tests {
         fn property(f: Frame<()>) -> bool {
             futures::executor::block_on(async move {
                 let id = crate::connection::Id::next();
-                let mut io = Io::new(
+                let pool = Arc::new(ArrayQueue::new(1));
+                let mut writer = Writer::new(
                     id,
-                    futures::io::Cursor::new(Vec::new()),
-                    Arc::new(ArrayQueue::new(1)),
+                    Vec::new(),
+                    pool.clone(),
                     crate::DEFAULT_SPLIT_SEND_SIZE,
                 );
-                if io.send(f.clone()).await.is_err() {
+                if writer.send(f.clone()).await.is_err() {
                     return false;
                 }
-                if io.flush().await.is_err() {
+                if writer.flush().await.is_err() {
                     return false;
                 }
-                io.io.set_position(0);
-                if let Ok(Some(x)) = io.try_next().await {
+                let written = writer.io;
+                let mut reader =
+                    Reader::new(id, futures::io::Cursor::new(written), pool);
+                if let Ok(Some(x)) = reader.try_next().await {
                     x == f
                 } else {
                     false

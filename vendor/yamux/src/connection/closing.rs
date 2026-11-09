@@ -1,47 +1,46 @@
-use crate::connection::StreamCommand;
+use crate::connection::{ConnWriter, StreamCommand};
 use crate::frame::Frame;
 use crate::tagged_stream::TaggedStream;
 use crate::Result;
-use crate::{frame, StreamId};
+use crate::StreamId;
 use futures::channel::mpsc;
-use futures::stream::{Fuse, SelectAll};
-use futures::{ready, AsyncRead, AsyncWrite, SinkExt, StreamExt};
+use futures::stream::SelectAll;
+use futures::{ready, Sink, StreamExt};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// A [`Future`] that gracefully closes the yamux connection.
+///
+/// frp-rs patch: it writes through the connection's shared write lock (the
+/// same one streams use for inline writes) instead of owning the socket, and
+/// no longer holds the read half — it never reads.
 #[must_use]
-pub struct Closing<T> {
+pub struct Closing {
     state: State,
     stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
     pending_frames: VecDeque<Frame<()>>,
-    socket: Fuse<frame::Io<T>>,
+    writer: Arc<ConnWriter>,
 }
 
-impl<T> Closing<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
+impl Closing {
     pub(crate) fn new(
         stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
         pending_frames: VecDeque<Frame<()>>,
-        socket: Fuse<frame::Io<T>>,
+        writer: Arc<ConnWriter>,
     ) -> Self {
         Self {
             state: State::ClosingStreamReceiver,
             stream_receivers,
             pending_frames,
-            socket,
+            writer,
         }
     }
 }
 
-impl<T> Future for Closing<T>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
+impl Future for Closing {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -75,15 +74,28 @@ where
                     }
                 }
                 State::FlushingPendingFrames => {
-                    ready!(this.socket.poll_ready_unpin(cx))?;
-
-                    match this.pending_frames.pop_front() {
-                        Some(frame) => this.socket.start_send_unpin(frame)?,
-                        None => this.state = State::ClosingSocket,
+                    let writer = this.writer.clone();
+                    // Contended: a stream is writing inline. It closes its
+                    // own sender first (above), so this is a short-lived
+                    // race, and `lock_owner` registers us to be woken.
+                    let Some(mut w) = writer.lock_owner(cx) else {
+                        return Poll::Pending;
+                    };
+                    for frame in this.pending_frames.drain(..) {
+                        w.push_data(frame);
+                    }
+                    match w.poll_drain(cx) {
+                        Poll::Ready(Ok(())) => this.state = State::ClosingSocket,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
+                        Poll::Pending => return Poll::Pending,
                     }
                 }
                 State::ClosingSocket => {
-                    ready!(this.socket.poll_close_unpin(cx))?;
+                    let writer = this.writer.clone();
+                    let Some(mut w) = writer.lock_owner(cx) else {
+                        return Poll::Pending;
+                    };
+                    ready!(Pin::new(&mut *w).poll_close(cx))?;
 
                     return Poll::Ready(Ok(()));
                 }
@@ -104,38 +116,35 @@ mod tests {
     use super::*;
     use futures::future::poll_fn;
     use futures::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
+    /// Records writes into shared state: the write half is boxed (`'static`),
+    /// so the test cannot look at a socket it handed over.
     struct Socket {
-        written: Vec<u8>,
-        closed: bool,
+        written: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<AtomicBool>,
     }
-    impl AsyncRead for Socket {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _: &mut Context<'_>,
-            _: &mut [u8],
-        ) -> Poll<std::io::Result<usize>> {
-            unimplemented!()
-        }
-    }
-    impl AsyncWrite for Socket {
+    impl futures::AsyncWrite for Socket {
         fn poll_write(
-            mut self: Pin<&mut Self>,
+            self: Pin<&mut Self>,
             _: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
-            assert!(!self.closed);
-            self.written.extend_from_slice(buf);
+            assert!(!self.closed.load(Ordering::SeqCst));
+            self.written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
         }
 
         fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            unimplemented!()
+            Poll::Ready(Ok(()))
         }
 
-        fn poll_close(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            assert!(!self.closed);
-            self.closed = true;
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            assert!(!self.closed.swap(true, Ordering::SeqCst));
             Poll::Ready(Ok(()))
         }
     }
@@ -148,8 +157,8 @@ mod tests {
         let frame_close_ack = Frame::close_stream(StreamId::new(6), true).into();
         let frame_term = Frame::term().into();
         fn encode(buf: &mut Vec<u8>, frame: &Frame<()>) {
-            buf.extend_from_slice(&frame::header::encode(frame.header()));
-            if frame.header().tag() == frame::header::Tag::Data {
+            buf.extend_from_slice(&crate::frame::header::encode(frame.header()));
+            if frame.header().tag() == crate::frame::header::Tag::Data {
                 buf.extend_from_slice(frame.clone().into_data().body());
             }
         }
@@ -182,24 +191,25 @@ mod tests {
             StreamCommand::CloseStream { ack: true },
         ));
         let pending_frames = vec![frame_pending];
-        let mut socket = Socket {
-            written: vec![],
-            closed: false,
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let closed = Arc::new(AtomicBool::new(false));
+        let socket = Socket {
+            written: written.clone(),
+            closed: closed.clone(),
         };
-        let mut closing = Closing::new(
-            stream_receivers,
-            pending_frames.into(),
-            frame::Io::new(
-                crate::connection::Id(0),
-                &mut socket,
-                std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(1)),
-                crate::DEFAULT_SPLIT_SEND_SIZE,
-            )
-            .fuse(),
-        );
+        let writer = Arc::new(ConnWriter::new(
+            crate::connection::Id(0),
+            Box::new(socket),
+            Arc::new(crossbeam_queue::ArrayQueue::new(1)),
+            crate::DEFAULT_SPLIT_SEND_SIZE,
+        ));
+        let mut closing = Closing::new(stream_receivers, pending_frames.into(), writer);
         futures::executor::block_on(async { poll_fn(|cx| closing.poll_unpin(cx)).await.unwrap() });
         assert!(closing.pending_frames.is_empty());
-        assert!(socket.closed);
-        assert_eq!(socket.written, expected_written);
+        assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(
+            *written.lock().unwrap_or_else(|e| e.into_inner()),
+            expected_written
+        );
     }
 }

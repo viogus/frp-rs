@@ -60,6 +60,16 @@ version = "1"
 [dependencies.web-time]
 version = "1"
 
+# frp-rs patch (inline stream writes): `tokio::sync::Mutex` is the gate that
+# keeps one writer on the wire while a stream writes its own data frame in the
+# caller's task. Only `sync` is enabled — no runtime, no `net`, no `time` — and
+# tokio is already in the frp dependency graph, so no crate is added to the
+# build.
+[dependencies.tokio]
+version = "1"
+features = ["sync"]
+default-features = false
+
 # frp-rs patch (body-buffer pool, send + read side): lock-free bounded queue
 # for reusing data-frame body buffers. Already in the workspace dependency tree
 # (frp-core's KCP chunk pool), so no new crates are added to the build.

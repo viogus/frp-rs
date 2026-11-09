@@ -303,6 +303,48 @@ When bumping yamux upstream: re-apply the `body_pool` field threading
 (`poll_write`, `WriteState::Body` completion, `ReadState::Body` init,
 `poll_read` consumed-chunk return), or carry the patch upstream.
 
+## Patch: write path split into read half + shared writer (inline stream writes)
+
+Why: on the frp data plane every data frame was written by the
+connection driver, so `Stream::poll_write` handed each frame to the
+driver task through an mpsc channel and the driver had to be woken —
+measured at 29.1 µs per frame, the bulk of the 83 µs per-packet mux tax.
+The frame must instead reach the socket from the task that produced it.
+
+### What changed
+
+- `frame::Io` (`src/frame/io.rs`) is split into `Reader<R>` (read state
+  machine) and `Writer<W>` (write state machine). `Writer` additionally
+  owns the frame queues: a control queue (ping/pong/goaway/reset/window
+  update, written first) and a data queue, plus `poll_drain`, which
+  writes queued frames one at a time — a frame's header and body must
+  reach the socket contiguously — and flushes when the queues are empty.
+- `Connection::new(socket)` splits the socket
+  (`futures::AsyncReadExt::split`) and delegates to
+  `Connection::new_split(read, write, cfg, mode)`. `Connection<T>`'s
+  type parameter is the read half; the write half is type-erased
+  (`Box<dyn AsyncWrite + Unpin + Send>`) so `Stream` and `Closing` need
+  no socket type parameter and frp's `YamuxStream = Compat<Stream>`
+  stays as it is.
+- The writer is shared as an `Arc<ConnWriter>` between the driver and
+  every stream. `ConnWriter` is a `tokio::sync::Mutex<frame::Writer>`
+  plus the owner-wake handshake: the driver registers its waker on every
+  poll and sets `owner_wants_lock` when it fails to take the lock; the
+  lock holder releases *then* wakes it (waking while still holding would
+  be answered by another failed `try_lock`, i.e. a lost wakeup).
+- New dependency: `tokio = { version = "1", default-features = false,
+  features = ["sync"] }` (`Cargo.toml`) — `tokio::sync::Mutex` only. No
+  runtime, no `net`, no `time`; tokio is already in the frp dependency
+  graph, so no crate enters the build.
+- `Connection`'s driver and `Closing` both write through that lock, so
+  there is exactly one writer on the wire.
+
+### Upgrade note
+
+This patch replaces `frame::Io` wholesale and changes `Connection::new`'s
+signature surface (`new_split`) — carry it upstream rather than
+re-applying it as hunks on a yamux bump.
+
 ## Patch: exact outbound-ACK backlog counter (O(1) instead of O(N) scan)
 
 Upstream's `ack_backlog()` scans the whole stream map on every
@@ -346,28 +388,28 @@ this audit records that gap rather than closing over it.
 ### Busy loop after shutdown: no reachable path
 
 The port's one terminal state, `ConnectionState::Closed`, returns
-`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:219`) or
-`Poll::Ready(Err(ConnectionError::Closed))` (`:162`) — a caller that keeps
+`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:243`) or
+`Poll::Ready(Err(ConnectionError::Closed))` (`:186`) — a caller that keeps
 polling a closed connection would indeed spin. There are **four** live poll
 sites under `tcp-mux`, and all four treat that as terminal:
 
 - the server acceptor (`frp-core/src/mux.rs:814` is its `select!`; terminal at
   `:908`/`:912`) — `break` on `Some(Err(e))`/`None`, and the poll is wrapped in
   `timeout(keepalive, ..)`;
-- the client driver (`frp-core/src/mux.rs:1143`/`:1148`) — same, inside a
+- the client driver (`frp-core/src/mux.rs:1144`/`:1149`) — same, inside a
   `select!` whose other branch is a synchronous single poll (never parks);
 - the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1126`/`:1132`) — tick-bounded;
-- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:801`/`:954`, terminal at
-  `:1034`/`:1038`) — timeout-bounded.
+- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:804`/`:957`, terminal at
+  `:1037`/`:1041`) — timeout-bounded.
 
 So a `Ready`-forever terminal state has no caller that can keep polling it.
 
 ### Blocked write: enforced **above** the port, not inside it
 
 `Active::poll` drives writes through `poll_ready_unpin` / `start_send_unpin` /
-`poll_flush_unpin` (`vendor/yamux/src/connection.rs:468-500`) and, when the
+`poll_flush_unpin` (`vendor/yamux/src/connection.rs:630-639`) and, when the
 transport is not writable, falls through to `return Poll::Pending`
-(`:613`) after the socket registered its waker. The crate itself still has **no
+(`:720`) after the socket registered its waker. The crate itself still has **no
 write deadline** — `grep -rn "write_timeout\|WriteTimeout\|write deadline"
 vendor/yamux/src/` is empty and `Config` (`vendor/yamux/src/lib.rs:100-116`) has
 no timeout field — and it is deliberately runtime-agnostic, so a timer cannot
