@@ -1,4 +1,4 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::msg::{self, FrpMessage};
 
@@ -17,11 +17,11 @@ pub async fn write_v1_frame<W: AsyncWriteExt + Unpin>(
 
 /// [`write_v1_frame`] with a caller-owned serialization scratch buffer.
 ///
-/// The JSON payload is serialized straight into `scratch` (cleared per call),
-/// so a task that sends frame after frame reuses one allocation instead of
-/// paying for a fresh `Vec` on every control message — [`write_v1_frame`]
-/// allocates one per call. Wire bytes are identical: same serializer, same
-/// 9-byte header, same vectored write.
+/// The JSON payload is serialized straight into `scratch` (cleared per call)
+/// after a reserved 9-byte header slot, so a task that sends frame after frame
+/// reuses one allocation instead of paying for a fresh `Vec` on every control
+/// message — [`write_v1_frame`] allocates one per call. Wire bytes are
+/// identical: same serializer, same 9-byte header.
 ///
 /// The caller owns the buffer, so the scratch is only ever touched by one
 /// task; a partially-serialized buffer left by a serialization error is
@@ -35,30 +35,29 @@ pub async fn write_v1_frame_scratch<W: AsyncWriteExt + Unpin>(
     // extensions. Go frp v0.70.0 treats unknown type bytes as errors.
     // These MUST NOT be sent to Go peers. See msg.rs lines 26-29.
     let type_byte = msg.v1_type_byte();
+    // Reserve the header slot BEFORE serializing so header and payload share
+    // one contiguous allocation — the serializer appends at the end of
+    // `scratch`, a zero-copy reservation. Non-vectored writers then hand the
+    // whole frame to a single `write_all` instead of two writes (tokio's
+    // default `poll_write_vectored` only writes the first non-empty iovec).
+    // On yamux the old two-iovec loop issued the 9-byte header and the
+    // payload as two DATA frames per UDP packet.
     scratch.clear();
+    scratch.resize(V1_HEADER_LEN, 0);
     if let Err(e) = serde_json::to_writer(&mut *scratch, msg) {
         scratch.clear();
         return Err(crate::Error::Protocol(
             format!("serialize V1 msg: {e}").into(),
         ));
     }
-    let buf: &[u8] = scratch;
+    let payload_len = (scratch.len() - V1_HEADER_LEN) as u64;
 
-    if buf.len() as u64 > V1_MAX_MSG_LENGTH as u64 {
+    if payload_len > V1_MAX_MSG_LENGTH as u64 {
         return Err(crate::Error::Protocol("V1 message too large".into()));
     }
 
-    // Header + payload go out as ONE writev(2) call (mirrors
-    // write_v2_frame_raw): the old resize + copy_within was a full-payload
-    // memmove per control message. The 9-byte header lives in a stack array —
-    // no allocation, no payload copy. Transports without native vectored
-    // writes fall back to per-buffer poll_write (tokio's default impl),
-    // semantically identical to the old single write_all for buffered
-    // transports (KCP, yamux, WebSocket, CipherWriter).
-    let payload_len = buf.len() as u64;
-    let mut header = [0u8; V1_HEADER_LEN];
-    header[0] = type_byte;
-    header[1..V1_HEADER_LEN].copy_from_slice(&payload_len.to_be_bytes());
+    scratch[0] = type_byte;
+    scratch[1..V1_HEADER_LEN].copy_from_slice(&payload_len.to_be_bytes());
 
     tracing::trace!(
         type_byte = %type_byte,
@@ -68,6 +67,21 @@ pub async fn write_v1_frame_scratch<W: AsyncWriteExt + Unpin>(
         payload_len
     );
 
+    if !writer.is_write_vectored() {
+        // One write, one frame on buffered transports (yamux, KCP, WebSocket,
+        // CipherWriter). The header is already contiguous with its payload,
+        // so no merge copy is needed.
+        writer
+            .write_all(scratch)
+            .await
+            .map_err(|e| crate::Error::Protocol(format!("write V1 frame: {e}").into()))?;
+        return Ok(());
+    }
+
+    // Native vectored write (TcpStream): header + payload go out as ONE
+    // writev(2) call — one syscall, no payload copy. writev may consume a
+    // partial iovec, so retries continue from the exact unwritten byte.
+    let (header, buf) = scratch.split_at(V1_HEADER_LEN);
     let mut hdr_off = 0usize;
     let mut payload_off = 0usize;
     loop {
@@ -420,12 +434,43 @@ pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
     // as its own tiny segment: two packets and ~40 extra bytes of IP/TCP
     // header per frame on the UDP data plane. write_vectored maps to writev
     // on TcpStream: one syscall, no allocation, no payload memcpy, and the
-    // kernel packs header + payload into one segment. Transports whose
-    // is_write_vectored is false (KCP, yamux, WebSocket, CipherWriter) fall
-    // back to per-buffer poll_write in tokio's default impl — semantically
-    // identical to the old two write_all's, so buffered transports are
-    // unaffected. writev may consume a partial iovec, so retries continue
-    // from the exact unwritten byte.
+    // kernel packs header + payload into one segment. writev may consume a
+    // partial iovec, so retries continue from the exact unwritten byte.
+    //
+    // Transports whose is_write_vectored is false (yamux, KCP, WebSocket,
+    // CipherWriter) take the merge branch below instead: tokio's default
+    // poll_write_vectored only writes the first non-empty iovec, so the
+    // vectored loop would issue the 8-byte header and the payload as TWO
+    // writes. On yamux each poll_write becomes its own DATA frame, so a UDP
+    // packet cost two frames (two frame headers + two body copies) instead of
+    // one. Merging into a single buffer restores one write per frame; wire
+    // bytes are unchanged because the header is still followed contiguously
+    // by the same payload.
+    if !writer.is_write_vectored() {
+        // UDP-sized frames (the hot path) fit the stack buffer; larger
+        // frames pay one scratch allocation for the merge.
+        const MERGE_STACK_MAX: usize = 256;
+        let total = header.len() + payload.len();
+        if total <= MERGE_STACK_MAX {
+            let mut merged = [0u8; MERGE_STACK_MAX];
+            merged[..header.len()].copy_from_slice(&header);
+            merged[header.len()..total].copy_from_slice(payload);
+            writer
+                .write_all(&merged[..total])
+                .await
+                .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
+        } else {
+            let mut merged = Vec::with_capacity(total);
+            merged.extend_from_slice(&header);
+            merged.extend_from_slice(payload);
+            writer
+                .write_all(&merged)
+                .await
+                .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
+        }
+        return Ok(());
+    }
+
     let mut hdr_off = 0usize;
     let mut payload_off = 0usize;
     loop {
@@ -1344,6 +1389,13 @@ mod tests {
             Pin::new(&mut self.inner).poll_write(cx, &buf[..n])
         }
 
+        fn is_write_vectored(&self) -> bool {
+            // This writer exists to exercise the writev partial-progress
+            // loop; without the hint `write_v1_frame` takes the merged
+            // single-write path instead.
+            true
+        }
+
         fn poll_write_vectored(
             mut self: Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
@@ -1459,6 +1511,87 @@ mod tests {
             err.is_err(),
             "zero-length write must error out, not loop forever"
         );
+    }
+
+    /// A non-vectored transport paired with tokio's default
+    /// `poll_write_vectored` (first iovec only) used to see the 8/9-byte
+    /// header and the payload as two separate writes. On yamux each write is
+    /// its own DATA frame, so a UDP packet cost two frames per direction.
+    /// Both frame writers must now emit the whole frame in ONE poll_write.
+    struct SingleWriteCounter {
+        inner: tokio::io::DuplexStream,
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for SingleWriteCounter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_v1_v2_frames_write_once_on_non_vectored_transport() {
+        // V2, stack-merge arm (header + payload <= 256 B).
+        for payload in [&b"hello v2 world"[..], &[7u8; 300][..]] {
+            let (writer, mut reader) = duplex(4096);
+            let mut counter = SingleWriteCounter {
+                inner: writer,
+                writes: 0,
+            };
+            write_v2_frame_raw(&mut counter, 16, 0, payload)
+                .await
+                .expect("write V2 frame");
+            let writes = counter.writes;
+            drop(counter);
+            assert_eq!(
+                writes,
+                1,
+                "V2 frame of payload {} must be one write",
+                payload.len()
+            );
+            let (ft, _, data) = read_v2_frame_raw(&mut reader).await.expect("read V2 frame");
+            assert_eq!(ft, 16);
+            assert_eq!(data, payload, "merged V2 wire bytes must be unchanged");
+        }
+
+        // V1 JSON frame.
+        let (writer, mut reader) = duplex(4096);
+        let mut counter = SingleWriteCounter {
+            inner: writer,
+            writes: 0,
+        };
+        let msg = FrpMessage::Ping(msg::Ping {
+            privilege_key: None,
+            timestamp: None,
+        });
+        write_v1_frame(&mut counter, &msg)
+            .await
+            .expect("write V1 frame");
+        let writes = counter.writes;
+        drop(counter);
+        assert_eq!(writes, 1, "V1 frame must be one write");
+        let (ty, data) = read_v1_frame(&mut reader).await.expect("read V1 frame");
+        assert_eq!(ty, msg.v1_type_byte());
+        assert_eq!(data, serde_json::to_vec(&msg).expect("serialize reference"));
     }
 
     #[tokio::test]
