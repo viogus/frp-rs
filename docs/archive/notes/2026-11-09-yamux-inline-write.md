@@ -145,3 +145,36 @@ of Go's 9.7k while keeping its cheaper per-datagram CPU.
    adversarial) before any PR.
 4. If step 2 shows less than ~10% on the mux rows, stop and record the
    negative result here rather than landing the complexity.
+
+## 7. Implementation checklist (option A, agreed)
+
+Decided: implement, do not document-around. Each step compiles and can be
+measured on its own; step 5 is the stop/go gate.
+
+1. `vendor/yamux/src/frame/io.rs`: split `Io<T>` into `Reader<T>` (read states,
+   frame decoding, ack/window bookkeeping) and `Writer<W>` (`write_state`,
+   `split_send_size`, `body_pool` handle, `start_frame` / `poll_frame` /
+   `flush`). `Io<T>` becomes a thin façade over both for the existing `new`
+   path, so nothing changes behaviourally yet. Vendor tests must stay green.
+2. `vendor/yamux/src/connection.rs`: `Active` holds `reader: Reader<T>` and
+   `writer: Arc<tokio::sync::Mutex<Writer<W>>>`; `Connection::new(socket)`
+   uses `futures_util::AsyncReadExt::split` on the socket and `new_split` takes
+   the halves explicitly (frp passes `tokio::io::split(...)` halves through
+   `.compat()`).
+3. `Stream` gets `writer: Arc<Mutex<Writer<W>>>` and `poll_write` becomes:
+   `try_lock` → drain queued control frames → encode + write inline →
+   `Poll::Pending` on socket backpressure (register waker) → on lock
+   contention fall back to the existing `Sender<StreamCommand>` mpsc path.
+4. `Active::poll` writes through the same mutex (single writer, frame
+   atomicity unchanged); control frames (ping/pong/goaway/rst/window) are
+   queued into the `Writer` and drained first by whoever holds the lock.
+5. Measure with `/tmp/udp-mix.sh go rs 512 4 10 <label>` and the
+   `yamux_pp` bench: go/no-go is **≥ 8,500 pps at 4 flows** (from 6,781) with
+   `scripts/protocol-matrix.sh` and `scripts/compat-test.sh` still green.
+6. Gates before any PR: vendor tests (`rst`, `ack_timing`, `window_update`,
+   `close`, `read_after_close`), workspace tests, compat 86, matrix 11,
+   `scripts/stress-test.sh`, then two reviews, one adversarial.
+
+Known unfinished scaffolding: `frp-core/examples/yamux_pp_task.rs` (two-task
+variant) deadlocks — do not use it as evidence; fix it only if it is needed for
+step 5, otherwise rely on the product measurement.
