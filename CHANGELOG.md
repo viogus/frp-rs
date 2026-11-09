@@ -13,6 +13,16 @@ User-facing release notes for frp-rs.
 
 ### Fixes
 
+- KCP: pre-compute the FEC parity multiply. `Fec::encode_parity` called a
+  bit-serial GF(2^8) multiply (eight shift/XOR rounds) once per byte per data
+  shard — 240 rounds per byte position for kcp-go's 10+3 group. The
+  coefficients are fixed at construction, so their 256 products are now
+  tables and the loop is one lookup plus XOR. KCP throughput on loopback
+  (64 KiB ping-pong, one flow) went from ~21 MiB/s to ~63 MiB/s and 4-flow
+  from 40 to 87 MiB/s with unchanged CPU time; the wire format and the
+  encode matrix are untouched. See
+  `docs/archive/notes/2026-11-09-kcp-fec-multiply-tables.md`.
+
 - **Each protocol frame leaves the process in one write on buffered transports (tcpMux, KCP, WebSocket, cipher).** These transports cannot take a vectored write, so the 8/9-byte frame header and its payload used to become two writes — two yamux frames and two socket writes per protocol frame, which a UDP datagram pays twice. The frame is now merged and written once: frames whose header plus payload fit in 256 bytes use a stack buffer, larger frames one temporary heap buffer. TCP keeps the existing zero-copy vectored path, and the wire bytes are unchanged. Measured with 512-byte datagrams: Rust↔Rust (V2) +46% at 4 flows and +17% at 1 flow, Go frps↔Rust frpc (V1) +26% and +9%.
 
 - **UDP proxies stop paying a 1 ms timer on every returned datagram.** The client's reply path reused a buffer only when it was already at least as large as `transport.udpPacketSize` (1500 by default), but the buffer it allocated itself had exactly the datagram's length — so a 512-byte datagram's buffer was rejected by the check that produced it, and every reply re-entered a bounded 1 ms wait before being allocated again. Undersized buffers are now grown and reused. Measured with 512-byte datagrams, four flows, against a Go frps: 914 to 7,916 datagrams/s; the `udpPacketSize = 512` config workaround that used to hide this now changes nothing. Details: [`docs/archive/notes/2026-11-08-udp-spare-reuse.md`](docs/archive/notes/2026-11-08-udp-spare-reuse.md).
