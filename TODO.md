@@ -12910,6 +12910,10 @@ kept out of the main P2 list so that adding them does not renumber every later
   frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
   per-packet. The small-payload shape is the opposite (394 round trips/s against
   40), which rules out the KCP core's ARQ in general.
-  **Done-when:** a symbol-resolved profile (the debuginfo build, not the stripped
-  release binary) attributes the per-packet cost to a named function, and either
-  a fix lands or the note records that the cost is inherent to the in-tree KCP.
+  **Done-when:** all three readings exist on the same host — (a) a debuginfo-build
+  profile (not the stripped release binary; it now puts 16.3% of frps samples in
+  `KcpSession::fec_encode_output`, next to Go's vectorised `klauspost/reedsolomon`
+  encode), (b) a per-session `xmit` (RTO retransmissions) and dead-link reading
+  for both sides, and (c) frp-rs's payload per datagram within ~5% of the 1,020 B
+  a 10+3 group at mss 1326 predicts. Then either a fix lands or the note names
+  the measured mechanism instead of the cost.
