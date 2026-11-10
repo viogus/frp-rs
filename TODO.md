@@ -12880,19 +12880,14 @@ kept out of the main P2 list so that adding them does not renumber every later
   exits zero — plus a `grep -Fq -- '--floors scripts/protocol-matrix.floors'`
   assertion wired into the same step, with the usual sha256 pin in `ci.yml`.
 
-- [ ] **The matrix's `tcp-plain` floor cannot fire in CI.**
-  Evidence: `tcp-plain=60` in `scripts/protocol-matrix.floors` against 527 MiB/s
-  measured on the reference host, an 8.8x slack. Every other floor is
-  `ratio × tcp-plain`, so a regression in a *shared* path (bridge copy loop,
-  work-conn setup) can cost up to 8.8x before the base row reddens, and it drags
-  every dependent floor down with it — at `tcp-plain=61` the `kcp-plain` floor
-  becomes 3.05 MiB/s, which a simultaneous 2.5x KCP regression would still clear.
-  The runner's own capacity is the reason the number is loose, which is exactly
-  why it should be anchored on measured CI data rather than on this host.
-  **Done-when:** the `protocol-matrix-rates` artifact from a few `compat` runs on
-  the CI runner class is used to set `tcp-plain` to ~2.5x below the runner's own
-  measured rate, and the floors file records that derivation (the same rule the
-  ratio floors already follow).
+- [x] **The matrix's `tcp-plain` floor cannot fire in CI.**
+  Closed 2026-11-10: three `compat` runs on the runner class
+  (42844190428, 42844263709, 42844271249) measured `tcp-plain` at
+  636.1 / 1098.5 / 803.0 MiB/s, so the floor is `tcp-plain=300` — 2.1x below the
+  slowest observed run and 1.8x below a local macOS run's 527.3, which reddens a
+  regression the old `60` could not see (8.8x slack). The derivation and the
+  per-row minimum ratios are recorded in `scripts/protocol-matrix.floors`, and
+  CI now enforces the file instead of reporting on it.
 
 - [ ] **The KCP Go-vs-Rust stream comparison has no publishable number.**
   Evidence: the withdrawn rows in

@@ -153,17 +153,18 @@ jobs:
         # rate for the project's whole life while this step stayed green) is
         # visible, while host-to-host MiB/s drift does not.
         #
-        # Report-only here: a shared runner is not a stable host. One run
-        # measured tcp-plain at 18.0 MiB/s and wss at 315.3 MiB/s in the same
-        # five-second windows, and the three KCP rows spanned 3.05-22.5, so a
-        # 3x regression cannot be separated from that noise. The per-row verdict
-        # still prints, and the rates file is archived and rendered below; use
-        # `--floors` (enforce) on a quiet host, or once the base floor is
-        # re-derived from these artifacts (TODO.md).
+        # Enforced since 2026-11-10. It used to be `--floors-report` because a
+        # shared runner looked unusable: one run measured tcp-plain at 18.0 and
+        # wss at 315.3 MiB/s in the same windows. That spread was the benchmark
+        # peer running a Nagle timer, not the runner (fixed in #603), and three
+        # runs after the fix stayed within 1.3x on every ratio while tcp-plain's
+        # own capacity varied 1.7x — which is exactly what the ratio floors are
+        # built to absorb. The floors are calibrated at half the lowest observed
+        # ratio; the measured table is still archived as an artifact.
         run: |
           cargo build --release --manifest-path scripts/frp-stress/Cargo.toml
           bash scripts/protocol-matrix.sh \
-            --floors-report scripts/protocol-matrix.floors \
+            --floors scripts/protocol-matrix.floors \
             --rates-json "${RUNNER_TEMP}/protocol-matrix-rates.json"
 
       - name: Protocol matrix rates

@@ -7,50 +7,56 @@
 # the host-to-host capacity differences that make an absolute number fragile
 # on a shared CI runner.
 #
-# Harness change 2026-11-10: the benchmark peer now sets TCP_NODELAY. Before
-# that it ran a Nagle timer, which cost a chunked 64 KiB message ~8 ms per
-# round trip (18.0 vs 736.8 MiB/s through a plain relay). These ratios were
-# calibrated on the pre-fix harness and a pre-64 KiB-default tree; re-derive
-# them before trusting them after any further harness or default change.
-#
 # What this gate is for: a row that still bridges bytes but at a fraction of
 # its previous rate. That is not hypothetical — KCP spent its whole life at
 # 20.7 MiB/s on the ping-pong bench (65.5 MiB/s in the matrix after the FEC
-# multiply tables landed in #596) while this matrix ran green in CI, because a
-# row only had to be above zero.
+# fix), and `mbps > 0` never noticed.
 #
-# How the numbers were chosen (macOS arm64 M2, 2026-11-09, commit 7240e159),
-# one full matrix run on an idle machine — MiB/s, and the ratio to tcp-plain:
-#   tcp-plain 527.1 (1.000) · tcp-tls 364.2 (0.691) · tcp-tls-mux 285.5 (0.542)
-#   ws-plain 297.9 (0.565) · ws-tls 220.7 (0.419) · ws-tls-mux 180.4 (0.342)
-#   wss 221.0 (0.419) · kcp-plain 65.5 (0.124) · kcp-tls 66.4 (0.126)
-#   kcp-tls-mux 54.5 (0.103) · quic 86.3 (0.164)
-# The window is a one-stream 64 KiB ping-pong, so its absolute numbers are
-# frame-latency-bound and move with the bridge buffer default (#601 raised it to
-# 64 KiB on Linux, #602 followed on macOS): treat `tcp-plain` as the normaliser
-# of its own run, not as a capacity figure, and do not compare raw rows across
-# commits that changed `FRP_BRIDGE_BUF_KB`.
+# Calibrated 2026-11-10 from three `compat` runs on the CI runner class
+# (42844190428, 42844263709, 42844271249) plus one local macOS run. `tcp-plain`
+# measured 636.1 / 1098.5 / 803.0 MiB/s in CI and 527.3 locally — a 2.1x
+# capacity spread, which is why every other row is a ratio and not an absolute.
 #
-# Each ratio floor sits roughly 2.5x below the measured ratio (KCP: 0.124 →
-# 0.05), which leaves room for a slower runner while still reddening the ~3x
-# KCP regression that motivated the gate: before #596 the matrix measured
-# kcp-plain at 22.25 MiB/s against tcp-plain 526.9, a ratio of 0.042, and the
-# ping-pong harness that isolated the cause measured the same binary at
-# 20.7 MiB/s, a ratio of 0.039. Both are below the 0.045 floor.
+# Rule: each floor is half the LOWEST ratio observed on the platform that binds
+# it, so one file serves both. CI (Linux) is the binding platform for tcp/kcp,
+# macOS for the WebSocket rows — the 1-stream ping-pong in this matrix is a
+# frame-latency measurement in which macOS loses about 2x on `ws` at the current
+# buffer size (`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md` §4),
+# and that shape is why the ws floors are lower than the Linux ratio would allow.
 #
-# Re-tuning: the CI job uploads `protocol-matrix-rates.json`; take the new rate
-# from it and keep the same ~2.5x headroom. A floor that starts firing on a
+#   row           CI ratio (min)  macOS ratio  binding  floor
+#   tcp-plain     636.1 MiB/s     527.3        -        absolute 300
+#   tcp-tls       0.639           0.664        CI       0.32
+#   tcp-tls-mux   0.548           0.587        CI       0.27
+#   ws-plain      0.781           0.309        macOS    0.15
+#   ws-tls        0.570           0.253        macOS    0.12
+#   ws-tls-mux    0.503           0.334        macOS    0.16
+#   wss           0.571           0.260        macOS    0.13
+#   kcp-plain     0.100           0.121        CI       0.05
+#   kcp-tls       0.131           0.126        macOS    0.06
+#   kcp-tls-mux   0.049           0.099        CI       0.025
+#   quic          0.298           0.167        macOS    0.08
+#
+# Before 2026-11-10 these numbers were measured through a benchmark peer with
+# Nagle on, which cost a chunked shape ~8 ms per round trip and produced rows
+# spread over 18-526 MiB/s (`docs/archive/notes/2026-11-10-nagle-in-the-benchmark.md`).
+# Ratios from that harness are not comparable with these — re-derive, do not
+# rescale.
+#
+# Re-tuning: the CI job uploads `protocol-matrix-rates.json`; take the new rates
+# from it, apply the same rule (half the lowest observed ratio, on the binding
+# platform), and record the run ids here. A floor that starts firing on a
 # healthy run is a floor that is too high, not a machine that is too slow — the
 # row's own `mbps > 0` check still guards connectivity, this file only guards
 # rate.
-tcp-plain=60
-tcp-tls=ratio:0.25
-tcp-tls-mux=ratio:0.25
-ws-plain=ratio:0.20
-ws-tls=ratio:0.15
-ws-tls-mux=ratio:0.12
-wss=ratio:0.15
+tcp-plain=300
+tcp-tls=ratio:0.32
+tcp-tls-mux=ratio:0.27
+ws-plain=ratio:0.15
+ws-tls=ratio:0.12
+ws-tls-mux=ratio:0.16
+wss=ratio:0.13
 kcp-plain=ratio:0.05
-kcp-tls=ratio:0.05
-kcp-tls-mux=ratio:0.045
-quic=ratio:0.05
+kcp-tls=ratio:0.06
+kcp-tls-mux=ratio:0.025
+quic=ratio:0.08
