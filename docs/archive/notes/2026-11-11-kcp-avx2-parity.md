@@ -20,8 +20,9 @@ dependent lookups per output byte for kcp-go's 10+3 group. Go's
   (`xor_mul_avx2`, `#[target_feature(enable = "avx2")]`), detected once with
   `is_x86_feature_detected!`.
 - Lengths below 32 bytes and CPU/targets without AVX2 keep the existing
-  scalar 256-entry table path unchanged, so aarch64 and older x86 pay nothing
-  for this change.
+  scalar 256-entry table path unchanged. aarch64 and pre-AVX2 x86 pay only a
+  one-time build cost: 960 B and 960 `gf256::mul` calls per `Fec` (10+3), not
+  per byte.
 
 `encode` and `encode_parity` both call the shared helper, so the two cannot
 drift apart.
@@ -37,12 +38,13 @@ Linux VM (4 vCPU AMD EPYC-Milan, Debian 13, loopback), 2048 MiB one-way stream,
 | 4 flows | 48.2 / 48.5 MiB/s | 58.7 / 60.3 MiB/s | **+23%** | 95.9 → 79.8 (**−17%**) |
 
 For scale, the same host measures **76-77 MiB/s** with FEC disabled outright
-(parity set to 0 in the codec) — that is the ceiling a perfect encoder would
-reach with the 30% packet saving still in place, and it is not attainable: Go
-pays the FEC bandwidth too, and Go measures 103 MiB/s with FEC on.
+(parity set to 0 in the codec) — an upper bound for any codec that still pays
+the FEC overhead, since that figure does not send parity at all.
 
-So the encode was worth roughly half of the total frp-rs-vs-Go gap: 49 → 58
-MiB/s against 103.
+So the parity pass now costs frp-rs **9 MiB/s** where it cost 27: the encode
+closed about a sixth of the 54 MiB/s separating frp-rs from Go (49 → 58
+against 103). Go carries the same FEC overhead and still reaches 103, so what
+remains is the per-packet path, not the parity maths.
 
 ## Correctness
 
@@ -53,8 +55,12 @@ MiB/s against 103.
   against the scalar table path at lengths 1, 5, 16, 31, 32, 33, 63, 100, 1326
   and 1327, which covers both sides of the 32-byte vector width and the odd tail
   of a 1326-byte KCP segment.
-- `cargo test -p frp-core --all-features --lib kcp_compat`: 17 passed on x86_64
-  (where the vector path executes) and on aarch64 (where the scalar path does).
+- `cargo test -p frp-core --all-features --lib kcp_compat`: 18 passed on
+  x86_64, where the vector path executes. On aarch64 the same suite passing is a
+  build/compatibility check only — both sides of the differential test are the
+  scalar loop there, so it cannot fail; the assembler-free evidence on those
+  targets is the nibble-table assertion in
+  `mul_tables_match_bitwise_field_multiply`.
 
 ## What is left
 
@@ -68,6 +74,10 @@ the untested half of the `TODO.md` item.
 
 - One host, one transport shape (bulk one-way stream over loopback). The
   ping-pong shape was not re-measured; it was already far ahead of Go.
+- The harness is host-local (`/root/bench/kcp3.sh` on the measurement VM):
+  both v0.72.0 builds, `abbench sink` on 19054 and `abbench stream` on 19056
+  through an frpc proxy, CPU from `/proc/<pid>/stat`. Re-measuring elsewhere
+  needs those binaries and that shape, not this script.
 - x86_64 only. aarch64 keeps the scalar table path — `vqtbl1q_u8` would be the
   equivalent, and nothing here measures whether it pays as well.
 - The vector path needs `src.len() >= 32`; shorter shards fall back, which is

@@ -145,10 +145,11 @@ static AVX2_SUPPORTED: std::sync::LazyLock<bool> =
 unsafe fn xor_mul_avx2(dst: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16]) {
     use std::arch::x86_64::*;
 
-    // SAFETY (edition 2024 requires the block even inside an `unsafe fn`):
-    // AVX2 is enabled for this function by `target_feature`, the caller
+    // SAFETY: AVX2 is enabled for this function by `target_feature`, the caller
     // verified the CPU supports it, and every load/store stays inside
     // `min(src.len(), dst.len())` bytes of slices that are alive for the call.
+    // The explicit block keeps the body correct if this crate adopts
+    // `unsafe_op_in_unsafe_fn` (edition 2024) — the workspace is edition 2021.
     unsafe {
         let n = src.len().min(dst.len());
         let mask = _mm256_set1_epi8(0x0f);
@@ -205,9 +206,10 @@ fn xor_mul_into(dst: &mut [u8], src: &[u8], table: &[u8], nibbles: &[u8]) {
     #[cfg(not(target_arch = "x86_64"))]
     let _ = nibbles;
 
-    // Scalar fallback: one 256-entry lookup per byte, which is what every
-    // non-AVX2 target (including aarch64) used before the vector path existed
-    // — keeping it means those targets pay nothing for this change.
+    // Scalar fallback: one 256-entry lookup per byte, unchanged from before the
+    // vector path existed. Non-AVX2 targets (aarch64, pre-AVX2 x86) pay only the
+    // one-time nibble-table build in `Fec::new` (960 B and 960 multiplies for
+    // 10+3), never more per byte.
     let n = dst.len().min(src.len());
     for (d, &b) in dst.iter_mut().zip(src.iter()).take(n) {
         *d ^= table[b as usize];
@@ -829,8 +831,49 @@ mod tests {
     fn disabled_codec_builds_no_tables() {
         let fec = Fec::new(0, 0);
         assert!(fec.mul_tables.is_empty());
+        assert!(fec.nibble_tables.is_empty());
         assert!(fec.encode_matrix.is_empty());
         assert!(!fec.enabled());
+    }
+
+    /// The AVX2 kernel itself, called without going through `xor_mul_into`'s
+    /// dispatch — so inverting `AVX2_SUPPORTED` or moving the 32-byte threshold
+    /// cannot make this pass vacuously. Also pins the `min` contract: a `dst`
+    /// longer than `src` must leave its tail untouched.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_kernel_matches_scalar_table_and_respects_lengths() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let fec = Fec::new(10, 3);
+        for len in 0..=96usize {
+            let src: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            for (pi, di) in [(0usize, 0usize), (2, 7), (1, 9)] {
+                let table = fec.mul_table(pi, di);
+                let nib = fec.nibble_table(pi, di);
+                let lo: &[u8; 16] = nib[..16].try_into().expect("lo half is 16 bytes");
+                let hi: &[u8; 16] = nib[16..].try_into().expect("hi half is 16 bytes");
+                let mut got = vec![0u8; len];
+                // SAFETY: AVX2 verified immediately above; lengths equal.
+                unsafe { xor_mul_avx2(&mut got, &src, lo, hi) };
+                let mut want = vec![0u8; len];
+                for (w, &b) in want.iter_mut().zip(src.iter()) {
+                    *w = table[b as usize];
+                }
+                assert_eq!(got, want, "len {len}, coef row {pi}/{di}");
+
+                // dst longer than src: the tail must not be written.
+                let mut long = vec![0xAAu8; len + 5];
+                // SAFETY: as above; `xor_mul_avx2` bounds itself with min().
+                unsafe { xor_mul_avx2(&mut long, &src, lo, hi) };
+                assert_eq!(&long[..len], &want[..], "prefix len {len}");
+                assert!(
+                    long[len..].iter().all(|&b| b == 0xAA),
+                    "tail written at len {len}"
+                );
+            }
+        }
     }
 
     /// The vector path must be byte-identical to the scalar table path for
