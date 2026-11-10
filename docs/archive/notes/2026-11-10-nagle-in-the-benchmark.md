@@ -19,7 +19,7 @@ on both relay sockets — shows the same collapse:
 
 | message | relay buffer | throughput | round-trip rate |
 |---|---|---|---|
-| 64 KiB | 32 KiB | **12.6 / 14.7 MiB/s** | 101 / 118 /s (≈ 7–9 ms) |
+| 64 KiB | 32 KiB | **12.6 / 14.7 MiB/s** | 101 / 118 /s (8.5–9.9 ms) |
 | 64 KiB | 64 KiB | 642.9 / 677.1 MiB/s | 5,143 / 5,417 /s |
 | 32 KiB | 32 KiB | 560.4 MiB/s | 8,966 /s |
 | 128 KiB | 64 KiB | 36.1 MiB/s | 145 /s |
@@ -71,14 +71,17 @@ the harness measures, not what the proxy does.
 
 - **Explained:** the Linux collapse at a 32 KiB buffer (10–30 → 736 MiB/s once
   the peer stops running a timer), and part of the row-to-row noise.
-- **Not explained:** the macOS 1-stream dip. With nodelay on both ends, a
-  64 KiB message still measures 298 MiB/s at a 32 KiB buffer and 168 MiB/s at
-  64 KiB, and four streams measure the same at both sizes (718.8 / 712.6). That
-  is a real latency shape of a store-and-forward relay at that message size:
-  419 µs per round trip at a 32 KiB buffer and 744 µs at 64 KiB, against 83 µs
-  for the same 64 KiB round trip over a direct connection (1,508 MiB/s at
-  12,067 round trips/s). Not a defect, and not what the throughput gate should
-  be measuring.
+- **Not this:** the macOS 1-stream dip. With nodelay on both ends, a 64 KiB
+  message still measures 298 MiB/s at a 32 KiB buffer and 168 MiB/s at 64 KiB —
+  the buffer-size effect already recorded in
+  [`baselines/README.md`](../../../scripts/frp-stress/baselines/README.md) and
+  [§4 of the 64 KiB note](2026-11-10-bridge-buffer-64k-default.md), not a timer.
+  Per round trip that is 419 µs at a 32 KiB buffer and 744 µs at 64 KiB, against
+  83 µs for the same 64 KiB round trip over a direct connection (1,508 MiB/s at
+  12,067 round trips/s). Four streams move the same aggregate at both sizes
+  (718.8 / 712.6 MiB/s), so the per-message cost is not fixed — it is the same
+  store-and-forward shape, not a defect, and still not something the throughput
+  gate measures.
 
 ## 6. Consequence for recorded numbers
 
@@ -86,8 +89,14 @@ Throughput baselines and matrix rows recorded before this change carry the tax
 and should not be compared against a run from a fixed harness without saying so.
 The latency and memory records do not: those scenarios send 64-byte messages one
 at a time, so the previous write is already acknowledged and Nagle never
-engages. The
-one-way throughput numbers in
+engages. The one-way throughput numbers in
 [`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) are
 unaffected in kind — a streaming write is not a ping-pong — but they were taken
 with the same peer, so a re-run on a fixed harness is the honest comparison.
+Three earlier notes published `frp-stress throughput` tables measured through
+the Nagle-on peer and cannot say from their own text whether a row was taxed:
+[`2026-11-08-mux-throughput-scaling.md`](2026-11-08-mux-throughput-scaling.md),
+[`2026-11-08-bridge-buffer-frame-match.md`](2026-11-08-bridge-buffer-frame-match.md)
+and [`2026-11-10-bridge-buffer-64k-default.md`](2026-11-10-bridge-buffer-64k-default.md).
+Their relative comparisons were made in-pair on one harness, which is the
+property this fix preserves; their absolute rows are the ones to re-measure.
