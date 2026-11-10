@@ -12901,16 +12901,19 @@ kept out of the main P2 list so that adding them does not renumber every later
   withdrawn "+23%" stays retracted in
   `docs/archive/notes/2026-11-10-real-host-throughput.md` section 6.
 
-- [ ] **KCP bulk streams are ~1.8x behind Go (~2.1x before the AVX2 parity pass).**
+- [ ] **KCP bulk streams are ~1.7x behind Go (2.1x before the AVX2 parity pass).**
 
   Two of the three known costs are now fixed (AVX2 parity: 48.7 → 57.3 MiB/s;
-  one `sendmmsg` per flush: 58.8 → 61.3). What is left is per-packet scheduling
+  `sendmmsg` for both the flush and the 10 ms tick: → 60.7-61.7 MiB/s against
+  Go's 101.7). What is left is per-packet scheduling
   — the current profile puts frps's largest single entry in the kernel's task
   wakeup path (`try_to_wake_up` under `ep_poll_callback`) and frpc's in
   `KcpSocket::run` (4.6%) plus `clock_gettime` (3.4%). Both are driver-loop
   costs, so the next step is fewer wakeups per packet, not more arithmetic.
-  Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` — 49 vs 103
-  MiB/s at one and four flows, CPU per MiB 46.2 ms vs 22.1 ms, and 661,824
+  Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` and
+  `docs/archive/notes/2026-11-11-kcp-avx2-parity.md` /
+  `docs/archive/notes/2026-11-11-kcp-sendmmsg.md` — 49 vs 103 MiB/s when first
+  measured (61 vs 102 now), CPU per MiB 46.2 ms vs 22.1 ms, and 661,824
   datagrams per 512 MiB against Go's 536,444 (811 B per datagram vs 1,001 B).
   FEC parameters, mtu and mss match Go's, so neither the lookup tables nor the
   configuration explain it; a `perf` run on the stripped binary puts ~26% of
