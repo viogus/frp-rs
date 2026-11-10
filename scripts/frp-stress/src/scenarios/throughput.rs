@@ -60,6 +60,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("stream {} connect timed out", i))?
                 .with_context(|| format!("stream {} connect failed", i))?;
+            // Same reason as the echo peer (see `echo.rs`): Nagle would put a
+            // 40 ms-class timer inside the measurement on a chunked path.
+            let _ = stream.set_nodelay(true);
             let mut bytes = 0u64;
             let stream_start = tokio::time::Instant::now();
             let mut buf = vec![0u8; PAYLOAD_SIZE];

@@ -46,6 +46,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
             let mut stream = TcpStream::connect(&target)
                 .await
                 .with_context(|| format!("steady connect to {target} failed"))?;
+            // No Nagle: a serialized ping-pong is exactly the shape Nagle
+            // delays, and the RTT numbers are the point of this scenario.
+            stream.set_nodelay(true)?;
             // Warm-up: one untimed round-trip to establish the work-conn bridge.
             stream.write_all(&msg).await?;
             stream.read_exact(&mut buf).await?;
@@ -63,6 +66,7 @@ pub async fn run(cli: &Cli) -> Result<()> {
                 let mut stream = TcpStream::connect(&target)
                     .await
                     .with_context(|| format!("setup connect to {target} failed"))?;
+                stream.set_nodelay(true)?;
                 stream.write_all(&msg).await?;
                 stream.read_exact(&mut buf).await?;
                 samples_ns.push(t0.elapsed().as_nanos());
