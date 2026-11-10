@@ -46,6 +46,15 @@ Platform scope: `sendmmsg` is Linux-only here. macOS and Windows keep the loop;
 `sendmmsg` exists on neither (`sendmsg_x`/`WSASendMsg` are different APIs) and
 neither was measured.
 
+## Go, re-measured on the same host
+
+The comparison paragraph in `README.md` quotes 61 against 102 MiB/s. The Go end
+of that pair is a re-run of `/root/bench/kcp3.sh go go … 1 2048 true` on the
+same VM after this change: **101.7 MiB/s** (CPU 2690+1947 ticks), against
+39.3 s of CPU for frp-rs — about 1.7× more CPU per byte. The base measurement in
+`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` put Go at 105.9/100.7
+(mean 103.3); the two agree within the host's run-to-run spread.
+
 ## Limits
 
 - One host, one transport shape, loopback inside a virtualised guest. The
