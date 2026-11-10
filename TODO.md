@@ -12910,6 +12910,10 @@ kept out of the main P2 list so that adding them does not renumber every later
   frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
   per-packet. The small-payload shape is the opposite (394 round trips/s against
   40), which rules out the KCP core's ARQ in general.
+  Partial fix landed: the parity encode is now AVX2-vectorised
+  (`docs/archive/notes/2026-11-11-kcp-avx2-parity.md`), which is +19% at one
+  flow and +23% at four on the shape above (49 → 58 MiB/s against Go's 103).
+  What is left is the per-packet path, not the parity math.
   **Done-when:** all three readings exist on the same host — (a) a debuginfo-build
   profile (not the stripped release binary; it now puts 16.3% of frps samples in
   `KcpSession::fec_encode_output`, next to Go's vectorised `klauspost/reedsolomon`
