@@ -193,10 +193,10 @@ async fn bridge_user_to_work<W: AsyncWrite + Unpin>(
     let cap = buf.as_mut_slice().len();
     // Pre-size the compression buffer to the bridge chunk size only when
     // compression is on — the plaintext path never touches it, so a
-    // pre-sized Vec there is a 32 KiB dead allocation per bridge.
+    // pre-sized Vec there is one buffer's worth of dead allocation per bridge.
     // Snappy worst-case expansion is ~1.06× + tag overhead (max ~cap + cap/6 +
     // 32), so pre-sizing to `cap` alone reallocs + copies once on the first
-    // incompressible 32 KiB chunk (round-3 core F6).
+    // incompressible chunk (round-3 core F6).
     let mut comp_buf = if use_compression {
         Vec::with_capacity(cap + cap / 6 + 32)
     } else {
@@ -451,7 +451,7 @@ async fn bridge_work_to_user(
     let cap = buf.as_mut_slice().len();
     // Pre-size the decompression batch buffer to the bridge chunk size only
     // when decompression is on — the plaintext path never touches it, so a
-    // pre-sized Vec there is a 32 KiB dead allocation per bridge.
+    // pre-sized Vec there is one buffer's worth of dead allocation per bridge.
     let mut batch_buf = if decompress_read {
         Vec::with_capacity(cap)
     } else {
@@ -938,7 +938,7 @@ async fn bridge_plain_core(
 /// write half can still receive the rest of a response. It has to be
 /// bounded, because a peer that never sends its own FIN leaves the opposite
 /// read parked on a future that can never complete — pinning two sockets and
-/// two pooled 32 KiB buffers for the lifetime of the process. Measured on a
+/// two pooled bridge buffers for the lifetime of the process. Measured on a
 /// live frpc (OpenWrt router, socks5 plugin proxy, ordinary browser
 /// traffic): 2137 permanently half-closed sockets (1490 `FIN_WAIT2` + 647
 /// `CLOSE_WAIT`) and ~224 MB RSS+swap after 23 h, growing at ~2 fds and

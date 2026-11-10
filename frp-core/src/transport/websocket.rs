@@ -190,8 +190,8 @@ fn inner_tcp_mut(inner: &mut Box<dyn AsyncReadWrite>) -> Option<&mut TcpStream> 
 /// XOR a payload with an RFC 6455 masking key.
 ///
 /// The aligned prefix is processed as 32-bit words instead of a byte-by-byte
-/// loop with a per-byte modulo, which is ~4x cheaper on the 32 KiB bridge
-/// chunks used by the WebSocket transport.
+/// loop with a per-byte modulo, which is ~4x cheaper on the bridge chunks the
+/// WebSocket transport writes.
 #[inline]
 fn xor_mask(payload: &mut [u8], mask: [u8; 4]) {
     let mask_u32 = u32::from_ne_bytes(mask);
@@ -940,7 +940,7 @@ impl AsyncWrite for WsByteStream {
                 // never needs in-place mutation — emit [frame header, payload]
                 // as two iovecs straight to the raw TcpStream (real writev),
                 // skipping the per-chunk memcpy of the payload into write_buf
-                // (32 KiB per bridge chunk). The downcast is the same one the
+                // (one bridge chunk per frame). The downcast is the same one the
                 // splice(2) fast path uses; TLS/QUIC/KCP-wrapped WS (and the
                 // leftover-BufferedRead accept variant) fall through to the
                 // combined-buffer path below. The writev goes DIRECTLY on the

@@ -494,7 +494,7 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // `yamux_config_carries_window_growth_seed_rtt` test).
     // A full bridge chunk travels as one yamux data frame in the steady
     // state: `split_send_size` is the bridge's copy buffer
-    // (`FRP_BRIDGE_BUF_KB`, 32 KiB by default) — not padded, and not split
+    // (64 KiB default, 32 KiB on macOS; knob overrides) - not padded, not split
     // further unless the send window is short (a partly consumed window
     // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:408-409`)
     // or the chunk is short (compression shrinks it, encryption writes the

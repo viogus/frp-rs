@@ -414,8 +414,8 @@ round trip.
 `StartWorkConn` with proxy metadata (encryption flag, compression flag), the
 server writes any pre-read bytes (from HTTP VHost parsing) and then bridges the
 user connection to the work connection using either
-`tokio::io::copy_bidirectional_with_sizes` with the 32 KiB default
-`BUFFER_SIZE` (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
+`tokio::io::copy_bidirectional_with_sizes` with the
+`BUFFER_SIZE` default (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
 + Snappy, streaming — a single random 16-byte IV followed by continuous
 ciphertext, no per-frame length prefix). The client-side plain relay mirrors this
 (`relay_plain_fast` with `splice(2)` on Linux, `copy_bidirectional_with_sizes`
@@ -662,7 +662,7 @@ changes.
   and ignored (a failed socket option must not kill a connection). KCP sets its
   own nodelay; QUIC/UDP are excluded. Wire-invisible.
 - **Bridge buffer size**: `frp_core::buffer_pool::BUFFER_SIZE` defaults to
-  **32 KiB** (matching Go frp's `io.Copy`). Override with `FRP_BRIDGE_BUF_KB`
+  **64 KiB** (**32 KiB on macOS**). Override with `FRP_BRIDGE_BUF_KB`
   (4–1024). The plain bridge copies through `relay_plain_pooled` (which loops on
   `copy_pooled`), so `BUFFER_SIZE` applies to the plain path too; the
   encrypted/compressed path uses the `PoolGuard` buffer pool (also
@@ -670,15 +670,19 @@ changes.
   (`mux.rs` sets `split_send_size` from it), so in the steady state one full
   bridge chunk is one frame; the split is capped at 64 KiB, which leaves the 12-byte header inside the
   WebSocket transport's 65664-byte read limit; a rejected frame kills the
-  whole mux session. Raising the buffer to 64 KiB is the one knob with a
-  measured data-plane win on the mux path (+12% on tcpMux at 4 flows, +6% at
-  one, +11% on tcp-tls, from 2x64 KiB per bridge instead of 2x32 KiB) — but it
-  also costs the non-mux WebSocket rows ~40–45% on macOS (`ws` 301 → 165 MiB/s,
-  `wss` 226 → 134), which is why the default stays at Go parity and the knob
-  carries the tradeoff. The measured cost model — ≈11.6 µs of mux overhead per 32 KiB frame, of
-  which only ~5 µs is fixed, so bytes per frame are a lever rather than a
-  ceiling — and three structural alternatives that measured at zero gain are in
-  [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md).
+  whole mux session — which is why the default is exactly the cap and a larger
+  buffer buys memory, not frames. On a 4-vCPU Linux VM the 64 KiB default is
+  worth **+13.5%** on `tcpMux` + TLS (526 → 597 MiB/s over five interleaved
+  pairs of the same binary), +12.8% at one flow and +13.9% on WebSocket without
+  mux, with the plain rows unchanged; macOS keeps 32 KiB because there the same
+  setting costs the non-mux WebSocket rows ~40–45% (`ws` 301 → 165 MiB/s,
+  `wss` 226 → 134). The measured cost model — ≈11.6 µs of mux overhead per
+  32 KiB frame, of which only ~5 µs is fixed, so bytes per frame are a lever
+  rather than a ceiling — and three structural alternatives that measured at
+  zero gain are in
+  [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md);
+  the default change is
+  [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
 ### Transport status
 
