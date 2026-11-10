@@ -34,30 +34,27 @@ use std::sync::LazyLock;
 /// one flow 508.4 -> 573.5 (+12.8%), `ws` without `tcpMux` 1064 -> 1213
 /// (+13.9%), and the no-mux plain and TLS rows unchanged within noise.
 ///
-/// macOS keeps 32 KiB: the same 64 KiB buffer costs its non-mux WebSocket
-/// rows ~40-45% there (301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`
-/// via `scripts/protocol-matrix.sh`, three runs, knob as the only difference),
-/// and its mux rows are within a few percent (one +8%, one -2.5%). The cause is
-/// **unknown** — the frames there are the same size as a mux WS frame that does
-/// not regress — so this is an observation about one code path on one OS, not a
-/// transport property; `FRP_BRIDGE_BUF_KB` overrides it either way.
-///
-/// Measurements, cost model and the three structural alternatives that changed
-/// nothing: `docs/archive/notes/2026-11-10-mux-frame-cost.md` and
-/// `docs/archive/notes/2026-11-10-real-host-throughput.md`.
-#[cfg(not(target_os = "macos"))]
+/// The same size everywhere, macOS included. macOS was briefly left at 32 KiB
+/// because `scripts/protocol-matrix.sh` reported its `ws` rows 40-45% slower at
+/// 64 KiB — but that row is a **one-stream 64 KiB ping-pong**, which measures
+/// frame-granularity latency, not throughput: the writer cannot overlap the
+/// next chunk with the peer's reply, so a buffer exactly as large as the
+/// message is the worst case there (and, symmetrically, a 32 KiB buffer is the
+/// worst case on Linux, where the same row drops to 10-30 MiB/s). On the
+/// streaming shape — one-way 4 MiB transfers, the shape a proxy actually sees —
+/// macOS gains **+48%** at one flow (1,557 -> 2,303 MiB/s), +27-42% at four
+/// flows without `tcpMux` (1,684-1,862 -> 2,362-2,390) and +55% at four flows
+/// with it (704-732 -> 1,107-1,183), so the platform split was measuring the
+/// harness. Measurements and the ping-pong trap:
+/// `docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`.
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
-
-/// Default pooled buffer size on macOS — see [`BUFFER_SIZE`].
-#[cfg(target_os = "macos")]
-const DEFAULT_BUFFER_SIZE: usize = 32 * 1024;
 
 /// Pooled buffer size in bytes.
 ///
-/// Default: [`DEFAULT_BUFFER_SIZE`] — 64 KiB, or 32 KiB on macOS. Keeping the
+/// Default: [`DEFAULT_BUFFER_SIZE`] — 64 KiB. Keeping the
 /// buffer equal to the frame payload is what makes a bridge chunk travel as a
 /// single yamux frame; the per-bridge footprint is two buffers, so the default
-/// costs 2x64 KiB (2x32 KiB on macOS) per live bridge.
+/// costs 2x64 KiB per live bridge.
 ///
 /// Override via env `FRP_BRIDGE_BUF_KB` (valid range: 4-1024 KB, i.e. 4 KiB -
 /// 1 MiB); values outside the range are ignored and the default applies. Read
@@ -83,7 +80,7 @@ fn resolve_buffer_size(raw: Option<&str>) -> usize {
 
 /// Maximum number of buffers to retain in the pool.
 ///
-/// Default 128 (8 MiB of 64 KiB buffers, 4 MiB on macOS); override via
+/// Default 128 (8 MiB of 64 KiB buffers); override via
 /// `FRP_BRIDGE_POOL_MAX` (capped at 4096). 32 was too small under high
 /// connection churn — excess buffers were dropped and re-allocated. The
 /// retained bytes scale with `FRP_BRIDGE_BUF_KB`: 128 x 64 KiB is the default
@@ -282,11 +279,7 @@ mod tests {
     fn test_resolve_buffer_size_default_and_override() {
         let default = resolve_buffer_size(None);
         assert_eq!(default, DEFAULT_BUFFER_SIZE);
-        if cfg!(target_os = "macos") {
-            assert_eq!(default, 32 * 1024, "macOS keeps the 32 KiB default");
-        } else {
-            assert_eq!(default, 64 * 1024);
-        }
+        assert_eq!(default, 64 * 1024, "64 KiB everywhere, macOS included");
         // Accepted overrides, with surrounding whitespace.
         assert_eq!(resolve_buffer_size(Some("4")), 4 * 1024);
         assert_eq!(resolve_buffer_size(Some("64")), 64 * 1024);

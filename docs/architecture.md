@@ -662,7 +662,7 @@ changes.
   and ignored (a failed socket option must not kill a connection). KCP sets its
   own nodelay; QUIC/UDP are excluded. Wire-invisible.
 - **Bridge buffer size**: `frp_core::buffer_pool::BUFFER_SIZE` defaults to
-  **64 KiB** (**32 KiB on macOS**). Override with `FRP_BRIDGE_BUF_KB`
+  **64 KiB** on every platform. Override with `FRP_BRIDGE_BUF_KB`
   (4–1024). The plain bridge copies through `relay_plain_pooled` (which loops on
   `copy_pooled`), so `BUFFER_SIZE` applies to the plain path too; the
   encrypted/compressed path uses the `PoolGuard` buffer pool (also
@@ -674,9 +674,10 @@ changes.
   buffer buys memory, not frames. On a 4-vCPU Linux VM the 64 KiB default is
   worth **+13.5%** on `tcpMux` + TLS (526 → 597 MiB/s over five interleaved
   pairs of the same binary), +12.8% at one flow and +13.9% on WebSocket without
-  mux, with the plain rows unchanged; macOS keeps 32 KiB because there the same
-  setting costs the non-mux WebSocket rows ~40–45% (`ws` 301 → 165 MiB/s,
-  `wss` 226 → 134). The measured cost model — ≈11.6 µs of mux overhead per
+  mux, with the plain rows unchanged; macOS gains more than any of them on the
+  streaming shape (+48% at one flow, +27–42% at four without mux), and the
+  one-stream ping-pong rows that once argued for a 32 KiB default there measure
+  frame latency rather than throughput. The measured cost model — ≈11.6 µs of mux overhead per
   32 KiB frame, of which only ~5 µs is fixed, so bytes per frame are a lever
   rather than a ceiling — and three structural alternatives that measured at
   zero gain are in

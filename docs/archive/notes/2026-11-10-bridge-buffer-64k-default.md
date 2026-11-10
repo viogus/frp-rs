@@ -61,34 +61,59 @@ instead of two) and costs 2×64 KiB of buffer per live bridge instead of
 2×32 KiB — about 2 MB of RSS at the measured fan-out, versus 12 µs per frame
 saved.
 
-## 4. Why macOS keeps 32 KiB
+## 4. Why macOS keeps 64 KiB too
 
-Same knob, macOS arm64 loopback, `scripts/protocol-matrix.sh`, three runs, knob
-as the only difference:
+The first version of this change shipped a macOS carve-out (32 KiB there), on
+the strength of `scripts/protocol-matrix.sh` reporting macOS `ws` rows 40-45%
+slower at 64 KiB: `ws` 301.5 -> 165.5 MiB/s, `wss` 226.2 -> 134.0, `ws`+TLS
+222.75 -> 133.2, while `ws`+TLS+mux moved only 185.8 -> 181.2 and `tcp`+TLS+mux
+went 288.8 -> 312.9 the other way.
 
-| row | 32 KiB | 64 KiB |
+**That row does not measure throughput.** `protocol-matrix.sh` runs
+`frp-stress --scenario throughput --streams 1`, which is a strict ping-pong: one
+64 KiB write, then a 64 KiB read, repeated. Nothing overlaps, so the number is
+frame-granularity *latency*, and the buffer size that wins depends on how the
+chunks line up with the message — not on how fast bytes move. Re-measured with
+the same harness on both platforms, same binary, knob as the only difference:
+
+| shape | macOS arm64 | Linux VM |
 |---|---|---|
-| `ws` (no mux) | 301.5 | **165.5** |
-| `wss` (no mux) | 226.2 | **134.0** |
-| `ws` + TLS without mux | 222.75 | **133.2** |
-| `ws` + TLS + mux | 185.8 | 181.2 |
-| `tcp` + TLS + mux | 288.8 | 312.9 |
+| 1-stream 64 KiB ping-pong, 64 KiB buffer | 165 MiB/s | 191-197 |
+| 1-stream 64 KiB ping-pong, 32 KiB buffer | **301** | **10-30** |
+| 8 KiB ping-pong, 32 vs 64 KiB buffer | 73.5 vs 73.9 (no difference) | — |
+| 32 KiB ping-pong, 32 vs 64 KiB buffer | 193.6 vs 194.4 (no difference) | — |
 
-Linux gains on the same WebSocket rows (+13.9%), so this is a property of the
-macOS loopback/`ws` write path, not of the frame size in principle. Making the
-default depend on the *transport* at runtime was rejected: `BUFFER_SIZE` is read
-once per process and the transport is per-connection, so a shared process
-serving both `tcp` and `ws` proxies cannot honour it. A platform constant can,
-and macOS is where the cost is measured.
+The pathology needs the buffer to be **as large as the message** (64 KiB chunk,
+64 KiB buffer) — and then it hits whichever side the chunking does not pipeline
+on: macOS at 64 KiB, Linux at 32 KiB, by 2x and 10-20x respectively. With an
+8 KiB or 32 KiB message both sizes measure the same. So the row measures the
+harness, and using it to pick a default would have been choosing a platform
+kernel's ping-pong behaviour.
+
+**The streaming shape disagrees decisively.** One-way transfers (the shape a
+proxy is actually asked to move), macOS arm64, `abbench stream`, three
+independent runs per cell:
+
+| shape | 32 KiB | 64 KiB |
+|---|---|---|
+| `ws`, no mux, 1 flow | 1,340 / 1,461 / 1,557 / 1,558 | **2,248 / 2,297 / 2,303 / 2,313** (+48%) |
+| `ws`, no mux, 4 flows | 1,684 / 1,774 / 1,852 / 1,862 | **2,362 / 2,376 / 2,390 / 2,390** (+27-42%) |
+| `ws` + `tcpMux`, 4 flows | 704 / 709 / 730 / 735 | **1,107 / 1,139 / 1,183** (+55%) |
+| `tcp`, 1 flow | 458 / 468 | 458 / 464 (no difference) |
+
+macOS therefore keeps 64 KiB, and `DEFAULT_BUFFER_SIZE` is a single constant.
+The lesson is recorded here rather than in the matrix README because the matrix
+is still the right gate for "does data move on this transport" — it is the wrong
+instrument for "how fast", and it was used as one.
 
 ## 5. What ships
 
-- `DEFAULT_BUFFER_SIZE` = 64 KiB, 32 KiB under `#[cfg(target_os = "macos")]`.
+- `DEFAULT_BUFFER_SIZE` = 64 KiB, the same on every platform (§4).
 - `FRP_BRIDGE_BUF_KB` (4–1024) still wins; out-of-range values fall back to the
   platform default (`resolve_buffer_size` is a pure function with tests).
 - `MAX_POOLED_BUFFERS` (128) is unchanged, so the pool ceiling becomes 8 MiB of
-  64 KiB buffers (4 MiB on macOS); the pool only holds buffers that were used
-  and released, so an idle process keeps none of it.
+  64 KiB buffers; the pool only holds buffers that were used and released, so an
+  idle process keeps none of it.
 - Docs updated: `docs/architecture.md` (bridge buffer bullet),
   `docs/deployment.md` (the knob paragraph), `CHANGELOG.md`, `README.md`
   (Performance section — the shipping row is now +41%, not +23%).
@@ -112,9 +137,9 @@ Go is unchanged by this work; its own rows do not use frp-rs's buffer.
 - Four flows on four vCPUs is a CPU-bound regime; a host with idle cores can
   reorder the cross-implementation comparison (see
   `2026-11-10-real-host-throughput.md` §8).
-- The macOS numbers come from the protocol matrix harness, not from `abbench`;
-  they are consistent across three runs but have not been re-measured with the
-  stream harness.
+- The macOS *streaming* numbers above are from `abbench stream` on one laptop,
+  four runs per cell, alternating; the ping-pong numbers are the matrix harness.
+  Neither is a CI measurement.
 - The 64 KiB frame is legal for every peer: `fatedier/yamux v0.3.0` writes
   `min(window, len)` with no small-frame constant, and KCP/QUIC/WS accept it —
   the WebSocket reader's cap is 65664 bytes, 116 more than a 64 KiB frame plus

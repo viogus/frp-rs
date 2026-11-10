@@ -33,7 +33,7 @@ use tokio::time::timeout;
 
 const HEAD_LEN: usize = 91; // StartWorkConn-sized head frame
 /// Bridge copy chunk, i.e. the frame size the product actually emits. Read at
-/// runtime because the default is 64 KiB (32 KiB on macOS) and
+/// runtime because the default is 64 KiB and
 /// `FRP_BRIDGE_BUF_KB` can change it; pinning a literal here would leave the
 /// stall regression pinned at a size the product no longer sends.
 fn frame_len() -> usize {
