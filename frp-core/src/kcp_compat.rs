@@ -863,8 +863,10 @@ mod tests {
                 }
                 assert_eq!(got, want, "len {len}, coef row {pi}/{di}");
 
-                // dst longer than src: the tail must not be written.
-                let mut long = vec![0xAAu8; len + 5];
+                // dst longer than src: the tail must not be written. The
+                // prefix starts as zeros so it can be compared with `want`.
+                let mut long = vec![0u8; len];
+                long.extend_from_slice(&[0xAAu8; 5]);
                 // SAFETY: as above; `xor_mul_avx2` bounds itself with min().
                 unsafe { xor_mul_avx2(&mut long, &src, lo, hi) };
                 assert_eq!(&long[..len], &want[..], "prefix len {len}");
