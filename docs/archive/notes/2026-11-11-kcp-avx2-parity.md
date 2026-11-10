@@ -65,10 +65,15 @@ remains is the per-packet path, not the parity maths.
 ## What is left
 
 At 58 MiB/s against Go's 103 the bulk KCP stream is still ~1.8× behind, and the
-remaining cost is not the parity math — the profile has to be re-taken on this
-build to see what moved up. The other measured cost (`clock_gettime` ~3.6%,
-wake-up spin locks) points at per-packet scheduling in the driver task, which is
-the untested half of the `TODO.md` item.
+parity pass is no longer where the time goes: the same debuginfo build profiled
+after this change has `fec_encode_output` out of the top frames entirely. What
+sits there now is scheduling — frps's largest single entry is the kernel's
+task-wakeup path under the epoll callback (`native_queued_spin_lock_slowpath` →
+`try_to_wake_up` → `ep_poll_callback`, 6.5%), and frpc spends 3.4% in
+`clock_gettime`, 4.0% in the `KcpSocket::run` loop and 3.3% in yamux's
+connection poll. That is the per-packet driver-task cost, which is the untested
+half of the `TODO.md` item — a batch send (`sendmmsg`) or fewer cross-task
+wakeups per packet is the next thing to try, not more FEC work.
 
 ## Limits
 
