@@ -675,7 +675,7 @@ changes.
   worth **+13.5%** on `tcpMux` + TLS (526 → 597 MiB/s over five interleaved
   pairs of the same binary), +12.8% at one flow and +13.9% on WebSocket without
   mux, with the plain rows unchanged; macOS gains more than any of them on the
-  streaming shape (+48% at one flow, +27–42% at four without mux), and the
+  streaming shape (mean-to-mean +55% at one flow, +33% at four without mux), and the
   one-stream ping-pong rows that once argued for a 32 KiB default there measure
   frame latency rather than throughput. The measured cost model — ≈11.6 µs of mux overhead per
   32 KiB frame, of which only ~5 µs is fixed, so bytes per frame are a lever

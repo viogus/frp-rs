@@ -1132,8 +1132,8 @@ limit, and a bigger buffer does not buy more frames. It is also unsafe on
 and anything above 64 KiB is rejected by the peer as "WS frame too large". On a 4-vCPU Linux VM the
 64 KiB default measured **+13.5%** on tcpMux + TLS, +12.8% at one stream and
 +13.9% on WebSocket without mux, with the plain rows unchanged, and macOS gains
-more than any of them on the streaming shape (**+48%** at one flow, +27–42% at
-four without mux). The macOS WebSocket numbers that once argued for a 32 KiB
+more than any of them on the streaming shape (**+55%** at one flow, +33% at
+four without mux, mean-to-mean). The macOS WebSocket numbers that once argued for a 32 KiB
 default there came from a one-stream ping-pong row, which measures frame
 latency, not throughput — see the note below. For memory-constrained or
 high-fan-out servers, lower it (`FRP_BRIDGE_BUF_KB=8` is a 16 KiB footprint per
@@ -1145,7 +1145,7 @@ frame size is a lever, not a ceiling. That is what the 64 KiB default buys, and
 why going further does not help: the frame is capped at 64 KiB.
 Measurements and the frame-cost model:
 [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md);
-the default and its platform split:
+the default and the knob that overrides it:
 [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
 **Heartbeat intervals:**

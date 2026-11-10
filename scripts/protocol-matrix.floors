@@ -19,6 +19,12 @@
 #   ws-plain 297.9 (0.565) · ws-tls 220.7 (0.419) · ws-tls-mux 180.4 (0.342)
 #   wss 221.0 (0.419) · kcp-plain 65.5 (0.124) · kcp-tls 66.4 (0.126)
 #   kcp-tls-mux 54.5 (0.103) · quic 86.3 (0.164)
+# The window is a one-stream 64 KiB ping-pong, so its absolute numbers are
+# frame-latency-bound and move with the bridge buffer default (#601 raised it to
+# 64 KiB on Linux, #602 followed on macOS): treat `tcp-plain` as the normaliser
+# of its own run, not as a capacity figure, and do not compare raw rows across
+# commits that changed `FRP_BRIDGE_BUF_KB`.
+#
 # Each ratio floor sits roughly 2.5x below the measured ratio (KCP: 0.124 →
 # 0.05), which leaves room for a slower runner while still reddening the ~3x
 # KCP regression that motivated the gate: before #596 the matrix measured

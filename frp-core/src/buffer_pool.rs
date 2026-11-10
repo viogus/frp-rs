@@ -16,7 +16,7 @@ use std::sync::LazyLock;
 
 /// Default pooled buffer size, in bytes, when `FRP_BRIDGE_BUF_KB` is unset.
 ///
-/// 64 KiB everywhere except macOS. The buffer is also the yamux data-frame
+/// 64 KiB on every platform. The buffer is also the yamux data-frame
 /// payload (`mux.rs` derives `split_send_size` from it), so one full bridge
 /// chunk travels as one frame — no second 12-byte header and no second
 /// window-credit hand-off per chunk. The derived split is capped at 64 KiB,
@@ -36,17 +36,18 @@ use std::sync::LazyLock;
 ///
 /// The same size everywhere, macOS included. macOS was briefly left at 32 KiB
 /// because `scripts/protocol-matrix.sh` reported its `ws` rows 40-45% slower at
-/// 64 KiB — but that row is a **one-stream 64 KiB ping-pong**, which measures
-/// frame-granularity latency, not throughput: the writer cannot overlap the
-/// next chunk with the peer's reply, so a buffer exactly as large as the
-/// message is the worst case there (and, symmetrically, a 32 KiB buffer is the
-/// worst case on Linux, where the same row drops to 10-30 MiB/s). On the
-/// streaming shape — one-way 4 MiB transfers, the shape a proxy actually sees —
-/// macOS gains **+48%** at one flow (1,557 -> 2,303 MiB/s), +27-42% at four
-/// flows without `tcpMux` (1,684-1,862 -> 2,362-2,390) and +55% at four flows
-/// with it (704-732 -> 1,107-1,183), so the platform split was measuring the
-/// harness. Measurements and the ping-pong trap:
-/// `docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`.
+/// 64 KiB — but that row is a **one-stream 64 KiB ping-pong** (one 64 KiB write,
+/// then one 64 KiB read, nothing overlapping), so it measures frame-granularity
+/// latency rather than throughput, and the number moves with the chunk-to-buffer
+/// ratio: with a 64 KiB message macOS is fastest at a 32 KiB buffer (301 vs 165
+/// MiB/s) and Linux is fastest at 64 KiB (191-197 vs 10-30), while at 8 KiB or
+/// 32 KiB messages both buffer sizes measure the same. Why the 64 KiB case is
+/// slow on one OS and fast on the other is not established. On the streaming
+/// shape — one-way transfers, the shape a proxy actually sees — macOS means
+/// gain **+55%** at one flow (1,479 -> 2,290 MiB/s), +33% at four flows without
+/// `tcpMux` (1,793 -> 2,380) and +59% at four flows with it (720 -> 1,143), so
+/// the carve-out was measuring the harness. Measurements and the ping-pong
+/// trap: `docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`.
 const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Pooled buffer size in bytes.
@@ -285,7 +286,7 @@ mod tests {
         assert_eq!(resolve_buffer_size(Some("64")), 64 * 1024);
         assert_eq!(resolve_buffer_size(Some(" 128 ")), 128 * 1024);
         assert_eq!(resolve_buffer_size(Some("1024")), 1024 * 1024);
-        // Out-of-range or unparsable values fall back to the platform default.
+        // Out-of-range or unparsable values fall back to the default.
         for bad in ["3", "1025", "0", "abc", "", "-8"] {
             assert_eq!(resolve_buffer_size(Some(bad)), default, "raw = {bad:?}");
         }

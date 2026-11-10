@@ -39,7 +39,7 @@ const HEAD_LEN: usize = 91; // StartWorkConn-sized head frame
 fn frame_len() -> usize {
     *frp_core::buffer_pool::BUFFER_SIZE
 }
-const TOTAL_FRAMES: usize = 320; // ~10 MB total
+const TOTAL_FRAMES: usize = 320; // ~20 MiB total at the 64 KiB default
 
 #[tokio::test(flavor = "multi_thread")]
 async fn ws_over_tls_burst_does_not_stall() {

@@ -337,7 +337,7 @@ impl AsyncWrite for KcpStream {
 
         // M1 perf: pop a recycled chunk from the pool (or allocate with
         // with_capacity when the pool is empty) instead of buf.to_vec()'s
-        // fresh 32 KiB alloc + memcpy on every bridge write. The driver
+        // fresh chunk-sized alloc + memcpy on every bridge write. The driver
         // returns the chunk to the pool once the session's segmentation has
         // copied the payload out.
         let mut chunk = chunk_pool_pop(&self.chunk_pool, buf.len());

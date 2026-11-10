@@ -1,4 +1,4 @@
-# The bridge buffer is 64 KiB by default (32 KiB on macOS)
+# The bridge buffer is 64 KiB by default, on every platform
 
 **Date:** 2026-11-10 · **Status:** shipped · **Scope:** `frp-core/src/buffer_pool.rs`,
 `frp-core/src/mux.rs` (unchanged derivation), `FRP_BRIDGE_BUF_KB` semantics
@@ -16,8 +16,9 @@ The earlier record (`2026-11-10-mux-frame-cost.md`) measured the knob on a
 `FRP_BRIDGE_BUF_KB=64` costs the macOS non-mux WebSocket rows ~40–45%. Re-running
 the comparison on a dedicated Linux VM with more repeats, the gain is larger and
 much tighter than the container suggested, and the loss does not reproduce on
-Linux at all. So the default follows the platform: 64 KiB where it helps,
-32 KiB on macOS where it hurts.
+Linux at all. That reasoning kept macOS at 32 KiB for one release; §4 then
+re-ran the macOS rows on the streaming shape and found the loss was the
+harness, not the platform, so the default is 64 KiB everywhere.
 
 ## 2. Method
 
@@ -83,23 +84,30 @@ the same harness on both platforms, same binary, knob as the only difference:
 | 8 KiB ping-pong, 32 vs 64 KiB buffer | 73.5 vs 73.9 (no difference) | — |
 | 32 KiB ping-pong, 32 vs 64 KiB buffer | 193.6 vs 194.4 (no difference) | — |
 
-The pathology needs the buffer to be **as large as the message** (64 KiB chunk,
-64 KiB buffer) — and then it hits whichever side the chunking does not pipeline
-on: macOS at 64 KiB, Linux at 32 KiB, by 2x and 10-20x respectively. With an
-8 KiB or 32 KiB message both sizes measure the same. So the row measures the
-harness, and using it to pick a default would have been choosing a platform
-kernel's ping-pong behaviour.
+What the four rows establish is narrower than a mechanism. The observation is
+that the difference appears only with a 64 KiB message, where macOS prefers the
+32 KiB buffer (2.0x) and Linux prefers the 64 KiB one (6.4-19.7x, on this
+harness only — §3's streaming table shows Linux at 32 KiB costing just 13.5%);
+at 8 KiB and 32 KiB messages the two buffer sizes measure the same on macOS. Why
+the 64 KiB case is asymmetric between the two kernels is **not established** by
+these runs — no profile or syscall trace was taken. What is established is that
+the row is latency-shaped: the same binary uses 9.4 s of CPU for 300 MiB/s at
+32 KiB and 4.3 s for 165 MiB/s at 64 KiB, i.e. identical CPU per byte, so the
+64 KiB case is waiting, not computing. Picking a default from that row would
+have been choosing a kernel's ping-pong behaviour, not a throughput property.
 
 **The streaming shape disagrees decisively.** One-way transfers (the shape a
-proxy is actually asked to move), macOS arm64, `abbench stream`, three
-independent runs per cell:
+proxy is actually asked to move), macOS arm64, `abbench stream`, four runs per
+cell (three for the 64 KiB `tcpMux` arm, whose first run of the day leaked
+624 MiB/s — the outlier is listed, not dropped). Percentages are
+mean-to-mean:
 
-| shape | 32 KiB | 64 KiB |
-|---|---|---|
-| `ws`, no mux, 1 flow | 1,340 / 1,461 / 1,557 / 1,558 | **2,248 / 2,297 / 2,303 / 2,313** (+48%) |
-| `ws`, no mux, 4 flows | 1,684 / 1,774 / 1,852 / 1,862 | **2,362 / 2,376 / 2,390 / 2,390** (+27-42%) |
-| `ws` + `tcpMux`, 4 flows | 704 / 709 / 730 / 735 | **1,107 / 1,139 / 1,183** (+55%) |
-| `tcp`, 1 flow | 458 / 468 | 458 / 464 (no difference) |
+| shape | 32 KiB | 64 KiB | mean |
+|---|---|---|---|
+| `ws`, no mux, 1 flow | 1,340 / 1,461 / 1,557 / 1,558 | 2,248 / 2,297 / 2,303 / 2,313 | 1,479 -> 2,290 (**+55%**) |
+| `ws`, no mux, 4 flows | 1,684 / 1,774 / 1,852 / 1,862 | 2,362 / 2,376 / 2,390 / 2,390 | 1,793 -> 2,380 (**+33%**) |
+| `ws` + `tcpMux`, 4 flows | 704 / 709 / 730 / 735 | 624 / 1,107 / 1,139 / 1,183 | 720 -> 1,013 (**+41%**; without the 624 outlier 720 -> 1,143 = +59%) |
+| `tcp`, 1 flow | 458 / 468 | 458 / 464 | no difference |
 
 macOS therefore keeps 64 KiB, and `DEFAULT_BUFFER_SIZE` is a single constant.
 The lesson is recorded here rather than in the matrix README because the matrix
@@ -110,7 +118,7 @@ instrument for "how fast", and it was used as one.
 
 - `DEFAULT_BUFFER_SIZE` = 64 KiB, the same on every platform (§4).
 - `FRP_BRIDGE_BUF_KB` (4–1024) still wins; out-of-range values fall back to the
-  platform default (`resolve_buffer_size` is a pure function with tests).
+  default (`resolve_buffer_size` is a pure function with tests).
 - `MAX_POOLED_BUFFERS` (128) is unchanged, so the pool ceiling becomes 8 MiB of
   64 KiB buffers; the pool only holds buffers that were used and released, so an
   idle process keeps none of it.

@@ -18,6 +18,17 @@ stream, 0.66x at eight) and a single session plateaus near 485-520 MiB/s from
 four streams up — see
 `docs/archive/notes/2026-11-08-mux-throughput-scaling.md`.
 
+**The scenario is a strict ping-pong, so read it as a data-mover, not as a
+capacity figure.** One chunk is written and its echo read before the next one
+starts; nothing overlaps. That makes the absolute MiB/s a frame-latency
+measurement, and it moves with the bridge buffer size in a way that depends on
+the chunk-to-buffer ratio rather than on throughput — a 64 KiB buffer is the
+worst case for a 64 KiB chunk on macOS and the best case on Linux, by 2x and
+10-20x (`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md` §4). Use a
+one-way stream harness (`abbench stream`, `ab2.sh`) to compare buffer sizes; use
+this scenario and `scripts/protocol-matrix.sh` to assert that a transport still
+moves bytes.
+
 ## Matrix
 
 One JSON line per bridge configuration:
