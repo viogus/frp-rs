@@ -200,7 +200,7 @@ pub async fn read_msg_v1<R: AsyncReadExt + Unpin>(
     }
     let length = length as usize;
     // Use the global buffer pool for small payloads (<= BUFFER_SIZE, 64 KiB
-    // by default, 32 KiB on macOS).  Larger payloads fall back to a heap
+    // by default).  Larger payloads fall back to a heap
     // allocation.  The
     // PoolGuard is dropped after deserialization, returning the buffer.
     let pool_size = *crate::buffer_pool::BUFFER_SIZE;

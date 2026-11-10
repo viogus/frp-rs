@@ -255,7 +255,7 @@ pub struct Kcp<Output> {
     /// frp-rs patch: receive-side counterpart of `snd_data_pool`. `recv()`
     /// returns consumed segment payloads here; `input()` reuses a buffer
     /// instead of a fresh `Vec::with_capacity` per PUSH segment (~24
-    /// segments per 32 KiB bridge chunk). Same cap and single-owner rules
+    /// segments per 64 KiB bridge chunk). Same cap and single-owner rules
     /// as the send-side pool.
     rcv_data_pool: Vec<Vec<u8>>,
 
@@ -545,7 +545,7 @@ impl<Output> Kcp<Output> {
             // buffer (no split_off tail moves): each byte is copied exactly
             // once, into the single segment that owns it. frp-rs patch (F3):
             // reuse a retired segment's payload buffer instead of a fresh
-            // `to_vec()` per segment (~24 segments per 32 KiB bridge chunk).
+            // `to_vec()` per segment (~48 segments per 64 KiB bridge chunk).
             let data = match self.snd_data_pool.pop() {
                 Some(mut v) => {
                     v.clear();

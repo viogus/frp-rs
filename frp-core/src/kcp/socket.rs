@@ -37,9 +37,9 @@ pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 pub(crate) const KCP_SND_BACKLOG_THRESHOLD: usize = 2048;
 
 /// Max recycled write chunks kept in the per-socket chunk pool. Each chunk
-/// is a reused bridge-write buffer (one `BUFFER_SIZE`, 64 KiB by default and
-/// 32 KiB on macOS), so the pool caps recycled memory at 8 × that per socket
-/// (512 KiB by default). Chunks beyond the cap are
+/// is a reused bridge-write buffer (one `BUFFER_SIZE`, 64 KiB by default), so
+/// the pool caps recycled memory at 8 × that per socket (512 KiB by default).
+/// Chunks beyond the cap are
 /// simply dropped on return.
 pub(crate) const CHUNK_POOL_CAP: usize = 8;
 

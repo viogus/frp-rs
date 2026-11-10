@@ -56,8 +56,8 @@ struct ShardGroup {
 /// `write()` calls between drains don't reallocate the outer Vec on every push.
 ///
 /// frp-rs patch (F3): each KCP output datagram is drawn from a buffer pool
-/// instead of a fresh `to_vec()` — a 32 KiB bridge write over KCP costs ~24
-/// segment allocs in `Kcp::send` plus ~24 datagram allocs here; the datagram
+/// instead of a fresh `to_vec()` — a 64 KiB bridge write over KCP costs ~48
+/// segment allocs in `Kcp::send` plus ~48 datagram allocs here; the datagram
 /// side drops to pool pops. The pool is the socket's shared `chunk_pool`: the
 /// driver returns a datagram to it after `try_send_to` (terminal states only —
 /// a queued datagram stays in `pending_udp` until sent), and `KcpStream` write

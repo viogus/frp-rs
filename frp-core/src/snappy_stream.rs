@@ -48,7 +48,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::encryption::{SnappyCompressor, SnappyDecompressor};
 
 /// Read granularity for the decompressor's inner read. A bridge chunk is now
-/// 64 KiB by default (32 KiB on macOS), so this is a fixed granularity rather
+/// 64 KiB by default, so this is a fixed granularity rather
 /// than a match of `buffer_pool::BUFFER_SIZE`: the decompressor loops over the
 /// inner reader, so a chunk larger than this is read in more than one pass and
 /// correctness does not depend on the two sizes agreeing.

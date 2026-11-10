@@ -1,5 +1,5 @@
 > **Superseded on one point (2026-11-10).** §6 argued the default should stay a
-> knob; it now defaults to 64 KiB (32 KiB on macOS) — see
+> knob; it now defaults to 64 KiB — see
 > [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](2026-11-10-bridge-buffer-64k-default.md).
 > Every other section still stands.
 >

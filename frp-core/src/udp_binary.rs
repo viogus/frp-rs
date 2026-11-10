@@ -709,7 +709,7 @@ fn parse_udp_packet_header(body: &[u8]) -> Result<DecodedHeader, String> {
 ///
 /// Deliberately **not** `buffer_pool::BUFFER_SIZE`: the UDP read buffer is a
 /// pool buffer whose size is a bridge/transport knob (`FRP_BRIDGE_BUF_KB`,
-/// 64 KiB by default and 32 KiB on macOS), so keying this off it let a knob
+/// 64 KiB by default), so keying this off it let a knob
 /// silently change the codec's allocation strategy — at a 64 KiB pool no
 /// legal UDP payload can reach the take path, and the zero-copy branch became
 /// dead code. The trade-off this pins is UDP-local: below the threshold the
