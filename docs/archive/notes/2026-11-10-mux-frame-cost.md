@@ -129,6 +129,15 @@ of the 23 µs frame is fixed cost).
 
 ## 7. What is left
 
+> **Corrected 2026-11-10.** The deficit described in this section was a
+> container artefact. Re-measured on a dedicated Linux VM, frp-rs is **ahead**
+> of Go frp on every TCP row, including the shipped `tcpMux` + TLS one (+23% at
+> four flows) — see
+> [`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §3.
+> The section is kept as written because it records what the container
+> comparison implied at the time and why the structural experiments were tried;
+> read the numbers as superseded.
+
 frp-rs is still behind Go frp on the mux path at the **shipped** 32 KiB
 default — 1348.5 vs 1773 MiB/s at 4 flows, **23.9%** — and the 64 KiB knob
 narrows that to ~15% (1513 vs 1773). On the plain path it is ~17% behind, and

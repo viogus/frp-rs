@@ -12893,3 +12893,16 @@ kept out of the main P2 list so that adding them does not renumber every later
   the CI runner class is used to set `tcp-plain` to ~2.5x below the runner's own
   measured rate, and the floors file records that derivation (the same rule the
   ratio floors already follow).
+
+- [ ] **The KCP Go-vs-Rust stream comparison has no publishable number.**
+  Evidence: the withdrawn rows in
+  `docs/archive/notes/2026-11-09-kcp-fec-multiply-tables.md` §"Go frp, measured"
+  came from a bench mode that mis-reports its own duration (it claims
+  121.2 MiB/s for a transfer its wall clock finishes in 12 ms), so the "+23%"
+  figure that reached `README.md` is retracted in
+  `docs/archive/notes/2026-11-10-real-host-throughput.md` §6. The KCP ping-pong
+  rows survive because that mode's durations agree with wall clock.
+  **Done-when:** a one-way harness that reports its own elapsed time runs both
+  stacks on a non-containerised Linux host (the same host rule as
+  `2026-11-10-real-host-throughput.md` §2), and the note + README carry that
+  number — or the note states that no KCP stream comparison is published.
