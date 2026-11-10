@@ -312,15 +312,13 @@ impl KcpSocket {
                     for (key, session) in &mut self.sessions {
                         match session.update(now_ms) {
                             Ok(packets) => {
-                                for pkt in packets {
-                                    Self::send_udp_packet(
-                                        &self.socket,
-                                        &mut self.pending_udp,
-                                        pkt,
-                                        key.1,
-                                        &self.chunk_pool,
-                                    );
-                                }
+                                Self::send_packets(
+                                    &self.socket,
+                                    &mut self.pending_udp,
+                                    packets,
+                                    key.1,
+                                    &self.chunk_pool,
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP session error");
@@ -857,6 +855,32 @@ impl KcpSocket {
         }
     }
 
+    /// Send a run of datagrams aimed at one peer, batching where the platform
+    /// allows it and queueing whatever the kernel did not take.
+    ///
+    /// Both the flush path and the tick path (ACKs, retransmits) produce runs
+    /// for a single peer, so they share this.
+    fn send_packets(
+        socket: &UdpSocket,
+        pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
+        packets: Vec<Vec<u8>>,
+        peer: SocketAddr,
+        pool: &ArrayQueue<Vec<u8>>,
+    ) {
+        #[cfg(target_os = "linux")]
+        let sent = Self::send_udp_batch(socket, &packets, peer);
+        #[cfg(not(target_os = "linux"))]
+        let sent = 0usize;
+
+        for (i, pkt) in packets.into_iter().enumerate() {
+            if i < sent {
+                chunk_pool_push(pool, pkt);
+            } else {
+                Self::send_udp_packet(socket, pending_udp, pkt, peer, pool);
+            }
+        }
+    }
+
     /// Send a run of datagrams that all target the same peer.
     ///
     /// On Linux this is one `sendmmsg(2)` — a KCP flush produces several
@@ -873,10 +897,7 @@ impl KcpSocket {
         if packets.len() < 2 {
             return 0;
         }
-        let (addr, addr_len) = match Self::sockaddr_of(&peer) {
-            Some(v) => v,
-            None => return 0,
-        };
+        let (addr, addr_len) = Self::sockaddr_of(&peer);
         let mut iovs: Vec<libc::iovec> = packets
             .iter()
             .map(|p| libc::iovec {
@@ -884,13 +905,17 @@ impl KcpSocket {
                 iov_len: p.len(),
             })
             .collect();
-        let mut msgs: Vec<libc::mmsghdr> = vec![unsafe { std::mem::zeroed() }; iovs.len()];
+        // SAFETY: `mmsghdr` is a C POD and an all-zeroed one is a valid empty
+        // header (null name/iov/control, zero lengths) that the loop below
+        // fills in before the array is handed to the kernel.
+        let zeroed: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        let mut msgs: Vec<libc::mmsghdr> = vec![zeroed; iovs.len()];
         // SAFETY: every pointer handed to the kernel points into a live
         // `iovs`/`addr` inside this function, and `msgs` is exactly as long as
         // `iovs`; the lengths come from the slices themselves.
         unsafe {
             for (i, msg) in msgs.iter_mut().enumerate() {
-                msg.msg_hdr.msg_name = addr.as_ptr() as *mut libc::c_void;
+                msg.msg_hdr.msg_name = (&addr as *const libc::sockaddr_storage).cast_mut().cast();
                 msg.msg_hdr.msg_namelen = addr_len;
                 msg.msg_hdr.msg_iov = &mut iovs[i];
                 msg.msg_hdr.msg_iovlen = 1;
@@ -910,30 +935,38 @@ impl KcpSocket {
 
     /// Build a `sockaddr` for `sendmmsg`.
     ///
-    /// Returns the storage plus the length to pass in `msg_namelen`.
+    /// Returns the storage plus the length to pass in `msg_namelen`. The
+    /// storage is `sockaddr_storage` rather than a byte array so that the
+    /// `sockaddr_in`/`sockaddr_in6` writes below are aligned for their types
+    /// (a `[u8; 128]` is only byte-aligned, and writing through a misaligned
+    /// pointer is undefined even when the runtime address happens to be fine).
     #[cfg(target_os = "linux")]
-    fn sockaddr_of(peer: &SocketAddr) -> Option<([u8; 128], libc::socklen_t)> {
-        let mut buf = [0u8; 128];
+    fn sockaddr_of(peer: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+        // SAFETY: `sockaddr_storage` is a C POD; an all-zero value is a valid
+        // empty storage for any address family, and both arms overwrite the
+        // header they use before the value is handed to the kernel.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         match peer {
             SocketAddr::V4(v4) => {
-                // SAFETY: `sockaddr_in` fits in `buf`.
+                // SAFETY: `storage` is aligned for `sockaddr_in` (the family it
+                // is being filled for) and large enough to hold it.
                 unsafe {
-                    let sa = buf.as_mut_ptr() as *mut libc::sockaddr_in;
+                    let sa = std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in>();
                     (*sa).sin_family = libc::AF_INET as libc::sa_family_t;
                     (*sa).sin_port = v4.port().to_be();
                     (*sa).sin_addr = libc::in_addr {
                         s_addr: u32::from_ne_bytes(v4.ip().octets()),
                     };
                 }
-                Some((
-                    buf,
+                (
+                    storage,
                     std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-                ))
+                )
             }
             SocketAddr::V6(v6) => {
-                // SAFETY: `sockaddr_in6` fits in `buf`.
+                // SAFETY: as above, for `sockaddr_in6`.
                 unsafe {
-                    let sa = buf.as_mut_ptr() as *mut libc::sockaddr_in6;
+                    let sa = std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in6>();
                     (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
                     (*sa).sin6_port = v6.port().to_be();
                     (*sa).sin6_addr = libc::in6_addr {
@@ -941,10 +974,10 @@ impl KcpSocket {
                     };
                     (*sa).sin6_scope_id = v6.scope_id();
                 }
-                Some((
-                    buf,
+                (
+                    storage,
                     std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-                ))
+                )
             }
         }
     }
@@ -989,37 +1022,14 @@ impl KcpSocket {
             Vec::new()
         };
         let n = packets.len();
-        #[cfg(target_os = "linux")]
-        {
-            let sent = Self::send_udp_batch(&self.socket, &packets, peer_addr);
-            for (i, pkt) in packets.into_iter().enumerate() {
-                if i < sent {
-                    chunk_pool_push(&self.chunk_pool, pkt);
-                } else {
-                    Self::send_udp_packet(
-                        &self.socket,
-                        &mut self.pending_udp,
-                        pkt,
-                        peer_addr,
-                        &self.chunk_pool,
-                    );
-                }
-            }
-            return n;
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            for pkt in packets {
-                Self::send_udp_packet(
-                    &self.socket,
-                    &mut self.pending_udp,
-                    pkt,
-                    peer_addr,
-                    &self.chunk_pool,
-                );
-            }
-            n
-        }
+        Self::send_packets(
+            &self.socket,
+            &mut self.pending_udp,
+            packets,
+            peer_addr,
+            &self.chunk_pool,
+        );
+        n
     }
 
     /// Extract (conv, peer_addr) key from a raw UDP packet.

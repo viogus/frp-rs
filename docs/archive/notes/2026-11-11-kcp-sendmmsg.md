@@ -4,10 +4,10 @@ date: 2026-11-11
 
 # One `sendmmsg` per KCP flush (+4.4% on a bulk stream)
 
-A KCP flush does not produce one datagram — a 1326-byte MSS with 10+3 FEC turns
-one 16 KiB input burst into about thirteen output segments, and the driver was
-issuing one `sendto(2)` for each of them. Batching them costs one syscall per
-flush instead.
+A KCP flush does not produce one datagram — a 1326-byte MSS turns one 16 KiB
+input burst into about thirteen data segments, and a completed 10-shard group
+adds three parity shards on top (~16 datagrams), each sent with its own
+`sendto(2)`. Batching them costs one syscall per flush instead.
 
 ## Result
 
@@ -23,8 +23,9 @@ Linux VM, both ends frp-rs at the previous commit, 2048 MiB one-way stream,
 | **1 flow, mean** | **58.8** | **61.3** | **+4.4%** |
 | 4 flows | 59.4 | 61.6 | +3.7% |
 
-CPU-seconds for the same runs fell with throughput (e.g. pair 2: 4034+4122 →
-3797+3893), so the win is not bought with work elsewhere. Every pair moved the
+CPU ticks from `/proc/<pid>/stat` (100 Hz) fell with throughput in the same
+runs — pair 2: 4034+4122 → 3797+3893 ticks, i.e. ~81.6 s of CPU over 35 s wall
+(2.33 of the guest's 4 vCPU) — so the win is not bought with work elsewhere. Every pair moved the
 same direction, which is what separates this from the +2.3% on the rustls
 read-buffer experiment that was discarded.
 
@@ -32,10 +33,10 @@ read-buffer experiment that was discarded.
 
 `frp-core/src/kcp/socket.rs`: `send_udp_batch` builds one `mmsghdr` per datagram
 (all targeting the same peer, which a flush guarantees), issues a single
-`sendmmsg(2)` and returns how many the kernel took. `flush_session_output`
-recycles the sent buffers into the chunk pool and hands the remainder to the
-existing one-at-a-time path, which already queues on `EWOULDBLOCK` into
-`pending_udp`. Ordering is unchanged: the pending queue is drained before the
+`sendmmsg(2)` and returns how many the kernel took. `send_packets` — shared by `flush_session_output` and the 10 ms tick that
+carries ACKs and retransmissions — recycles the sent buffers into the chunk pool
+and hands the remainder to the existing one-at-a-time path, which already queues
+on `EWOULDBLOCK` into `pending_udp`. Ordering is unchanged: the pending queue is drained before the
 flush, and the remainder is pushed after it in flush order.
 
 The helper declines (`returns 0`, ordinary path) when there is only one packet,
@@ -49,6 +50,13 @@ neither was measured.
 
 - One host, one transport shape, loopback inside a virtualised guest. The
   absolute numbers are not transferable; the paired deltas are.
+- One run per pair, four interleaved pairs: the sign agrees four times out of
+  four, but a per-pair delta of this size is not far from the ±3% the host shows
+  between runs of the same binary.
+- The batch path allocates two small vectors per flush (≈13 iovecs and 13
+  `mmsghdr`s, ~1 KB for a 16 KiB burst) where the scalar loop allocated nothing.
+  That cost is inside the measured +4.4%; it is not free, and for flushes of two
+  or three packets it can exceed the syscall it saves.
 - The gain is per syscall avoided, so it shrinks with larger MSS, smaller FEC
   overhead, or a host where a syscall is cheaper. It should be re-measured if
   either changes.
@@ -58,11 +66,15 @@ neither was measured.
 
 ## Verification
 
-- `cargo test -p frp-core --all-features --lib kcp_compat` and the full
-  `frp-core` library suite pass.
+- `cargo test -p frp-core --all-features --lib send_udp_batch` — run on the
+  Linux measurement host and in the `Tests (unit)` lane; the module is
+  `#[cfg(target_os = "linux")]`, so on macOS it is not compiled at all. The full
+  `frp-core` library suite passes too.
 - Two Linux-only tests: `send_udp_batch_delivers_all_packets_in_order` (five
-  datagrams of different lengths arrive intact and in order) and
-  `send_udp_batch_declines_a_single_packet`.
+  datagrams of different lengths arrive intact and in order, over IPv4 and
+  IPv6) and `send_udp_batch_declines_a_single_packet`. A *partial* `sendmmsg` is
+  not deterministically inducible on loopback, so the sent-prefix accounting is
+  covered by construction, not by a test.
 - Cross-compat: the batch path changes no wire bytes — the datagrams are the
   same ones `sendto` carried — so `scripts/compat-test.sh` is unchanged.
 
