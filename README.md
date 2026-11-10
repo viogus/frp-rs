@@ -138,7 +138,7 @@ Measured against the real Go frp release frp-rs replaces — same host, same
 config files, same client, both at v0.72.0. A dedicated 4-vCPU Linux VM, four
 flows of a one-way stream, 8192 MiB per run, mean of two interleaved repeats:
 
-| configuration | frp-rs | Go frp v0.72.0 | frp-rs |
+| configuration | frp-rs | Go frp v0.72.0 | frp-rs lead |
 |---|---|---|---|
 | **`tcpMux` + TLS** — what both projects ship by default | **511 MiB/s** | 415 MiB/s | **+23%** |
 | `tcpMux`, TLS off | 865 MiB/s | 660 MiB/s | **+31%** |
