@@ -3,6 +3,7 @@
   <p><em>A fast reverse proxy written in Rust — protocol-compatible with frp.</em></p>
   <p>
     <a href="#overview">Overview</a> •
+    <a href="#performance">Performance</a> •
     <a href="#features--usage">Features &amp; Usage</a> •
     <a href="#deployment">Deployment</a> •
     <a href="#technical-differences-vs-go-frp">Technical Differences</a> •
@@ -46,6 +47,11 @@ version number is deliberately not independent (see
 - **No garbage collector** — a stable heap instead of one that grows to roughly 2×
   live, and no stop-the-world component in the tail. Long-uptime head-to-head RSS
   is still an open measurement: see [TODO.md](TODO.md).
+- **Faster on the same bytes, with less of the machine.** In the configuration
+  both projects ship by default (`tcpMux` + TLS), frp-rs moves **+23%** more
+  bytes than the Go release it replaces, at **13–19% less CPU per MiB**, with
+  **2.5–4× lower peak RSS** and a **2.3× smaller binary**. Tables, method and
+  the caveats that go with them are in [Performance](#performance).
 - **Operational knobs Go frp does not have** — UDP bandwidth limiting, SSH gateway
   per-IP login throttling with `ssh_session_idle_timeout`, and
   `frpc verify --strict-config`.
@@ -123,6 +129,58 @@ detail with Go source references is in the
   anonymous behaviour on a trusted network.
 - **Windows vnet (TUN)** — Linux and macOS only; the Windows TUN is a stub pending
   Wintun integration. Go frp's vnet is Linux-focused too, so this is not a compat gap.
+
+---
+
+## Performance
+
+Measured against the real Go frp release frp-rs replaces — same host, same
+config files, same client, both at v0.72.0. A dedicated 4-vCPU Linux VM, four
+flows of a one-way stream, 8192 MiB per run, mean of two interleaved repeats:
+
+| configuration | frp-rs | Go frp v0.72.0 | frp-rs lead |
+|---|---|---|---|
+| **`tcpMux` + TLS** — what both projects ship by default | **511 MiB/s** | 415 MiB/s | **+23%** |
+| `tcpMux`, TLS off | 865 MiB/s | 660 MiB/s | **+31%** |
+| no `tcpMux`, TLS on | 1199 MiB/s | 1050 MiB/s | **+14%** |
+| no `tcpMux`, TLS off | 2057 MiB/s | 1654 MiB/s | **+24%** |
+
+and it does that with less of the machine, in the same session:
+
+| resource | frp-rs | Go frp v0.72.0 |
+|---|---|---|
+| CPU per MiB, `tcpMux` + TLS | **4,272 µs** | 4,897 µs |
+| CPU per MiB, `tcpMux`, no TLS | **2,547 µs** | 3,134 µs |
+| Peak RSS, `frps` / `frpc` | **13.9 / 15.2 MB** | 35.5 / 55.2 MB |
+| Release binary, `frps` / `frpc` | **9 / 7 MiB** | 21 / 17 MiB |
+
+**The caveats matter as much as the numbers.** These are four flows on a
+**four-vCPU box shared by client, sink and both proxies**, so the side that burns
+fewer cycles per byte wins — on a host with idle cores the ordering can invert
+(measured once on an 8-core M2: frp-rs used ~36% less CPU while Go pushed more
+bytes by spending more cores). TLS costs about 40% of throughput on **both**
+implementations, so it is not a differentiator. One host, one network path, two
+repeats: the direction is robust (every repeat-pair ratio positive, +7% to
++43%), the no-`tcpMux` magnitudes are good to ~10 points, and nothing here
+predicts your hardware or your path.
+
+**Why it is faster, and what is left.** The profile of the shipping
+configuration is dominated by things frp-rs does not own: AES-GCM ~9%,
+`rustls`'s deframer re-allocating per record ~5%, kernel copies ~10%. No yamux,
+bridge or protocol-frame code appears in the top 15 — which is why the three
+structural rewrites that were built and measured (vectored yamux write, a
+one-copy `poll_write_bufs` path, an inline writer) all landed inside the noise
+and were not adopted. The changes that *did* move numbers were narrower and are
+in the changelog: [one write per protocol frame][coalesce] (+46% UDP packets/s
+under `tcpMux`), [no 1 ms timer per returned datagram][udp-reply] (773 → 7,916
+pps), and [KCP FEC parity from a lookup table][kcp-fec] (~21 → ~63 MiB/s).
+
+Method, host details, the retractions and the limits:
+[`docs/archive/notes/2026-11-10-real-host-throughput.md`](docs/archive/notes/2026-11-10-real-host-throughput.md).
+
+[coalesce]: docs/archive/notes/2026-11-09-yamux-inline-write.md
+[udp-reply]: docs/archive/notes/2026-11-08-udp-spare-reuse.md
+[kcp-fec]: docs/archive/notes/2026-11-09-kcp-fec-multiply-tables.md
 
 ---
 
@@ -288,18 +346,12 @@ links. The short version:
    [compatibility audit](docs/go-frp-compat-audit.md) and the
    [development log](docs/history/development-log.md), and the compat suite runs
    against the real Go binary on every push.
-6. **Faster on the paths we have measured.** In one `debian:bookworm-slim`
-   container, both sides at v0.72.0: **150 vs 121 MiB/s** on a single-flow KCP
-   stream (+23%). On an Apple M2 macOS loopback, writing a frame in one call
-   under `tcpMux` added **+46%** UDP packets/s, and the reply path stopped
-   paying a 1 ms timer per datagram — **773 → 7,916** pps at 512 bytes, four
-   flows (10.2×, Go `frps` serving an frp-rs `frpc`). Every figure is a loopback
-   measurement whose method, host and caveats live in a note —
-   [KCP](docs/archive/notes/2026-11-09-kcp-fec-multiply-tables.md),
-   [UDP reply path](docs/archive/notes/2026-11-08-udp-spare-reuse.md),
-   [frame coalescing](docs/archive/notes/2026-11-09-yamux-inline-write.md) — and
-   none of them predicts your hardware or your path. Figures as of 2026-11-10;
-   the notes are the source of truth.
+6. **Faster on the paths we have measured.** +23% throughput in the shipping
+   `tcpMux` + TLS configuration, +14% to +31% across the rest of the TCP matrix,
+   13–19% less CPU per MiB and 2.5–4× lower peak RSS than the Go release this
+   replaces — plus +46% UDP packets/s from writing each frame once, and 10.2×
+   the datagram rate on the reply path. Tables, method and caveats:
+   [Performance](#performance).
 
 <!-- Generated by scripts/compare-go-frp.sh on 2026-11-06 —
      platform: darwin_arm64; frp-rs 0.72.0; Go frp 0.72.0;

@@ -87,28 +87,32 @@ causes are separable:
 So both implementations were measured in `debian:bookworm-slim`
 (`--platform linux/arm64`, same host), both at v0.72.0, one harness:
 
+> **The stream rows of this table are withdrawn (2026-11-10).** They were
+> produced by that harness's `stream` mode, whose outputs contradict each other:
+> `121.2 MiB/s` for a 256 MiB transfer implies 2.11 s, the same run printed
+> `in 0.00s`, and the process exited in 12 ms. Which field is wrong cannot be
+> determined from that output; what can is that the transfer those rows claim did
+> not take place as reported. Only the ping-pong rows were produced by a mode
+> whose duration agrees with wall clock. See
+> [`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §1.
+
 | workload | Go frp v0.72.0 | frp-rs 0.72.0 |
 |---|---|---|
-| 1 flow, one-way 256 MiB stream | 121.2 MiB/s | **149.5 MiB/s** |
-| 4 flows, one-way 256 MiB stream | 128.9 MiB/s | **150.7 MiB/s** |
+| ~~1 flow, one-way 256 MiB stream~~ | ~~121.2 MiB/s~~ | ~~**149.5 MiB/s**~~ |
+| ~~4 flows, one-way 256 MiB stream~~ | ~~128.9 MiB/s~~ | ~~**150.7 MiB/s**~~ |
 | 1 flow, 64 KiB ping-pong | 4.6 MiB/s | 65.4 MiB/s |
 | 4 flows, 64 KiB ping-pong | 25.3 MiB/s | 144.3 MiB/s |
 
-"Stream" is a client writing 256 MiB through the proxy to a sink that only reads,
-so it measures the path ceiling; "ping-pong" is one 64 KiB write followed by a
-64 KiB read, so it measures the cost of a round trip.
+A KCP comparison therefore **has no publishable stream number yet**. The
+re-measurement has to run a one-way harness whose elapsed time it reports
+itself — see
+[`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §1,
+which is also where the TCP rows that replaced the container claims live.
 
-The ping-pong gap is a per-round-trip queueing cost, not per-byte compute: Go's
-stream row moves 121 MiB/s through the same code, while the ping-pong row implies
-~14 ms per 64 KiB round trip against ~0.96 ms for frp-rs. Which side's flush or
-scheduling dominates was **not isolated** — both run the same aggressive KCP
-parameters (`nodelay`, `interval` 20) — and the harness only moves 64 KiB, so a
+The ping-pong gap it does show is a per-round-trip queueing cost, not per-byte
+compute: the two implementations run the same aggressive KCP parameters
+(`nodelay`, `interval` 20), and the harness only moves 64 KiB, so a
 small-payload RTT test is open work rather than something this row answers.
-
-The honest headline is the single-flow stream row — **+23%**; the 4-flow row is
-+16.9% (one sample per arm). Both are consistent with the table above removing a
-cost Go never had: `kcp-go` delegates FEC to `klauspost/reedsolomon`, which ships
-NEON/SSE assembly, so parity was the goal here rather than a win.
 
 Absolute figures are container-bound and must not be compared with the macOS
 rows above: the same container measured frp-rs at 65.4 MiB/s ping-pong where
