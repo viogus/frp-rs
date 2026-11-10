@@ -2,11 +2,13 @@
 
 **Date:** 2026-11-08
 **Scope note (2026-11-10):** every number here was measured on Apple M2 macOS
-loopback. The cross-implementation comparison in §3 (frp-rs ~15% behind Go) does
-**not** reproduce on a dedicated Linux VM, where frp-rs leads on all four TCP
-rows — see
-[`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md).
-Read §3 as a laptop measurement, not as a statement about the implementation.
+loopback. The cross-implementation comparison in §3 (frp-rs ~15% behind Go) was
+**not re-run on the Linux host** — the only re-measurement there uses a different
+workload (one-way stream, 8192 MiB) and found frp-rs ahead, so read §3 as a
+laptop ping-pong measurement rather than as a statement about the
+implementation. See
+[`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §3
+and §8.
 **Context:** The `release-perf` A/B (same day) left one unexplained row: the `mux`
 throughput cell moved only +15% under `-O3` while the encrypted/compressed cells
 moved +19-40%, and a single-window pairing had shown `mux` at 43% below `plain`.

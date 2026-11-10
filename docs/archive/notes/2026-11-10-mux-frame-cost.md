@@ -7,6 +7,15 @@ counter-measurement that stopped it from becoming the default.
 
 ## 1. The gap and the unit
 
+> **Scope note (2026-11-10, later the same day).** The cross-implementation
+> rows in this section were measured in a `linux/arm64` container on a laptop;
+> on a Linux VM with a measured noise floor frp-rs leads on every TCP row at
+> four flows — see
+> [`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §3.
+> The same-binary A/B deltas in §2–§5 (build against build, interleaved in one
+> window) are unaffected and remain the reason those changes were accepted or
+> rejected.
+
 Same host, same harness, same peer, `linux/arm64` container with 4 vCPUs,
 64 KiB writes, `TCP_NODELAY`, one-way stream unless marked ping-pong.
 MiB/s, medians of three interleaved runs:
@@ -144,10 +153,10 @@ narrows that to ~15% (1513 vs 1773). On the plain path it is ~17% behind, and
 the worst unexplained row in §1 is single-flow `ws` (Go 1199 vs 726 MiB/s,
 **−39%**), which is also the row the 64 KiB knob makes worse on macOS (§5).
 Nothing measured above explains the remainder: copies, syscalls and the channel
-hop are each worth ~0. A profile of both processes during a 4-flow run is the
-next step — the `profiling` feature can dump one — and until that lands, treat
-the remainder as unexplained rather
-than as a known defect.
+hop are each worth ~0. That profile now exists — see
+[`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §5:
+AES-GCM is the largest term, the rustls deframer allocates per record, and no
+frp code is hot.
 
 ## 8. Reproduce
 

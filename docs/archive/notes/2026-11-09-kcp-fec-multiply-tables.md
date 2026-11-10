@@ -88,10 +88,13 @@ So both implementations were measured in `debian:bookworm-slim`
 (`--platform linux/arm64`, same host), both at v0.72.0, one harness:
 
 > **The stream rows of this table are withdrawn (2026-11-10).** They were
-> produced by that harness's `stream` mode, which mis-reports its own duration —
-> it claims 121.2 MiB/s for a transfer its wall clock finishes in 12 ms, and its
-> `in 0.00s` line contradicts both numbers. Only the ping-pong rows were produced
-> by a mode whose duration agrees with wall clock.
+> produced by that harness's `stream` mode, whose outputs contradict each other:
+> `121.2 MiB/s` for a 256 MiB transfer implies 2.11 s, the same run printed
+> `in 0.00s`, and the process exited in 12 ms. Which field is wrong cannot be
+> determined from that output; what can is that the transfer those rows claim did
+> not take place as reported. Only the ping-pong rows were produced by a mode
+> whose duration agrees with wall clock. See
+> [`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) §1.
 
 | workload | Go frp v0.72.0 | frp-rs 0.72.0 |
 |---|---|---|

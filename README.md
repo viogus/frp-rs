@@ -291,7 +291,7 @@ links. The short version:
 6. **Faster on the paths we have measured.** On a dedicated 4-vCPU Linux VM,
    both sides at v0.72.0, four flows, one-way stream: **511 vs 415 MiB/s** in
    the shipping `tcpMux` + TLS configuration (**+23%**), and **865 vs
-   661 MiB/s** with TLS off (**+31%**); without `tcpMux` it is 1199 vs 1050
+   660 MiB/s** with TLS off (**+31%**); without `tcpMux` it is 1199 vs 1050
    (+14%) and 2057 vs 1654 (+24%). On an Apple M2 macOS loopback, writing a
    frame in one call under `tcpMux` added **+46%** UDP packets/s, and the reply
    path stopped paying a 1 ms timer per datagram — **773 → 7,916** pps at 512
