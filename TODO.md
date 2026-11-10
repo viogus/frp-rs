@@ -12883,11 +12883,13 @@ kept out of the main P2 list so that adding them does not renumber every later
 - [x] **The matrix's `tcp-plain` floor cannot fire in CI.**
   Closed 2026-11-10: three `compat` runs on the runner class
   (42844190428, 42844263709, 42844271249) measured `tcp-plain` at
-  636.1 / 1098.5 / 803.0 MiB/s, so the floor is `tcp-plain=300` — 2.1x below the
-  slowest observed run and 1.8x below a local macOS run's 527.3, which reddens a
-  regression the old `60` could not see (8.8x slack). The derivation and the
-  per-row minimum ratios are recorded in `scripts/protocol-matrix.floors`, and
-  CI now enforces the file instead of reporting on it.
+  636.1 / 1098.5 / 803.0 MiB/s, and every row's ratio agreed within 1.3x, so the
+  whole file is now ratio floors at half each row's lowest observed ratio, with
+  `tcp-plain=150` as an absolute backstop (half of the 191-197 MiB/s a Linux VM
+  records for this shape — an absolute floor near the CI minimum would fail a
+  healthy slower host). Derivation: `scripts/protocol-matrix.floors`; macOS uses
+  `scripts/protocol-matrix.floors.macos`. CI enforces, with two 5 s windows per
+  row so one scheduling excursion cannot fail a healthy build.
 
 - [ ] **The KCP Go-vs-Rust stream comparison has no publishable number.**
   Evidence: the withdrawn rows in

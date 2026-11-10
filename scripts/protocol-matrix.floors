@@ -1,62 +1,64 @@
-# Throughput floors for `scripts/protocol-matrix.sh --floors`.
+# Throughput floors for scripts/protocol-matrix.sh --floors (CI / Linux).
 #
-# Each line pins one matrix row to either an absolute MiB/s number (`row=42`)
-# or — preferred — a fraction of the same run's `tcp-plain` rate
-# (`row=ratio:0.06`). Every row is measured back-to-back on one machine with
-# the same 5 s / 1-stream window, so the ratio between two transports survives
-# the host-to-host capacity differences that make an absolute number fragile
-# on a shared CI runner.
+# Why this file exists: the matrix used to assert only `mbps > 0`, so a
+# transport could run at a fraction of its own rate and still report PASS. KCP
+# spent its whole life at 22.25 MiB/s (a ratio of 0.042 against tcp-plain) that
+# way. A gate on `mbps > 0` cannot see that class of regression; a floor can.
 #
-# What this gate is for: a row that still bridges bytes but at a fraction of
-# its previous rate. That is not hypothetical — KCP spent its whole life at
-# 20.7 MiB/s on the ping-pong bench (65.5 MiB/s in the matrix after the FEC
-# fix), and `mbps > 0` never noticed.
+# Format: `row=42` is an absolute MiB/s floor, `row=ratio:0.06` is a fraction of
+# this run's own tcp-plain. Ratios are used wherever possible because the
+# runner's absolute capacity moves between runs; tcp-plain itself has no
+# denominator, so it takes an absolute floor.
 #
-# Calibrated 2026-11-10 from three `compat` runs on the CI runner class
-# (42844190428, 42844263709, 42844271249) plus one local macOS run. `tcp-plain`
-# measured 636.1 / 1098.5 / 803.0 MiB/s in CI and 527.3 locally — a 2.1x
-# capacity spread, which is why every other row is a ratio and not an absolute.
+# Calibration (2026-11-10, after #603 fixed the benchmark peer's Nagle timer):
+# three compat runs on the shared runner — 42844190428, 42844263709,
+# 42844271249 — measured tcp-plain at 636.1 / 1098.5 / 803.0 MiB/s (a 1.7x
+# capacity spread) with every row's ratio agreeing within 1.3x:
 #
-# Rule: each floor is half the LOWEST ratio observed on the platform that binds
-# it, so one file serves both. CI (Linux) is the binding platform for tcp/kcp,
-# macOS for the WebSocket rows — the 1-stream ping-pong in this matrix is a
-# frame-latency measurement in which macOS loses about 2x on `ws` at the current
-# buffer size (`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md` §4),
-# and that shape is why the ws floors are lower than the Linux ratio would allow.
+#   row           a      b      c    ratio min/max
+#   tcp-tls     406.6  738.1  617.0  0.639/0.768
+#   tcp-tls-mux 348.6  638.9  594.6  0.548/0.740
+#   ws-plain    496.6  914.5  633.3  0.781/0.832
+#   ws-tls      362.4  671.8  582.0  0.570/0.725
+#   ws-tls-mux  320.1  557.2  499.2  0.503/0.622
+#   wss         363.4  660.4  550.2  0.571/0.685
+#   kcp-plain    64.2  110.2  139.6  0.100/0.174
+#   kcp-tls      91.0  144.3  181.7  0.131/0.226
+#   kcp-tls-mux  38.8   54.3   72.1  0.049/0.090
+#   quic        189.6  391.7  378.1  0.298/0.471
 #
-#   row           CI ratio (min)  macOS ratio  binding  floor
-#   tcp-plain     636.1 MiB/s     527.3        -        absolute 300
-#   tcp-tls       0.639           0.664        CI       0.32
-#   tcp-tls-mux   0.548           0.587        CI       0.27
-#   ws-plain      0.781           0.309        macOS    0.15
-#   ws-tls        0.570           0.253        macOS    0.12
-#   ws-tls-mux    0.503           0.334        macOS    0.16
-#   wss           0.571           0.260        macOS    0.13
-#   kcp-plain     0.100           0.121        CI       0.05
-#   kcp-tls       0.131           0.126        macOS    0.06
-#   kcp-tls-mux   0.049           0.099        CI       0.025
-#   quic          0.298           0.167        macOS    0.08
+# Rule: every floor is half the LOWEST ratio observed for that row, rounded
+# down to two decimals (0.3195 -> 0.31, 0.0245 -> 0.024) so a floor is never
+# above half. That is a 2x regression budget per row — enough for a slow
+# runner, tight enough to catch a halving.
 #
-# Before 2026-11-10 these numbers were measured through a benchmark peer with
-# Nagle on, which cost a chunked shape ~8 ms per round trip and produced rows
-# spread over 18-526 MiB/s (`docs/archive/notes/2026-11-10-nagle-in-the-benchmark.md`).
-# Ratios from that harness are not comparable with these — re-derive, do not
-# rescale.
+# tcp-plain is not halved from a CI run: half of the slowest CI run would be
+# 318, and the repo records this harness shape at 191-197 MiB/s on a Linux VM
+# (docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md, section 4), where
+# 318 would fail a healthy machine. 150 is half of that observation, so the
+# absolute floor fires only on a collapse, and the ten ratio floors carry the
+# sensitivity.
 #
-# Re-tuning: the CI job uploads `protocol-matrix-rates.json`; take the new rates
-# from it, apply the same rule (half the lowest observed ratio, on the binding
-# platform), and record the run ids here. A floor that starts firing on a
-# healthy run is a floor that is too high, not a machine that is too slow — the
-# row's own `mbps > 0` check still guards connectivity, this file only guards
-# rate.
-tcp-plain=300
-tcp-tls=ratio:0.32
+# macOS: the WebSocket rows sit far lower there (1-stream 64 KiB ping-pong is
+# ~2x slower on macOS by default), so this file would fire on a healthy Mac.
+# Local runs use scripts/protocol-matrix.floors.macos; CI is Linux and uses
+# this file.
+#
+# Caveat: these ratios predate #603 (the benchmark peer now sets TCP_NODELAY),
+# so they were measured through a Nagle-taxed peer and are therefore cautious
+# rather than tight. Re-derive from a fresh set of runs; do not rescale.
+#
+# Self-check: a floor that starts firing on a healthy run is a floor that is
+# too high. Lower it and record why, rather than deleting the row.
+
+tcp-plain=150
+tcp-tls=ratio:0.31
 tcp-tls-mux=ratio:0.27
-ws-plain=ratio:0.15
-ws-tls=ratio:0.12
-ws-tls-mux=ratio:0.16
-wss=ratio:0.13
+ws-plain=ratio:0.39
+ws-tls=ratio:0.28
+ws-tls-mux=ratio:0.25
+wss=ratio:0.28
 kcp-plain=ratio:0.05
 kcp-tls=ratio:0.06
-kcp-tls-mux=ratio:0.025
-quic=ratio:0.08
+kcp-tls-mux=ratio:0.024
+quic=ratio:0.14

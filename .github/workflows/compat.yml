@@ -178,8 +178,9 @@ jobs:
           {
             echo "### Protocol matrix throughput"
             echo
-            echo "Floors are checked in report-only mode on shared CI runners; the"
-            echo "\`compat\` log carries the per-row verdict."
+            echo "Floors are **enforced** (\`scripts/protocol-matrix.floors\`): a red"
+            echo "matrix means a row fell below its floor or failed; the \`compat\` log"
+            echo "carries the per-row verdict."
             echo
             echo "| row | MiB/s |"
             echo "| --- | ---: |"
