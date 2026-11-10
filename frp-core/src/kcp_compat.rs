@@ -114,7 +114,106 @@ pub struct Fec {
     /// possible products can be pre-computed once and the hot loop becomes a
     /// table lookup plus XOR. Measured on the KCP transport (64 KiB
     /// ping-pong, single flow): 20.8 → 62.7 MiB/s.
+    ///
+    /// Scalar fallback only — the vector path uses `nibble_tables`.
     mul_tables: Vec<u8>,
+    /// Nibble tables for the AVX2 path, indexed
+    /// `(parity_shard * data_shards + data_shard) * 32`, layout
+    /// `[lo16][hi16]` where `lo[n] = coef * n` and `hi[n] = coef * (n << 4)`.
+    ///
+    /// A byte `b` is `(b & 0x0f) ^ (b >> 4) << 4` in GF(2^8), so
+    /// `coef * b = lo[b & 0x0f] ^ hi[b >> 4]`, which is exactly
+    /// `VPSHUFB`-shaped: two 16-byte table lookups and one XOR per 32 bytes.
+    /// Go gets the same effect from `klauspost/reedsolomon`'s assembly.
+    /// 32 bytes per coefficient (960 B for 10+3) instead of the 256-entry
+    /// scalar table.
+    nibble_tables: Vec<u8>,
+}
+
+/// True when this CPU can run [`xor_mul_avx2`]. Detected once.
+#[cfg(target_arch = "x86_64")]
+static AVX2_SUPPORTED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::arch::is_x86_feature_detected!("avx2"));
+
+/// AVX2: `dst[i] ^= coef * src[i]` for a fixed `coef`, 32 bytes at a time.
+///
+/// # Safety
+/// Caller must have checked AVX2 support (`is_x86_feature_detected!`) and
+/// passed slices that live for the call.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn xor_mul_avx2(dst: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16]) {
+    use std::arch::x86_64::*;
+
+    // SAFETY: AVX2 is enabled for this function by `target_feature`, the caller
+    // verified the CPU supports it, and every load/store stays inside
+    // `min(src.len(), dst.len())` bytes of slices that are alive for the call.
+    // The explicit block keeps the body correct if this crate adopts
+    // `unsafe_op_in_unsafe_fn` (edition 2024) — the workspace is edition 2021.
+    unsafe {
+        let n = src.len().min(dst.len());
+        let mask = _mm256_set1_epi8(0x0f);
+        // `VPSHUFB` is per-128-bit-lane, so broadcast the 16-byte table to both.
+        let lo_tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128(lo.as_ptr().cast()));
+        let hi_tbl = _mm256_broadcastsi128_si256(_mm_loadu_si128(hi.as_ptr().cast()));
+        let (sp, dp) = (src.as_ptr(), dst.as_mut_ptr());
+
+        let mut i = 0usize;
+        while i + 32 <= n {
+            let x = _mm256_loadu_si256(sp.add(i).cast());
+            let l = _mm256_and_si256(x, mask);
+            // Per byte: the low nibble, and the high nibble after the 16-bit
+            // shift (byte 1 of `x >> 4` is `hi >> 4`; byte 0 is
+            // `(hi << 4) | (lo >> 4)`), then the AND keeps the right nibble.
+            let h = _mm256_and_si256(_mm256_srli_epi16(x, 4), mask);
+            let prod = _mm256_xor_si256(
+                _mm256_shuffle_epi8(lo_tbl, l),
+                _mm256_shuffle_epi8(hi_tbl, h),
+            );
+            let acc = _mm256_loadu_si256(dp.add(i).cast());
+            _mm256_storeu_si256(dp.add(i).cast(), _mm256_xor_si256(acc, prod));
+            i += 32;
+        }
+        // Fewer than 32 bytes left (short shards never enter here, but the
+        // tail of a 1326-byte KCP segment does).
+        while i < n {
+            let b = *sp.add(i);
+            *dp.add(i) ^= lo[(b & 0x0f) as usize] ^ hi[(b >> 4) as usize];
+            i += 1;
+        }
+    }
+}
+
+/// `dst[i] ^= coef * src[i]`, vectorised when the CPU and length allow it.
+#[inline]
+fn xor_mul_into(dst: &mut [u8], src: &[u8], table: &[u8], nibbles: &[u8]) {
+    debug_assert_eq!(nibbles.len(), 32, "nibble table is lo[16] ++ hi[16]");
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let lo: &[u8; 16] = nibbles[..16].try_into().expect("lo half is 16 bytes");
+        let hi: &[u8; 16] = nibbles[16..].try_into().expect("hi half is 16 bytes");
+        if *AVX2_SUPPORTED && src.len() >= 32 {
+            // SAFETY: `AVX2_SUPPORTED` is the runtime `is_x86_feature_detected!`
+            // check for the instruction set this function is compiled for, and
+            // `xor_mul_avx2` bounds itself with `min(len)`. Both slices are
+            // alive for the call and only read/written inside their lengths.
+            unsafe { xor_mul_avx2(dst, src, lo, hi) };
+            return;
+        }
+    }
+    // Non-x86 targets never build the vector path; the nibble table is unused.
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = nibbles;
+
+    // Scalar fallback: one 256-entry lookup per byte, unchanged from before the
+    // vector path existed. Non-AVX2 targets (aarch64, pre-AVX2 x86) pay only the
+    // one-time nibble-table build in `Fec::new` (960 B and 960 multiplies for
+    // 10+3), never more per byte.
+    let n = dst.len().min(src.len());
+    for (d, &b) in dst.iter_mut().zip(src.iter()).take(n) {
+        *d ^= table[b as usize];
+    }
 }
 
 impl Fec {
@@ -124,6 +223,14 @@ impl Fec {
     fn mul_table(&self, parity: usize, data: usize) -> &[u8] {
         let start = (parity * self.data_shards + data) * 256;
         &self.mul_tables[start..start + 256]
+    }
+
+    /// Nibble-table slice (`lo[16] ++ hi[16]`) for parity shard `parity` and
+    /// data shard `data`.
+    #[inline]
+    fn nibble_table(&self, parity: usize, data: usize) -> &[u8] {
+        let start = (parity * self.data_shards + data) * 32;
+        &self.nibble_tables[start..start + 32]
     }
 
     /// Create a new FEC codec.
@@ -179,10 +286,17 @@ impl Fec {
             Vec::new()
         };
         let mut mul_tables = Vec::with_capacity(encode_matrix.len() * data_shards.max(1) * 256);
+        let mut nibble_tables = Vec::with_capacity(encode_matrix.len() * data_shards.max(1) * 32);
         for row in &encode_matrix {
             for &coef in row {
                 for v in 0..=255u8 {
                     mul_tables.push(gf256::mul(coef, v));
+                }
+                for v in 0..16u8 {
+                    nibble_tables.push(gf256::mul(coef, v));
+                }
+                for v in 0..16u8 {
+                    nibble_tables.push(gf256::mul(coef, v << 4));
                 }
             }
         }
@@ -191,6 +305,7 @@ impl Fec {
             parity_shards,
             encode_matrix,
             mul_tables,
+            nibble_tables,
         }
     }
 
@@ -221,10 +336,12 @@ impl Fec {
                 // Rows are equal-length by contract; `zip` would treat a short
                 // row as zero-extended, so fail loudly on a caller bug instead.
                 debug_assert_eq!(inp.len(), block_size, "FEC shards must be equal length");
-                let table = self.mul_table(i, data_idx);
-                for (p, &b) in parity.iter_mut().zip(inp.iter()) {
-                    *p ^= table[b as usize];
-                }
+                xor_mul_into(
+                    &mut parity,
+                    inp,
+                    self.mul_table(i, data_idx),
+                    self.nibble_table(i, data_idx),
+                );
             }
             output.push(parity);
         }
@@ -248,10 +365,12 @@ impl Fec {
             for (data_idx, inp) in input.iter().enumerate() {
                 // See `encode`: the rows must be equal length.
                 debug_assert_eq!(inp.len(), block_size, "FEC shards must be equal length");
-                let table = self.mul_table(i, data_idx);
-                for (p, &b) in parity.iter_mut().zip(inp.iter()) {
-                    *p ^= table[b as usize];
-                }
+                xor_mul_into(
+                    &mut parity,
+                    inp,
+                    self.mul_table(i, data_idx),
+                    self.nibble_table(i, data_idx),
+                );
             }
             parity_shards.push(parity);
         }
@@ -712,8 +831,79 @@ mod tests {
     fn disabled_codec_builds_no_tables() {
         let fec = Fec::new(0, 0);
         assert!(fec.mul_tables.is_empty());
+        assert!(fec.nibble_tables.is_empty());
         assert!(fec.encode_matrix.is_empty());
         assert!(!fec.enabled());
+    }
+
+    /// The AVX2 kernel itself, called without going through `xor_mul_into`'s
+    /// dispatch — so inverting `AVX2_SUPPORTED` or moving the 32-byte threshold
+    /// cannot make this pass vacuously. Also pins the `min` contract: a `dst`
+    /// longer than `src` must leave its tail untouched.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_kernel_matches_scalar_table_and_respects_lengths() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let fec = Fec::new(10, 3);
+        for len in 0..=96usize {
+            let src: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            for (pi, di) in [(0usize, 0usize), (2, 7), (1, 9)] {
+                let table = fec.mul_table(pi, di);
+                let nib = fec.nibble_table(pi, di);
+                let lo: &[u8; 16] = nib[..16].try_into().expect("lo half is 16 bytes");
+                let hi: &[u8; 16] = nib[16..].try_into().expect("hi half is 16 bytes");
+                let mut got = vec![0u8; len];
+                // SAFETY: AVX2 verified immediately above; lengths equal.
+                unsafe { xor_mul_avx2(&mut got, &src, lo, hi) };
+                let mut want = vec![0u8; len];
+                for (w, &b) in want.iter_mut().zip(src.iter()) {
+                    *w = table[b as usize];
+                }
+                assert_eq!(got, want, "len {len}, coef row {pi}/{di}");
+
+                // dst longer than src: the tail must not be written. The
+                // prefix starts as zeros so it can be compared with `want`.
+                let mut long = vec![0u8; len];
+                long.extend_from_slice(&[0xAAu8; 5]);
+                // SAFETY: as above; `xor_mul_avx2` bounds itself with min().
+                unsafe { xor_mul_avx2(&mut long, &src, lo, hi) };
+                assert_eq!(&long[..len], &want[..], "prefix len {len}");
+                assert!(
+                    long[len..].iter().all(|&b| b == 0xAA),
+                    "tail written at len {len}"
+                );
+            }
+        }
+    }
+
+    /// The vector path must be byte-identical to the scalar table path for
+    /// lengths on both sides of the 32-byte vector width, including the odd
+    /// tails a 1326-byte KCP segment produces. On targets without AVX2 both
+    /// sides of this assertion are the same loop, so it costs nothing there.
+    #[test]
+    fn vector_encode_matches_scalar_for_all_lengths() {
+        for (data, parity) in [(10usize, 3usize), (4, 2), (3, 2)] {
+            let fec = Fec::new(data, parity);
+            for len in [1usize, 5, 16, 31, 32, 33, 63, 100, 1326, 1327] {
+                let shards: Vec<Vec<u8>> = (0..data)
+                    .map(|i| (0..len).map(|b| (b * 7 + i * 13) as u8).collect())
+                    .collect();
+                let refs: Vec<&[u8]> = shards.iter().map(Vec::as_slice).collect();
+                let got = fec.encode_parity(&refs);
+                for (pi, shard) in got.iter().enumerate() {
+                    let mut want = vec![0u8; len];
+                    for (di, inp) in refs.iter().enumerate() {
+                        let table = fec.mul_table(pi, di);
+                        for (w, &b) in want.iter_mut().zip(inp.iter()) {
+                            *w ^= table[b as usize];
+                        }
+                    }
+                    assert_eq!(shard, &want, "parity {pi} differs at len {len}");
+                }
+            }
+        }
     }
 
     /// The table-driven encode must be byte-identical to the reference

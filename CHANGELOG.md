@@ -17,6 +17,18 @@ User-facing release notes for frp-rs.
 
 ### Fixes
 
+- KCP: vectorise the FEC parity encode. The tables from the previous entry made
+  the multiply a lookup, but the loop still did ten dependent lookups per output
+  byte; the parity pass was 16.3% of frps samples on a bulk stream. `Fec` now also
+  builds two 16-entry nibble tables per coefficient and runs them through
+  `VPSHUFB` (`xor_mul_avx2`, AVX2 detected at runtime) 32 bytes at a time, with
+  the 256-entry table loop kept for aarch64 and short shards. On a 4-vCPU Linux
+  VM a 2048 MiB one-way KCP stream went 48.3/49.1/50.0 → 57.7/59.5/58.2 MiB/s
+  (**+19%**, CPU −16%) at one flow and 48.2/48.5 → 58.7/60.3 (+23%) at four.
+  Byte-identical output, pinned by the existing bit-serial and `klauspost`
+  golden vectors plus a new scalar-vs-vector test over lengths on both sides of
+  the 32-byte boundary; see
+  [`docs/archive/notes/2026-11-11-kcp-avx2-parity.md`](docs/archive/notes/2026-11-11-kcp-avx2-parity.md).
 
 - KCP: pre-compute the FEC parity multiply. `Fec::encode_parity` called a
   bit-serial GF(2^8) multiply (eight shift/XOR rounds) once per byte per data

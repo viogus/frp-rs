@@ -12901,7 +12901,7 @@ kept out of the main P2 list so that adding them does not renumber every later
   withdrawn "+23%" stays retracted in
   `docs/archive/notes/2026-11-10-real-host-throughput.md` section 6.
 
-- [ ] **KCP bulk streams are 2.1x behind Go.**
+- [ ] **KCP bulk streams are ~1.8x behind Go (~2.1x before the AVX2 parity pass).**
   Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` — 49 vs 103
   MiB/s at one and four flows, CPU per MiB 46.2 ms vs 22.1 ms, and 661,824
   datagrams per 512 MiB against Go's 536,444 (811 B per datagram vs 1,001 B).
@@ -12910,10 +12910,14 @@ kept out of the main P2 list so that adding them does not renumber every later
   frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
   per-packet. The small-payload shape is the opposite (394 round trips/s against
   40), which rules out the KCP core's ARQ in general.
+  Partial fix landed: the parity encode is now AVX2-vectorised
+  (`docs/archive/notes/2026-11-11-kcp-avx2-parity.md`), which is +19% at one
+  flow and +23% at four on the shape above (49 → 58 MiB/s against Go's 103).
+  What is left is the per-packet path, not the parity math.
   **Done-when:** all three readings exist on the same host — (a) a debuginfo-build
-  profile (not the stripped release binary; it now puts 16.3% of frps samples in
-  `KcpSession::fec_encode_output`, next to Go's vectorised `klauspost/reedsolomon`
-  encode), (b) a per-session `xmit` (RTO retransmissions) and dead-link reading
+  profile (not the stripped release binary; the pre-vectorisation profile put
+  16.3% of frps samples in `KcpSession::fec_encode_output`, and the current one
+  has not been re-taken), (b) a per-session `xmit` (RTO retransmissions) and dead-link reading
   for both sides, and (c) frp-rs's payload per datagram within ~5% of the 1,020 B
   a 10+3 group at mss 1326 predicts. Then either a fix lands or the note names
   the measured mechanism instead of the cost.
