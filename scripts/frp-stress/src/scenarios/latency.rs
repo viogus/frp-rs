@@ -46,6 +46,13 @@ pub async fn run(cli: &Cli) -> Result<()> {
             let mut stream = TcpStream::connect(&target)
                 .await
                 .with_context(|| format!("steady connect to {target} failed"))?;
+            // Set for consistency with the rest of the harness. A strict
+            // ping-pong never leaves unacknowledged data outstanding, so this
+            // is not where Nagle could bite; a failure is not fatal either,
+            // matching frp-core's own policy for this socket option.
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::debug!("could not disable Nagle on the latency socket: {e}");
+            }
             // Warm-up: one untimed round-trip to establish the work-conn bridge.
             stream.write_all(&msg).await?;
             stream.read_exact(&mut buf).await?;
@@ -63,6 +70,12 @@ pub async fn run(cli: &Cli) -> Result<()> {
                 let mut stream = TcpStream::connect(&target)
                     .await
                     .with_context(|| format!("setup connect to {target} failed"))?;
+                // Inside the measured window on purpose: the metric is
+                // connect->first byte, and one setsockopt is negligible
+                // against a millisecond-scale number.
+                if let Err(e) = stream.set_nodelay(true) {
+                    tracing::debug!("could not disable Nagle on the setup socket: {e}");
+                }
                 stream.write_all(&msg).await?;
                 stream.read_exact(&mut buf).await?;
                 samples_ns.push(t0.elapsed().as_nanos());

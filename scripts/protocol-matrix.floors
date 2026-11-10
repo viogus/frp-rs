@@ -7,6 +7,12 @@
 # the host-to-host capacity differences that make an absolute number fragile
 # on a shared CI runner.
 #
+# Harness change 2026-11-10: the benchmark peer now sets TCP_NODELAY. Before
+# that it ran a Nagle timer, which cost a chunked 64 KiB message ~8 ms per
+# round trip (18.0 vs 736.8 MiB/s through a plain relay). These ratios were
+# calibrated on the pre-fix harness and a pre-64 KiB-default tree; re-derive
+# them before trusting them after any further harness or default change.
+#
 # What this gate is for: a row that still bridges bytes but at a fraction of
 # its previous rate. That is not hypothetical — KCP spent its whole life at
 # 20.7 MiB/s on the ping-pong bench (65.5 MiB/s in the matrix after the FEC

@@ -10,8 +10,17 @@ printed unit used to say MB/s. Each run rewrites (truncates) that file; pass
 `--profile release-perf` — out of the committed per-host baseline. Numbers are
 **host-specific**
 (CPU, kernel, NIC) — compare a change only against a baseline captured on
-the SAME host. Regenerate the baseline before starting a Phase 2 change,
-then re-run after and diff: any config dropping >5% MiB/s rejects the change.
+the SAME host. They are also **harness-version-specific**: before 2026-11-10
+the echo peer ran with Nagle on, and on a chunked shape that put a timer inside
+the round trip — a 64 KiB message through a 32 KiB buffer measured 18 MiB/s
+where it measures 737 without it
+([note](../../../docs/archive/notes/2026-11-10-nagle-in-the-benchmark.md)).
+Rows whose framing keeps the message in one write never saw it. Do not diff a
+file recorded before that date against a run from a fixed harness; the record
+does not carry a timestamp, so date it with
+`git log -1 --format=%cs -- <file>`. Regenerate the baseline before starting a
+Phase 2 change, then re-run after and diff: any config dropping >5% MiB/s
+rejects the change.
 
 `mux` deserves a caveat: its rate is concurrency-shaped (0.80x `plain` at one
 stream, 0.66x at eight) and a single session plateaus near 485-520 MiB/s from
@@ -43,6 +52,11 @@ One JSON line per bridge configuration:
 | `tls` | TLS control+work transport |
 
 ## Latency and memory baselines
+
+`TCP_NODELAY` was added to both latency clients on 2026-11-10 as well, but a
+strictly serialized ping-pong never has unacknowledged data outstanding when it
+writes, so the measured effect was nil — latency files recorded before that date
+stay comparable, unlike throughput ones.
 
 Besides the throughput matrix, this directory also tracks:
 

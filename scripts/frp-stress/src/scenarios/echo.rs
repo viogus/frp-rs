@@ -14,6 +14,15 @@ pub async fn run(cli: &Cli) -> Result<()> {
 
     loop {
         let (mut sock, peer) = listener.accept().await?;
+        // Nagle turns this peer into a timer: a relay that splits a message
+        // into two chunks makes the echo's second write wait for an ACK, and
+        // the measured round trip jumps from ~0.2 ms to ~7 ms (measured: 64 KiB
+        // ping-pong through a plain tokio relay, 32 KiB chunks, 18 MiB/s with
+        // Nagle vs 737 MiB/s without). Every matrix row and baseline goes
+        // through this socket, so it must not add delay of its own.
+        if let Err(e) = sock.set_nodelay(true) {
+            tracing::warn!("could not disable Nagle on the echo socket: {e}");
+        }
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
