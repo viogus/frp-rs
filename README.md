@@ -50,7 +50,7 @@ version number is deliberately not independent (see
 - **Faster on the same bytes, with less of the machine.** In the configuration
   both projects ship by default (`tcpMux` + TLS), frp-rs moves **+41%** more
   bytes than the Go release it replaces, at **28–30% less CPU per MiB**, with
-  **2–3× lower peak RSS** and a **2.4× smaller binary**. Tables, method and the
+  **2–3.4× lower peak RSS** and a **2.4× smaller binary**. Tables, method and the
   caveats that go with them are in [Performance](#performance).
 - **Operational knobs Go frp does not have** — UDP bandwidth limiting, SSH gateway
   per-IP login throttling with `ssh_session_idle_timeout`, and
@@ -350,7 +350,7 @@ links. The short version:
    against the real Go binary on every push.
 6. **Faster on the paths we have measured.** +41% throughput in the shipping
    `tcpMux` + TLS configuration, +31% to +50% across the rest of the TCP matrix,
-   28–30% less CPU per MiB and 2–3× lower peak RSS than the Go release this
+   28–30% less CPU per MiB and 2–3.4× lower peak RSS than the Go release this
    replaces — plus +46% UDP packets/s from writing each frame once, and 10.2×
    the datagram rate on the reply path. Tables, method and caveats:
    [Performance](#performance).

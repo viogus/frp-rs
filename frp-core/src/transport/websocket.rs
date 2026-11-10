@@ -24,7 +24,7 @@ use super::{AsyncReadWrite, IoStream, Transport};
 /// below that; the V1 10 KiB limit stays enforced by `protocol.rs`.
 /// +128 bytes covers the V2 AEAD overhead (AES-256-GCM tag + nonce) so an
 /// encrypted V2 frame at the payload cap is not rejected by the transport.
-const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128;
+pub(crate) const MAX_WS_FRAME_PAYLOAD: u64 = crate::protocol::V2_MAX_FRAME_PAYLOAD as u64 + 128;
 
 /// Cap on no-progress frames (zero-length data, ping, pong) drained within a
 /// single `poll_read` call. Each such frame is consumed, woken, and re-polled

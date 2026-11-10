@@ -181,7 +181,7 @@ shipping `tcpMux` path. The deltas here are same-binary A/B comparisons, which
 | yamux frame written with one `write_vectored` (header+body) | neutral (1 flow 1241 vs 1213; 4 flows 1337 vs 1340 MiB/s) |
 | one-copy path: `Stream::poll_write_bufs` + `YamuxStream` newtype so the protocol layer takes its vectored branch | neutral (means 1388.6 → 1364.9 at 4 flows) |
 | inline yamux write with a writer lock and mpsc fallback | **−9%** (1274.9 vs 1400 MiB/s at 4 flows) |
-| bridge buffer default 32 KiB → 64 KiB | +12% under `tcpMux`, but −40 to −45% on macOS `ws`/`wss` without `tcpMux`; measured, not adopted (the default stays 32 KiB) |
+| bridge buffer default 32 KiB → 64 KiB | +12% under `tcpMux`, but −40 to −45% on macOS `ws`/`wss` without `tcpMux`; **later adopted** as 64 KiB (32 KiB still on macOS) — see the bridge-buffer note |
 | rustls `READ_SIZE` 4 KiB → 16 KiB | +2.3% on the laptop, inside a ±4% spread; not adopted |
 
 The frame-coalescing change that *did* land (one `write_all` per protocol frame

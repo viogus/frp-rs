@@ -1,5 +1,10 @@
 # What a tcpMux frame costs, and the one knob that moves it (2026-11-10)
 
+**Status update (2026-11-10, later the same day).** The buffer half of §5 *did*
+land: the default is now 64 KiB (32 KiB on macOS) — see
+[`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](2026-11-10-bridge-buffer-64k-default.md).
+The three rejected structural changes and the frame-cost model stand as written.
+
 **Status (2026-11-10).** Accepted as a measurement record, **nothing landed**.
 §2–§4 are three structural changes that were built, measured and rejected
 because none moved throughput. §5 is the one setting that did move it, and the

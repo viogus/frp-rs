@@ -1383,10 +1383,13 @@ mod tests {
         assert_eq!(mux_split_size(32 * 1024), 32 * 1024);
         assert_eq!(mux_split_size(64 * 1024), 64 * 1024);
         assert_eq!(mux_split_size(1024 * 1024), MAX_MUX_FRAME_PAYLOAD);
-        // `MAX_WS_FRAME_PAYLOAD` is the V2 cap plus 128 bytes of AEAD slack,
-        // and a yamux data frame is this payload plus a 12-byte header.
+        // A yamux data frame is this payload plus a 12-byte header, and it must
+        // fit the WebSocket transport's read limit. Reference the transport's
+        // own constant (not a re-derived expression) so a change there reds this
+        // test instead of silently killing ws sessions at the frame cap.
+        #[cfg(feature = "websocket")]
         assert!(
-            MAX_MUX_FRAME_PAYLOAD + 12 <= crate::protocol::V2_MAX_FRAME_PAYLOAD as usize + 128,
+            MAX_MUX_FRAME_PAYLOAD as u64 + 12 <= crate::transport::websocket::MAX_WS_FRAME_PAYLOAD,
             "a frame at MAX_MUX_FRAME_PAYLOAD must fit the WebSocket transport"
         );
     }

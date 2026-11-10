@@ -32,7 +32,7 @@ mod tcp;
 #[cfg(feature = "tls")]
 pub(crate) mod tls;
 #[cfg(feature = "websocket")]
-mod websocket;
+pub(crate) mod websocket;
 mod yamux;
 
 use buffered_read::BufferedReadTransport;

@@ -1127,7 +1127,9 @@ The per-connection bridge buffer defaults to **64 KiB** (32 KiB on macOS) and ca
 be tuned via the `FRP_BRIDGE_BUF_KB` environment variable (range 4–1024). It is
 also the tcpMux frame payload, so the default is the largest frame worth having:
 the split is capped at 64 KiB to stay inside the WebSocket reader's 65664-byte
-limit, and a bigger buffer would only buy memory. On a 4-vCPU Linux VM the
+limit, and a bigger buffer does not buy more frames. It is also unsafe on
+`ws`/`wss` without `tcpMux`: there each bridge chunk becomes one transport frame
+and anything above 64 KiB is rejected by the peer as "WS frame too large". On a 4-vCPU Linux VM the
 64 KiB default measured **+13.5%** on tcpMux + TLS, +12.8% at one stream and
 +13.9% on WebSocket without mux, with the plain rows unchanged. macOS keeps
 32 KiB because there the same setting costs the **non-mux** WebSocket rows
@@ -1135,7 +1137,7 @@ limit, and a bigger buffer would only buy memory. On a 4-vCPU Linux VM the
 high-fan-out servers, lower it (`FRP_BRIDGE_BUF_KB=8` is a 16 KiB footprint per
 bridge) — the pool ceiling follows the buffer size.
 
-The mux data path costs ≈11.6 µs more per 32 KiB frame than the plain path, but
+The mux data path costs ≈11.6 µs more per 32 KiB of frame payload than the plain path, but
 only ~5 µs of a frame's ~23 µs is fixed cost — the rest scales with bytes — so
 frame size is a lever, not a ceiling. That is what the 64 KiB default buys, and
 why going further does not help: the frame is capped at 64 KiB.

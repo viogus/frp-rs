@@ -21,6 +21,10 @@ Linux at all. So the default follows the platform: 64 KiB where it helps,
 
 ## 2. Method
 
+The harness and both binary sets live **outside the tree**, in
+`/Users/cdf/kcpbench` (`ab2.sh`, `res2.sh`, `bench-linux`, `abbench`, and the
+`base-bin/` + `def64-bin/` builds); the VM copies are in `/root/bench`.
+
 `ab2.sh <bindir> <label> <flows> <mux> <server-extra> <client-extra>` on the
 host described in `2026-11-10-real-host-throughput.md` §2 (4 vCPU EPYC-Milan,
 steal 0.0%, Debian 13, kernel 6.12). One binary — the release build of the commit

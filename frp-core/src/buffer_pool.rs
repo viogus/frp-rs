@@ -21,8 +21,12 @@ use std::sync::LazyLock;
 /// chunk travels as one frame — no second 12-byte header and no second
 /// window-credit hand-off per chunk. The derived split is capped at 64 KiB,
 /// which leaves the 12-byte frame header inside the WebSocket transport's
-/// 65664-byte read limit (65548 of 65664 at 64 KiB), so a larger buffer buys
-/// memory, not frames.
+/// 65664-byte read limit (65548 of 65664 at 64 KiB), so anything above 64 KiB
+/// does not buy more frames. It is also **not** harmless: with
+/// `tcpMux` off, a WebSocket connection writes one transport frame per bridge
+/// chunk, and above 64 KiB the peer rejects it ("WS frame too large") and drops
+/// the session — keep `FRP_BRIDGE_BUF_KB` at or below 64 on `ws`/`wss` unless
+/// `tcpMux` is on.
 ///
 /// Measured on a 4-vCPU Linux VM against Go frp v0.72.0, five interleaved
 /// pairs of the same binary with only this knob changing: `tcpMux` + TLS
@@ -30,12 +34,13 @@ use std::sync::LazyLock;
 /// one flow 508.4 -> 573.5 (+12.8%), `ws` without `tcpMux` 1064 -> 1213
 /// (+13.9%), and the no-mux plain and TLS rows unchanged within noise.
 ///
-/// macOS keeps 32 KiB: the same 64 KiB buffer costs the non-mux WebSocket
-/// rows ~40-45% there (measured 301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0
-/// for `wss` via `scripts/protocol-matrix.sh`, three runs, knob as the only
-/// difference) while the mux rows are only slightly better. The Linux WebSocket
-/// rows gain at 64 KiB, so this is a platform property, not a transport one;
-/// `FRP_BRIDGE_BUF_KB` overrides it either way.
+/// macOS keeps 32 KiB: the same 64 KiB buffer costs its non-mux WebSocket
+/// rows ~40-45% there (301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`
+/// via `scripts/protocol-matrix.sh`, three runs, knob as the only difference),
+/// and its mux rows are within a few percent (one +8%, one -2.5%). The cause is
+/// **unknown** — the frames there are the same size as a mux WS frame that does
+/// not regress — so this is an observation about one code path on one OS, not a
+/// transport property; `FRP_BRIDGE_BUF_KB` overrides it either way.
 ///
 /// Measurements, cost model and the three structural alternatives that changed
 /// nothing: `docs/archive/notes/2026-11-10-mux-frame-cost.md` and
@@ -84,7 +89,10 @@ fn resolve_buffer_size(raw: Option<&str>) -> usize {
 /// retained bytes scale with `FRP_BRIDGE_BUF_KB`: 128 x 64 KiB is the default
 /// ceiling, and a 1 MiB buffer size reaches 128 MiB at the same count. The pool
 /// only holds buffers that were used and released, so an idle process keeps
-/// none of it.
+/// none of it. This ceiling covers this pool only: a compressed bridge also
+/// holds `cap + cap/6 + 32` of compression scratch plus snap's encoder buffer
+/// (a 64 KiB bridge is ~4x two buffers in total), and each KCP socket keeps its
+/// own 8 x `BUFFER_SIZE` chunk pool.
 static MAX_POOLED_BUFFERS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_POOL_MAX")
         .ok()
