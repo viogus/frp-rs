@@ -54,7 +54,11 @@ number comes from a **different harness and host** (Linux container,
    production binary (symbols stripped) puts ~26% of frpc samples in the
    `sendto` syscall path, 3.5% in `clock_gettime` through the vDSO, and 2% in
    wake-up spin locks — i.e. per-packet work, not bulk copying.
-3. **The FEC encode is still the hottest named user-space frame.** On the
+3. **The FEC encode is still the hottest named user-space frame** — and it was
+   vectorised after this measurement, which took the stream shape from 49 to 58
+   MiB/s (**+19%**, CPU −16%); see
+   [`2026-11-11-kcp-avx2-parity.md`](2026-11-11-kcp-avx2-parity.md). Before that
+   change the wording was: On the
    debuginfo build (the stripped release binary cannot resolve it) frps spends
    **16.3%** of its samples in `KcpSession::fec_encode_output`, and frpc 4.3% in
    the `KcpSocket::run` loop plus 3.6% in `clock_gettime` and 3.6% in wake-up
