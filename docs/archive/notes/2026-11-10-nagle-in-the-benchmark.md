@@ -25,7 +25,10 @@ on both relay sockets — shows the same collapse:
 | 128 KiB | 64 KiB | 36.1 MiB/s | 145 /s |
 | direct, no relay | — | 1,508 MiB/s | 12,067 /s |
 
-Same relay, same run, with the echo peer's `TCP_NODELAY` turned on:
+Same relay, with the echo peer's `TCP_NODELAY` turned on. (These are separate
+runs from the table above: 18.0 MiB/s here against 12.6 / 14.7 MiB/s there for
+the same shape — the taxed rate is not stable, which is itself part of the
+problem.)
 
 | shape | echo without nodelay | echo with nodelay |
 |---|---|---|
@@ -34,6 +37,11 @@ Same relay, same run, with the echo peer's `TCP_NODELAY` turned on:
 | 128 KiB × 64 KiB buffer | 36.1 MiB/s | 1,007.5 MiB/s |
 
 ## 3. Cause
+
+Recorded earlier as a platform property in
+[`2026-11-10-bridge-buffer-64k-default.md`](2026-11-10-bridge-buffer-64k-default.md)
+("Linux prefers the 64 KiB one (6.4-19.7x, on this harness only)") — the
+parenthetical was the clue.
 
 Nagle. When the relay splits a message into more chunks than the peer expects,
 the peer's second `write` finds an unacknowledged small segment in flight and
@@ -47,16 +55,17 @@ matrix exists to compare.
 
 ## 4. Fix
 
-`set_nodelay(true)` on all three benchmark sockets:
+`set_nodelay(true)` on all four benchmark call sites (three files):
 
 - `scripts/frp-stress/src/scenarios/echo.rs` — each accepted connection.
 - `scripts/frp-stress/src/scenarios/throughput.rs` — the load client.
 - `scripts/frp-stress/src/scenarios/latency.rs` — the `steady` and `setup`
   clients, where the measurement *is* the round trip.
 
-frp itself has always set `TCP_NODELAY` on its own sockets
-(`frp-server/src/service.rs:866`, `frp-core/src/transport/mod.rs:943`), so this
-changes what the harness measures, not what the proxy does.
+frp itself sets `TCP_NODELAY` on every data-path socket since the 2026-07 L1
+work (`frp-server/src/service.rs:866`, `frp-core/src/transport/mod.rs:943`, and
+the helper at `mod.rs:998-1002` used at ~15 further sites), so this changes what
+the harness measures, not what the proxy does.
 
 ## 5. What this does and does not explain
 
@@ -65,14 +74,19 @@ changes what the harness measures, not what the proxy does.
 - **Not explained:** the macOS 1-stream dip. With nodelay on both ends, a
   64 KiB message still measures 298 MiB/s at a 32 KiB buffer and 168 MiB/s at
   64 KiB, and four streams measure the same at both sizes (718.8 / 712.6). That
-  is a real latency shape of a store-and-forward relay at that message size,
-  ~750 µs per round trip against a 47 µs direct connection — not a defect, and
-  not what the throughput gate should be measuring.
+  is a real latency shape of a store-and-forward relay at that message size:
+  419 µs per round trip at a 32 KiB buffer and 744 µs at 64 KiB, against 83 µs
+  for the same 64 KiB round trip over a direct connection (1,508 MiB/s at
+  12,067 round trips/s). Not a defect, and not what the throughput gate should
+  be measuring.
 
 ## 6. Consequence for recorded numbers
 
-Baselines and matrix rows recorded before this change carry the tax and should
-not be compared against a run from a fixed harness without saying so. The
+Throughput baselines and matrix rows recorded before this change carry the tax
+and should not be compared against a run from a fixed harness without saying so.
+The latency and memory records do not: those scenarios send 64-byte messages one
+at a time, so the previous write is already acknowledged and Nagle never
+engages. The
 one-way throughput numbers in
 [`2026-11-10-real-host-throughput.md`](2026-11-10-real-host-throughput.md) are
 unaffected in kind — a streaming write is not a ping-pong — but they were taken

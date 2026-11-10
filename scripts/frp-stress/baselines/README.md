@@ -14,7 +14,7 @@ the SAME host. They are also **harness-version-specific**: before
 2026-11-10 the echo peer ran with Nagle on, which put a ~7 ms timer inside
 every chunked round trip and made a 64 KiB message through a 32 KiB buffer
 measure 18 MiB/s where it measures 737 without it
-([note](../archive/notes/2026-11-10-nagle-in-the-benchmark.md)). Do not diff a
+([note](../../../docs/archive/notes/2026-11-10-nagle-in-the-benchmark.md)). Do not diff a
 file recorded before that date against a run from a fixed harness. Regenerate the baseline before starting a Phase 2 change,
 then re-run after and diff: any config dropping >5% MiB/s rejects the change.
 

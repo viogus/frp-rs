@@ -20,7 +20,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
         // ping-pong through a plain tokio relay, 32 KiB chunks, 18 MiB/s with
         // Nagle vs 737 MiB/s without). Every matrix row and baseline goes
         // through this socket, so it must not add delay of its own.
-        let _ = sock.set_nodelay(true);
+        if let Err(e) = sock.set_nodelay(true) {
+            tracing::warn!("could not disable Nagle on the echo socket: {e}");
+        }
         tokio::spawn(async move {
             let mut buf = vec![0u8; 64 * 1024];
             loop {

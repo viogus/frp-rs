@@ -66,6 +66,9 @@ pub async fn run(cli: &Cli) -> Result<()> {
                 let mut stream = TcpStream::connect(&target)
                     .await
                     .with_context(|| format!("setup connect to {target} failed"))?;
+                // Inside the measured window on purpose: the metric is
+                // connect->first byte, and one setsockopt is negligible
+                // against a millisecond-scale number.
                 stream.set_nodelay(true)?;
                 stream.write_all(&msg).await?;
                 stream.read_exact(&mut buf).await?;
