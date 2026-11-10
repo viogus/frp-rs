@@ -102,6 +102,25 @@ processing (per-record AEAD, per-record copies, 16 KiB record ceiling) and not a
 property of either implementation, so it is not a gap to chase. It is, however,
 where most of the measurable CPU goes — see §5.
 
+### Resource use
+
+Same matrix, same VM, both processes' `user+sys` ticks from `/proc/<pid>/stat`
+read before and after each run, and `VmHWM` at the end (two repeats per row):
+
+| row | frp-rs | Go frp v0.72.0 |
+|---|---|---|
+| `tcpMux` + TLS, CPU per MiB | 4,272 µs | 4,897 µs (**−13%**) |
+| `tcpMux` + TLS, peak RSS frps / frpc | 13.9 / 15.2 MB | 35.5 / 55.2 MB |
+| `tcpMux`, no TLS, CPU per MiB | 2,547 µs | 3,134 µs (**−19%**) |
+| `tcpMux`, no TLS, peak RSS frps / frpc | 13.4 / 15.1 MB | 35.1 / 69.4 MB |
+
+Release binaries on the same host: `frps` 9 MiB vs 21 MiB, `frpc` 7 MiB vs
+17 MiB.
+
+Two cautions on the RSS column: it is a peak that includes the buffers of an
+8 GiB transfer, and Go's `frpc` figure is not stable across runs (51–77 MB), so
+read it as "grows with load", not as a constant.
+
 ## 5. Where the CPU goes
 
 `perf record -F 499 -p <pid> -g -- sleep 20` on both processes of the shipping
