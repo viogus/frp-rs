@@ -1123,26 +1123,28 @@ Latency-sensitive deployments can raise `pool_count` further.
 (matching Go frp), so small request/response and interactive traffic is not
 delayed by Nagle's algorithm — no configuration needed.
 
-For memory-constrained or high-fan-out servers, the per-connection bridge buffer
-defaults to 32 KiB (matching Go frp) and can be tuned via the `FRP_BRIDGE_BUF_KB`
-environment variable (range 4–1024).
+The per-connection bridge buffer defaults to **64 KiB** (32 KiB on macOS) and can
+be tuned via the `FRP_BRIDGE_BUF_KB` environment variable (range 4–1024). It is
+also the tcpMux frame payload, so the default is the largest frame worth having:
+the split is capped at 64 KiB to stay inside the WebSocket reader's 65664-byte
+limit, and a bigger buffer does not buy more frames. It is also unsafe on
+`ws`/`wss` without `tcpMux`: there each bridge chunk becomes one transport frame
+and anything above 64 KiB is rejected by the peer as "WS frame too large". On a 4-vCPU Linux VM the
+64 KiB default measured **+13.5%** on tcpMux + TLS, +12.8% at one stream and
++13.9% on WebSocket without mux, with the plain rows unchanged. macOS keeps
+32 KiB because there the same setting costs the **non-mux** WebSocket rows
+~40–45% (`ws` 301 → 165 MiB/s, `wss` 226 → 134). For memory-constrained or
+high-fan-out servers, lower it (`FRP_BRIDGE_BUF_KB=8` is a 16 KiB footprint per
+bridge) — the pool ceiling follows the buffer size.
 
-That knob now also sizes the tcpMux data frame, so a full bridge chunk travels
-as one yamux frame in the steady state — except that the split is capped at
-64 KiB, which leaves the 12-byte header inside the WebSocket reader's
-65664-byte limit (an oversized frame is rejected by the peer and kills the
-whole mux session, not just one bridge).
-The mux data path costs ≈11.6 µs more per 32 KiB frame than the plain path, but
+The mux data path costs ≈11.6 µs more per 32 KiB of frame payload than the plain path, but
 only ~5 µs of a frame's ~23 µs is fixed cost — the rest scales with bytes — so
-frame size is a lever, not a ceiling: on a 4-vCPU Linux container, 64 KiB
-frames measured +12% on tcpMux at 4 streams
-(1348 → 1513 MiB/s), +6% at one stream and +11% on tcp-tls, at 2x64 KiB of
-buffer per live bridge instead of 2x32 KiB and a doubled pool ceiling.
-But on macOS the same setting costs the **non-mux** WebSocket rows ~40–45%
-(`ws` 301 → 165 MiB/s, `wss` 226 → 134), so 64 KiB is a knob for tcp/tcp-tls
-deployments rather than the default; leave `tcpMux` on if you raise it.
+frame size is a lever, not a ceiling. That is what the 64 KiB default buys, and
+why going further does not help: the frame is capped at 64 KiB.
 Measurements and the frame-cost model:
-[`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md).
+[`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md);
+the default and its platform split:
+[`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
 **Heartbeat intervals:**
 

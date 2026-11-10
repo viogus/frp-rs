@@ -494,7 +494,7 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // `yamux_config_carries_window_growth_seed_rtt` test).
     // A full bridge chunk travels as one yamux data frame in the steady
     // state: `split_send_size` is the bridge's copy buffer
-    // (`FRP_BRIDGE_BUF_KB`, 32 KiB by default) — not padded, and not split
+    // (64 KiB default, 32 KiB on macOS; knob overrides) - not padded, not split
     // further unless the send window is short (a partly consumed window
     // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:408-409`)
     // or the chunk is short (compression shrinks it, encryption writes the
@@ -1383,10 +1383,13 @@ mod tests {
         assert_eq!(mux_split_size(32 * 1024), 32 * 1024);
         assert_eq!(mux_split_size(64 * 1024), 64 * 1024);
         assert_eq!(mux_split_size(1024 * 1024), MAX_MUX_FRAME_PAYLOAD);
-        // `MAX_WS_FRAME_PAYLOAD` is the V2 cap plus 128 bytes of AEAD slack,
-        // and a yamux data frame is this payload plus a 12-byte header.
+        // A yamux data frame is this payload plus a 12-byte header, and it must
+        // fit the WebSocket transport's read limit. Reference the transport's
+        // own constant (not a re-derived expression) so a change there reds this
+        // test instead of silently killing ws sessions at the frame cap.
+        #[cfg(feature = "websocket")]
         assert!(
-            MAX_MUX_FRAME_PAYLOAD + 12 <= crate::protocol::V2_MAX_FRAME_PAYLOAD as usize + 128,
+            MAX_MUX_FRAME_PAYLOAD as u64 + 12 <= crate::transport::websocket::MAX_WS_FRAME_PAYLOAD,
             "a frame at MAX_MUX_FRAME_PAYLOAD must fit the WebSocket transport"
         );
     }

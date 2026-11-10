@@ -14,55 +14,85 @@
 use crossbeam_queue::ArrayQueue;
 use std::sync::LazyLock;
 
+/// Default pooled buffer size, in bytes, when `FRP_BRIDGE_BUF_KB` is unset.
+///
+/// 64 KiB everywhere except macOS. The buffer is also the yamux data-frame
+/// payload (`mux.rs` derives `split_send_size` from it), so one full bridge
+/// chunk travels as one frame — no second 12-byte header and no second
+/// window-credit hand-off per chunk. The derived split is capped at 64 KiB,
+/// which leaves the 12-byte frame header inside the WebSocket transport's
+/// 65664-byte read limit (65548 of 65664 at 64 KiB), so anything above 64 KiB
+/// does not buy more frames. It is also **not** harmless: with
+/// `tcpMux` off, a WebSocket connection writes one transport frame per bridge
+/// chunk, and above 64 KiB the peer rejects it ("WS frame too large") and drops
+/// the session — keep `FRP_BRIDGE_BUF_KB` at or below 64 on `ws`/`wss` unless
+/// `tcpMux` is on.
+///
+/// Measured on a 4-vCPU Linux VM against Go frp v0.72.0, five interleaved
+/// pairs of the same binary with only this knob changing: `tcpMux` + TLS
+/// 526.0 -> 597.0 MiB/s (**+13.5%**, every pair positive, +9.9% to +16.2%),
+/// one flow 508.4 -> 573.5 (+12.8%), `ws` without `tcpMux` 1064 -> 1213
+/// (+13.9%), and the no-mux plain and TLS rows unchanged within noise.
+///
+/// macOS keeps 32 KiB: the same 64 KiB buffer costs its non-mux WebSocket
+/// rows ~40-45% there (301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`
+/// via `scripts/protocol-matrix.sh`, three runs, knob as the only difference),
+/// and its mux rows are within a few percent (one +8%, one -2.5%). The cause is
+/// **unknown** — the frames there are the same size as a mux WS frame that does
+/// not regress — so this is an observation about one code path on one OS, not a
+/// transport property; `FRP_BRIDGE_BUF_KB` overrides it either way.
+///
+/// Measurements, cost model and the three structural alternatives that changed
+/// nothing: `docs/archive/notes/2026-11-10-mux-frame-cost.md` and
+/// `docs/archive/notes/2026-11-10-real-host-throughput.md`.
+#[cfg(not(target_os = "macos"))]
+const DEFAULT_BUFFER_SIZE: usize = 64 * 1024;
+
+/// Default pooled buffer size on macOS — see [`BUFFER_SIZE`].
+#[cfg(target_os = "macos")]
+const DEFAULT_BUFFER_SIZE: usize = 32 * 1024;
+
 /// Pooled buffer size in bytes.
 ///
-/// Default: 32 KiB (32768), matching Go frp's `io.Copy` buffer and keeping the
-/// per-bridge footprint at two 32 KiB buffers. This size is **also** the yamux
-/// data-frame payload: `mux.rs` derives `split_send_size` from it, so in the
-/// steady state one full bridge chunk travels as one frame — no second
-/// 12-byte frame header, no second window-credit round trip, no second waker
-/// hand-off per chunk. (Short chunks, a partly consumed send window, and the
-/// encrypted path's separate IV write can still produce a second frame.) The
-/// derived split is capped at 64 KiB, which leaves the 12-byte frame header
-/// inside the WebSocket transport's 65664-byte read limit (65548 of 65664 at
-/// 64 KiB).
+/// Default: [`DEFAULT_BUFFER_SIZE`] — 64 KiB, or 32 KiB on macOS. Keeping the
+/// buffer equal to the frame payload is what makes a bridge chunk travel as a
+/// single yamux frame; the per-bridge footprint is two buffers, so the default
+/// costs 2x64 KiB (2x32 KiB on macOS) per live bridge.
 ///
-/// A 64 KiB default is **not** adopted even though it is 12% faster on
-/// tcpMux at 4 flows: on macOS it costs the non-mux WebSocket rows ~40-45%
-/// (measured 301.5 -> 165.5 MiB/s for `ws`, 226.2 -> 134.0 for `wss`, via
-/// `scripts/protocol-matrix.sh` with `FRP_BRIDGE_BUF_KB` as the only
-/// difference), while the mux rows are flat or slightly better and plain tcp
-/// is flat (+0.7%). Since `ws`/`wss` without `tcpMux` is a supported configuration,
-/// the default stays at Go parity and the knob carries the tradeoff:
-/// `FRP_BRIDGE_BUF_KB=64` is worth +12% on tcpMux (1348 -> 1513 MiB/s at 4
-/// flows on a 4-vCPU Linux container), +6% at one flow, +11% on tcp-tls, at
-/// 2x64 KiB of buffer per live bridge instead of 2x32 KiB. Measurements, the
-/// cost model and the three structural alternatives that changed nothing:
-/// `docs/archive/notes/2026-11-10-mux-frame-cost.md`.
-///
-/// Override via env `FRP_BRIDGE_BUF_KB` (valid range: 4–1024 KB,
-/// i.e. 4 KiB – 1 MiB). Read once at process start via `LazyLock`.
+/// Override via env `FRP_BRIDGE_BUF_KB` (valid range: 4-1024 KB, i.e. 4 KiB -
+/// 1 MiB); values outside the range are ignored and the default applies. Read
+/// once at process start via `LazyLock`.
 ///
 /// This buffer size is used by the encrypted/compressed bridge data
 /// path (`bridge.rs`), the V2 frame read path (`protocol.rs`), and —
 /// via `copy_pooled`/`relay_plain_pooled` — the plain (unencrypted)
 /// bridge path, so `FRP_BRIDGE_BUF_KB` applies uniformly.
-pub static BUFFER_SIZE: LazyLock<usize> = LazyLock::new(|| {
-    std::env::var("FRP_BRIDGE_BUF_KB")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|kb| *kb >= 4 && *kb <= 1024)
+pub static BUFFER_SIZE: LazyLock<usize> =
+    LazyLock::new(|| resolve_buffer_size(std::env::var("FRP_BRIDGE_BUF_KB").ok().as_deref()));
+
+/// Parse `FRP_BRIDGE_BUF_KB`, falling back to [`DEFAULT_BUFFER_SIZE`].
+///
+/// Kept as a pure function so the default/override rules are testable without
+/// touching the process environment (which `BUFFER_SIZE` reads exactly once).
+fn resolve_buffer_size(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|kb| (4..=1024).contains(kb))
         .map(|kb| kb * 1024)
-        .unwrap_or(32768)
-});
+        .unwrap_or(DEFAULT_BUFFER_SIZE)
+}
 
 /// Maximum number of buffers to retain in the pool.
 ///
-/// Default 128 (4 MiB of 32 KiB buffers); override via `FRP_BRIDGE_POOL_MAX`
-/// (capped at 4096). 32 was too small under high connection churn — excess
-/// buffers were dropped and re-allocated. The retained bytes therefore scale
-/// with `FRP_BRIDGE_BUF_KB`: the default ceiling is 4 MiB, and a 1 MiB buffer
-/// size reaches 128 MiB at the same buffer count.
+/// Default 128 (8 MiB of 64 KiB buffers, 4 MiB on macOS); override via
+/// `FRP_BRIDGE_POOL_MAX` (capped at 4096). 32 was too small under high
+/// connection churn — excess buffers were dropped and re-allocated. The
+/// retained bytes scale with `FRP_BRIDGE_BUF_KB`: 128 x 64 KiB is the default
+/// ceiling, and a 1 MiB buffer size reaches 128 MiB at the same count. The pool
+/// only holds buffers that were used and released, so an idle process keeps
+/// none of it. This ceiling covers this pool only: a compressed bridge also
+/// holds `cap + cap/6 + 32` of compression scratch plus snap's encoder buffer
+/// (a 64 KiB bridge is ~4x two buffers in total), and each KCP socket keeps its
+/// own 8 x `BUFFER_SIZE` chunk pool.
 static MAX_POOLED_BUFFERS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("FRP_BRIDGE_POOL_MAX")
         .ok()
@@ -246,6 +276,34 @@ mod tests {
         }
         // After releasing extras, pool size should be capped
         assert!(pool.inner.len() <= *MAX_POOLED_BUFFERS);
+    }
+
+    #[test]
+    fn test_resolve_buffer_size_default_and_override() {
+        let default = resolve_buffer_size(None);
+        assert_eq!(default, DEFAULT_BUFFER_SIZE);
+        if cfg!(target_os = "macos") {
+            assert_eq!(default, 32 * 1024, "macOS keeps the 32 KiB default");
+        } else {
+            assert_eq!(default, 64 * 1024);
+        }
+        // Accepted overrides, with surrounding whitespace.
+        assert_eq!(resolve_buffer_size(Some("4")), 4 * 1024);
+        assert_eq!(resolve_buffer_size(Some("64")), 64 * 1024);
+        assert_eq!(resolve_buffer_size(Some(" 128 ")), 128 * 1024);
+        assert_eq!(resolve_buffer_size(Some("1024")), 1024 * 1024);
+        // Out-of-range or unparsable values fall back to the platform default.
+        for bad in ["3", "1025", "0", "abc", "", "-8"] {
+            assert_eq!(resolve_buffer_size(Some(bad)), default, "raw = {bad:?}");
+        }
+    }
+
+    /// The live static agrees with the pure resolver for the current process
+    /// environment, so the LazyLock wrapper cannot drift from the rules.
+    #[test]
+    fn test_buffer_size_static_matches_resolver() {
+        let raw = std::env::var("FRP_BRIDGE_BUF_KB").ok();
+        assert_eq!(*BUFFER_SIZE, resolve_buffer_size(raw.as_deref()));
     }
 
     #[test]

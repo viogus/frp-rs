@@ -47,9 +47,11 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 #[cfg(feature = "compression")]
 use crate::encryption::{SnappyCompressor, SnappyDecompressor};
 
-/// Read granularity for the decompressor's inner read. Matches the bridge's
-/// `BUFFER_SIZE` (32 KiB default) so the two data planes share one working
-/// size.
+/// Read granularity for the decompressor's inner read. A bridge chunk is now
+/// 64 KiB by default (32 KiB on macOS), so this is a fixed granularity rather
+/// than a match of `buffer_pool::BUFFER_SIZE`: the decompressor loops over the
+/// inner reader, so a chunk larger than this is read in more than one pass and
+/// correctness does not depend on the two sizes agreeing.
 #[cfg(feature = "compression")]
 const READ_CHUNK_SIZE: usize = 32 * 1024;
 
@@ -100,7 +102,7 @@ pub struct SnappyStreamReader<R: AsyncRead + Unpin> {
     meta_budget: usize,
     /// Set once the inner reader returned EOF; no further inner reads.
     eof: bool,
-    /// Reusable 32 KiB input scratch for the inner read.
+    /// Reusable [`READ_CHUNK_SIZE`] input scratch for the inner read.
     read_buf: [u8; READ_CHUNK_SIZE],
 }
 

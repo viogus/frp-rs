@@ -1,4 +1,9 @@
-> **Still current (re-checked 2026-11-10).** §6 argues the default should stay
+> **Superseded on one point (2026-11-10).** §6 argued the default should stay a
+> knob; it now defaults to 64 KiB (32 KiB on macOS) — see
+> [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](2026-11-10-bridge-buffer-64k-default.md).
+> Every other section still stands.
+>
+> **Original status (re-checked 2026-11-10).** §6 argues the default should stay
 > at 32 KiB. A 64 KiB default measured +12% on tcpMux but ~40% slower on `ws`
 > without `tcpMux` on macOS, so it stays a knob — see
 > [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](2026-11-10-mux-frame-cost.md).

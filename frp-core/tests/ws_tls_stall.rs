@@ -32,7 +32,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 const HEAD_LEN: usize = 91; // StartWorkConn-sized head frame
-const FRAME_LEN: usize = 32768; // bridge copy chunk
+/// Bridge copy chunk, i.e. the frame size the product actually emits. Read at
+/// runtime because the default is 64 KiB (32 KiB on macOS) and
+/// `FRP_BRIDGE_BUF_KB` can change it; pinning a literal here would leave the
+/// stall regression pinned at a size the product no longer sends.
+fn frame_len() -> usize {
+    *frp_core::buffer_pool::BUFFER_SIZE
+}
 const TOTAL_FRAMES: usize = 320; // ~10 MB total
 
 #[tokio::test(flavor = "multi_thread")]
@@ -58,7 +64,7 @@ async fn ws_over_tls_burst_does_not_stall() {
         let mut ws = WsByteStream::from_raw(Box::new(tls), false); // server mode
         let head = vec![0x11u8; HEAD_LEN];
         ws.write_all(&head).await.expect("write head");
-        let data = vec![0xABu8; FRAME_LEN];
+        let data = vec![0xABu8; frame_len()];
         for i in 0..TOTAL_FRAMES {
             ws.write_all(&data).await.expect("write frame");
             // Pace every 16 frames (~512 KiB) so the client's kernel never
@@ -82,7 +88,7 @@ async fn ws_over_tls_burst_does_not_stall() {
             .expect("tls connect");
         let mut ws = WsByteStream::from_raw(Box::new(tls), true); // client mode
         let mut total = 0usize;
-        let mut buf = vec![0u8; FRAME_LEN];
+        let mut buf = vec![0u8; frame_len()];
         loop {
             match timeout(Duration::from_secs(5), ws.read(&mut buf)).await {
                 Ok(Ok(0)) => break,
@@ -91,7 +97,7 @@ async fn ws_over_tls_burst_does_not_stall() {
                 Err(_) => panic!("STALLED: read timeout, total={total} bytes"),
             }
         }
-        assert_eq!(total, HEAD_LEN + FRAME_LEN * TOTAL_FRAMES);
+        assert_eq!(total, HEAD_LEN + frame_len() * TOTAL_FRAMES);
     });
 
     let (s, c) = tokio::join!(server_handle, client_handle);

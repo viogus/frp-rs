@@ -363,7 +363,8 @@ pub(crate) async fn dispatch_plugin_start(
 ///
 /// `tokio::io::copy` defaults to an 8 KiB internal buffer; wrapping the
 /// reader in a `BufReader` lets the plugin HTTP/HTTPS data planes honor
-/// `FRP_BRIDGE_BUF_KB` (32 KiB default) without changing flush semantics.
+/// `FRP_BRIDGE_BUF_KB` (64 KiB default, 32 KiB on macOS) without changing
+/// flush semantics.
 pub(super) async fn copy_stream_large<R, W>(reader: R, writer: &mut W) -> std::io::Result<u64>
 where
     R: tokio::io::AsyncRead + Unpin,
