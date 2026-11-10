@@ -12891,15 +12891,29 @@ kept out of the main P2 list so that adding them does not renumber every later
   `scripts/protocol-matrix.floors.macos`. CI enforces, with two 5 s windows per
   row so one scheduling excursion cannot fail a healthy build.
 
-- [ ] **The KCP Go-vs-Rust stream comparison has no publishable number.**
-  Evidence: the withdrawn rows in
-  `docs/archive/notes/2026-11-09-kcp-fec-multiply-tables.md` §"Go frp, measured"
-  came from a bench mode whose three outputs contradict each other (it prints
-  121.2 MiB/s for a 256 MiB transfer, which implies 2.11 s, alongside `in 0.00s`
-  and a 12 ms process lifetime), so the "+23%" figure that reached `README.md` is
-  retracted in `docs/archive/notes/2026-11-10-real-host-throughput.md` §6. The
-  KCP ping-pong rows survive because that mode's durations agree with wall clock.
-  **Done-when:** a one-way harness that reports its own elapsed time runs both
-  stacks on a non-containerised Linux host (the same host rule as
-  `2026-11-10-real-host-throughput.md` §2), and the note + README carry that
-  number — or the note states that no KCP stream comparison is published.
+- [x] **The KCP Go-vs-Rust stream comparison has no publishable number.**
+  Closed 2026-11-11: measured with a one-way harness that reports its own
+  elapsed time, both stacks v0.72.0, on a non-containerised Linux VM. frp-rs
+  49.6 / 49.5 MiB/s against Go's 105.9 / 100.7 (one flow, 2048 MiB, two runs
+  each), 48.6 / 48.3 against 105.9 / 100.9 at four flows, at 2.09x the CPU per
+  byte. `README.md` and
+  `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` carry the numbers; the
+  withdrawn "+23%" stays retracted in
+  `docs/archive/notes/2026-11-10-real-host-throughput.md` section 6.
+
+- [ ] **KCP bulk streams are 2.1x behind Go.**
+  Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` — 49 vs 103
+  MiB/s at one and four flows, CPU per MiB 46.2 ms vs 22.1 ms, and 661,824
+  datagrams per 512 MiB against Go's 536,444 (811 B per datagram vs 1,001 B).
+  FEC parameters, mtu and mss match Go's, so neither the lookup tables nor the
+  configuration explain it; a `perf` run on the stripped binary puts ~26% of
+  frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
+  per-packet. The small-payload shape is the opposite (394 round trips/s against
+  40), which rules out the KCP core's ARQ in general.
+  **Done-when:** all three readings exist on the same host — (a) a debuginfo-build
+  profile (not the stripped release binary; it now puts 16.3% of frps samples in
+  `KcpSession::fec_encode_output`, next to Go's vectorised `klauspost/reedsolomon`
+  encode), (b) a per-session `xmit` (RTO retransmissions) and dead-link reading
+  for both sides, and (c) frp-rs's payload per datagram within ~5% of the 1,020 B
+  a 10+3 group at mss 1326 predicts. Then either a fix lands or the note names
+  the measured mechanism instead of the cost.
