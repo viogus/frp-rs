@@ -312,15 +312,13 @@ impl KcpSocket {
                     for (key, session) in &mut self.sessions {
                         match session.update(now_ms) {
                             Ok(packets) => {
-                                for pkt in packets {
-                                    Self::send_udp_packet(
-                                        &self.socket,
-                                        &mut self.pending_udp,
-                                        pkt,
-                                        key.1,
-                                        &self.chunk_pool,
-                                    );
-                                }
+                                Self::send_packets(
+                                    &self.socket,
+                                    &mut self.pending_udp,
+                                    packets,
+                                    key.1,
+                                    &self.chunk_pool,
+                                );
                             }
                             Err(e) => {
                                 tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP session error");
@@ -857,6 +855,133 @@ impl KcpSocket {
         }
     }
 
+    /// Send a run of datagrams aimed at one peer, batching where the platform
+    /// allows it and queueing whatever the kernel did not take.
+    ///
+    /// Both the flush path and the tick path (ACKs, retransmits) produce runs
+    /// for a single peer, so they share this.
+    fn send_packets(
+        socket: &UdpSocket,
+        pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
+        packets: Vec<Vec<u8>>,
+        peer: SocketAddr,
+        pool: &ArrayQueue<Vec<u8>>,
+    ) {
+        #[cfg(target_os = "linux")]
+        let sent = Self::send_udp_batch(socket, &packets, peer);
+        #[cfg(not(target_os = "linux"))]
+        let sent = 0usize;
+
+        for (i, pkt) in packets.into_iter().enumerate() {
+            if i < sent {
+                chunk_pool_push(pool, pkt);
+            } else {
+                Self::send_udp_packet(socket, pending_udp, pkt, peer, pool);
+            }
+        }
+    }
+
+    /// Send a run of datagrams that all target the same peer.
+    ///
+    /// On Linux this is one `sendmmsg(2)` — a KCP flush produces several
+    /// segments at once (a 1326-byte MSS with 10+3 FEC means ~13 datagrams per
+    /// 16 KiB input burst), and one syscall per segment is measurable at
+    /// stream rates. Everything else keeps the one-syscall-per-packet loop.
+    ///
+    /// Returns how many were sent; the caller recycles those buffers into the
+    /// chunk pool and queues the rest.
+    #[cfg(target_os = "linux")]
+    fn send_udp_batch(socket: &UdpSocket, packets: &[Vec<u8>], peer: SocketAddr) -> usize {
+        use std::os::fd::AsRawFd;
+
+        if packets.len() < 2 {
+            return 0;
+        }
+        let (addr, addr_len) = Self::sockaddr_of(&peer);
+        let mut iovs: Vec<libc::iovec> = packets
+            .iter()
+            .map(|p| libc::iovec {
+                iov_base: p.as_ptr() as *mut libc::c_void,
+                iov_len: p.len(),
+            })
+            .collect();
+        // SAFETY: `mmsghdr` is a C POD and an all-zeroed one is a valid empty
+        // header (null name/iov/control, zero lengths) that the loop below
+        // fills in before the array is handed to the kernel.
+        let zeroed: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        let mut msgs: Vec<libc::mmsghdr> = vec![zeroed; iovs.len()];
+        // SAFETY: every pointer handed to the kernel points into a live
+        // `iovs`/`addr` inside this function, and `msgs` is exactly as long as
+        // `iovs`; the lengths come from the slices themselves.
+        unsafe {
+            for (i, msg) in msgs.iter_mut().enumerate() {
+                msg.msg_hdr.msg_name = (&addr as *const libc::sockaddr_storage).cast_mut().cast();
+                msg.msg_hdr.msg_namelen = addr_len;
+                msg.msg_hdr.msg_iov = &mut iovs[i];
+                msg.msg_hdr.msg_iovlen = 1;
+            }
+            let sent = libc::sendmmsg(
+                socket.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                msgs.len() as libc::c_uint,
+                0,
+            );
+            if sent <= 0 {
+                return 0;
+            }
+            sent as usize
+        }
+    }
+
+    /// Build a `sockaddr` for `sendmmsg`.
+    ///
+    /// Returns the storage plus the length to pass in `msg_namelen`. The
+    /// storage is `sockaddr_storage` rather than a byte array so that the
+    /// `sockaddr_in`/`sockaddr_in6` writes below are aligned for their types
+    /// (a `[u8; 128]` is only byte-aligned, and writing through a misaligned
+    /// pointer is undefined even when the runtime address happens to be fine).
+    #[cfg(target_os = "linux")]
+    fn sockaddr_of(peer: &SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+        // SAFETY: `sockaddr_storage` is a C POD; an all-zero value is a valid
+        // empty storage for any address family, and both arms overwrite the
+        // header they use before the value is handed to the kernel.
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        match peer {
+            SocketAddr::V4(v4) => {
+                // SAFETY: `storage` is aligned for `sockaddr_in` (the family it
+                // is being filled for) and large enough to hold it.
+                unsafe {
+                    let sa = std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in>();
+                    (*sa).sin_family = libc::AF_INET as libc::sa_family_t;
+                    (*sa).sin_port = v4.port().to_be();
+                    (*sa).sin_addr = libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    };
+                }
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            }
+            SocketAddr::V6(v6) => {
+                // SAFETY: as above, for `sockaddr_in6`.
+                unsafe {
+                    let sa = std::ptr::addr_of_mut!(storage).cast::<libc::sockaddr_in6>();
+                    (*sa).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                    (*sa).sin6_port = v6.port().to_be();
+                    (*sa).sin6_addr = libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    };
+                    (*sa).sin6_scope_id = v6.scope_id();
+                }
+                (
+                    storage,
+                    std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                )
+            }
+        }
+    }
+
     /// Re-send packets queued by a previous full send buffer (FIFO).
     fn drain_pending_udp(&mut self) {
         let mut still_pending = VecDeque::new();
@@ -897,15 +1022,13 @@ impl KcpSocket {
             Vec::new()
         };
         let n = packets.len();
-        for pkt in packets {
-            Self::send_udp_packet(
-                &self.socket,
-                &mut self.pending_udp,
-                pkt,
-                peer_addr,
-                &self.chunk_pool,
-            );
-        }
+        Self::send_packets(
+            &self.socket,
+            &mut self.pending_udp,
+            packets,
+            peer_addr,
+            &self.chunk_pool,
+        );
         n
     }
 
@@ -936,6 +1059,61 @@ impl KcpSocket {
             return (conv, src);
         }
         (0, src)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod batch_tests {
+    use super::*;
+
+    /// One `sendmmsg` must deliver every datagram, in order, to the peer the
+    /// caller named — the batch path is only correct if it is indistinguishable
+    /// from the one-syscall-per-packet loop.
+    #[test]
+    fn send_udp_batch_delivers_all_packets_in_order() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = receiver.local_addr().unwrap();
+            let packets: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 16 + i as usize]).collect();
+
+            let sent = KcpSocket::send_udp_batch(&sender, &packets, peer);
+            assert_eq!(sent, packets.len(), "sendmmsg reported a short send");
+
+            let mut buf = [0u8; 64];
+            for (i, pkt) in packets.iter().enumerate() {
+                let (n, from) =
+                    tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+                        .await
+                        .expect("datagram did not arrive")
+                        .unwrap();
+                assert_eq!(from, sender.local_addr().unwrap());
+                assert_eq!(&buf[..n], &pkt[..], "datagram {i} came back changed");
+            }
+        });
+    }
+
+    /// A single packet takes the ordinary path (`sendmmsg` needs at least two),
+    /// so the batch helper must decline rather than assume.
+    #[test]
+    fn send_udp_batch_declines_a_single_packet() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = receiver.local_addr().unwrap();
+            let packets = vec![b"one".to_vec()];
+            assert_eq!(KcpSocket::send_udp_batch(&sender, &packets, peer), 0);
+        });
     }
 }
 
