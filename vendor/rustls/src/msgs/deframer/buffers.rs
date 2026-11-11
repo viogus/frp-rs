@@ -217,12 +217,18 @@ impl DeframerVecBuffer {
         /// service.
         const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
 
-        const READ_SIZE: usize = 4096;
+        // frp-rs vendored patch: read a whole TLS record per syscall instead of 4 KiB.
+        // At 4 KiB a 16 KiB application write arrives as four reads, and every
+        // time the buffer empties `shrink_to` frees the grown capacity, so the
+        // next record re-allocates and re-faults its pages. Profiling a bulk
+        // transfer put `Vec::resize` at 16.9% of frpc's samples; reading a full
+        // record here takes that to nothing for ~14 KiB more per connection.
+        const READ_SIZE: usize = MAX_WIRE_SIZE;
 
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
         // by varying the maximum allowed buffer size here based on whether a prefix of a
         // handshake payload is currently being buffered. Given that the first read of such a
-        // payload will only ever be 4k bytes, the next time we come around here we allow a
+        // payload will only ever fill one read buffer, the next time we come around here we allow a
         // larger buffer size. Once the large message and any following handshake messages in
         // the same flight have been consumed, `pop()` will call `discard()` to reset `used`.
         // At this point, the buffer resizing logic below should reduce the buffer size.
@@ -235,7 +241,7 @@ impl DeframerVecBuffer {
             return Err("message buffer full");
         }
 
-        // If we can and need to increase the buffer size to allow a 4k read, do so. After
+        // If we can and need to increase the buffer size to allow a full read, do so. After
         // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
         // make sure to reduce the buffer size again (large messages should be rare).
         // Also, reduce the buffer size if there are neither full nor partial messages in it,

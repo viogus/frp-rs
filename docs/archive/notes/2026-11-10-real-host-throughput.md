@@ -182,7 +182,7 @@ shipping `tcpMux` path. The deltas here are same-binary A/B comparisons, which
 | one-copy path: `Stream::poll_write_bufs` + `YamuxStream` newtype so the protocol layer takes its vectored branch | neutral (means 1388.6 → 1364.9 at 4 flows) |
 | inline yamux write with a writer lock and mpsc fallback | **−9%** (1274.9 vs 1400 MiB/s at 4 flows) |
 | bridge buffer default 32 KiB → 64 KiB | +12% under `tcpMux`, but −40 to −45% on macOS `ws`/`wss` without `tcpMux`; **later adopted** as 64 KiB (32 KiB still on macOS) — see the bridge-buffer note |
-| rustls `READ_SIZE` 4 KiB → 16 KiB | +2.3% on the laptop, inside a ±4% spread; not adopted |
+| rustls `READ_SIZE` 4 KiB → 16 KiB | +2.3% on the laptop, inside a ±4% spread; **not adopted at 16 KiB** — 16 384 B is still under one record's wire size (16 389 B), so it left the grow-and-shrink cycle in place. Later adopted at `MAX_WIRE_SIZE` (18 437 B), which removes it: see `2026-11-11-tls-record-read-size.md`. |
 
 The frame-coalescing change that *did* land (one `write_all` per protocol frame
 when the writer is not vectored, PR #594) is a different fix: it removed a frame

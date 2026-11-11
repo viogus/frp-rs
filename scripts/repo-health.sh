@@ -2469,10 +2469,10 @@ CLAIMS = [
     # (`Vendored` / `vendors` / `crates.io`), so an unrelated upstream version
     # in the same file (e.g. "hashicorp yamux v0.1.1") cannot satisfy or trip
     # it. Deliberately OUT OF SCOPE, with reasons:
-    #   vendor/rustls/README-FRP-RS.md:66  — the bump-history bullets, a list of
+    #   vendor/rustls/README-FRP-RS.md:101 — the bump-history bullets, a list of
     #                                        historical versions, not the current
     #                                        one
-    #   vendor/rustls/README-FRP-RS.md:112 — crates.io `max_stable_version` /
+    #   vendor/rustls/README-FRP-RS.md:147 — crates.io `max_stable_version` /
     #                                        `newest_version`, which move
     #                                        independently of this vendored copy
     #   docs/developing.md:3932             — the same crates.io fact
@@ -2873,6 +2873,43 @@ if [ "${1:-}" = "--sizes" ]; then
 else
   hdr "Release binary sizes"
   printf '  skipped (pass --sizes to build and measure)\n'
+fi
+
+# Vendored patches must survive a re-vendor. `vendor/rustls` carries two: the
+# SNI arm (covered by `cargo test --test xtcp_quic_sni`) and the deframer read
+# size (covered by `cargo test --test tls_deframer_read_size`). Those tests only
+# run on a machine with the crate built for the target; this gate is the cheap,
+# always-on half — a mechanical 0.23.x re-vendor that copies upstream sources
+# over the patched files reds here even if nobody runs the tests.
+hdr "Vendored patch markers"
+vendor_patch_misses=""
+check_vendor_patch() {
+  local path="$1" pattern="$2" what="$3"
+  case "$path" in
+    */\.*) printf '  FAIL  vendored patch: path %s is not a regular file\n' "$path"; vendor_patch_misses="$vendor_patch_misses$path:not-a-file\n"; return 1 ;;
+  esac
+  if [ ! -f "$path" ] || [ -L "$path" ]; then
+    printf '  FAIL  vendored patch: %s is missing or not a regular file\n' "$path"
+    vendor_patch_misses="$vendor_patch_misses$path:missing\n"
+    return 1
+  fi
+  if grep -qF -- "$pattern" "$path" 2>/dev/null; then
+    printf '  ok    %s carries %s\n' "$path" "$what"
+  else
+    printf '  FAIL  vendored patch: %s does not carry %s (%s) — a re-vendor dropped it\n' \
+      "$path" "$what" "$pattern"
+    vendor_patch_misses="$vendor_patch_misses$path:missing-pattern\n"
+    return 1
+  fi
+}
+if [ -d vendor/rustls/src ]; then
+  check_vendor_patch 'vendor/rustls/src/msgs/deframer/buffers.rs' \
+    'const READ_SIZE: usize = MAX_WIRE_SIZE;' 'the whole-record READ_SIZE patch' || fail=1
+else
+  # The fixture suite builds stub trees that carry only `vendor/<crate>/Cargo.toml`;
+  # a real tree always has the vendored sources, and one that lost them fails the
+  # build through `[patch.crates-io]` before this gate matters.
+  printf '  -     vendored patch markers: no vendor/rustls/src in this tree, skipped\n'
 fi
 
 # Self-check: no captured gate output may contain a failure *line* while the run
