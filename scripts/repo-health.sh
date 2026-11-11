@@ -2469,10 +2469,10 @@ CLAIMS = [
     # (`Vendored` / `vendors` / `crates.io`), so an unrelated upstream version
     # in the same file (e.g. "hashicorp yamux v0.1.1") cannot satisfy or trip
     # it. Deliberately OUT OF SCOPE, with reasons:
-    #   vendor/rustls/README-FRP-RS.md:66  — the bump-history bullets, a list of
+    #   vendor/rustls/README-FRP-RS.md:96  — the bump-history bullets, a list of
     #                                        historical versions, not the current
     #                                        one
-    #   vendor/rustls/README-FRP-RS.md:112 — crates.io `max_stable_version` /
+    #   vendor/rustls/README-FRP-RS.md:142 — crates.io `max_stable_version` /
     #                                        `newest_version`, which move
     #                                        independently of this vendored copy
     #   docs/developing.md:3932             — the same crates.io fact

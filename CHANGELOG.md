@@ -29,6 +29,16 @@ User-facing release notes for frp-rs.
   of throughput lost); see
   [`docs/archive/notes/2026-11-11-kcp-segment-carry.md`](docs/archive/notes/2026-11-11-kcp-segment-carry.md).
 
+- **TLS: read a whole record per syscall instead of 4 KiB** — the vendored
+  rustls deframer read in 4 KiB steps and freed the grown buffer whenever it
+  emptied, so a 16 KiB record was four reads and its pages were faulted again
+  for the next one: `Vec::resize` was 16.9% of frpc's samples in a bulk
+  transfer. Reading a whole record per syscall is worth +4.2% throughput and
+  −4.8% CPU on a one-flow TLS stream (554.1 → 577.6 MiB/s, eight interleaved
+  pairs on a 4-vCPU Linux VM), +3.5% at four flows, for up to ~14 KiB more per
+  TLS connection; see
+  [`docs/archive/notes/2026-11-11-tls-record-read-size.md`](docs/archive/notes/2026-11-11-tls-record-read-size.md).
+
 - **KCP: one flush per batch of bridge writes** — the driver now coalesces up to
   four queued writes before segmenting and sending, turning ~4,000 flushes per
   second per direction into ~1,000: +4.0% throughput and −4% CPU on a one-flow

@@ -1,8 +1,9 @@
 # Vendored rustls 0.23.46 (frp-rs)
 
-This directory vendors `rustls` 0.23.46 (crates.io) with **one** server-side
-patch, wired in via `[patch.crates-io]` in the workspace root `Cargo.toml`
-(`rustls = { path = "vendor/rustls" }`).
+This directory vendors `rustls` 0.23.46 (crates.io) with **two** patches, wired
+in via `[patch.crates-io]` in the workspace root `Cargo.toml`
+(`rustls = { path = "vendor/rustls" }`): a server-side SNI compatibility patch
+that interop requires, and a read-buffer patch that is a performance choice.
 
 This is the most security-sensitive vendored crate in the tree: it is the TLS
 implementation for frps/frpc. Read the maintenance note below before bumping or
@@ -60,6 +61,35 @@ first flight instead of a fatal alert. It runs in CI as part of
 > step that does. The file is otherwise byte-identical to crates.io, and this
 > has been true since the patch was first vendored — do not "fix" it on a bump
 > unless you also start running these tests.
+
+## Patch: read a whole TLS record per syscall
+
+**Site:** `src/msgs/deframer/buffers.rs`, `DeframerVecBuffer::prepare_read`, the
+`READ_SIZE` constant (4 KiB upstream → `MAX_WIRE_SIZE`, 18 437 B).
+
+**Behavior:** upstream grows the deframer's read buffer in 4 KiB steps and
+`shrink_to`s it back whenever the buffer is empty, so a 16 KiB application
+record is read in four syscalls and the capacity freed after each record is
+re-allocated and re-faulted for the next one. The patch reads up to a full
+record per syscall.
+
+**Why:** profiling a bulk transfer through frps+frpc on a 4-vCPU host
+(`perf record -F 499`, tcpMux + TLS, 8192 MiB one flow) put
+`Vec::<u8>::resize` — instantiated from this crate — at **16.9% of frpc's
+samples**, the single largest user-space entry, with `clear_page_erms` another
+4.3% from the page faults the growth causes. With the patch the same transfer
+measured **+4.2% throughput (554 → 578 MiB/s, eight interleaved pairs) and −4%
+CPU**; four flows measured +3.5%. Numbers, method and limits:
+[`docs/archive/notes/2026-11-11-tls-record-read-size.md`](../../docs/archive/notes/2026-11-11-tls-record-read-size.md).
+
+**Cost:** the read buffer is allocated per TLS connection and only grows to what
+a record needs, so each connection carries up to ~14 KiB more. Nothing about the
+wire format, record sizes, key schedule or certificate handling changes: only
+how many bytes the deframer asks for per `read(2)`.
+
+**Exit condition:** re-check on every rustls bump. Upstream may make the read
+size configurable, size it from the record it is waiting for, or stop shrinking
+capacity between records; if any lands, drop this patch and keep the SNI one.
 
 ## Security release history of the vendored line
 
@@ -124,7 +154,7 @@ Because the crate is patched, `cargo update` will **not** pick up upstream
    backports. Do this as part of every release checklist (see the Security audit
    steps in [`CLAUDE.md`](../../CLAUDE.md)).
 2. When upstream publishes a 0.23.x security release, re-vendor that version and
-   re-apply the one patch. The diff is small and localized (see "Site" above).
+   re-apply both patches. The diffs are small and localized (see "Site" above).
    Concretely: unpack the `.crate` from `static.crates.io`, drop `Cargo.lock`,
    `benches/` and `examples/` (the vendoring convention), keep this README, then
    re-apply the `None` arm.
@@ -136,7 +166,8 @@ Because the crate is patched, `cargo update` will **not** pick up upstream
 ## Diff from crates.io rustls 0.23.46
 
 Everything outside the `Some(ServerNamePayload::Invalid)` arm of
-`src/server/hs.rs` is byte-identical to crates.io rustls 0.23.46 (apart from
-`Cargo.lock`, `benches/` and `examples/`, which are not vendored). The patch
-carries an inline `// frp-rs vendored patch:` comment at the site so it can be
-found with `grep -rn "frp-rs vendored patch" vendor/`.
+`src/server/hs.rs` and the `READ_SIZE` constant of
+`src/msgs/deframer/buffers.rs` is byte-identical to crates.io rustls 0.23.46
+(apart from `Cargo.lock`, `benches/` and `examples/`, which are not vendored).
+Both patches carry an inline `// frp-rs vendored patch:` comment at the site so
+they can be found with `grep -rn "frp-rs vendored patch" vendor/`.

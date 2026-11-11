@@ -622,8 +622,8 @@ scripts/tests/repo-health-fixtures.sh	628	-	6018ad7271207f2f	-	absolute	scripts/
 scripts/tests/repo-health-fixtures.sh	666	-	ea3a01e306ae784f	-	absolute	.github/workflows/ci.yml	scripts/tests/repo-health-fixtures.sh:666	273
 scripts/tests/rss-soak-run-dir.sh	57	-	b73144f48f56d3ae	-	absolute	scripts/frp-stress/baselines/README.md	scripts/tests/rss-soak-run-dir.sh:57	159
 scripts/tests/rss-soak-run-dir.sh	93	-	4aba9fd2ed383d4a	-	absolute	scripts/frp-stress/baselines/README.md	scripts/tests/rss-soak-run-dir.sh:93	162
-vendor/rustls/README-FRP-RS.md	112	-	061ba1967b15cb2c	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:112	2475
-vendor/rustls/README-FRP-RS.md	66	-	da2f3d4cfb7eb930	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:66	2472
+vendor/rustls/README-FRP-RS.md	142	-	061ba1967b15cb2c	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:142	2475
+vendor/rustls/README-FRP-RS.md	96	-	da2f3d4cfb7eb930	-	absolute	scripts/repo-health.sh	vendor/rustls/README-FRP-RS.md:96	2472
 vendor/yamux/src/connection.rs	186	-	01846589e610cd4d	-	shorthand	vendor/yamux/README-FRP-RS.md	:186	392
 vendor/yamux/src/connection.rs	243	-	fe141fed83051941	-	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/connection.rs:243	391
 vendor/yamux/src/connection.rs	630	639	2092f8f4694cd2d1	e3b0c44298fc1c14	absolute	vendor/yamux/README-FRP-RS.md	vendor/yamux/src/connection.rs:630-639	410

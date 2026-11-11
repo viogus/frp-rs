@@ -217,7 +217,13 @@ impl DeframerVecBuffer {
         /// service.
         const MAX_HANDSHAKE_SIZE: u32 = 0xffff;
 
-        const READ_SIZE: usize = 4096;
+        // frp-rs vendored patch: read a whole TLS record per syscall instead of 4 KiB.
+        // At 4 KiB a 16 KiB application write arrives as four reads, and every
+        // time the buffer empties `shrink_to` frees the grown capacity, so the
+        // next record re-allocates and re-faults its pages. Profiling a bulk
+        // transfer put `Vec::resize` at 16.9% of frpc's samples; reading a full
+        // record here takes that to nothing for ~14 KiB more per connection.
+        const READ_SIZE: usize = MAX_WIRE_SIZE;
 
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
         // by varying the maximum allowed buffer size here based on whether a prefix of a
