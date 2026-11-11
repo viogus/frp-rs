@@ -1166,6 +1166,15 @@ impl<Output: Write> Kcp<Output> {
 
     /// Flush pending data in the buffer to the output.
     pub fn flush(&mut self) -> Result<()> {
+        self.flush_with_acks(true)
+    }
+
+    /// Flush pending data in the buffer to the output.
+    ///
+    /// `emit_acks` controls whether the pending ack list is encoded into this
+    /// flush. A caller that flushes on every write can suppress the acks: they
+    /// stay in `acklist` and ride the next flush or the periodic `update()`.
+    pub fn flush_with_acks(&mut self, emit_acks: bool) -> Result<()> {
         if !self.updated {
             return Err(Error::NeedUpdate);
         }
@@ -1178,7 +1187,9 @@ impl<Output: Write> Kcp<Output> {
             ..Default::default()
         };
 
-        self._flush_ack(&mut segment)?;
+        if emit_acks {
+            self._flush_ack(&mut segment)?;
+        }
         self.probe_wnd_size();
         self.flush_probe_commands(&mut segment)?;
 

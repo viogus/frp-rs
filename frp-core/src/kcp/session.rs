@@ -122,6 +122,21 @@ impl Write for KcpWriter {
     }
 }
 
+/// Flush calls between ack emissions when `FRP_KCP_ACK_EVERY` is set.
+fn ack_every() -> u32 {
+    static EVERY: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("FRP_KCP_ACK_EVERY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|n| *n >= 1)
+            .unwrap_or(1)
+    });
+    *EVERY
+}
+
+/// Ack at least this often (ms of KCP clock), however many flushes happen.
+const ACK_MAX_MS: u32 = 5;
+
 pub struct KcpSession {
     conv: u32,
     _peer_addr: std::net::SocketAddr,
@@ -173,6 +188,10 @@ pub struct KcpSession {
     /// Bounded by `mss - 1` bytes in the worst case (anything smaller is
     /// flushed by the 10 ms tick or by an explicit flush).
     carry: Vec<u8>,
+    /// Force-flushes since the last ack emission (see `FRP_KCP_ACK_EVERY`).
+    flushes_since_ack: u32,
+    /// KCP clock of the last ack emission, in ms.
+    last_ack_ms: u32,
     /// Max RS payload length in current pending group.
     pending_max_size: usize,
     /// Set to false when the session is removed from the KcpSocket driver.
@@ -285,6 +304,8 @@ impl KcpSession {
             pending_read: None,
             pending_shards: Vec::new(),
             carry: Vec::new(),
+            flushes_since_ack: 0,
+            last_ack_ms: 0,
             pending_max_size: 0,
             alive,
             snd_backlog: Arc::new(AtomicUsize::new(0)),
@@ -567,7 +588,22 @@ impl KcpSession {
         // This is a no-op if snd_queue was already drained, but critical when
         // poll_flush is called between ticks (e.g. StartWorkConn → flush →
         // bridge data sequence).
-        self.kcp.flush().map_err(io::Error::other)?;
+        //
+        // ACK throttle experiment: writable at most once per N flushes or every
+        // ACK_MAX_MS, so the peer's `una` still advances promptly.
+        let emit_acks = {
+            self.flushes_since_ack += 1;
+            let every = ack_every();
+            let stale = now_ms.wrapping_sub(self.last_ack_ms) >= ACK_MAX_MS;
+            if self.flushes_since_ack >= every || stale {
+                self.flushes_since_ack = 0;
+                self.last_ack_ms = now_ms;
+                true
+            } else {
+                false
+            }
+        };
+        self.kcp.flush_with_acks(emit_acks).map_err(io::Error::other)?;
         self.reconcile_snd_backlog();
         let output = self.kcp.output_mut().drain();
         if output.is_empty() {
