@@ -33,7 +33,7 @@ User-facing release notes for frp-rs.
   driver now drains up to 32 datagrams per readiness event on Linux (other
   platforms keep one per wakeup), so a bulk stream no longer pays a syscall and
   a `select!` iteration per received packet: +3.9% throughput and −4% CPU on a
-  one-flow 2048 MiB stream (60.4 → 62.8 MiB/s, seven interleaved pairs on a
+  one-flow 2048 MiB stream (58.5 → 64.0 MiB/s, four interleaved pairs on a
   4-vCPU Linux VM). Reaching that required routing the call through
   `UdpSocket::try_io`, without which the uncleared readiness starved the write
   arm and the proxy never completed a handshake; see

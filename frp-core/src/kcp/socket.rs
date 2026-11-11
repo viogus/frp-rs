@@ -289,46 +289,43 @@ impl KcpSocket {
     /// single `recv_from` elsewhere. Returns `(slot, len, src)` per datagram,
     /// empty when the socket has nothing left.
     async fn drain_recv(&mut self, slots: &mut [Vec<u8>]) {
+        // `try_io` clears tokio's readiness when a batch comes back empty; a
+        // raw `recvmmsg` would leave the socket marked readable and starve
+        // every other arm of the driver's `select!`.
+        //
+        // The datagrams of a batch are handed over before the next syscall:
+        // subsequent rounds reuse the same slots.
+        let count = slots.len().min(RECV_BATCH);
+        let mut rounds = 0;
         loop {
-            // `try_io` clears tokio's readiness when the batch comes back
-            // empty; a raw `recvmmsg` would leave the socket marked readable
-            // and starve every other arm of the driver's `select!`.
-            let socket = &self.socket;
-            let batch = match socket.try_io(Interest::READABLE, || recv_datagrams(socket, slots)) {
-                Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "KCP UDP recv error");
-                    return;
+            let batch = {
+                let socket = &self.socket;
+                match socket.try_io(Interest::READABLE, || recv_datagrams(socket, slots)) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "KCP UDP recv error");
+                        return;
+                    }
                 }
             };
-            if batch.is_empty() {
-                return;
-            }
             let got = batch.len();
             for (slot, len, src) in batch {
                 self.handle_datagram(&slots[slot][..len], src).await;
             }
-            // A short batch means the socket is drained; loop again otherwise.
-            if got < slots.len() {
+            rounds += 1;
+            if !another_drain_round(got, count, rounds) {
                 return;
             }
         }
     }
 
-    /// Feed one received datagram to the session table.
     async fn handle_datagram(&mut self, data: &[u8], src: SocketAddr) {
         if data.is_empty() {
             return;
         }
-        // Borrow the receive buffer directly instead of
-        // copying with to_vec(): every use below (resolve_key,
-        // is_fec check, session.input) takes `data` by
-        // reference, and this arm contains no `.await`, so
-        // the borrow is dropped before `buf` is reused.
-        // `data` is the received datagram (borrowed for this call).
+        // `data` is the received datagram, borrowed from the driver's receive
+        // slot for this call only; nothing below holds it across an await.
         let key = Self::resolve_key(data, src);
         let is_fec = data.len() >= 6
             && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
@@ -1212,7 +1209,10 @@ fn recv_datagrams(
     }
     let mut out = Vec::with_capacity(rc as usize);
     for (idx, msg) in msgs.iter().enumerate().take(rc as usize) {
-        let len = msg.msg_len as usize;
+        // The kernel reports the copied length because `MSG_TRUNC` is not
+        // requested; clamp anyway so a surprising value cannot slice past the
+        // slot and panic the driver task.
+        let len = (msg.msg_len as usize).min(slots[idx].len());
         let src = match socket_addr_from_storage(&names[idx]) {
             Some(addr) => addr,
             None => continue,
@@ -1239,6 +1239,24 @@ fn recv_datagrams(
     }
 }
 
+/// Rounds (syscalls) one wakeup may drain before the driver returns to its
+/// `select!`.
+///
+/// Without a bound, a peer that keeps the receive queue full would keep this
+/// task inside the receive arm and starve the tick (KCP `update`, ACKs,
+/// retransmits) and the write arms — the same starvation the readiness bug in
+/// `drain_recv` caused, by another route. Four rounds still amortise the
+/// syscall over up to `4 * RECV_BATCH` datagrams.
+const MAX_DRAIN_ROUNDS: usize = 4;
+
+/// Whether the driver should issue another receive syscall in this wakeup.
+///
+/// A short batch means the socket is drained; the round bound keeps a
+/// persistently full queue from starving the other arms of the `select!`.
+fn another_drain_round(got: usize, count: usize, rounds_done: usize) -> bool {
+    got >= count && rounds_done < MAX_DRAIN_ROUNDS
+}
+
 /// Decode a `sockaddr_storage` filled by the kernel into a `SocketAddr`.
 #[cfg(target_os = "linux")]
 fn socket_addr_from_storage(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
@@ -1262,8 +1280,14 @@ fn socket_addr_from_storage(storage: &libc::sockaddr_storage) -> Option<SocketAd
                 &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
             };
             let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-            // A scope id survives only if the address is link-local.
-            Some(SocketAddr::new(ip.into(), u16::from_be(addr.sin6_port)))
+            // Keep the scope id: a link-local peer is only addressable (and
+            // only matches its registered session) with it.
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                u16::from_be(addr.sin6_port),
+                0,
+                addr.sin6_scope_id,
+            )))
         }
         _ => None,
     }
@@ -1321,6 +1345,40 @@ mod batch_tests {
             let packets = vec![b"one".to_vec()];
             assert_eq!(KcpSocket::send_udp_batch(&sender, &packets, peer), 0);
         });
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// A full batch means more may be waiting, until the round bound.
+    #[test]
+    fn another_round_while_batches_stay_full() {
+        assert!(another_drain_round(RECV_BATCH, RECV_BATCH, 1));
+        assert!(another_drain_round(
+            RECV_BATCH,
+            RECV_BATCH,
+            MAX_DRAIN_ROUNDS - 1
+        ));
+    }
+
+    /// The bound is what keeps the driver's tick and write arms alive.
+    #[test]
+    fn no_round_past_the_bound() {
+        assert!(!another_drain_round(
+            RECV_BATCH,
+            RECV_BATCH,
+            MAX_DRAIN_ROUNDS
+        ));
+    }
+
+    /// A short batch means the socket is drained; `WorthBlock` was handled by
+    /// the caller and an empty batch must not spin.
+    #[test]
+    fn no_round_after_a_short_or_empty_batch() {
+        assert!(!another_drain_round(0, RECV_BATCH, 1));
+        assert!(!another_drain_round(RECV_BATCH - 1, RECV_BATCH, 1));
     }
 }
 

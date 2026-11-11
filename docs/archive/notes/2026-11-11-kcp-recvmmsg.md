@@ -36,7 +36,7 @@ cleared exactly when the batch comes back empty.
 ## 3. Result
 
 One-flow 2048 MiB bulk stream, `tcpMux` + TLS, 4-vCPU AMD EPYC-Milan VM,
-loopback, single-thread transfer, five interleaved pairs of the same build
+loopback, single-thread transfer, seven interleaved pairs of the same build
 (`/root/bench/merged` vs the `recvmmsg` build), CPU ticks from
 `/proc/<pid>/stat` (100 Hz):
 
@@ -52,18 +52,41 @@ loopback, single-thread transfer, five interleaved pairs of the same build
 | mean | 60.4 | 62.8 |
 | CPU ticks | 3.92k | 3.76k |
 
-**+3.9% throughput, −4% CPU** — a seventh of what Go's 102 MiB/s still leads by,
-but it is the receive-side counterpart of the `sendmmsg` change and costs
-nothing on the hot path beyond one `recvmmsg` per wakeup.
+**+3.9% throughput, −4% CPU** on that series — about a sixteenth of what Go's
+102 MiB/s still leads by, but it is the receive-side counterpart of the
+`sendmmsg` change.
+
+The shipped build also bounds one wakeup at `MAX_DRAIN_ROUNDS = 4` batches, so a
+persistently full receive queue cannot starve the tick or the write arms. That
+version, re-measured after the review on a busier VM (four pairs, same shape):
+
+| pair | before | after |
+|---|---|---|
+| 1 | 57.5 | 64.4 |
+| 2 | 57.8 | 63.1 |
+| 3 | 59.4 | 63.3 |
+| 4 | 59.2 | 65.1 |
+| mean | 58.5 | 64.0 |
+| CPU ticks | 4.05k | 3.71k |
+
+**+9.4% throughput, −8% CPU** against a baseline that ran ~3% slower than in the
+first series, so the two series bound the effect at +4-9% rather than agreeing
+on one number; the sign and the CPU saving are stable across both.
 
 ## 4. Limits
 
 - Batching is Linux-only. macOS, the BSDs and Windows keep one datagram per
   wakeup (`try_recv_from`), which is the pre-change behaviour.
-- `RECV_BATCH = 32` slots of 2 KiB each: the driver holds 64 KiB of receive
-  buffers, allocated once per socket.
-- The drain loop stops at the first short batch; a packet that arrives between
-  the syscall and the next `select!` simply wakes the driver again.
+- `RECV_BATCH = 32` slots of `DRIVER_RECV_BUF_SIZE` (1500 B) each: the driver holds
+  48 KB of receive
+  buffers, allocated once per socket even on platforms that only use the first
+  slot (the allocation is not yet platform-sized).
+- One wakeup drains at most `MAX_DRAIN_ROUNDS = 4` batches, so a persistently
+  full receive queue cannot starve the driver's tick (KCP `update`, ACKs,
+  retransmits) or its write arms. A packet that arrives between the syscall
+  and the next `select!` simply wakes the driver again.
+- The per-wakeup setup is four small `Vec`s for the `mmsghdr`, `iovec` and
+  name arrays, against the 1-32 `recv_from` calls it replaces.
 - Not measured: multi-flow streams, other transports, or a host without the
   containerised veth the VM runs on.
 
@@ -73,7 +96,7 @@ nothing on the hot path beyond one `recvmmsg` per wakeup.
 # on the VM
 /root/bench/kcp3.sh rs recv-before 1 2048      # baseline build
 # after building the branch into /root/recvbin:
-/root/bench/vmcmp3.sh                          # 3 interleaved pairs
+/root/bench/vmcmp3.sh                          # 7 interleaved pairs
 ```
 
 Scripts: `/root/vmcmp3.sh` (interleaved A/B with per-process CPU),

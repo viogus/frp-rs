@@ -183,7 +183,7 @@ Method, host details, the retractions and the limits:
 
 **Not every shape is faster.** On bulk KCP streams — one to four flows of a
 2048 MiB one-way transfer over loopback, `tcpMux` and TLS on — frp-rs moves
-63 MiB/s where Go moves 102, at about 1.7× the CPU per byte (78 against 45
+64 MiB/s where Go moves 102, at about 1.6× the CPU per byte (74 against 45
 CPU-seconds per 2048 MiB), while KCP's small-payload latency is far better
 (394 round trips/s against 40 — a different harness and host, so direction
 only). That gap was 49 versus 103 when it was first measured: the AVX2 parity
