@@ -470,6 +470,7 @@ impl KcpSocket {
                     self.chunk_pool.clone(),
                 );
                 if let Err(e) = session.input(data) {
+                    eprintln!("DBGFAIL conv={} err={e}", key.0);
                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
                     return;
                 }
@@ -481,6 +482,7 @@ impl KcpSocket {
                 // Share the session's send-queue backlog counter with the
                 // stream so poll_write can gate on a stalled peer (window 0)
                 // instead of letting snd_queue grow without bound.
+                eprintln!("DBGCREATE conv={}", key.0);
                 let (snd_backlog, snd_notify) = session.snd_backlog_handle();
                 let stream = KcpStream::new(
                     key.0,
