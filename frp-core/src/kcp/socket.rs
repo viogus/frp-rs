@@ -291,12 +291,18 @@ impl KcpSocket {
         loop {
             let batch = match recv_datagrams(&self.socket, slots) {
                 Ok(b) => b,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    return;
+                }
                 Err(e) => {
+                    eprintln!("DBGRECV err {e:?}");
                     tracing::warn!(error = %e, "KCP UDP recv error");
                     return;
                 }
             };
+            if std::env::var_os("DBGRECV").is_some() {
+                eprintln!("DBGRECV batch={} first={:?}", batch.len(), batch.first());
+            }
             if batch.is_empty() {
                 return;
             }
@@ -313,6 +319,9 @@ impl KcpSocket {
 
     /// Feed one received datagram to the session table.
     async fn handle_datagram(&mut self, data: &[u8], src: SocketAddr) {
+        if std::env::var_os("DBGRECV").is_some() {
+            eprintln!("DBGHANDLE len={} src={}", data.len(), src);
+        }
         if data.is_empty() {
             return;
         }
