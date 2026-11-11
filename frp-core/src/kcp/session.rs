@@ -160,6 +160,18 @@ pub struct KcpSession {
     pending_read: Option<Vec<u8>>,
     /// Inter-packet FEC: pending data shard RS payloads (SIZE + raw KCP data).
     pending_shards: Vec<Vec<u8>>,
+    /// Bytes held back because they do not fill a whole KCP segment.
+    ///
+    /// `send_carry` sends only whole `mss`-sized segments and keeps the
+    /// remainder here, so the next write tops it up instead of starting a
+    /// new, short segment. Without this every bridge write ends with a
+    /// partial segment: at a 16 KiB write against a 1326-byte mss that is
+    /// 13 segments where 12.4 would do, i.e. ~6% more datagrams and ~8%
+    /// more kcp segments than the payload needs.
+    ///
+    /// Bounded by `mss - 1` bytes in the worst case (anything smaller is
+    /// flushed by the 10 ms tick or by an explicit flush).
+    carry: Vec<u8>,
     /// Max RS payload length in current pending group.
     pending_max_size: usize,
     /// Set to false when the session is removed from the KcpSocket driver.
@@ -271,6 +283,7 @@ impl KcpSession {
             shutdown: false,
             pending_read: None,
             pending_shards: Vec::new(),
+            carry: Vec::new(),
             pending_max_size: 0,
             alive,
             snd_backlog: Arc::new(AtomicUsize::new(0)),
@@ -461,6 +474,61 @@ impl KcpSession {
             sent += self.send(chunk)?;
         }
         Ok(sent)
+    }
+
+    /// Queue `data`, holding back a trailing partial segment.
+    ///
+    /// Sends only whole `mss`-sized segments and keeps the remainder in
+    /// `self.carry`, so the next write tops it up instead of starting a
+    /// short segment. Every bridge write ends on a chunk boundary that is
+    /// almost never a segment boundary (a 16 KiB read is 12.4 segments), so
+    /// without this each write wastes one segment: the measured payload was
+    /// 1,244 bytes per segment against an mss of 1,326.
+    ///
+    /// Returns `Ok(true)` when at least one whole segment was queued, so the
+    /// caller knows whether a flush has anything to send. A write smaller
+    /// than one segment that arrives with an empty carry is sent immediately
+    /// (the interactive path: no latency added for small writes).
+    pub fn send_carry(&mut self, data: &[u8]) -> io::Result<bool> {
+        let mss = self.kcp.mss().max(1);
+        if self.carry.is_empty() && data.len() < mss {
+            self.send_chunked(data)?;
+            return Ok(true);
+        }
+
+        self.carry.extend_from_slice(data);
+        let full = self.carry.len() / mss * mss;
+        if full == 0 {
+            return Ok(false);
+        }
+
+        let mut buf = std::mem::take(&mut self.carry);
+        let sent = self.send_chunked(&buf[..full]);
+        // Keep the tail for the next write; capacity is reused either way.
+        buf.copy_within(full.., 0);
+        buf.truncate(buf.len().saturating_sub(full));
+        self.carry = buf;
+        sent.map(|_| true)
+    }
+
+    /// Send the held-back tail, if any. Called from the 10 ms tick (so a
+    /// paused stream does not strand its last bytes) and on explicit flush
+    /// (control messages must reach the wire immediately).
+    pub fn flush_carry(&mut self) -> io::Result<bool> {
+        if self.carry.is_empty() {
+            return Ok(false);
+        }
+        let mut buf = std::mem::take(&mut self.carry);
+        let sent = self.send_chunked(&buf);
+        buf.clear();
+        self.carry = buf;
+        sent.map(|_| true)
+    }
+
+    /// Bytes currently held back because they do not fill a segment.
+    #[cfg(test)]
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
     }
 
     /// Force KCP to flush pending data and produce output packets immediately.
@@ -749,7 +817,7 @@ impl KcpSession {
                     // `recv_buf[..n].to_vec()` copy is gone. The channel
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // session.rs:416), so a hostile peer cannot inflate it.
+                    // session.rs:428), so a hostile peer cannot inflate it.
                     //
                     // Read-side pool (M4): the buffer is drawn from the
                     // shared chunk pool (the same pool KcpWriter draws
@@ -935,6 +1003,41 @@ mod tests {
                 nc: true,
             },
         }
+    }
+
+    #[test]
+    fn send_carry_holds_back_a_partial_segment() {
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel(16);
+        let mut session =
+            KcpSession::new(7, "127.0.0.1:9000".parse().unwrap(), test_config(), read_tx);
+        let mss = session.kcp.mss();
+        assert_eq!(session.carry_len(), 0);
+
+        // A write smaller than one segment on an empty carry is the
+        // interactive path: sent immediately, so latency-sensitive callers
+        // are unaffected.
+        assert!(session.send_carry(&[1u8; 64]).unwrap());
+        assert_eq!(session.carry_len(), 0);
+
+        // A write that ends mid-segment holds the remainder back and reports
+        // that a whole segment was queued.
+        assert!(session.send_carry(&vec![2u8; mss + 100]).unwrap());
+        assert_eq!(session.carry_len(), 100);
+
+        // Top the carry up without reaching a whole segment: nothing queued.
+        assert!(!session.send_carry(&vec![3u8; mss - 101]).unwrap());
+        assert_eq!(session.carry_len(), mss - 1);
+
+        // One more byte completes the segment and empties the carry.
+        assert!(session.send_carry(&[4u8; 1]).unwrap());
+        assert_eq!(session.carry_len(), 0);
+
+        // Explicit flush releases a held-back tail (the control-message path).
+        assert!(session.send_carry(&vec![5u8; mss + 50]).unwrap());
+        assert_eq!(session.carry_len(), 50);
+        assert!(session.flush_carry().unwrap());
+        assert_eq!(session.carry_len(), 0);
+        assert!(!session.flush_carry().unwrap());
     }
 
     #[test]

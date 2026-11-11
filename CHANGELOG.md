@@ -16,6 +16,18 @@ User-facing release notes for frp-rs.
 - **Bridge buffer now defaults to 64 KiB — +13.5% on `tcpMux` + TLS.** The buffer is also the tcpMux frame payload, so a bridge chunk travels as one yamux frame instead of two: on a 4-vCPU Linux VM, five interleaved pairs of the same binary with only `FRP_BRIDGE_BUF_KB` changing measured 526 → 597 MiB/s (**+13.5%**, every pair positive), +12.8% at one stream, +13.9% on WebSocket without mux, and no change on the plain rows. `FRP_BRIDGE_BUF_KB` still overrides it (4–1024). The same size ships on macOS: its WebSocket streaming rows gain more than the Linux ones (mean-to-mean +55% at one flow, +33% at four flows), and the ping-pong row that once argued for 32 KiB there measures frame latency, not throughput. Three structural alternatives — one `writev` per yamux frame, a one-copy vectored write into the frame body, and inline writes from the bridge task — were built and measured at zero gain; see [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](docs/archive/notes/2026-11-10-mux-frame-cost.md) and [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
 ### Fixes
+- **KCP: fill a segment before sending it** — the bridge writes whatever one
+  socket read returned (16,406 bytes in the measured runs), which is 12 full
+  1,326-byte segments plus a 494-byte tail, and the tail was sent as its own
+  short segment. Every write now fills segments and the remainder waits for the
+  next write (or the 10 ms tick, or an explicit flush), so the average data
+  segment carries a full mss: +3.8% on a one-flow bulk stream (60.3 → 62.6 MiB/s,
+  three interleaved pairs on a 4-vCPU Linux VM) and 5.1% fewer datagrams. Small
+  interactive writes are unaffected — they are sent immediately. Batching the
+  ack list to the tick was measured and rejected (+48k datagrams saved but 28%
+  of throughput lost); see
+  [`docs/archive/notes/2026-11-11-kcp-segment-carry.md`](docs/archive/notes/2026-11-11-kcp-segment-carry.md).
+
 - **KCP: one `sendmmsg` per flush and per tick instead of one syscall per datagram** —
   a 10+3 FEC flush emits ~13 data segments plus 3 parity shards; batching them is
   worth +4.4% on a bulk stream (58.8 → 61.3 MiB/s, four interleaved pairs on a

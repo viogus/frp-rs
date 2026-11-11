@@ -310,6 +310,13 @@ impl KcpSocket {
                     self.drain_pending_udp();
                     self.to_remove.clear();
                     for (key, session) in &mut self.sessions {
+                        // A paused stream must not strand its last bytes: any
+                        // held-back tail goes out on the tick.
+                        if let Err(e) = session.flush_carry() {
+                            tracing::debug!(conv = key.0, peer = %key.1, error = %e, "KCP carry flush error");
+                            self.to_remove.push(*key);
+                            continue;
+                        }
                         match session.update(now_ms) {
                             Ok(packets) => {
                                 Self::send_packets(
@@ -460,7 +467,7 @@ impl KcpSocket {
                             // poll_write already claimed it (write chunk >
                             // one KCP window = data loss).
                             let _result = match addr.and_then(|a| self.sessions.get_mut(&(conv, a))) {
-                                Some(session) => session.send_chunked(&data),
+                                Some(session) => session.send_carry(&data),
                                 None => Err(io::Error::new(
                                     io::ErrorKind::NotConnected,
                                     "session not found",
@@ -476,8 +483,16 @@ impl KcpSocket {
                                 // V1 control messages (Login/NewProxy/
                                 // StartWorkConn) would sit in the send queue
                                 // up to ~10-30ms per control round trip.
-                                if let Some(peer_addr) = addr {
-                                    self.flush_session_output(conv, peer_addr).await;
+                                //
+                                // `send_carry` holds back a partial trailing
+                                // segment, so a write that produced no whole
+                                // segment has nothing to flush: the bytes wait
+                                // in the carry for the next write or the tick.
+                                let queued_full_segment = matches!(_result, Ok(true));
+                                if queued_full_segment {
+                                    if let Some(peer_addr) = addr {
+                                        self.flush_session_output(conv, peer_addr).await;
+                                    }
                                 }
                             }
                             // The session's segmentation copied the payload
@@ -506,6 +521,13 @@ impl KcpSocket {
                             tracing::trace!(conv, "KCP SOCKET: flush");
                             let addr = self.conv_index.get(&conv).copied();
                             let npkts = if let Some(peer_addr) = addr {
+                                // Control messages must not wait for a full
+                                // segment: release any held-back tail first.
+                                if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
+                                    if let Err(e) = session.flush_carry() {
+                                        tracing::debug!(conv, error = %e, "KCP SOCKET: flush carry error");
+                                    }
+                                }
                                 self.flush_session_output(conv, peer_addr).await
                             } else {
                                 0
