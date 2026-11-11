@@ -285,14 +285,6 @@ impl KcpSocket {
         (this, handle, accept_rx)
     }
 
-    /// Batch receive on Linux: one `recvmmsg` per burst, falling back to a
-    /// single `recv_from` elsewhere. Returns `(slot, len, src)` per datagram,
-    /// empty when the socket has nothing left.
-    /// Drain output for one session (one `sendmmsg` per burst).
-    async fn flush_burst(&mut self, conv: u32, addr: SocketAddr) {
-        self.flush_session_output(conv, addr).await;
-    }
-
     /// Force a flush of one session (control-plane write or explicit flush).
     async fn handle_flush(&mut self, conv: u32, tx: tokio::sync::oneshot::Sender<()>) {
         let addr = self.conv_index.get(&conv).copied();
@@ -308,6 +300,24 @@ impl KcpSocket {
         };
         tracing::trace!(conv, npkts, "KCP SOCKET: flush sent {} packets", npkts);
         let _ = tx.send(());
+    }
+
+    /// Remember that a batch touched a session, at most once per session:
+    /// a flush drains everything queued so far, so a second mention would
+    /// only re-run the retransmission scan over an unchanged send buffer.
+    fn record_touched(
+        touched: &mut Vec<(u32, SocketAddr)>,
+        full: &mut Vec<(u32, SocketAddr)>,
+        conv: u32,
+        addr: SocketAddr,
+        queued: bool,
+    ) {
+        if !touched.contains(&(conv, addr)) {
+            touched.push((conv, addr));
+        }
+        if queued && !full.contains(&(conv, addr)) {
+            full.push((conv, addr));
+        }
     }
 
     /// Decrement the write backlog and wake one blocked writer.
@@ -334,10 +344,7 @@ impl KcpSocket {
                 Ok(queued) => {
                     tracing::trace!(conv = c, len, "KCP SOCKET: write queued {len} bytes");
                     if let Some(addr) = addr {
-                        touched.push((c, addr));
-                        if queued {
-                            full.push((c, addr));
-                        }
+                        Self::record_touched(&mut touched, &mut full, c, addr, queued);
                     }
                 }
                 Err(e) => {
@@ -361,11 +368,14 @@ impl KcpSocket {
                 }
             }
             if burst_end || full.contains(&(conv, addr)) {
-                self.flush_burst(conv, addr).await;
+                self.flush_session_output(conv, addr).await;
             }
         }
     }
 
+    /// Batch receive on Linux: one `recvmmsg` per burst, falling back to a
+    /// single `recv_from` elsewhere. Returns `(slot, len, src)` per datagram,
+    /// empty when the socket has nothing left.
     async fn drain_recv(&mut self, slots: &mut [Vec<u8>]) {
         // `try_io` clears tokio's readiness when a batch comes back empty; a
         // raw `recvmmsg` would leave the socket marked readable and starve
@@ -778,16 +788,24 @@ impl KcpSocket {
                             // segments), so batching turns one sendmmsg and
                             // one KCP update per write into one per batch.
                             let mut queue: Vec<(u32, Vec<u8>)> = vec![(conv, data)];
-                            while queue.len() < WRITE_BATCH {
+                            let mut taken = 1;
+                            while taken < WRITE_BATCH {
                                 match self.write_rx.try_recv() {
-                                    Ok((c, WriteRequest::Data(d))) => queue.push((c, d)),
+                                    Ok((c, WriteRequest::Data(d))) => {
+                                        queue.push((c, d));
+                                        taken += 1;
+                                    }
                                     // A flush is ordered after the writes that
                                     // preceded it, so drain them first and let
                                     // the flush run once the batch is done.
                                     Ok((c, WriteRequest::Flush(tx))) => {
                                         self.handle_data_burst(&mut queue).await;
                                         self.handle_flush(c, tx).await;
-                                        queue.clear();
+                                        // A flush is ordered after the writes
+                                        // that preceded it; returning to the
+                                        // driver now would starve the tick arm
+                                        // once the batch budget is spent.
+                                        break;
                                     }
                                     Err(_) => break,
                                 }
@@ -804,21 +822,7 @@ impl KcpSocket {
                             // increment the backlog (it uses a oneshot for
                             // wakeup, not the backlog gate).
                             tracing::trace!(conv, "KCP SOCKET: flush");
-                            let addr = self.conv_index.get(&conv).copied();
-                            let npkts = if let Some(peer_addr) = addr {
-                                // Control messages must not wait for a full
-                                // segment: release any held-back tail first.
-                                if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
-                                    if let Err(e) = session.flush_carry() {
-                                        tracing::debug!(conv, error = %e, "KCP SOCKET: flush carry error");
-                                    }
-                                }
-                                self.flush_session_output(conv, peer_addr).await
-                            } else {
-                                0
-                            };
-                            tracing::trace!(conv, npkts, "KCP SOCKET: flush sent {} packets", npkts);
-                            let _ = tx.send(());
+                            self.handle_flush(conv, tx).await;
                         }
                     }
                 }
@@ -1459,6 +1463,29 @@ mod tests {
         assert!(now_wrapped.wrapping_sub(just_before_wrap) <= window);
         let long_ago = u32::MAX - 60_000;
         assert!(now_wrapped.wrapping_sub(long_ago) > window);
+    }
+
+    /// A batch must flush each session at most once: a flush drains everything
+    /// queued so far, so a repeated mention only re-runs the retransmission
+    /// scan over an unchanged send buffer.
+    #[test]
+    fn record_touched_is_idempotent_per_session() {
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let mut touched = Vec::new();
+        let mut full = Vec::new();
+        for _ in 0..3 {
+            KcpSocket::record_touched(&mut touched, &mut full, 7, a, true);
+        }
+        assert_eq!(touched, vec![(7, a)]);
+        assert_eq!(full, vec![(7, a)]);
+
+        // A short write after a full one keeps the "flush now" decision of the
+        // full write, and a second session is recorded independently.
+        KcpSocket::record_touched(&mut touched, &mut full, 7, a, false);
+        KcpSocket::record_touched(&mut touched, &mut full, 9, b, false);
+        assert_eq!(touched, vec![(7, a), (9, b)]);
+        assert_eq!(full, vec![(7, a)], "a short write must not add a flush");
     }
 
     /// Regression for the driver recv-buffer clamp defect: the recv buffer
