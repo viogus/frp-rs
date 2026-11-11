@@ -285,6 +285,94 @@ impl KcpSocket {
         (this, handle, accept_rx)
     }
 
+    /// Force a flush of one session (control-plane write or explicit flush).
+    async fn handle_flush(&mut self, conv: u32, tx: tokio::sync::oneshot::Sender<()>) {
+        let addr = self.conv_index.get(&conv).copied();
+        let npkts = if let Some(peer_addr) = addr {
+            if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
+                if let Err(e) = session.flush_carry() {
+                    tracing::debug!(conv, error = %e, "KCP SOCKET: flush carry error");
+                }
+            }
+            self.flush_session_output(conv, peer_addr).await
+        } else {
+            0
+        };
+        tracing::trace!(conv, npkts, "KCP SOCKET: flush sent {} packets", npkts);
+        let _ = tx.send(());
+    }
+
+    /// Remember that a batch touched a session, at most once per session:
+    /// a flush drains everything queued so far, so a second mention would
+    /// only re-run the retransmission scan over an unchanged send buffer.
+    fn record_touched(
+        touched: &mut Vec<(u32, SocketAddr)>,
+        full: &mut Vec<(u32, SocketAddr)>,
+        conv: u32,
+        addr: SocketAddr,
+        queued: bool,
+    ) {
+        if !touched.contains(&(conv, addr)) {
+            touched.push((conv, addr));
+        }
+        if queued && !full.contains(&(conv, addr)) {
+            full.push((conv, addr));
+        }
+    }
+
+    /// Decrement the write backlog and wake one blocked writer.
+    fn release_write_slot(&mut self) {
+        let _prev = self.write_backlog.fetch_sub(1, Ordering::Release);
+        self.write_notify.notify_one();
+    }
+
+    /// Queue a batch of bridge writes and issue one flush per touched session.
+    async fn handle_data_burst(&mut self, queue: &mut Vec<(u32, Vec<u8>)>) {
+        let mut touched: Vec<(u32, SocketAddr)> = Vec::new();
+        let mut full: Vec<(u32, SocketAddr)> = Vec::new();
+        for (c, data) in queue.drain(..) {
+            let len = data.len();
+            let addr = self.conv_index.get(&c).copied();
+            let result = match addr.and_then(|a| self.sessions.get_mut(&(c, a))) {
+                Some(session) => session.send_carry(&data),
+                None => Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "session not found",
+                )),
+            };
+            match result {
+                Ok(queued) => {
+                    tracing::trace!(conv = c, len, "KCP SOCKET: write queued {len} bytes");
+                    if let Some(addr) = addr {
+                        Self::record_touched(&mut touched, &mut full, c, addr, queued);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(conv = c, len, error = %e, "KCP SOCKET: write failed");
+                }
+            }
+            chunk_pool_push(&self.chunk_pool, data);
+            self.release_write_slot();
+        }
+        // A write that filled a whole segment may go out now; a short write
+        // waits for the next one — except at the end of a burst, where a reply
+        // ending mid-segment would otherwise sit until the 10 ms tick (a 10x
+        // ping-pong regression, measured on #611).
+        let burst_end = self.write_rx.is_empty();
+        for (conv, addr) in touched {
+            if burst_end {
+                if let Some(session) = self.sessions.get_mut(&(conv, addr)) {
+                    if let Err(e) = session.flush_carry() {
+                        tracing::debug!(conv, error = %e, "KCP SOCKET: carry flush error");
+                    }
+                }
+            }
+            if burst_end || full.contains(&(conv, addr)) {
+                self.flush_session_output(conv, addr).await;
+            }
+        }
+    }
+
     /// Batch receive on Linux: one `recvmmsg` per burst, falling back to a
     /// single `recv_from` elsewhere. Returns `(slot, len, src)` per datagram,
     /// empty when the socket has nothing left.
@@ -695,82 +783,34 @@ impl KcpSocket {
                     // each arm.
                     match req {
                         WriteRequest::Data(data) => {
-                            let len = data.len();
-                            // O(1) lookup via conv_index instead of O(n) iter().find().
-                            let addr = self.conv_index.get(&conv).copied();
-                            // Borrow the payload into the session: the KCP
-                            // segmentation copies it into segments, so the
-                            // chunk survives and is recycled into the pool
-                            // below (M1: no fresh Vec alloc per bridge write).
-                            //
-                            // `send_chunked` splits by the window bound:
-                            // `send` rejects one buffer larger than the send
-                            // window (~176 KiB) with UserBufTooBig, which
-                            // would silently drop the payload after
-                            // poll_write already claimed it (write chunk >
-                            // one KCP window = data loss).
-                            let _result = match addr.and_then(|a| self.sessions.get_mut(&(conv, a))) {
-                                Some(session) => session.send_carry(&data),
-                                None => Err(io::Error::new(
-                                    io::ErrorKind::NotConnected,
-                                    "session not found",
-                                )),
-                            };
-                            if let Err(ref e) = _result {
-                                tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed");
-                            } else {
-                                tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
-                                // Flush-on-write: Go kcp-go flushes on every
-                                // Write, but the driver otherwise only drains
-                                // output on the 10ms tick / explicit Flush —
-                                // V1 control messages (Login/NewProxy/
-                                // StartWorkConn) would sit in the send queue
-                                // up to ~10-30ms per control round trip.
-                                //
-                                // `send_carry` holds back a partial trailing
-                                // segment, so a write that produced no whole
-                                // segment has nothing to flush: the bytes wait
-                                // in the carry for the next write or the tick.
-                                let queued_full_segment = matches!(_result, Ok(true));
-                                if queued_full_segment {
-                                    if let Some(peer_addr) = addr {
-                                        self.flush_session_output(conv, peer_addr).await;
+                            // Coalesce up to WRITE_BATCH queued writes into
+                            // one flush: a bridge write is ~16 KiB (12-13
+                            // segments), so batching turns one sendmmsg and
+                            // one KCP update per write into one per batch.
+                            let mut queue: Vec<(u32, Vec<u8>)> = vec![(conv, data)];
+                            let mut taken = 1;
+                            while taken < WRITE_BATCH {
+                                match self.write_rx.try_recv() {
+                                    Ok((c, WriteRequest::Data(d))) => {
+                                        queue.push((c, d));
+                                        taken += 1;
                                     }
+                                    // A flush is ordered after the writes that
+                                    // preceded it, so drain them first and let
+                                    // the flush run once the batch is done.
+                                    Ok((c, WriteRequest::Flush(tx))) => {
+                                        self.handle_data_burst(&mut queue).await;
+                                        self.handle_flush(c, tx).await;
+                                        // A flush is ordered after the writes
+                                        // that preceded it; returning to the
+                                        // driver now would starve the tick arm
+                                        // once the batch budget is spent.
+                                        break;
+                                    }
+                                    Err(_) => break,
                                 }
                             }
-                            // Burst-end flush. `send_carry` holds a partial
-                            // trailing segment back so the NEXT write can fill
-                            // it, which is a win only while writes keep coming.
-                            // When the writer has nothing else queued (a
-                            // request/response shape rather than a bulk
-                            // stream), that tail would otherwise wait for the
-                            // 10 ms tick — and a reply that ends mid-segment
-                            // then costs a full tick of latency, which measured
-                            // as a 10x ping-pong regression (65 -> 6 MiB/s on
-                            // the protocol matrix). Release it now.
-                            if let Some(peer_addr) = addr {
-                                if self.write_rx.is_empty() {
-                                    if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
-                                        if let Err(e) = session.flush_carry() {
-                                            tracing::debug!(conv, error = %e, "KCP SOCKET: carry flush error");
-                                        }
-                                    }
-                                    self.flush_session_output(conv, peer_addr).await;
-                                }
-                            }
-                            // The session's segmentation copied the payload
-                            // out; clear the chunk and return it to the pool
-                            // (dropped if the pool is at its cap).
-                            chunk_pool_push(&self.chunk_pool, data);
-                            // Decrement backlog and wake ONE blocked writer.
-                            // notify_one() stores a permit if no waiters exist,
-                            // preventing the lost-wake race between poll_write's
-                            // notified_owned() and our decrement. (If we used
-                            // notify_waiters() and no waiter is registered yet,
-                            // the notification is lost, permanently blocking the
-                            // writer.)
-                            let _prev = self.write_backlog.fetch_sub(1, Ordering::Release);
-                            self.write_notify.notify_one();
+                            self.handle_data_burst(&mut queue).await;
                         }
                         WriteRequest::Flush(tx) => {
                             // Force immediate KCP flush: update → drain output →
@@ -782,21 +822,7 @@ impl KcpSocket {
                             // increment the backlog (it uses a oneshot for
                             // wakeup, not the backlog gate).
                             tracing::trace!(conv, "KCP SOCKET: flush");
-                            let addr = self.conv_index.get(&conv).copied();
-                            let npkts = if let Some(peer_addr) = addr {
-                                // Control messages must not wait for a full
-                                // segment: release any held-back tail first.
-                                if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
-                                    if let Err(e) = session.flush_carry() {
-                                        tracing::debug!(conv, error = %e, "KCP SOCKET: flush carry error");
-                                    }
-                                }
-                                self.flush_session_output(conv, peer_addr).await
-                            } else {
-                                0
-                            };
-                            tracing::trace!(conv, npkts, "KCP SOCKET: flush sent {} packets", npkts);
-                            let _ = tx.send(());
+                            self.handle_flush(conv, tx).await;
                         }
                     }
                 }
@@ -1229,6 +1255,9 @@ fn recv_datagrams(
     }
 }
 
+/// Writes coalesced into one flush in the driver's write arm.
+const WRITE_BATCH: usize = 4;
+
 /// Rounds (syscalls) one wakeup may drain before the driver returns to its
 /// `select!`.
 ///
@@ -1434,6 +1463,29 @@ mod tests {
         assert!(now_wrapped.wrapping_sub(just_before_wrap) <= window);
         let long_ago = u32::MAX - 60_000;
         assert!(now_wrapped.wrapping_sub(long_ago) > window);
+    }
+
+    /// A batch must flush each session at most once: a flush drains everything
+    /// queued so far, so a repeated mention only re-runs the retransmission
+    /// scan over an unchanged send buffer.
+    #[test]
+    fn record_touched_is_idempotent_per_session() {
+        let a: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:2".parse().unwrap();
+        let mut touched = Vec::new();
+        let mut full = Vec::new();
+        for _ in 0..3 {
+            KcpSocket::record_touched(&mut touched, &mut full, 7, a, true);
+        }
+        assert_eq!(touched, vec![(7, a)]);
+        assert_eq!(full, vec![(7, a)]);
+
+        // A short write after a full one keeps the "flush now" decision of the
+        // full write, and a second session is recorded independently.
+        KcpSocket::record_touched(&mut touched, &mut full, 7, a, false);
+        KcpSocket::record_touched(&mut touched, &mut full, 9, b, false);
+        assert_eq!(touched, vec![(7, a), (9, b)]);
+        assert_eq!(full, vec![(7, a)], "a short write must not add a flush");
     }
 
     /// Regression for the driver recv-buffer clamp defect: the recv buffer
