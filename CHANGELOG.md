@@ -20,10 +20,11 @@ User-facing release notes for frp-rs.
   socket read returned (16,406 bytes in the measured runs), which is 12 full
   1,326-byte segments plus a 494-byte tail, and the tail was sent as its own
   short segment. Every write now fills segments and the remainder waits for the
-  next write (or the 10 ms tick, or an explicit flush), so the average data
-  segment carries a full mss: +3.8% on a one-flow bulk stream (60.3 → 62.6 MiB/s,
-  three interleaved pairs on a 4-vCPU Linux VM) and 5.1% fewer datagrams. Small
-  interactive writes are unaffected — they are sent immediately. Batching the
+  next write (or the 10 ms tick, or an explicit flush), so a write no longer
+  ends in a short segment: +3.8% on a one-flow bulk stream (60.3 → 62.6 MiB/s,
+  three interleaved pairs on a 4-vCPU Linux VM) and 5.1% fewer datagrams. A
+  write smaller than one segment is still sent immediately when no segment is
+  pending; one that follows a partial write waits at most one 10 ms tick. Batching the
   ack list to the tick was measured and rejected (+48k datagrams saved but 28%
   of throughput lost); see
   [`docs/archive/notes/2026-11-11-kcp-segment-carry.md`](docs/archive/notes/2026-11-11-kcp-segment-carry.md).

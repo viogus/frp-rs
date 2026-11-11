@@ -166,8 +166,9 @@ pub struct KcpSession {
     /// remainder here, so the next write tops it up instead of starting a
     /// new, short segment. Without this every bridge write ends with a
     /// partial segment: at a 16 KiB write against a 1326-byte mss that is
-    /// 13 segments where 12.4 would do, i.e. ~6% more datagrams and ~8%
-    /// more kcp segments than the payload needs.
+    /// 13 segments where 12.4 would do: one short tail per write, ~5% more
+    /// segments than the payload needs, and the tail also drags the average
+    /// payload per segment below mss.
     ///
     /// Bounded by `mss - 1` bytes in the worst case (anything smaller is
     /// flushed by the 10 ms tick or by an explicit flush).
@@ -485,12 +486,16 @@ impl KcpSession {
     /// without this each write wastes one segment: the measured payload was
     /// 1,244 bytes per segment against an mss of 1,326.
     ///
-    /// Returns `Ok(true)` when at least one whole segment was queued, so the
-    /// caller knows whether a flush has anything to send. A write smaller
-    /// than one segment that arrives with an empty carry is sent immediately
-    /// (the interactive path: no latency added for small writes).
+    /// Returns `Ok(true)` when a flush has something to send: either a whole
+    /// segment was queued, or a write smaller than one segment was sent
+    /// straight through (the interactive path, which adds no latency but also
+    /// does not fill a segment). Returns `Ok(false)` only when the bytes were
+    /// held back in the carry and nothing was queued.
     pub fn send_carry(&mut self, data: &[u8]) -> io::Result<bool> {
         let mss = self.kcp.mss().max(1);
+        if data.is_empty() {
+            return Ok(false);
+        }
         if self.carry.is_empty() && data.len() < mss {
             self.send_chunked(data)?;
             return Ok(true);
@@ -503,12 +508,24 @@ impl KcpSession {
         }
 
         let mut buf = std::mem::take(&mut self.carry);
-        let sent = self.send_chunked(&buf[..full]);
-        // Keep the tail for the next write; capacity is reused either way.
-        buf.copy_within(full.., 0);
-        buf.truncate(buf.len().saturating_sub(full));
-        self.carry = buf;
-        sent.map(|_| true)
+        match self.send_chunked(&buf[..full]) {
+            Ok(_) => {
+                // Keep the tail for the next write; capacity is reused.
+                buf.copy_within(full.., 0);
+                buf.truncate(buf.len().saturating_sub(full));
+                self.carry = buf;
+                Ok(true)
+            }
+            Err(e) => {
+                // Nothing left the session: keep every byte so a later flush
+                // retries instead of silently dropping a prefix. Unreachable
+                // today (`send_chunked` splits at 127*mss and `send` only
+                // rejects `count >= KCP_WND_RCV`), but the carry is the one
+                // place where a dropped byte would corrupt the stream.
+                self.carry = buf;
+                Err(e)
+            }
+        }
     }
 
     /// Send the held-back tail, if any. Called from the 10 ms tick (so a
@@ -519,10 +536,19 @@ impl KcpSession {
             return Ok(false);
         }
         let mut buf = std::mem::take(&mut self.carry);
-        let sent = self.send_chunked(&buf);
-        buf.clear();
-        self.carry = buf;
-        sent.map(|_| true)
+        match self.send_chunked(&buf) {
+            Ok(_) => {
+                buf.clear();
+                self.carry = buf;
+                Ok(true)
+            }
+            Err(e) => {
+                // Keep the bytes: a control message that failed to enqueue
+                // must not be reported as flushed.
+                self.carry = buf;
+                Err(e)
+            }
+        }
     }
 
     /// Bytes currently held back because they do not fill a segment.
@@ -817,7 +843,7 @@ impl KcpSession {
                     // `recv_buf[..n].to_vec()` copy is gone. The channel
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // session.rs:428), so a hostile peer cannot inflate it.
+                    // session.rs:429), so a hostile peer cannot inflate it.
                     //
                     // Read-side pool (M4): the buffer is drawn from the
                     // shared chunk pool (the same pool KcpWriter draws

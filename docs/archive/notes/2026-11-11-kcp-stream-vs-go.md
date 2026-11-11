@@ -41,7 +41,11 @@ number comes from a **different harness and host** (Linux container,
    The FEC parameters are not the difference — `frp-core/src/kcp/mod.rs` mirrors
    kcp-go's `10, 3` with mtu 1350 and mss 1326, and a 10+3 group at that mss
    predicts ~1,020 B per datagram, which is where Go lands. Why frp-rs lands at
-   811 is **not established**. The leading candidate is **retransmission and
+   811 is **not established** by the measurements in this note. It was subsequently
+explained in `2026-11-11-kcp-segment-carry.md`: short tail segments (~6% capacity
+waste) plus one ack datagram per write (78k against Go's ~9k) account for most
+of it, and filling segments before sending them moved the one-flow stream from
+60.3 to 62.6 MiB/s. The leading candidate is **retransmission and
    control traffic**, not a smaller segment: the socket driver queues a failed
    send in `pending_udp` and drops it once that queue is full, relying on KCP to
    resend (`frp-core/src/kcp/socket.rs:828-842`), and every session already
