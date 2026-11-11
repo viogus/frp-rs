@@ -1170,21 +1170,11 @@ fn recv_datagrams(
     // SAFETY: `sockaddr_storage` is plain old data, so an all-zero value is a
     // valid (family-0) instance; the kernel fills it in.
     let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; count];
-    let mut msgs: Vec<libc::mmsghdr> = vec![
-        libc::mmsghdr {
-            msg_hdr: libc::msghdr {
-                msg_name: std::ptr::null_mut(),
-                msg_namelen: 0,
-                msg_iov: std::ptr::null_mut(),
-                msg_iovlen: 0,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
-                msg_flags: 0,
-            },
-            msg_len: 0,
-        };
-        count
-    ];
+    // SAFETY: `mmsghdr` is a C POD and an all-zeroed one is a valid empty
+    // message header; field literals are not usable because musl's
+    // `msghdr` carries private padding fields.
+    let zeroed: libc::mmsghdr = unsafe { std::mem::zeroed() };
+    let mut msgs: Vec<libc::mmsghdr> = vec![zeroed; count];
     for idx in 0..count {
         msgs[idx].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovecs[idx]);
         msgs[idx].msg_hdr.msg_iovlen = 1;
@@ -1200,7 +1190,7 @@ fn recv_datagrams(
             socket.as_raw_fd(),
             msgs.as_mut_ptr(),
             count as libc::c_uint,
-            libc::MSG_DONTWAIT,
+            libc::MSG_DONTWAIT as _,
             std::ptr::null_mut(),
         )
     };
