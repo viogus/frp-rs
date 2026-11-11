@@ -12901,12 +12901,13 @@ kept out of the main P2 list so that adding them does not renumber every later
   withdrawn "+23%" stays retracted in
   `docs/archive/notes/2026-11-10-real-host-throughput.md` section 6.
 
-- [ ] **KCP bulk streams are ~1.7x behind Go (2.1x before the AVX2 parity pass).**
+- [ ] **KCP bulk streams are ~1.6x behind Go (2.1x before the AVX2 parity pass).**
 
   Two of the three known costs are now fixed (AVX2 parity: 49.1 → 58.5 MiB/s
   one-flow means; `sendmmsg` for both the flush and the 10 ms tick: 60.6-61.9
   MiB/s, mean 61.3, against Go's 101.7 re-measured on the same host at the end
-  of this work). What is left is per-packet scheduling
+  of this work; `recvmmsg` batching on the receive side: 60.4 → 62.8 MiB/s,
+  seven interleaved pairs). What is left is per-packet scheduling
   — the current profile puts frps's largest single entry in the kernel's task
   wakeup path (`try_to_wake_up` under `ep_poll_callback`) and frpc's in
   `KcpSocket::run` (4.0%) plus `clock_gettime` (3.4%). Both are driver-loop

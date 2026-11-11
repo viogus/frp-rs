@@ -1170,6 +1170,8 @@ fn recv_datagrams(
             iov_len: slot.len(),
         });
     }
+    // SAFETY: `sockaddr_storage` is plain old data, so an all-zero value is a
+    // valid (family-0) instance; the kernel fills it in.
     let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; count];
     let mut msgs: Vec<libc::mmsghdr> = vec![
         libc::mmsghdr {
@@ -1243,14 +1245,19 @@ fn socket_addr_from_storage(storage: &libc::sockaddr_storage) -> Option<SocketAd
     use std::net::{Ipv4Addr, Ipv6Addr};
     match storage.ss_family as libc::c_int {
         libc::AF_INET => {
-            // SAFETY: family says the storage holds a `sockaddr_in`.
-            let addr =
-                unsafe { &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            let addr = {
+                // SAFETY: `ss_family` says the storage holds a `sockaddr_in`;
+                // the read is bounded by the storage's own size and only
+                // scalar fields (address, port) are touched.
+                unsafe { &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() }
+            };
             let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
             Some(SocketAddr::new(ip.into(), u16::from_be(addr.sin_port)))
         }
         libc::AF_INET6 => {
-            // SAFETY: family says the storage holds a `sockaddr_in6`.
+            // SAFETY: `ss_family` says the storage holds a `sockaddr_in6`; the
+            // read is bounded by the storage's own size and only scalar fields
+            // (address, port) are touched.
             let addr = unsafe {
                 &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
             };
@@ -1314,6 +1321,42 @@ mod batch_tests {
             let packets = vec![b"one".to_vec()];
             assert_eq!(KcpSocket::send_udp_batch(&sender, &packets, peer), 0);
         });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod recv_batch_tests {
+    use super::*;
+
+    /// One `recvmmsg` must hand back every datagram that is queued, with the
+    /// sender address and length intact, and report `WouldBlock` when empty.
+    #[tokio::test]
+    async fn recv_datagrams_returns_queued_packets_in_order() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = receiver.local_addr().unwrap();
+        for i in 0..3u8 {
+            sender.send_to(&[i; 32], peer).await.unwrap();
+        }
+
+        let mut slots: Vec<Vec<u8>> = (0..RECV_BATCH)
+            .map(|_| vec![0u8; DRIVER_RECV_BUF_SIZE])
+            .collect();
+        receiver.readable().await.unwrap();
+        let batch = recv_datagrams(&receiver, &mut slots).unwrap();
+        assert_eq!(batch.len(), 3, "one call must drain all three datagrams");
+        for (idx, (slot, len, src)) in batch.iter().enumerate() {
+            assert_eq!(*len, 32);
+            assert_eq!(*src, sender.local_addr().unwrap());
+            assert_eq!(
+                slots[*slot][0], idx as u8,
+                "datagrams must keep their order"
+            );
+        }
+
+        // An empty socket reports the same `WouldBlock` the drain loop exits on.
+        let err = recv_datagrams(&receiver, &mut slots).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 }
 
