@@ -72,6 +72,12 @@ queue is empty, so a 64 KiB ping-pong round still leaves in the same wakeup that
 received it. `scripts/protocol-matrix.sh` measures `kcp-plain` at 61.3 MiB/s
 after the change, inside that row's spread.
 
+Cross-compatibility: `compat.yml` passed on the merged commit (`f15e1f5e`,
+run 42974707295), which is the suite `CLAUDE.md` requires after a transport
+change — the flush boundary carries the `StartWorkConn`-before-bridge-data
+ordering, so a green compat run is the evidence that ordering still holds
+against Go frp.
+
 ## 4. Limits
 
 - `WRITE_BATCH = 4` is a guess with one measurement behind it; the gain comes
