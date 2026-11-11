@@ -185,15 +185,15 @@ Method, host details, the retractions and the limits:
 
 **Not every shape is faster.** On bulk KCP streams — one to four flows of a
 2048 MiB one-way transfer over loopback, `tcpMux` and TLS on — frp-rs moves
-65 MiB/s where Go moves 99-102, at about 1.5× the CPU per byte (72 against 45
+65-66 MiB/s where Go moves 99-102, at about 1.5× the CPU per byte (69 against 45
 CPU-seconds per 2048 MiB), while KCP's small-payload latency is far better
 (394 round trips/s against 40 — a different harness and host, so direction
 only). That gap was 49 versus 103 when it was first measured: the AVX2 parity
 pass, one `sendmmsg` per flush and tick, filling segments before sending them,
 one `recvmmsg` per wakeup, one flush per batch of writes, and a 1400-byte MTU
 (matching kcp-go) have closed part of it. The rest is per-packet cost: frp-rs
-sends 1.1× Go's datagrams (591k against 535k per 512 MiB), and most of the
-remainder is one ack datagram per write (88k against Go's 18k) — batching those
+sends 1.06× Go's datagrams (568k against 535k per 512 MiB), and most of the
+remainder is one ack datagram per write (74k against Go's 18k) — batching those
 to the tick was measured and costs 28% of throughput, so it stays. The numbers, the
 evidence that separates them and the unestablished part are in
 [`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md`](docs/archive/notes/2026-11-11-kcp-stream-vs-go.md);

@@ -886,7 +886,7 @@ mod tests {
     fn vector_encode_matches_scalar_for_all_lengths() {
         for (data, parity) in [(10usize, 3usize), (4, 2), (3, 2)] {
             let fec = Fec::new(data, parity);
-            for len in [1usize, 5, 16, 31, 32, 33, 63, 100, 1326, 1327] {
+            for len in [1usize, 5, 16, 31, 32, 33, 63, 100, 1376, 1377] {
                 let shards: Vec<Vec<u8>> = (0..data)
                     .map(|i| (0..len).map(|b| (b * 7 + i * 13) as u8).collect())
                     .collect();
@@ -910,7 +910,7 @@ mod tests {
     /// bit-serial loop it replaced.
     #[test]
     fn encode_parity_matches_bitwise_reference() {
-        for (data, parity, block) in [(10, 3, 1350), (4, 2, 37), (1, 1, 256), (3, 2, 1299)] {
+        for (data, parity, block) in [(10, 3, 1400), (4, 2, 37), (1, 1, 256), (3, 2, 1299)] {
             let fec = Fec::new(data, parity);
             let shards: Vec<Vec<u8>> = (0..data)
                 .map(|i: usize| {

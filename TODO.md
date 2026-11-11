@@ -12917,8 +12917,9 @@ kept out of the main P2 list so that adding them does not renumber every later
   Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` and
   `docs/archive/notes/2026-11-11-kcp-avx2-parity.md` /
   `docs/archive/notes/2026-11-11-kcp-sendmmsg.md` — 49 vs 103 MiB/s when first
-  measured (65 vs 99-102 now), CPU per MiB 46.2 ms vs 22.1 ms, and 590,837
-  datagrams per 512 MiB against Go's 534,678. FEC parameters, mtu and mss now
+  measured (65 vs 99-102 now), CPU per MiB 46.2 ms vs 22.1 ms, and 568,440
+  datagrams per 512 MiB against Go's 534,678 (73,632 outbound acks against
+  18,424). FEC parameters, mtu and mss now
   match Go's, so neither the lookup tables nor the configuration explain it; a `perf` run on the stripped binary puts ~26% of
   frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
   per-packet. The small-payload shape is the opposite (394 round trips/s against
@@ -12931,6 +12932,6 @@ kept out of the main P2 list so that adding them does not renumber every later
   profile (not the stripped release binary; the pre-vectorisation profile put
   16.3% of frps samples in `KcpSession::fec_encode_output`, and the current one
   has not been re-taken), (b) a per-session `xmit` (RTO retransmissions) and dead-link reading
-  for both sides, and (c) frp-rs's payload per datagram within ~5% of the 1,020 B
-  a 10+3 group at mss 1326 predicts. Then either a fix lands or the note names
+  for both sides, and (c) frp-rs's payload per datagram within ~5% of the 1,058 B
+  a 10+3 group at mss 1376 predicts. Then either a fix lands or the note names
   the measured mechanism instead of the cost.

@@ -23,7 +23,10 @@ User-facing release notes for frp-rs.
   stream measures **+3.8% throughput and −6.3% CPU per MiB** (six interleaved
   pairs, both orders; `docs/archive/notes/2026-11-11-kcp-mtu-1400.md`). The
   wire is compatible: peers read into a 1500-byte slot and every peer built
-  since 2026-08-13 does, and Go's own default is 1400.
+  since 2026-08-13 does, and Go's own default is 1400. **Upgrade both ends
+  together**: an frp-rs peer older than 2026-08-13 sizes its receive buffer
+  from its own MTU, so it truncates these datagrams (`InvalidSegmentDataSize`,
+  then a retransmit loop) instead of degrading gracefully.
 
 ### Fixes
 - **KCP: fill a segment before sending it** — the bridge writes whatever one

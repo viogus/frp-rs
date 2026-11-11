@@ -24,7 +24,7 @@ pub use stream::KcpStream;
 ///
 /// The MTU is 1400, which is what kcp-go (and therefore Go frp) uses: a
 /// datagram then carries 1376 bytes of KCP payload instead of 1326, i.e. 3.6%
-/// fewer datagrams for the same stream. Measured at +3.8% throughput and -4.8%
+/// fewer datagrams for the same stream. Measured at +3.8% throughput and -6.3%
 /// CPU per MiB on a bulk KCP stream (six pairs, both orders:
 /// `docs/archive/notes/2026-11-11-kcp-mtu-1400.md`). Peers read into a
 /// 1500-byte slot (`DRIVER_RECV_BUF_SIZE`), so a 1400-MTU datagram is accepted

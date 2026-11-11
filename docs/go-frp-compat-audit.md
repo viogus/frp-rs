@@ -33,7 +33,7 @@ frp-rs targets Go frp v0.72.0 wire compatibility. Core tunneling (TCP/UDP/HTTP/S
 |-----------|------|--------|-------------|-------|
 | TCP | ✅ | ✅ | ✅ | Full interop verified by compat tests |
 | WebSocket | ✅ | ✅ | ✅ | Both client and server use Raw mode WsByteStream — treats all WS data frames as opaque bytes, tolerating Go frp TEXT frames with non-UTF-8 payload. Client masks outgoing frames per RFC 6455 §5.3. |
-| KCP | ✅ | ✅ | ✅ Full interop | Window 1024, MTU 1350. Go↔Rust KCP passes both directions, including KCP+TLS and KCP+tcpMux — Go frp v0.71.0 applies TLS and yamux over its KCP session layer exactly like TCP (frps `server/service.go` HandleListener runs CheckAndEnableTLSServerConn + fmux.Server over kcpListener; frpc `client/connector.go` realConnect applies TLS hooks with WithProtocol("kcp") and Open wraps in fmux.Client). Rust side uses the in-tree KCP implementation (kcp-go v5.6.13 aligned). |
+| KCP | ✅ | ✅ | ✅ Full interop | Window 1024, MTU 1400. Go↔Rust KCP passes both directions, including KCP+TLS and KCP+tcpMux — Go frp v0.71.0 applies TLS and yamux over its KCP session layer exactly like TCP (frps `server/service.go` HandleListener runs CheckAndEnableTLSServerConn + fmux.Server over kcpListener; frpc `client/connector.go` realConnect applies TLS hooks with WithProtocol("kcp") and Open wraps in fmux.Client). Rust side uses the in-tree KCP implementation (kcp-go v5.6.13 aligned). |
 | QUIC | ✅ | ✅ | ✅ Full interop | ALPN `"frp"`. Multi-stream QuicConnection wrapper accepts Go frp quic-go additional streams. Full Go↔Rust cross-compat verified. |
 | TLS | ✅ | ✅ | ✅ | `disableCustomTLSFirstByte` controls 0x17 prefix. Full interop with Go frp TLS. |
 
@@ -143,7 +143,7 @@ All key config fields implemented: `proxy_protocol_version` (v1/v2), `response_h
 - ✅ Admin `/api/status`: reports actual `plugin`, `remote_addr`, `err`; status reflects registration state
 - ✅ Config reload: detects changed proxies via config_snapshot hash, supports CloseProxy+NewProxy cycle for add/remove/modify without restart
 - ✅ Go↔Rust XTCP: server-side routing fixed (handle_client() for NatHoleResp wire path); frp-rs visitors default the P2P protocol to **QUIC** (Go parity — empty protocol normalized to `"quic"` via Go `EmptyOr`), `protocol="kcp"` selects the KCP+yamux data plane
-- ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp)
+- ✅ KCP parameters: window 128→1024, MTU 1400→1350 (matches Go frp) — *superseded 2026-11-11: the MTU is back to 1400, which is kcp-go's own default; see `docs/archive/notes/2026-11-11-kcp-mtu-1400.md`*
 - ✅ QUIC: verified both sides use one bidirectional stream per logical channel
 - ✅ Client `/api/metrics`: Prometheus-format metrics endpoint (traffic_in/out, connection_counts, current_conns) — matches server `/metrics`
 - ✅ KCP cross-compat: Rust↔Rust KCP + Go↔Rust KCP (plain, TLS, tcpMux) all pass in both directions — in-tree Rust KCP is aligned with Go kcp-go session layer (kcp-go v5.6.13), verified against Go frp v0.71.0

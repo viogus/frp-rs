@@ -30,7 +30,7 @@ pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 /// memory when a stalled peer (remote window 0, never ACKing) would otherwise
 /// let the KCP send queue grow without limit.
 /// Roughly 2x the default 1024-segment send window: with the default MSS of
-/// ~1376 bytes this caps un-acked + queued data at ~2.8 MiB per session, far
+/// ~1376 bytes this caps un-acked + queued data at ~2.7 MiB per session, far
 /// above the healthy steady-state occupancy (snd_buf drains to the window,
 /// snd_queue drains every flush), so normal full-window throughput is untouched.
 /// Keep it below a single `Kcp`'s practical ceiling; it is a memory bound, not
@@ -1509,8 +1509,15 @@ mod tests {
             DRIVER_RECV_BUF_SIZE,
             max_peer.mtu + KCP_WIRE_OVERHEAD
         );
-        // The default config (mtu 1350) must also land >= 1500 — this is
-        // the exact case that regressed (1358B).
+        // The production default (mtu 1400) must also land >= 1500 — the
+        // pre-2026-08-13 sizing used the local mtu (1358B at 1350).
+        let production = crate::kcp::default_kcp_config();
+        assert!(
+            DRIVER_RECV_BUF_SIZE >= production.mtu + KCP_WIRE_OVERHEAD,
+            "driver recv buffer {}B < production wire packet {}B",
+            DRIVER_RECV_BUF_SIZE,
+            production.mtu + KCP_WIRE_OVERHEAD
+        );
         let default = KcpConfig::default();
         assert!(
             DRIVER_RECV_BUF_SIZE >= default.mtu + KCP_WIRE_OVERHEAD,
