@@ -29,6 +29,14 @@ User-facing release notes for frp-rs.
   of throughput lost); see
   [`docs/archive/notes/2026-11-11-kcp-segment-carry.md`](docs/archive/notes/2026-11-11-kcp-segment-carry.md).
 
+- **KCP: one flush per batch of bridge writes** — the driver now coalesces up to
+  four queued writes before segmenting and sending, turning ~4,000 flushes per
+  second per direction into ~1,000: +4.0% throughput and −4% CPU on a one-flow
+  2048 MiB stream (63.9 → 66.5 MiB/s, eight interleaved pairs on a 4-vCPU Linux
+  VM), with the burst-end rule kept so a request/response shape still answers in
+  the wakeup that received it; see
+  [`docs/archive/notes/2026-11-11-kcp-write-batching.md`](docs/archive/notes/2026-11-11-kcp-write-batching.md).
+
 - **KCP: one `recvmmsg` per wakeup instead of one `recvfrom` per datagram** — the
   driver now drains up to 32 datagrams per readiness event on Linux (other
   platforms keep one per wakeup), so a bulk stream no longer pays a syscall and
