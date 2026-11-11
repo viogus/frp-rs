@@ -23,14 +23,14 @@ use tokio::sync::oneshot;
 #[cfg(feature = "tcp-mux")]
 use futures_util::future::poll_fn;
 #[cfg(feature = "tcp-mux")]
+use futures_util::io::AsyncWrite as _;
+#[cfg(feature = "tcp-mux")]
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
 #[cfg(feature = "tcp-mux")]
-use tokio_util::compat::{
-    Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
-};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 #[cfg(feature = "tcp-mux")]
 use tracing::{debug, warn};
 
@@ -82,8 +82,88 @@ const MAX_PENDING_OPEN_REQUESTS: usize = 64;
 const MUX_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Wrapper type for a yamux stream compatible with tokio's AsyncRead/AsyncWrite.
+///
+/// A newtype rather than `Compat<Stream>` so the write side can forward
+/// `poll_write_vectored` into yamux's `Stream::poll_write_bufs`: the protocol
+/// layer then hands header and payload over as two slices that yamux copies
+/// **once** into its pooled frame body, instead of the protocol layer merging
+/// them into a fresh `Vec` (one copy + one allocation) and yamux copying again.
+/// The read side still delegates through `Compat`, which speaks `ReadBuf`.
 #[cfg(feature = "tcp-mux")]
-pub type YamuxStream = Compat<Stream>;
+pub struct YamuxStream(Stream);
+
+#[cfg(feature = "tcp-mux")]
+impl YamuxStream {
+    pub(crate) fn new(stream: Stream) -> Self {
+        Self(stream)
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl tokio::io::AsyncRead for YamuxStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Zero-sized adapter over a reborrow; `Compat` owns the `ReadBuf`
+        // handshake (it fills through `unsafe { buf.assume_init }`), so this
+        // module needs no new `unsafe`.
+        let mut compat = std::pin::Pin::new(&mut self.get_mut().0).compat();
+        std::pin::Pin::new(&mut compat).poll_read(cx, buf)
+    }
+}
+
+#[cfg(feature = "tcp-mux")]
+impl tokio::io::AsyncWrite for YamuxStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    /// Hand the slices to yamux as ONE data frame (see `poll_write_bufs`).
+    /// The protocol layer's frame write passes exactly two slices (header,
+    /// payload); beyond that, writing just the first is a legal partial
+    /// result — the caller advances and retries.
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let mut stack: [&[u8]; 2] = [&[], &[]];
+        let slices: &[&[u8]] = if bufs.len() > 2 {
+            stack[0] = &bufs[0];
+            &stack[..1]
+        } else {
+            for (slot, buf) in stack.iter_mut().zip(bufs) {
+                *slot = &buf[..];
+            }
+            &stack[..bufs.len()]
+        };
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write_bufs(cx, slices)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_close(cx)
+    }
+}
 
 /// Stub type when tcp-mux is disabled. Never constructed at runtime;
 /// only exists as a type-level stub when the tcp-mux feature is disabled.
@@ -317,6 +397,28 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
             _ => {}
         }
         result
+    }
+
+    // frp-rs patch: forward vectored writes so a yamux frame's header and body
+    // can reach a TCP socket in one `writev` (the default impl would write
+    // only the first slice, costing one syscall per 12-byte header).
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        let result = std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        match &result {
+            std::task::Poll::Pending => this.stall.pending(),
+            std::task::Poll::Ready(Ok(n)) if *n > 0 => this.stall.progress(),
+            _ => {}
+        }
+        result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_shutdown(
@@ -697,7 +799,7 @@ impl YamuxSession {
         // The stream's queued frames (SYN flag / initial window update) are
         // flushed by the driver's I/O pass that served this open, within the
         // same poll. No further wakeup needed.
-        Some(stream.compat())
+        Some(YamuxStream::new(stream))
     }
 }
 
@@ -729,6 +831,51 @@ impl YamuxSession {
 /// - `incoming`: channel receiver for subsequent accepted streams (work connections)
 ///
 /// Spawns a background task to manage the yamux Connection.
+/// `futures::io::AsyncWrite` over a tokio writer that keeps vectored writes.
+///
+/// frp-rs patch: `tokio_util::compat::Compat` does not forward
+/// `poll_write_vectored`, so a yamux frame's 12-byte header and its body would
+/// reach the socket as two separate writes (two syscalls, and a 12-byte
+/// segment ahead of every body). This adapter forwards the vectored call to the
+/// tokio writer, which only does a real `writev` when the underlying transport
+/// supports it — otherwise tokio's default writes the first slice and the
+/// behaviour is exactly the pre-patch one.
+#[cfg(feature = "tcp-mux")]
+struct VectoredWrite<W>(W);
+
+#[cfg(feature = "tcp-mux")]
+impl<W: tokio::io::AsyncWrite + Unpin> futures_util::io::AsyncWrite for VectoredWrite<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
+
 #[cfg(feature = "tcp-mux")]
 pub async fn server_mux<S>(
     stream: S,
@@ -748,7 +895,7 @@ where
     let io = ActivityIo::new(stream, activity.clone(), stall.clone());
     let (read, write) = tokio::io::split(io);
     let mut conn =
-        Connection::new_split(read.compat(), write.compat_write(), yamux_cfg, Mode::Server);
+        Connection::new_split(read.compat(), VectoredWrite(write), yamux_cfg, Mode::Server);
 
     // Accept the first stream — this is the control channel. Bounded by
     // the caller's accept deadline: without it, a client that completes
@@ -770,7 +917,7 @@ where
         }
         .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
 
-    let control_compat = control.compat();
+    let control_compat = YamuxStream::new(control);
 
     // Channel for forwarding accepted work connection streams.
     let (tx, rx) = mpsc::channel(256);
@@ -868,7 +1015,7 @@ where
 
             match stream {
                 Some(Ok(stream)) => {
-                    let compat = stream.compat();
+                    let compat = YamuxStream::new(stream);
                     // Prefer try_send: the common case (channel has room)
                     // must not add a syscall/await. On a full channel, fall
                     // back to a bounded send so a freshly accepted stream is
@@ -973,14 +1120,14 @@ where
     let io = ActivityIo::new(stream, activity.clone(), stall.clone());
     let (read, write) = tokio::io::split(io);
     let mut conn =
-        Connection::new_split(read.compat(), write.compat_write(), yamux_cfg, Mode::Client);
+        Connection::new_split(read.compat(), VectoredWrite(write), yamux_cfg, Mode::Client);
 
     // Open the first stream — this is the control channel.
     let control = poll_fn(|cx| conn.poll_new_outbound(cx))
         .await
         .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
 
-    let control_compat = control.compat();
+    let control_compat = YamuxStream::new(control);
 
     // Shutdown signal: when the last YamuxSession is dropped (shutdown_tx
     // closed), the driver exits — mirrors server_mux's IncomingStreams.
@@ -1792,7 +1939,7 @@ mod tests {
         let control = poll_fn(|cx| conn.poll_new_outbound(cx))
             .await
             .map_err(|e| crate::Error::Protocol(format!("yamux: {e}").into()))?;
-        let control_compat = control.compat();
+        let control_compat = YamuxStream::new(control);
 
         // Session-drop shutdown signal (mirrors client_mux).
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();

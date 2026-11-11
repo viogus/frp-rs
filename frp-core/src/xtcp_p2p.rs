@@ -1020,7 +1020,7 @@ pub async fn xtcp_p2p_connect_yamux(
 ) -> Result<XtcpP2pYamuxStream, String> {
     use futures_util::future::poll_fn;
     use std::time::Duration;
-    use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+    use tokio_util::compat::TokioAsyncReadCompatExt;
     use yamux::{Config, Connection, Mode};
 
     // 1. Punch hole + create KCP stream.
@@ -1215,7 +1215,7 @@ pub async fn xtcp_p2p_connect_yamux(
             .map_err(|e| format!("yamux accept: {e}"))?
     };
 
-    let tokio_stream = stream.compat();
+    let tokio_stream = crate::mux::YamuxStream::new(stream);
 
     tracing::info!(
         conv,

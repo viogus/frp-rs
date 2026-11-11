@@ -384,11 +384,22 @@ impl AsyncRead for Stream {
     }
 }
 
-impl AsyncWrite for Stream {
-    fn poll_write(
+impl Stream {
+    /// frp-rs patch: write several slices as ONE data frame.
+    ///
+    /// `poll_write_vectored` on this stream cannot forward to the socket (the
+    /// frame body must be contiguous), and a caller that merges the slices
+    /// itself pays an extra copy plus an allocation per chunk. Filling the
+    /// pooled body straight from the slices costs one copy total — the same
+    /// copy `poll_write` already made — and keeps the frame count at one.
+    ///
+    /// Returns how many bytes were accepted (a prefix of `bufs`); a caller
+    /// with a partial result must retry with the remaining bytes, exactly as
+    /// with `poll_write`.
+    pub fn poll_write_bufs(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
-        buf: &[u8],
+        bufs: &[&[u8]],
     ) -> Poll<io::Result<usize>> {
         ready!(self
             .sender
@@ -405,21 +416,31 @@ impl AsyncWrite for Stream {
                 shared.writer = Some(cx.waker().clone());
                 return Poll::Pending;
             }
-            let k = std::cmp::min(shared.send_window() as usize, buf.len());
+            let total = bufs
+                .iter()
+                .fold(0usize, |acc, b| acc.saturating_add(b.len()));
+            let k = std::cmp::min(shared.send_window() as usize, total);
             let k = std::cmp::min(k, self.config.split_send_size);
             shared
                 .consume_send_window(k as u32)
                 .expect("not exceed receive window");
             // frp-rs patch: reuse a body buffer from the connection-scoped
-            // pool instead of allocating a fresh `Vec` per chunk (the last
-            // per-chunk allocation on the default tcp-mux data plane; Go's
-            // fatedier fork writes the user slice zero-copy). The driver
+            // pool instead of allocating a fresh `Vec` per chunk. The driver
             // returns the buffer to the pool once the frame is fully written
-            // (`frame::Io` WriteState::Body completion). A full pool just
-            // allocates fresh — this is a cache, not a guarantee.
+            // (`frame::Io` WriteState completion). A full pool just allocates
+            // fresh — this is a cache, not a guarantee.
             let mut body = self.body_pool.pop().unwrap_or_default();
             body.clear();
-            body.extend_from_slice(&buf[..k]);
+            body.reserve(k);
+            let mut left = k;
+            for b in bufs {
+                if left == 0 {
+                    break;
+                }
+                let take = std::cmp::min(left, b.len());
+                body.extend_from_slice(&b[..take]);
+                left -= take;
+            }
             body
         };
         let n = body.len();
@@ -427,10 +448,11 @@ impl AsyncWrite for Stream {
         self.add_flag(frame.header_mut());
         log::trace!("{}/{}: write {} bytes", self.conn, self.id, n);
 
-        // technically, the frame hasn't been sent yet on the wire but from the perspective of this data structure, we've queued the frame for sending
-        // We are tracking this information:
-        // a) to be consistent with outbound streams
-        // b) to correctly test our behaviour around timing of when ACKs are sent. See `ack_timing.rs` test.
+        // technically, the frame hasn't been sent yet on the wire but from the
+        // perspective of this data structure, we've queued the frame for
+        // sending. We are tracking this information: a) to be consistent with
+        // outbound streams b) to correctly test our behaviour around timing of
+        // when ACKs are sent. See `ack_timing.rs` test.
         if frame.header().flags().contains(ACK) {
             self.shared()
                 .update_state(self.conn, self.id, State::Open { acknowledged: true });
@@ -441,6 +463,16 @@ impl AsyncWrite for Stream {
             .start_send(cmd)
             .map_err(|_| self.write_zero_err())?;
         Poll::Ready(Ok(n))
+    }
+}
+
+impl AsyncWrite for Stream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write_bufs(cx, &[buf])
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
