@@ -12908,7 +12908,8 @@ kept out of the main P2 list so that adding them does not renumber every later
   MiB/s, mean 61.3, against Go's 101.7 re-measured on the same host at the end
   of this work; `recvmmsg` batching on the receive side: 58.5 → 64.0 MiB/s, four
   interleaved pairs; one flush per batch of up to four bridge writes:
-  63.9 → 66.5 MiB/s, eight interleaved pairs). What is left is per-packet scheduling
+  63.9 → 66.5 MiB/s, eight interleaved pairs; 1400-byte MTU matching kcp-go:
+  62.4 → 64.8 MiB/s and −6.3% CPU per MiB, six pairs in both orders). What is left is per-packet scheduling
   — the current profile puts frps's largest single entry in the kernel's task
   wakeup path (`try_to_wake_up` under `ep_poll_callback`) and frpc's in
   `KcpSocket::run` (4.0%) plus `clock_gettime` (3.4%). Both are driver-loop
@@ -12916,10 +12917,9 @@ kept out of the main P2 list so that adding them does not renumber every later
   Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` and
   `docs/archive/notes/2026-11-11-kcp-avx2-parity.md` /
   `docs/archive/notes/2026-11-11-kcp-sendmmsg.md` — 49 vs 103 MiB/s when first
-  measured (61 vs 102 now), CPU per MiB 46.2 ms vs 22.1 ms, and 661,824
-  datagrams per 512 MiB against Go's 536,444 (811 B per datagram vs 1,001 B).
-  FEC parameters, mtu and mss match Go's, so neither the lookup tables nor the
-  configuration explain it; a `perf` run on the stripped binary puts ~26% of
+  measured (65 vs 99-102 now), CPU per MiB 46.2 ms vs 22.1 ms, and 590,837
+  datagrams per 512 MiB against Go's 534,678. FEC parameters, mtu and mss now
+  match Go's, so neither the lookup tables nor the configuration explain it; a `perf` run on the stripped binary puts ~26% of
   frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
   per-packet. The small-payload shape is the opposite (394 round trips/s against
   40), which rules out the KCP core's ARQ in general.

@@ -30,7 +30,7 @@ pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 /// memory when a stalled peer (remote window 0, never ACKing) would otherwise
 /// let the KCP send queue grow without limit.
 /// Roughly 2x the default 1024-segment send window: with the default MSS of
-/// ~1350 bytes this caps un-acked + queued data at ~2.7 MiB per session, far
+/// ~1376 bytes this caps un-acked + queued data at ~2.8 MiB per session, far
 /// above the healthy steady-state occupancy (snd_buf drains to the window,
 /// snd_queue drains every flush), so normal full-window throughput is untouched.
 /// Keep it below a single `Kcp`'s practical ceiling; it is a memory bound, not
@@ -221,7 +221,7 @@ impl KcpSocket {
     ) -> (Self, KcpSocketHandle, mpsc::Receiver<KcpStream>) {
         // Clamp a configured MTU that would overflow the driver's fixed recv
         // buffer: `mtu + KCP_WIRE_OVERHEAD` (max wire packet with FEC) must
-        // fit in DRIVER_RECV_BUF_SIZE. The default MTU 1350 is far below the
+        // fit in DRIVER_RECV_BUF_SIZE. The default MTU 1400 is below the
         // cap; only an explicitly oversized config hits this. This is the
         // listen-path clamp; the dial path clamps earlier via
         // `KcpConfig::clamped` (before both KcpSocket::new and KcpSession::new)
@@ -990,7 +990,7 @@ impl KcpSocket {
     /// Send a run of datagrams that all target the same peer.
     ///
     /// On Linux this is one `sendmmsg(2)` — a KCP flush produces several
-    /// segments at once (a 1326-byte MSS with 10+3 FEC means ~13 datagrams per
+    /// segments at once (a 1376-byte MSS with 10+3 FEC means ~13 datagrams per
     /// 16 KiB input burst), and one syscall per segment is measurable at
     /// stream rates. Everything else keeps the one-syscall-per-packet loop.
     ///

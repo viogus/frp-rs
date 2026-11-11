@@ -15,6 +15,16 @@ User-facing release notes for frp-rs.
 
 - **Bridge buffer now defaults to 64 KiB — +13.5% on `tcpMux` + TLS.** The buffer is also the tcpMux frame payload, so a bridge chunk travels as one yamux frame instead of two: on a 4-vCPU Linux VM, five interleaved pairs of the same binary with only `FRP_BRIDGE_BUF_KB` changing measured 526 → 597 MiB/s (**+13.5%**, every pair positive), +12.8% at one stream, +13.9% on WebSocket without mux, and no change on the plain rows. `FRP_BRIDGE_BUF_KB` still overrides it (4–1024). The same size ships on macOS: its WebSocket streaming rows gain more than the Linux ones (mean-to-mean +55% at one flow, +33% at four flows), and the ping-pong row that once argued for 32 KiB there measures frame latency, not throughput. Three structural alternatives — one `writev` per yamux frame, a one-copy vectored write into the frame body, and inline writes from the bridge task — were built and measured at zero gain; see [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](docs/archive/notes/2026-11-10-mux-frame-cost.md) and [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
+### Performance
+
+- **KCP: 1400-byte MTU, matching kcp-go.** Production KCP config used
+  `mtu: 1350` while kcp-go (and therefore Go frp) uses 1400, so every KCP
+  datagram carried 1326 bytes of payload instead of 1376. A one-flow bulk
+  stream measures **+3.8% throughput and −6.3% CPU per MiB** (six interleaved
+  pairs, both orders; `docs/archive/notes/2026-11-11-kcp-mtu-1400.md`). The
+  wire is compatible: peers read into a 1500-byte slot and every peer built
+  since 2026-08-13 does, and Go's own default is 1400.
+
 ### Fixes
 - **KCP: fill a segment before sending it** — the bridge writes whatever one
   socket read returned (16,406 bytes in the measured runs), which is 12 full
