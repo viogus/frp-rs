@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_queue::ArrayQueue;
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
@@ -289,27 +290,24 @@ impl KcpSocket {
     /// empty when the socket has nothing left.
     async fn drain_recv(&mut self, slots: &mut [Vec<u8>]) {
         loop {
-            let batch = match recv_datagrams(&self.socket, slots) {
+            // `try_io` clears tokio's readiness when the batch comes back
+            // empty; a raw `recvmmsg` would leave the socket marked readable
+            // and starve every other arm of the driver's `select!`.
+            let socket = &self.socket;
+            let batch = match socket.try_io(Interest::READABLE, || recv_datagrams(socket, slots)) {
                 Ok(b) => b,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     return;
                 }
                 Err(e) => {
-                    eprintln!("DBGRECV err {e:?}");
                     tracing::warn!(error = %e, "KCP UDP recv error");
                     return;
                 }
             };
-            if std::env::var_os("DBGRECV").is_some() {
-                eprintln!("DBGRECV batch={} first={:?}", batch.len(), batch.first());
-            }
             if batch.is_empty() {
                 return;
             }
             let got = batch.len();
-            if std::env::var_os("DBGRECV").is_some() {
-                eprintln!("DBGSENDCHECK sessions={}", self.sessions.len());
-            }
             for (slot, len, src) in batch {
                 self.handle_datagram(&slots[slot][..len], src).await;
             }
@@ -322,9 +320,6 @@ impl KcpSocket {
 
     /// Feed one received datagram to the session table.
     async fn handle_datagram(&mut self, data: &[u8], src: SocketAddr) {
-        if std::env::var_os("DBGRECV").is_some() {
-            eprintln!("DBGHANDLE len={} src={}", data.len(), src);
-        }
         if data.is_empty() {
             return;
         }
@@ -470,7 +465,6 @@ impl KcpSocket {
                     self.chunk_pool.clone(),
                 );
                 if let Err(e) = session.input(data) {
-                    eprintln!("DBGFAIL conv={} err={e}", key.0);
                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
                     return;
                 }
@@ -482,7 +476,6 @@ impl KcpSocket {
                 // Share the session's send-queue backlog counter with the
                 // stream so poll_write can gate on a stalled peer (window 0)
                 // instead of letting snd_queue grow without bound.
-                eprintln!("DBGCREATE conv={}", key.0);
                 let (snd_backlog, snd_notify) = session.snd_backlog_handle();
                 let stream = KcpStream::new(
                     key.0,
