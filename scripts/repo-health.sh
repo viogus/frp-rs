@@ -2902,8 +2902,15 @@ check_vendor_patch() {
     return 1
   fi
 }
-check_vendor_patch 'vendor/rustls/src/msgs/deframer/buffers.rs' \
-  'const READ_SIZE: usize = MAX_WIRE_SIZE;' 'the whole-record READ_SIZE patch' || fail=1
+if [ -d vendor/rustls/src ]; then
+  check_vendor_patch 'vendor/rustls/src/msgs/deframer/buffers.rs' \
+    'const READ_SIZE: usize = MAX_WIRE_SIZE;' 'the whole-record READ_SIZE patch' || fail=1
+else
+  # The fixture suite builds stub trees that carry only `vendor/<crate>/Cargo.toml`;
+  # a real tree always has the vendored sources, and one that lost them fails the
+  # build through `[patch.crates-io]` before this gate matters.
+  printf '  -     vendored patch markers: no vendor/rustls/src in this tree, skipped\n'
+fi
 
 # Self-check: no captured gate output may contain a failure *line* while the run
 # is about to exit 0. Every verdict above comes from a process exit status or
