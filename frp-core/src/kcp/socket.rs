@@ -1150,6 +1150,8 @@ fn recv_datagrams(
     socket: &UdpSocket,
     slots: &mut [Vec<u8>],
 ) -> io::Result<Vec<(usize, usize, SocketAddr)>> {
+    use std::os::fd::AsRawFd;
+
     let count = slots.len().min(RECV_BATCH);
     if count == 0 {
         return Ok(Vec::new());
