@@ -99,7 +99,7 @@ mod tests {
         // Production KCP paths (client/server dial/listen, XTCP hole-punch
         // sessions, nathole) build their config from `default_kcp_config()`,
         // which matches Go frp v0.69.1's aggressive ListenKcp() defaults:
-        // nodelay=1/interval=20/resend=2/nc=1 with FEC (10,3) and mtu 1350.
+        // nodelay=1/interval=20/resend=2/nc=1 with FEC (10,3) and mtu 1400.
         // `KcpConfig::default()` stays the conservative kcp-go library
         // defaults (nodelay=0, interval=40, no FEC). The split is pin:
         // swapping one for the other would silently disable FEC — a Go peer
@@ -114,6 +114,18 @@ mod tests {
             "trait default keeps kcp-go nodelay=0"
         );
         assert_eq!(conservative.nodelay.interval, 40);
+        // MTU pins the wire framing: kcp-go (and Go frp) default to 1400, so a
+        // datagram carries 1376 bytes of payload. Peers read into a 1500-byte
+        // slot, so this is accepted by any peer built since 2026-08-13.
+        assert_eq!(aggressive.mtu, 1400, "server default follows kcp-go mtu");
+        assert_eq!(
+            aggressive_client.mtu, 1400,
+            "client default follows kcp-go mtu"
+        );
+        assert_eq!(
+            conservative.mtu, 1350,
+            "trait default stays kcp-go's library mtu"
+        );
         assert_eq!(
             (conservative.data_shards, conservative.parity_shards),
             (0, 0),
@@ -125,7 +137,7 @@ mod tests {
         assert_eq!(aggressive.nodelay.resend, 2);
         assert!(aggressive.nodelay.nc, "Go frp nc=1");
         assert_eq!((aggressive.data_shards, aggressive.parity_shards), (10, 3));
-        assert_eq!(aggressive.mtu, 1350);
+        assert_eq!(aggressive.mtu, 1400);
         assert_eq!(aggressive.wnd_size, (1024, 1024));
 
         // The client dial helper must stay wire-identical to the server-side

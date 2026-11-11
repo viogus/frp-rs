@@ -175,7 +175,7 @@ unsafe fn xor_mul_avx2(dst: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16])
             i += 32;
         }
         // Fewer than 32 bytes left (short shards never enter here, but the
-        // tail of a 1326-byte KCP segment does).
+        // tail of a 1376-byte KCP segment does).
         while i < n {
             let b = *sp.add(i);
             *dp.add(i) ^= lo[(b & 0x0f) as usize] ^ hi[(b >> 4) as usize];
@@ -880,13 +880,13 @@ mod tests {
 
     /// The vector path must be byte-identical to the scalar table path for
     /// lengths on both sides of the 32-byte vector width, including the odd
-    /// tails a 1326-byte KCP segment produces. On targets without AVX2 both
+    /// tails a 1376-byte KCP segment produces. On targets without AVX2 both
     /// sides of this assertion are the same loop, so it costs nothing there.
     #[test]
     fn vector_encode_matches_scalar_for_all_lengths() {
         for (data, parity) in [(10usize, 3usize), (4, 2), (3, 2)] {
             let fec = Fec::new(data, parity);
-            for len in [1usize, 5, 16, 31, 32, 33, 63, 100, 1326, 1327] {
+            for len in [1usize, 5, 16, 31, 32, 33, 63, 100, 1376, 1377] {
                 let shards: Vec<Vec<u8>> = (0..data)
                     .map(|i| (0..len).map(|b| (b * 7 + i * 13) as u8).collect())
                     .collect();
@@ -910,7 +910,7 @@ mod tests {
     /// bit-serial loop it replaced.
     #[test]
     fn encode_parity_matches_bitwise_reference() {
-        for (data, parity, block) in [(10, 3, 1350), (4, 2, 37), (1, 1, 256), (3, 2, 1299)] {
+        for (data, parity, block) in [(10, 3, 1400), (4, 2, 37), (1, 1, 256), (3, 2, 1299)] {
             let fec = Fec::new(data, parity);
             let shards: Vec<Vec<u8>> = (0..data)
                 .map(|i: usize| {

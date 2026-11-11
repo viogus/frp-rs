@@ -21,6 +21,14 @@ pub use stream::KcpStream;
 /// Go frp uses nodelay=1, interval=20, resend=2, nc=1 with FEC (10,3).
 /// This differs from `KcpConfig::default()` which uses conservative kcp-go
 /// library defaults (nodelay=0, interval=40, no FEC).
+///
+/// The MTU is 1400, which is what kcp-go (and therefore Go frp) uses: a
+/// datagram then carries 1376 bytes of KCP payload instead of 1326, i.e. 3.6%
+/// fewer datagrams for the same stream. Measured at +3.8% throughput and -6.3%
+/// CPU per MiB on a bulk KCP stream (six pairs, both orders:
+/// `docs/archive/notes/2026-11-11-kcp-mtu-1400.md`). Peers read into a
+/// 1500-byte slot (`DRIVER_RECV_BUF_SIZE`), so a 1400-MTU datagram is accepted
+/// by any peer built since 2026-08-13 and by Go frp.
 pub fn default_kcp_config() -> KcpConfig {
     KcpConfig {
         nodelay: KcpNoDelayConfig {
@@ -30,7 +38,7 @@ pub fn default_kcp_config() -> KcpConfig {
             nc: true,
         },
         wnd_size: (1024, 1024),
-        mtu: 1350,
+        mtu: 1400,
         // Go frp v0.69.1 ListenKcp() uses kcp.ListenWithOptions(addr, nil, 10, 3).
         // FEC IS enabled by default for KCP in Go frp. Match this for compat.
         data_shards: 10,
@@ -50,7 +58,7 @@ pub fn default_kcp_client_config() -> KcpConfig {
             nc: true,
         },
         wnd_size: (1024, 1024),
-        mtu: 1350,
+        mtu: 1400,
         // Go frp v0.69.1 ListenKcp() uses FEC (10,3). Client must match
         // server-side defaults or FEC-wrapped packets will be unparseable.
         data_shards: 10,

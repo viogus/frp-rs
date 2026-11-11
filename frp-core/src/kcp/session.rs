@@ -165,8 +165,8 @@ pub struct KcpSession {
     /// `send_carry` sends only whole `mss`-sized segments and keeps the
     /// remainder here, so the next write tops it up instead of starting a
     /// new, short segment. Without this every bridge write ends with a
-    /// partial segment: at a 16 KiB write against a 1326-byte mss that is
-    /// 13 segments where 12.4 would do: one short tail per write, ~5% more
+    /// partial segment: at a 16 KiB write against a 1376-byte mss that is
+    /// 12 segments where 11.9 would do: one short tail per write, ~5% more
     /// segments than the payload needs, and the tail also drags the average
     /// payload per segment below mss.
     ///
