@@ -307,6 +307,9 @@ impl KcpSocket {
                 return;
             }
             let got = batch.len();
+            if std::env::var_os("DBGRECV").is_some() {
+                eprintln!("DBGSENDCHECK sessions={}", self.sessions.len());
+            }
             for (slot, len, src) in batch {
                 self.handle_datagram(&slots[slot][..len], src).await;
             }
