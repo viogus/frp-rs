@@ -8750,14 +8750,14 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   "the only 0.24 artifact **is**" the dev.1 release, was already wrong at its own 2026-09-17 date and is
   corrected by this re-check. A 0.24 pre-release is not an option for the shipped TLS stack because the
   workspace requires `rustls ^0.23` and the vendored tree patches 0.23.45 specifically, so moving to a dev
-  release would mean depending on a pre-release **and** re-applying the SNI patch to unreleased source (the
+  release would mean depending on a pre-release **and** re-applying both vendor patches to unreleased source (the
   `edition = "2024"` / `rust_version = "1.85"` metadata is *not* the obstacle — the toolchain is pinned well
   above it).
   **Re-checked again 2026-10-04, 2026-10-10 and 2026-10-14** against the same endpoint: `max_stable_version`
   and `newest_version` are now **`0.23.46`** (the 2026-10-14 security release: `RUSTSEC-2026-0346/-0347/
   -0348/-0349`, where 0.23.45 had been the `GHSA-2mjx-qc3c-rqvc` fix), `max_version` is `0.24.0-dev.2`, and
   the only 0.24 artifacts are the prereleases `0.24.0-dev.0` (2026-01-28) and `0.24.0-dev.1` (2026-07-23),
-  as before. 0.23.46 was re-vendored on this branch (SNI patch re-applied; see
+  as before. 0.23.46 was re-vendored on this branch (both vendor patches re-applied; see
   `vendor/rustls/README-FRP-RS.md`), which the new `scripts/vendored-advisory-check.sh` surfaced. No stable
   0.24 has appeared, so the trigger-gated Done-when is unchanged and this item **stays blocked and must not be
   closed**; the next re-check is the only action it needs until upstream ships. The migration below is unchanged
@@ -8769,7 +8769,7 @@ names fourteen arms in twelve rows; that extra count is the likely origin of the
   0.23.45 was the fix for **GHSA-2mjx-qc3c-rqvc** (medium: TLS 1.3 handshake
   messages accepted across encryption-level boundaries; affects 0.23.13–0.23.44
   inclusive, so the previously vendored 0.23.43 *was* affected; same bug as Go
-  `GO-2026-4340`) and 0.23.46 the fix for the four 2026-10-14 advisories. Each re-vendor re-applied the SNI patch and is covered by
+  `GO-2026-4340`) and 0.23.46 the fix for the four 2026-10-14 advisories. Each re-vendor re-applies the vendor patches and is covered by
   `frp-core/tests/xtcp_quic_sni.rs`. The standing obligation is unchanged: while
   the patch exists, 0.23.x security releases arrive only by hand.
   **Done-when (trigger-gated):** *when `max_stable_version` ≥ `0.24`*, upgrade the

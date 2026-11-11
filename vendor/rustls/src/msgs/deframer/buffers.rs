@@ -228,7 +228,7 @@ impl DeframerVecBuffer {
         // We allow a maximum of 64k of buffered data for handshake messages only. Enforce this
         // by varying the maximum allowed buffer size here based on whether a prefix of a
         // handshake payload is currently being buffered. Given that the first read of such a
-        // payload will only ever be 4k bytes, the next time we come around here we allow a
+        // payload will only ever fill one read buffer, the next time we come around here we allow a
         // larger buffer size. Once the large message and any following handshake messages in
         // the same flight have been consumed, `pop()` will call `discard()` to reset `used`.
         // At this point, the buffer resizing logic below should reduce the buffer size.
@@ -241,7 +241,7 @@ impl DeframerVecBuffer {
             return Err("message buffer full");
         }
 
-        // If we can and need to increase the buffer size to allow a 4k read, do so. After
+        // If we can and need to increase the buffer size to allow a full read, do so. After
         // dealing with a large handshake message (exceeding `OutboundOpaqueMessage::MAX_WIRE_SIZE`),
         // make sure to reduce the buffer size again (large messages should be rare).
         // Also, reduce the buffer size if there are neither full nor partial messages in it,

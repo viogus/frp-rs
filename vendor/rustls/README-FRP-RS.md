@@ -82,8 +82,13 @@ measured **+4.2% throughput (554 → 578 MiB/s, eight interleaved pairs) and −
 CPU**; four flows measured +3.5%. Numbers, method and limits:
 [`docs/archive/notes/2026-11-11-tls-record-read-size.md`](../../docs/archive/notes/2026-11-11-tls-record-read-size.md).
 
-**Cost:** the read buffer is allocated per TLS connection and only grows to what
-a record needs, so each connection carries up to ~14 KiB more. Nothing about the
+**Cost:** each TLS connection keeps a whole-record deframer buffer (18 437 B
+after its first read, ~14 KiB more than the 4 KiB window) for its lifetime,
+whatever record sizes it carries — the allocation happens on the first read, so
+a connection that stalls mid-handshake on the unauthenticated accept path pays
+it too. The `received_plaintext` soft limit (`DEFAULT_RECEIVED_PLAINTEXT_LIMIT`,
+16 KiB) can also be overshot by up to one more record's worth of plaintext in a
+single `read_tls`, since it is checked once per call. Nothing about the
 wire format, record sizes, key schedule or certificate handling changes: only
 how many bytes the deframer asks for per `read(2)`.
 
@@ -154,13 +159,19 @@ Because the crate is patched, `cargo update` will **not** pick up upstream
    backports. Do this as part of every release checklist (see the Security audit
    steps in [`CLAUDE.md`](../../CLAUDE.md)).
 2. When upstream publishes a 0.23.x security release, re-vendor that version and
-   re-apply both patches. The diffs are small and localized (see "Site" above).
-   Concretely: unpack the `.crate` from `static.crates.io`, drop `Cargo.lock`,
-   `benches/` and `examples/` (the vendoring convention), keep this README, then
-   re-apply the `None` arm.
-3. Verify the patch survives the re-vendor by running
-   `cargo test -p frp-core --test xtcp_quic_sni` (the focused local proof) and
-   the XTCP QUIC compat scenarios — `bash scripts/download-go-frp.sh && bash scripts/compat-test.sh --verbose`
+   re-apply **both** patches. The diffs are small and localized (see the two
+   "Site" lines above). Concretely: unpack the `.crate` from `static.crates.io`,
+   drop `Cargo.lock`, `benches/` and `examples/` (the vendoring convention),
+   keep this README, then re-apply (a) the `None` arm in
+   `src/server/hs.rs` and (b) `const READ_SIZE: usize = MAX_WIRE_SIZE;` in
+   `src/msgs/deframer/buffers.rs`.
+3. Verify both survive the re-vendor:
+   `cargo test -p frp-core --test xtcp_quic_sni` proves the SNI arm, and
+   `cargo test -p frp-core --test tls_deframer_read_size` proves the read size
+   (it fails with "asked for 4096 bytes" if the constant is back at upstream's
+   value). `scripts/repo-health.sh` also greps for the constant, so a silent
+   re-vendor reds CI. For the SNI patch, additionally run the XTCP QUIC compat
+   scenarios — `bash scripts/download-go-frp.sh && bash scripts/compat-test.sh --verbose`
    plus the daily `xtcp-compat.yml` matrix.
 
 ## Diff from crates.io rustls 0.23.46
