@@ -474,7 +474,7 @@ impl KcpSocket {
                                 )),
                             };
                             if let Err(ref e) = _result {
-                                tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed — session not found");
+                                tracing::error!(conv, len, error = %e, "KCP SOCKET: write failed");
                             } else {
                                 tracing::trace!(conv, len, "KCP SOCKET: write queued {} bytes", len);
                                 // Flush-on-write: Go kcp-go flushes on every
@@ -493,6 +493,26 @@ impl KcpSocket {
                                     if let Some(peer_addr) = addr {
                                         self.flush_session_output(conv, peer_addr).await;
                                     }
+                                }
+                            }
+                            // Burst-end flush. `send_carry` holds a partial
+                            // trailing segment back so the NEXT write can fill
+                            // it, which is a win only while writes keep coming.
+                            // When the writer has nothing else queued (a
+                            // request/response shape rather than a bulk
+                            // stream), that tail would otherwise wait for the
+                            // 10 ms tick — and a reply that ends mid-segment
+                            // then costs a full tick of latency, which measured
+                            // as a 10x ping-pong regression (65 -> 6 MiB/s on
+                            // the protocol matrix). Release it now.
+                            if let Some(peer_addr) = addr {
+                                if self.write_rx.is_empty() {
+                                    if let Some(session) = self.sessions.get_mut(&(conv, peer_addr)) {
+                                        if let Err(e) = session.flush_carry() {
+                                            tracing::debug!(conv, error = %e, "KCP SOCKET: carry flush error");
+                                        }
+                                    }
+                                    self.flush_session_output(conv, peer_addr).await;
                                 }
                             }
                             // The session's segmentation copied the payload
