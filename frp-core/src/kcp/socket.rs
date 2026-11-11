@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_queue::ArrayQueue;
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
@@ -284,6 +285,243 @@ impl KcpSocket {
         (this, handle, accept_rx)
     }
 
+    /// Batch receive on Linux: one `recvmmsg` per burst, falling back to a
+    /// single `recv_from` elsewhere. Returns `(slot, len, src)` per datagram,
+    /// empty when the socket has nothing left.
+    async fn drain_recv(&mut self, slots: &mut [Vec<u8>]) {
+        // `try_io` clears tokio's readiness when a batch comes back empty; a
+        // raw `recvmmsg` would leave the socket marked readable and starve
+        // every other arm of the driver's `select!`.
+        //
+        // The datagrams of a batch are handed over before the next syscall:
+        // subsequent rounds reuse the same slots.
+        let count = slots.len().min(RECV_BATCH);
+        let mut rounds = 0;
+        loop {
+            let batch = {
+                let socket = &self.socket;
+                match socket.try_io(Interest::READABLE, || recv_datagrams(socket, slots)) {
+                    Ok(b) => b,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "KCP UDP recv error");
+                        return;
+                    }
+                }
+            };
+            let got = batch.len();
+            for (slot, len, src) in batch {
+                self.handle_datagram(&slots[slot][..len], src).await;
+            }
+            rounds += 1;
+            if !another_drain_round(got, count, rounds) {
+                return;
+            }
+        }
+    }
+
+    async fn handle_datagram(&mut self, data: &[u8], src: SocketAddr) {
+        if data.is_empty() {
+            return;
+        }
+        // `data` is the received datagram, borrowed from the driver's receive
+        // slot for this call only; nothing below holds it across an await.
+        let key = Self::resolve_key(data, src);
+        let is_fec = data.len() >= 6
+            && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
+                || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
+        tracing::trace!(conv = key.0, peer = %src, len = data.len(), is_fec, "KCP SOCKET: recv {} bytes conv={} fec={}", data.len(), key.0, is_fec);
+        if let Some(session) = self.sessions.get_mut(&key) {
+            if let Err(e) = session.input(data) {
+                tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
+            } else {
+                // Any inbound activity disproves idleness:
+                // stamp for the accepted-session reaper
+                // (M11) before delivering the data.
+                let now_ms = self.start.elapsed().as_millis() as u32;
+                session.note_inbound(now_ms);
+                // Deliver received data to the stream
+                // immediately instead of waiting for the
+                // next 10ms tick (Go kcp-go reads on
+                // arrival).
+                if let Err(e) = session.recv_and_push() {
+                    tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP recv push error");
+                    self.to_remove.push(key);
+                }
+            }
+        } else {
+            // FEC fallback: parity shards and data shards whose conv
+            // wasn't found in sessions are routed by peer_addr.
+            // With 6-byte FEC header (Go kcp-go format), conv is only
+            // available in data shards at offset 8.
+            let is_fec = data.len() >= 6
+                && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
+                    || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
+            let fec_key = if is_fec {
+                // O(1) reverse index lookup instead of O(n) sessions scan.
+                self.peer_addr_index.get(&src).map(|conv| (*conv, src))
+            } else {
+                None
+            };
+            if let Some(fk) = fec_key {
+                if let Some(session) = self.sessions.get_mut(&fk) {
+                    if let Err(e) = session.input(data) {
+                        tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
+                    } else if let Err(e) = session.recv_and_push() {
+                        // Same immediate-delivery path as
+                        // the direct-session lookup above.
+                        tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback recv push error");
+                        self.to_remove.push(fk);
+                    }
+                    // No reaper stamp here (M11): the
+                    // fallback sees parity shards whose
+                    // conv is not in the packet, and a
+                    // parity-only flood from a reused
+                    // peer addr must not keep a dead
+                    // session alive. Real data frames
+                    // always resolve via the direct
+                    // lookup above, which stamps.
+                }
+            } else if key.0 != 0 {
+                // New peer — validate packet before admission.
+                // FEC-enabled sessions accept <6 byte packets as
+                // Ok(()) (too short for header → no-op), which
+                // would create a permanent session from garbage.
+                // Require at minimum a valid KCP header (24 bytes
+                // per kcp crate IKCP_OVERHEAD).
+                const MIN_KCP_PACKET: usize = 24;
+                if data.len() < MIN_KCP_PACKET {
+                    tracing::debug!(conv = key.0, peer = %src, len = data.len(), "KCP new peer: packet too short ({}, min {})", data.len(), MIN_KCP_PACKET);
+                    return;
+                }
+
+                // Admission control — reject if the global
+                // session limit is reached (see the note
+                // above the constants: the per-IP
+                // steady-state cap was removed — same-NAT
+                // collateral DoS, and spoofable source IPs
+                // make per-IP accounting useless against
+                // attackers; rate limits below are the
+                // flood defense).
+                let ip = src.ip();
+                if self.sessions.len() >= MAX_SESSIONS {
+                    tracing::warn!(conv = key.0, peer = %src, total = self.sessions.len(), "KCP: session limit reached ({MAX_SESSIONS}), dropping new conv={}", key.0);
+                    return;
+                }
+                // Session-creation RATE limiting (defense
+                // vs the steady-state caps above): a UDP
+                // flood of 24-byte packets with random
+                // convs must not fill the 256-entry accept
+                // queue (or churn the session table) in
+                // one burst. Limits: 256 new sessions per
+                // 10 s globally, 32 per IP per 10 s.
+                let now_ms = self.start.elapsed().as_millis() as u32;
+                // Trim global log outside the window.
+                while let Some(&t) = self.session_create_log.front() {
+                    if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
+                        self.session_create_log.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if self.session_create_log.len() >= MAX_SESSION_CREATES_PER_WINDOW {
+                    tracing::warn!(conv = key.0, peer = %src, "KCP: session-creation rate limit reached ({MAX_SESSION_CREATES_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
+                    return;
+                }
+                // Trim per-IP log (empty keys are dropped
+                // by the tick cleanup).
+                {
+                    let log = self.ip_session_create_log.entry(ip).or_default();
+                    while let Some(&t) = log.front() {
+                        if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
+                            log.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    if log.len() >= MAX_SESSION_CREATES_PER_IP_PER_WINDOW {
+                        tracing::warn!(conv = key.0, peer = %src, "KCP: per-IP session-creation rate limit reached ({MAX_SESSION_CREATES_PER_IP_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
+                        return;
+                    }
+                    // NOTE: the rate counters are NOT incremented
+                    // here — they are charged only after the
+                    // session is actually created and queued
+                    // (below), so garbage packets that fail
+                    // input() or a saturated accept queue cannot
+                    // consume quota and starve legitimate peers.
+                }
+                // Create session and validate the first packet.
+                // If input() fails on the very first packet, the
+                // data is garbage — don't create a permanent session.
+                let (read_tx, read_rx) = mpsc::channel(256);
+                let mut session = KcpSession::with_chunk_pool(
+                    key.0,
+                    src,
+                    self.config.clone(),
+                    read_tx,
+                    self.chunk_pool.clone(),
+                );
+                if let Err(e) = session.input(data) {
+                    tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
+                    return;
+                }
+                // Baseline the reaper clock (M11) at the
+                // admission packet — an accepted session
+                // that never receives more data is idle
+                // from its creation instant.
+                session.note_inbound(now_ms);
+                // Share the session's send-queue backlog counter with the
+                // stream so poll_write can gate on a stalled peer (window 0)
+                // instead of letting snd_queue grow without bound.
+                let (snd_backlog, snd_notify) = session.snd_backlog_handle();
+                let stream = KcpStream::new(
+                    key.0,
+                    src,
+                    self.write_tx.clone(),
+                    read_rx,
+                    self.write_backlog.clone(),
+                    self.write_notify.clone(),
+                    self.chunk_pool.clone(),
+                    snd_backlog,
+                    snd_notify,
+                    session.alive_handle(),
+                    self.alive_streams.clone(),
+                );
+                if let Err(mpsc::error::TrySendError::Full(_)) = self.accept_tx.try_send(stream) {
+                    tracing::warn!(
+                        conv = key.0,
+                        peer = %key.1,
+                        "KCP: accept channel full, dropping new session"
+                    );
+                    // Clean up the partially-created session.
+                    // peer_addr_index is NOT removed here: the
+                    // session was never inserted (insertion happens
+                    // only after successful try_send below). Removing
+                    // it would clobber the reverse-index entry of a
+                    // sibling session sharing the same SocketAddr,
+                    // silently dropping their FEC parity shards.
+                    self.sessions.remove(&key);
+                    self.conv_index.remove(&key.0);
+                    return;
+                }
+                self.conv_index.insert(key.0, key.1);
+                self.peer_addr_index.insert(key.1, key.0);
+                self.sessions.insert(key, session);
+                let now_ms = self.start.elapsed().as_millis() as u32;
+                self.session_created_at.insert(key, now_ms);
+                // Charge the rate counters only now that the
+                // session is actually created and queued — the
+                // early-return paths above (input() failure,
+                // accept queue full) must not consume quota.
+                self.session_create_log.push_back(now_ms);
+                self.ip_session_create_log
+                    .entry(ip)
+                    .or_default()
+                    .push_back(now_ms);
+            }
+        }
+    }
+
     pub async fn run(mut self) {
         // Drain any pending registrations sent before the driver was spawned.
         // This prevents a race where recv_from fires before register_tx is processed,
@@ -300,7 +538,12 @@ impl KcpSocket {
         // session's mtu only bounds what WE send — sizing the buffer from it
         // would truncate legit mixed-mtu peers' packets, causing
         // InvalidSegmentDataSize → retransmit loop → dead link.
-        let mut buf = vec![0u8; DRIVER_RECV_BUF_SIZE];
+        // Batch receive buffers: one `recvmmsg` fills as many as are queued,
+        // so the driver pays one syscall for a burst of datagrams instead of
+        // one per packet (the recv counterpart of `send_udp_batch`).
+        let mut recv_slots: Vec<Vec<u8>> = (0..RECV_BATCH)
+            .map(|_| vec![0u8; DRIVER_RECV_BUF_SIZE])
+            .collect();
 
         loop {
             tokio::select! {
@@ -558,213 +801,8 @@ impl KcpSocket {
                     }
                 }
 
-                recv_result = self.socket.recv_from(&mut buf) => {
-                    match recv_result {
-                        Ok((n, src)) => {
-                            // Borrow the receive buffer directly instead of
-                            // copying with to_vec(): every use below (resolve_key,
-                            // is_fec check, session.input) takes `data` by
-                            // reference, and this arm contains no `.await`, so
-                            // the borrow is dropped before `buf` is reused.
-                            let data: &[u8] = &buf[..n];
-                            let key = Self::resolve_key(data, src);
-                            let is_fec = data.len() >= 6
-                                && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
-                                    || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
-                            tracing::trace!(conv = key.0, peer = %src, n, is_fec, "KCP SOCKET: recv {} bytes conv={} fec={}", n, key.0, is_fec);
-                            if let Some(session) = self.sessions.get_mut(&key) {
-                                if let Err(e) = session.input(data) {
-                                    tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
-                                } else {
-                                    // Any inbound activity disproves idleness:
-                                    // stamp for the accepted-session reaper
-                                    // (M11) before delivering the data.
-                                    let now_ms = self.start.elapsed().as_millis() as u32;
-                                    session.note_inbound(now_ms);
-                                    // Deliver received data to the stream
-                                    // immediately instead of waiting for the
-                                    // next 10ms tick (Go kcp-go reads on
-                                    // arrival).
-                                    if let Err(e) = session.recv_and_push() {
-                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP recv push error");
-                                        self.to_remove.push(key);
-                                    }
-                                }
-                            } else {
-                                // FEC fallback: parity shards and data shards whose conv
-                                // wasn't found in sessions are routed by peer_addr.
-                                // With 6-byte FEC header (Go kcp-go format), conv is only
-                                // available in data shards at offset 8.
-                                let is_fec = data.len() >= 6
-                                    && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
-                                        || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
-                                let fec_key = if is_fec {
-                                    // O(1) reverse index lookup instead of O(n) sessions scan.
-                                    self.peer_addr_index.get(&src).map(|conv| (*conv, src))
-                                } else {
-                                    None
-                                };
-                                if let Some(fk) = fec_key {
-                                    if let Some(session) = self.sessions.get_mut(&fk) {
-                                        if let Err(e) = session.input(data) {
-                                            tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback input error");
-                                        } else if let Err(e) = session.recv_and_push() {
-                                            // Same immediate-delivery path as
-                                            // the direct-session lookup above.
-                                            tracing::debug!(conv = fk.0, peer = %src, error = %e, "KCP FEC fallback recv push error");
-                                            self.to_remove.push(fk);
-                                        }
-                                        // No reaper stamp here (M11): the
-                                        // fallback sees parity shards whose
-                                        // conv is not in the packet, and a
-                                        // parity-only flood from a reused
-                                        // peer addr must not keep a dead
-                                        // session alive. Real data frames
-                                        // always resolve via the direct
-                                        // lookup above, which stamps.
-                                    }
-                                } else if key.0 != 0 {
-                                    // New peer — validate packet before admission.
-                                    // FEC-enabled sessions accept <6 byte packets as
-                                    // Ok(()) (too short for header → no-op), which
-                                    // would create a permanent session from garbage.
-                                    // Require at minimum a valid KCP header (24 bytes
-                                    // per kcp crate IKCP_OVERHEAD).
-                                    const MIN_KCP_PACKET: usize = 24;
-                                    if data.len() < MIN_KCP_PACKET {
-                                        tracing::debug!(conv = key.0, peer = %src, len = data.len(), "KCP new peer: packet too short ({}, min {})", data.len(), MIN_KCP_PACKET);
-                                        continue;
-                                    }
-
-                                    // Admission control — reject if the global
-                                    // session limit is reached (see the note
-                                    // above the constants: the per-IP
-                                    // steady-state cap was removed — same-NAT
-                                    // collateral DoS, and spoofable source IPs
-                                    // make per-IP accounting useless against
-                                    // attackers; rate limits below are the
-                                    // flood defense).
-                                    let ip = src.ip();
-                                    if self.sessions.len() >= MAX_SESSIONS {
-                                        tracing::warn!(conv = key.0, peer = %src, total = self.sessions.len(), "KCP: session limit reached ({MAX_SESSIONS}), dropping new conv={}", key.0);
-                                        continue;
-                                    }
-                                    // Session-creation RATE limiting (defense
-                                    // vs the steady-state caps above): a UDP
-                                    // flood of 24-byte packets with random
-                                    // convs must not fill the 256-entry accept
-                                    // queue (or churn the session table) in
-                                    // one burst. Limits: 256 new sessions per
-                                    // 10 s globally, 32 per IP per 10 s.
-                                    let now_ms = self.start.elapsed().as_millis() as u32;
-                                    // Trim global log outside the window.
-                                    while let Some(&t) = self.session_create_log.front() {
-                                        if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
-                                            self.session_create_log.pop_front();
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    if self.session_create_log.len() >= MAX_SESSION_CREATES_PER_WINDOW
-                                    {
-                                        tracing::warn!(conv = key.0, peer = %src, "KCP: session-creation rate limit reached ({MAX_SESSION_CREATES_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
-                                        continue;
-                                    }
-                                    // Trim per-IP log (empty keys are dropped
-                                    // by the tick cleanup).
-                                    {
-                                        let log = self.ip_session_create_log.entry(ip).or_default();
-                                        while let Some(&t) = log.front() {
-                                            if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
-                                                log.pop_front();
-                                            } else {
-                                                break;
-                                            }
-                                        }
-                                        if log.len() >= MAX_SESSION_CREATES_PER_IP_PER_WINDOW {
-                                            tracing::warn!(conv = key.0, peer = %src, "KCP: per-IP session-creation rate limit reached ({MAX_SESSION_CREATES_PER_IP_PER_WINDOW}/{SESSION_CREATE_WINDOW_MS}ms), dropping new conv={}", key.0);
-                                            continue;
-                                        }
-                                        // NOTE: the rate counters are NOT incremented
-                                        // here — they are charged only after the
-                                        // session is actually created and queued
-                                        // (below), so garbage packets that fail
-                                        // input() or a saturated accept queue cannot
-                                        // consume quota and starve legitimate peers.
-                                    }
-                                    // Create session and validate the first packet.
-                                    // If input() fails on the very first packet, the
-                                    // data is garbage — don't create a permanent session.
-                                    let (read_tx, read_rx) = mpsc::channel(256);
-                                    let mut session = KcpSession::with_chunk_pool(
-                                        key.0, src, self.config.clone(), read_tx,
-                                        self.chunk_pool.clone(),
-                                    );
-                                    if let Err(e) = session.input(data) {
-                                        tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
-                                        continue;
-                                    }
-                                    // Baseline the reaper clock (M11) at the
-                                    // admission packet — an accepted session
-                                    // that never receives more data is idle
-                                    // from its creation instant.
-                                    session.note_inbound(now_ms);
-                                    // Share the session's send-queue backlog counter with the
-                                    // stream so poll_write can gate on a stalled peer (window 0)
-                                    // instead of letting snd_queue grow without bound.
-                                    let (snd_backlog, snd_notify) = session.snd_backlog_handle();
-                                    let stream = KcpStream::new(
-                                        key.0, src,
-                                        self.write_tx.clone(),
-                                        read_rx,
-                                        self.write_backlog.clone(),
-                                        self.write_notify.clone(),
-                                        self.chunk_pool.clone(),
-                                        snd_backlog,
-                                        snd_notify,
-                                        session.alive_handle(),
-                                        self.alive_streams.clone(),
-                                    );
-                                    if let Err(mpsc::error::TrySendError::Full(_)) =
-                                        self.accept_tx.try_send(stream)
-                                    {
-                                        tracing::warn!(
-                                            conv = key.0,
-                                            peer = %key.1,
-                                            "KCP: accept channel full, dropping new session"
-                                        );
-                                        // Clean up the partially-created session.
-                                        // peer_addr_index is NOT removed here: the
-                                        // session was never inserted (insertion happens
-                                        // only after successful try_send below). Removing
-                                        // it would clobber the reverse-index entry of a
-                                        // sibling session sharing the same SocketAddr,
-                                        // silently dropping their FEC parity shards.
-                                        self.sessions.remove(&key);
-                                        self.conv_index.remove(&key.0);
-                                        continue;
-                                    }
-                                    self.conv_index.insert(key.0, key.1);
-                                    self.peer_addr_index.insert(key.1, key.0);
-                                    self.sessions.insert(key, session);
-                                    let now_ms = self.start.elapsed().as_millis() as u32;
-                                    self.session_created_at.insert(key, now_ms);
-                                    // Charge the rate counters only now that the
-                                    // session is actually created and queued — the
-                                    // early-return paths above (input() failure,
-                                    // accept queue full) must not consume quota.
-                                    self.session_create_log.push_back(now_ms);
-                                    self.ip_session_create_log
-                                        .entry(ip)
-                                        .or_default()
-                                        .push_back(now_ms);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "KCP UDP recv error");
-                        }
-                    }
+                _ = self.socket.readable() => {
+                    self.drain_recv(&mut recv_slots).await;
                     // Drain sessions whose read channel closed during this
                     // recv. The tick arm clears `to_remove` before its own
                     // scan, so entries pushed here would otherwise never be
@@ -1104,6 +1142,147 @@ impl KcpSocket {
     }
 }
 
+/// Datagrams per `recvmmsg` call.
+const RECV_BATCH: usize = 32;
+
+/// Receive every datagram the socket has queued, up to `slots.len()`.
+///
+/// Linux uses one `recvmmsg`; other platforms take a single `recv_from` into
+/// `slots[0]`, which keeps the behaviour identical at one packet per wakeup.
+#[cfg(target_os = "linux")]
+fn recv_datagrams(
+    socket: &UdpSocket,
+    slots: &mut [Vec<u8>],
+) -> io::Result<Vec<(usize, usize, SocketAddr)>> {
+    use std::os::fd::AsRawFd;
+
+    let count = slots.len().min(RECV_BATCH);
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(count);
+    for slot in slots.iter_mut().take(count) {
+        iovecs.push(libc::iovec {
+            iov_base: slot.as_mut_ptr().cast(),
+            iov_len: slot.len(),
+        });
+    }
+    // SAFETY: `sockaddr_storage` is plain old data, so an all-zero value is a
+    // valid (family-0) instance; the kernel fills it in.
+    let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; count];
+    // SAFETY: `mmsghdr` is a C POD and an all-zeroed one is a valid empty
+    // message header; field literals are not usable because musl's
+    // `msghdr` carries private padding fields.
+    let zeroed: libc::mmsghdr = unsafe { std::mem::zeroed() };
+    let mut msgs: Vec<libc::mmsghdr> = vec![zeroed; count];
+    for idx in 0..count {
+        msgs[idx].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovecs[idx]);
+        msgs[idx].msg_hdr.msg_iovlen = 1;
+        msgs[idx].msg_hdr.msg_name = std::ptr::addr_of_mut!(names[idx]).cast();
+        msgs[idx].msg_hdr.msg_namelen =
+            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    }
+    // SAFETY: `msgs`, `iovecs` and `names` outlive the call and each
+    // `msg_hdr` points at its own entry; the kernel writes at most one
+    // datagram per message, bounded by the slot's length.
+    let rc = unsafe {
+        libc::recvmmsg(
+            socket.as_raw_fd(),
+            msgs.as_mut_ptr(),
+            count as libc::c_uint,
+            libc::MSG_DONTWAIT as _,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut out = Vec::with_capacity(rc as usize);
+    for (idx, msg) in msgs.iter().enumerate().take(rc as usize) {
+        // The kernel reports the copied length because `MSG_TRUNC` is not
+        // requested; clamp anyway so a surprising value cannot slice past the
+        // slot and panic the driver task.
+        let len = (msg.msg_len as usize).min(slots[idx].len());
+        let src = match socket_addr_from_storage(&names[idx]) {
+            Some(addr) => addr,
+            None => continue,
+        };
+        out.push((idx, len, src));
+    }
+    Ok(out)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn recv_datagrams(
+    socket: &UdpSocket,
+    slots: &mut [Vec<u8>],
+) -> io::Result<Vec<(usize, usize, SocketAddr)>> {
+    let slot = match slots.first_mut() {
+        Some(slot) => slot,
+        None => return Ok(Vec::new()),
+    };
+    // `recv_from` on a non-blocking socket reports WouldBlock exactly like
+    // `recvmmsg` does, so the caller's drain loop is unchanged.
+    match socket.try_recv_from(slot) {
+        Ok((len, src)) => Ok(vec![(0, len, src)]),
+        Err(e) => Err(e),
+    }
+}
+
+/// Rounds (syscalls) one wakeup may drain before the driver returns to its
+/// `select!`.
+///
+/// Without a bound, a peer that keeps the receive queue full would keep this
+/// task inside the receive arm and starve the tick (KCP `update`, ACKs,
+/// retransmits) and the write arms — the same starvation the readiness bug in
+/// `drain_recv` caused, by another route. Four rounds still amortise the
+/// syscall over up to `4 * RECV_BATCH` datagrams.
+const MAX_DRAIN_ROUNDS: usize = 4;
+
+/// Whether the driver should issue another receive syscall in this wakeup.
+///
+/// A short batch means the socket is drained; the round bound keeps a
+/// persistently full queue from starving the other arms of the `select!`.
+fn another_drain_round(got: usize, count: usize, rounds_done: usize) -> bool {
+    got >= count && rounds_done < MAX_DRAIN_ROUNDS
+}
+
+/// Decode a `sockaddr_storage` filled by the kernel into a `SocketAddr`.
+#[cfg(target_os = "linux")]
+fn socket_addr_from_storage(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let addr = {
+                // SAFETY: `ss_family` says the storage holds a `sockaddr_in`;
+                // the read is bounded by the storage's own size and only
+                // scalar fields (address, port) are touched.
+                unsafe { &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() }
+            };
+            let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            Some(SocketAddr::new(ip.into(), u16::from_be(addr.sin_port)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: `ss_family` says the storage holds a `sockaddr_in6`; the
+            // read is bounded by the storage's own size and only scalar fields
+            // (address, port) are touched.
+            let addr = unsafe {
+                &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
+            };
+            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            // Keep the scope id: a link-local peer is only addressable (and
+            // only matches its registered session) with it.
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                u16::from_be(addr.sin6_port),
+                0,
+                addr.sin6_scope_id,
+            )))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod batch_tests {
     use super::*;
@@ -1156,6 +1335,76 @@ mod batch_tests {
             let packets = vec![b"one".to_vec()];
             assert_eq!(KcpSocket::send_udp_batch(&sender, &packets, peer), 0);
         });
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// A full batch means more may be waiting, until the round bound.
+    #[test]
+    fn another_round_while_batches_stay_full() {
+        assert!(another_drain_round(RECV_BATCH, RECV_BATCH, 1));
+        assert!(another_drain_round(
+            RECV_BATCH,
+            RECV_BATCH,
+            MAX_DRAIN_ROUNDS - 1
+        ));
+    }
+
+    /// The bound is what keeps the driver's tick and write arms alive.
+    #[test]
+    fn no_round_past_the_bound() {
+        assert!(!another_drain_round(
+            RECV_BATCH,
+            RECV_BATCH,
+            MAX_DRAIN_ROUNDS
+        ));
+    }
+
+    /// A short batch means the socket is drained; `WorthBlock` was handled by
+    /// the caller and an empty batch must not spin.
+    #[test]
+    fn no_round_after_a_short_or_empty_batch() {
+        assert!(!another_drain_round(0, RECV_BATCH, 1));
+        assert!(!another_drain_round(RECV_BATCH - 1, RECV_BATCH, 1));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod recv_batch_tests {
+    use super::*;
+
+    /// One `recvmmsg` must hand back every datagram that is queued, with the
+    /// sender address and length intact, and report `WouldBlock` when empty.
+    #[tokio::test]
+    async fn recv_datagrams_returns_queued_packets_in_order() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = receiver.local_addr().unwrap();
+        for i in 0..3u8 {
+            sender.send_to(&[i; 32], peer).await.unwrap();
+        }
+
+        let mut slots: Vec<Vec<u8>> = (0..RECV_BATCH)
+            .map(|_| vec![0u8; DRIVER_RECV_BUF_SIZE])
+            .collect();
+        receiver.readable().await.unwrap();
+        let batch = recv_datagrams(&receiver, &mut slots).unwrap();
+        assert_eq!(batch.len(), 3, "one call must drain all three datagrams");
+        for (idx, (slot, len, src)) in batch.iter().enumerate() {
+            assert_eq!(*len, 32);
+            assert_eq!(*src, sender.local_addr().unwrap());
+            assert_eq!(
+                slots[*slot][0], idx as u8,
+                "datagrams must keep their order"
+            );
+        }
+
+        // An empty socket reports the same `WouldBlock` the drain loop exits on.
+        let err = recv_datagrams(&receiver, &mut slots).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
     }
 }
 

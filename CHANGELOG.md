@@ -29,6 +29,16 @@ User-facing release notes for frp-rs.
   of throughput lost); see
   [`docs/archive/notes/2026-11-11-kcp-segment-carry.md`](docs/archive/notes/2026-11-11-kcp-segment-carry.md).
 
+- **KCP: one `recvmmsg` per wakeup instead of one `recvfrom` per datagram** — the
+  driver now drains up to 32 datagrams per readiness event on Linux (other
+  platforms keep one per wakeup), so a bulk stream no longer pays a syscall and
+  a `select!` iteration per received packet: +3.9% throughput and −4% CPU on a
+  one-flow 2048 MiB stream (58.5 → 64.0 MiB/s, four interleaved pairs on a
+  4-vCPU Linux VM). Reaching that required routing the call through
+  `UdpSocket::try_io`, without which the uncleared readiness starved the write
+  arm and the proxy never completed a handshake; see
+  [`docs/archive/notes/2026-11-11-kcp-recvmmsg.md`](docs/archive/notes/2026-11-11-kcp-recvmmsg.md).
+
 - **KCP: one `sendmmsg` per flush and per tick instead of one syscall per datagram** —
   a 10+3 FEC flush emits ~13 data segments plus 3 parity shards; batching them is
   worth +4.4% on a bulk stream (58.8 → 61.3 MiB/s, four interleaved pairs on a
