@@ -160,6 +160,19 @@ pub struct KcpSession {
     pending_read: Option<Vec<u8>>,
     /// Inter-packet FEC: pending data shard RS payloads (SIZE + raw KCP data).
     pending_shards: Vec<Vec<u8>>,
+    /// Bytes held back because they do not fill a whole KCP segment.
+    ///
+    /// `send_carry` sends only whole `mss`-sized segments and keeps the
+    /// remainder here, so the next write tops it up instead of starting a
+    /// new, short segment. Without this every bridge write ends with a
+    /// partial segment: at a 16 KiB write against a 1326-byte mss that is
+    /// 13 segments where 12.4 would do: one short tail per write, ~5% more
+    /// segments than the payload needs, and the tail also drags the average
+    /// payload per segment below mss.
+    ///
+    /// Bounded by `mss - 1` bytes in the worst case (anything smaller is
+    /// flushed by the 10 ms tick or by an explicit flush).
+    carry: Vec<u8>,
     /// Max RS payload length in current pending group.
     pending_max_size: usize,
     /// Set to false when the session is removed from the KcpSocket driver.
@@ -271,6 +284,7 @@ impl KcpSession {
             shutdown: false,
             pending_read: None,
             pending_shards: Vec::new(),
+            carry: Vec::new(),
             pending_max_size: 0,
             alive,
             snd_backlog: Arc::new(AtomicUsize::new(0)),
@@ -461,6 +475,86 @@ impl KcpSession {
             sent += self.send(chunk)?;
         }
         Ok(sent)
+    }
+
+    /// Queue `data`, holding back a trailing partial segment.
+    ///
+    /// Sends only whole `mss`-sized segments and keeps the remainder in
+    /// `self.carry`, so the next write tops it up instead of starting a
+    /// short segment. Every bridge write ends on a chunk boundary that is
+    /// almost never a segment boundary (a 16 KiB read is 12.4 segments), so
+    /// without this each write wastes one segment: the measured payload was
+    /// 1,244 bytes per segment against an mss of 1,326.
+    ///
+    /// Returns `Ok(true)` when a flush has something to send: either a whole
+    /// segment was queued, or a write smaller than one segment was sent
+    /// straight through (the interactive path, which adds no latency but also
+    /// does not fill a segment). Returns `Ok(false)` only when the bytes were
+    /// held back in the carry and nothing was queued.
+    pub fn send_carry(&mut self, data: &[u8]) -> io::Result<bool> {
+        let mss = self.kcp.mss().max(1);
+        if data.is_empty() {
+            return Ok(false);
+        }
+        if self.carry.is_empty() && data.len() < mss {
+            self.send_chunked(data)?;
+            return Ok(true);
+        }
+
+        self.carry.extend_from_slice(data);
+        let full = self.carry.len() / mss * mss;
+        if full == 0 {
+            return Ok(false);
+        }
+
+        let mut buf = std::mem::take(&mut self.carry);
+        match self.send_chunked(&buf[..full]) {
+            Ok(_) => {
+                // Keep the tail for the next write; capacity is reused.
+                buf.copy_within(full.., 0);
+                buf.truncate(buf.len().saturating_sub(full));
+                self.carry = buf;
+                Ok(true)
+            }
+            Err(e) => {
+                // Nothing left the session: keep every byte so a later flush
+                // retries instead of silently dropping a prefix. Unreachable
+                // today (`send_chunked` splits at 127*mss and `send` only
+                // rejects `count >= KCP_WND_RCV`), but the carry is the one
+                // place where a dropped byte would corrupt the stream.
+                self.carry = buf;
+                Err(e)
+            }
+        }
+    }
+
+    /// Send the held-back tail, if any. Called from the 10 ms tick (so a
+    /// paused stream does not strand its last bytes) and on explicit flush
+    /// (control messages must reach the wire immediately).
+    pub fn flush_carry(&mut self) -> io::Result<bool> {
+        if self.carry.is_empty() {
+            return Ok(false);
+        }
+        let mut buf = std::mem::take(&mut self.carry);
+        match self.send_chunked(&buf) {
+            Ok(_) => {
+                buf.clear();
+                self.carry = buf;
+                Ok(true)
+            }
+            Err(e) => {
+                // Keep the bytes: a control message that failed to enqueue
+                // must not be reported as flushed.
+                self.carry = buf;
+                Err(e)
+            }
+        }
+    }
+
+    /// Bytes currently held back because they do not fill a segment.
+    #[cfg(test)]
+    pub fn carry_len(&self) -> usize {
+        self.carry.len()
     }
 
     /// Force KCP to flush pending data and produce output packets immediately.
@@ -749,7 +843,7 @@ impl KcpSession {
                     // `recv_buf[..n].to_vec()` copy is gone. The channel
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // session.rs:416), so a hostile peer cannot inflate it.
+                    // session.rs:429), so a hostile peer cannot inflate it.
                     //
                     // Read-side pool (M4): the buffer is drawn from the
                     // shared chunk pool (the same pool KcpWriter draws
@@ -935,6 +1029,41 @@ mod tests {
                 nc: true,
             },
         }
+    }
+
+    #[test]
+    fn send_carry_holds_back_a_partial_segment() {
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel(16);
+        let mut session =
+            KcpSession::new(7, "127.0.0.1:9000".parse().unwrap(), test_config(), read_tx);
+        let mss = session.kcp.mss();
+        assert_eq!(session.carry_len(), 0);
+
+        // A write smaller than one segment on an empty carry is the
+        // interactive path: sent immediately, so latency-sensitive callers
+        // are unaffected.
+        assert!(session.send_carry(&[1u8; 64]).unwrap());
+        assert_eq!(session.carry_len(), 0);
+
+        // A write that ends mid-segment holds the remainder back and reports
+        // that a whole segment was queued.
+        assert!(session.send_carry(&vec![2u8; mss + 100]).unwrap());
+        assert_eq!(session.carry_len(), 100);
+
+        // Top the carry up without reaching a whole segment: nothing queued.
+        assert!(!session.send_carry(&vec![3u8; mss - 101]).unwrap());
+        assert_eq!(session.carry_len(), mss - 1);
+
+        // One more byte completes the segment and empties the carry.
+        assert!(session.send_carry(&[4u8; 1]).unwrap());
+        assert_eq!(session.carry_len(), 0);
+
+        // Explicit flush releases a held-back tail (the control-message path).
+        assert!(session.send_carry(&vec![5u8; mss + 50]).unwrap());
+        assert_eq!(session.carry_len(), 50);
+        assert!(session.flush_carry().unwrap());
+        assert_eq!(session.carry_len(), 0);
+        assert!(!session.flush_carry().unwrap());
     }
 
     #[test]
