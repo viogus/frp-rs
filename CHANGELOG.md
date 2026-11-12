@@ -28,6 +28,15 @@ User-facing release notes for frp-rs.
   from its own MTU, so it truncates these datagrams (`InvalidSegmentDataSize`,
   then a retransmit loop) instead of degrading gracefully.
 
+- **Runtime worker count dominates a single fat tunnel** — set tokio's
+  `TOKIO_WORKER_THREADS=1` on both ends. Unset keeps the runtime default (one
+  worker per core). On a single fat tunnel, one worker removes the task
+  migration that dominates the data path: a 2048 MiB KCP stream through `tcpMux`
+  went from 64.6 to 111.8 MiB/s (Go frp: 99-102) with CPU ticks halved, and four
+  independent tunnels were not slower. Leave it unset on a many-core server
+  carrying many tunnels. See
+  [`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md).
+
 ### Fixes
 - **KCP: fill a segment before sending it** — the bridge writes whatever one
   socket read returned (16,406 bytes in the measured runs), which is 12 full
