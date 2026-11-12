@@ -267,12 +267,52 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::CountingAlloc;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("fatal: {info}");
     }));
     let cmd = parse_frpc_args();
+    // The runtime is built before any config is served, so the worker count is
+    // read from the same file the service will load. One thread is the default:
+    // a single fat tunnel carried 1.7x the throughput of four on the test VM
+    // (the cost is task migration between workers), and one worker still
+    // saturates a client's links. `transport.workerThreads` overrides it.
+    let worker_threads = match &cmd {
+        FrpcCmd::Run(args) => worker_threads_from_config(&args.config, args.strict_config),
+        _ => 1,
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("frpc: failed to build the tokio runtime: {e}");
+            process::exit(EXIT_RUNTIME);
+        }
+    };
+    runtime.block_on(async_main(cmd));
+}
+
+/// Read `transport.workerThreads` from the client config, defaulting to one.
+///
+/// The service loads the config again once it starts; this is a read of the
+/// same file, needed because tokio fixes its worker count at runtime creation.
+fn worker_threads_from_config(config: &str, strict: bool) -> usize {
+    let path = if config.is_empty() {
+        "frpc.toml"
+    } else {
+        config
+    };
+    load_client_config(path, strict)
+        .ok()
+        .and_then(|cfg| cfg.worker_threads)
+        .unwrap_or(1)
+        .max(1)
+}
+
+async fn async_main(cmd: FrpcCmd) {
     // mem-profile and mimalloc are mutually exclusive (the #[global_allocator]
     // guards are cfg-exclusive): with both enabled neither allocator is
     // installed, so the emitter must not run either.

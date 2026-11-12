@@ -1206,6 +1206,15 @@ fn default_quic_stream_receive_window() -> i64 {
 pub struct ServerTransportConfig {
     #[serde(default = "default_tcp_mux_option", alias = "tcpMux")]
     pub tcp_mux: Option<bool>,
+    /// Tokio worker-thread count for the server runtime. Unset = one thread
+    /// per available CPU (tokio's default). Restart-only: the runtime is
+    /// built before the config is served.
+    #[serde(
+        default,
+        alias = "workerThreads",
+        deserialize_with = "crate::config::deserialize_worker_threads"
+    )]
+    pub worker_threads: Option<usize>,
     #[serde(default, alias = "tcpMuxKeepaliveInterval")]
     pub tcp_mux_keepalive_interval: i64,
     /// Idle-dead silence bound for the yamux dead-session reaper, in seconds.
@@ -1253,6 +1262,7 @@ impl Default for ServerTransportConfig {
             tcp_keepalive: default_tcp_keepalive(),
             tcp_send_buffer_size: 0,
             tcp_recv_buffer_size: 0,
+            worker_threads: None,
             quic_options: None,
         }
     }

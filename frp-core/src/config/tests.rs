@@ -49,6 +49,31 @@ path = "./frpc_store.json"
 }
 
 #[test]
+fn test_parse_client_worker_threads() {
+    // Unset means "the binary decides" (frpc defaults to one thread).
+    let cfg: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
+    assert_eq!(cfg.worker_threads, None);
+    // The camelCase spelling is what Go frp users have in their files.
+    let cfg: ClientConfig =
+        load_client_config_from_str("server_addr = '127.0.0.1'\nworkerThreads = 2").unwrap();
+    assert_eq!(cfg.worker_threads, Some(2));
+    // A zero would be fatal to the runtime, so it is rejected at load time.
+    assert!(load_client_config_from_str("server_addr = '127.0.0.1'\nworkerThreads = 0").is_err());
+}
+
+#[test]
+fn test_parse_server_worker_threads() {
+    let cfg: ServerConfig = load_server_config_from_str("bindPort = 7000").unwrap();
+    assert_eq!(cfg.transport.worker_threads, None);
+    let cfg: ServerConfig =
+        load_server_config_from_str("bindPort = 7000\n[transport]\nworkerThreads = 3").unwrap();
+    assert_eq!(cfg.transport.worker_threads, Some(3));
+    assert!(
+        load_server_config_from_str("bindPort = 7000\n[transport]\nworkerThreads = 0").is_err()
+    );
+}
+
+#[test]
 fn test_parse_client_store_defaults_to_none() {
     let cfg: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
     assert!(

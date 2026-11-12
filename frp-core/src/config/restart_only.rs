@@ -490,6 +490,7 @@ fn transport_restart_changes(
         tcp_keepalive: old_tcp_keepalive,
         tcp_send_buffer_size: old_tcp_send_buffer_size,
         tcp_recv_buffer_size: old_tcp_recv_buffer_size,
+        worker_threads: old_worker_threads,
         quic_options: old_quic_options,
     } = old;
     let ServerTransportConfig {
@@ -501,6 +502,7 @@ fn transport_restart_changes(
         tcp_keepalive: new_tcp_keepalive,
         tcp_send_buffer_size: new_tcp_send_buffer_size,
         tcp_recv_buffer_size: new_tcp_recv_buffer_size,
+        worker_threads: new_worker_threads,
         quic_options: new_quic_options,
     } = new;
 
@@ -559,6 +561,13 @@ fn transport_restart_changes(
         old_tcp_recv_buffer_size,
         new_tcp_recv_buffer_size,
         "transport.tcp_recv_buffer_size",
+        any,
+    );
+    push(
+        out,
+        &old_worker_threads.unwrap_or(0),
+        &new_worker_threads.unwrap_or(0),
+        "transport.worker_threads",
         any,
     );
     #[cfg(feature = "quic")]

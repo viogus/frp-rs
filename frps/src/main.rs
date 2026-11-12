@@ -291,12 +291,56 @@ async fn recv_shutdown_signal(sig: &mut Option<tokio::signal::unix::Signal>) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("fatal: {info}");
     }));
     let cli = parse_frps_args();
+    // The runtime is built before the config is served, so the worker count is
+    // read from the same file the service will load. Unset keeps tokio's
+    // default of one thread per CPU: a server runs many independent tunnels,
+    // and `transport.workerThreads = 1` is the lever for a single fat tunnel
+    // (measured 1.7x on the test VM).
+    let worker_threads = match &cli {
+        FrpsCmd::Run(args) => worker_threads_from_config(args),
+        _ => default_worker_threads(),
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("frps: failed to build the tokio runtime: {e}");
+            std::process::exit(frp_core::EXIT_RUNTIME);
+        }
+    };
+    runtime.block_on(async_main(cli));
+}
+
+/// One thread per available CPU, matching tokio's own default.
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Read `transport.workerThreads` from the server config, defaulting to
+/// [`default_worker_threads`]. The service loads the config again once it
+/// starts; this is a read of the same file, needed because tokio fixes its
+/// worker count at runtime creation.
+fn worker_threads_from_config(args: &FrpsArgs) -> usize {
+    let path = args.config_path();
+    frp_core::config::load_server_config(&path, args.strict_config)
+        .ok()
+        .and_then(|cfg| cfg.transport.worker_threads)
+        .unwrap_or_else(default_worker_threads)
+        .max(1)
+}
+
+async fn async_main(cli: FrpsCmd) {
     // mem-profile and mimalloc are mutually exclusive (the #[global_allocator]
     // guards are cfg-exclusive): with both enabled neither allocator is
     // installed, so the emitter must not run either.

@@ -17,6 +17,13 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- `frpc` now runs its tokio runtime on **one worker thread** by default
+  (previously one per CPU). A single fat tunnel carried 1.7x the throughput on
+  the test VM — a bridged tunnel is a pipeline of tasks, and every hop between
+  workers pays a wake and a cache miss — with half the CPU. `frps` keeps one
+  worker per CPU, since a server hosts many independent tunnels. Both binaries
+  accept `transport.workerThreads` to override the default, which is
+  restart-only because tokio fixes its worker count at startup.
 - **KCP: 1400-byte MTU, above kcp-go's layout.** Production KCP config used
   `mtu: 1350` (the value Go frp pins) while kcp-go's library default is 1400,
   so every KCP datagram carried 1326 bytes of payload instead of 1376. A

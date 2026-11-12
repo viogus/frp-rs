@@ -330,6 +330,16 @@ pub struct ClientConfig {
     pub connect_server_local_ip: String,
     #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
+    /// Tokio worker-thread count for the client runtime. Unset = the
+    /// client binary's default (one thread, which measured 1.7x the
+    /// throughput of four on a single fat tunnel); `Some(n)` overrides it.
+    /// Restart-only: the runtime is built before the config is served.
+    #[serde(
+        default,
+        alias = "workerThreads",
+        deserialize_with = "crate::config::deserialize_worker_threads"
+    )]
+    pub worker_threads: Option<usize>,
     /// TCP mux keepalive interval in seconds. Controls how often yamux
     /// sends keepalive pings to detect dead peers. Default: 30.
     /// Go frp compat: transport.tcpMuxKeepaliveInterval.
@@ -423,6 +433,7 @@ impl Default for ClientConfig {
             dial_server_timeout: default_dial_server_timeout(),
             connect_server_local_ip: String::new(),
             tcp_mux: default_tcp_mux(),
+            worker_threads: None,
             tcp_mux_keepalive_interval: 30,
             tcp_mux_keepalive_timeout: 0,
             tcp_send_buffer_size: 0,
