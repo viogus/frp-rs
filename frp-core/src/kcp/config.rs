@@ -114,17 +114,20 @@ mod tests {
             "trait default keeps kcp-go nodelay=0"
         );
         assert_eq!(conservative.nodelay.interval, 40);
-        // MTU pins the wire framing: kcp-go (and Go frp) default to 1400, so a
-        // datagram carries 1376 bytes of payload. Peers read into a 1500-byte
+        // MTU pins the wire framing: kcp-go's library default is 1400 (Go frp
+        // pins 1350), so a datagram carries 1376 bytes of payload. Peers read into a 1500-byte
         // slot, so this is accepted by any peer built since 2026-08-13.
-        assert_eq!(aggressive.mtu, 1400, "server default follows kcp-go mtu");
+        assert_eq!(
+            aggressive.mtu, 1400,
+            "server default is kcp-go's library mtu"
+        );
         assert_eq!(
             aggressive_client.mtu, 1400,
-            "client default follows kcp-go mtu"
+            "client default is kcp-go's library mtu"
         );
         assert_eq!(
             conservative.mtu, 1350,
-            "trait default stays kcp-go's library mtu"
+            "trait default stays 1350 (Go frp's value)"
         );
         assert_eq!(
             (conservative.data_shards, conservative.parity_shards),

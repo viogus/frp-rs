@@ -12903,35 +12903,29 @@ kept out of the main P2 list so that adding them does not renumber every later
 
 - [ ] **KCP bulk streams are ~1.5x behind Go (2.1x before the AVX2 parity pass).**
 
-  Two of the three known costs are now fixed (AVX2 parity: 49.1 → 58.5 MiB/s
-  one-flow means; `sendmmsg` for both the flush and the 10 ms tick: 60.6-61.9
-  MiB/s, mean 61.3, against Go's 101.7 re-measured on the same host at the end
-  of this work; `recvmmsg` batching on the receive side: 58.5 → 64.0 MiB/s, four
-  interleaved pairs; one flush per batch of up to four bridge writes:
-  63.9 → 66.5 MiB/s, eight interleaved pairs; 1400-byte MTU matching kcp-go:
-  62.4 → 64.8 MiB/s and −6.3% CPU per MiB, six pairs in both orders). What is left is per-packet scheduling
-  — the current profile puts frps's largest single entry in the kernel's task
-  wakeup path (`try_to_wake_up` under `ep_poll_callback`) and frpc's in
-  `KcpSocket::run` (4.0%) plus `clock_gettime` (3.4%). Both are driver-loop
-  costs, so the next step is fewer wakeups per packet, not more arithmetic.
-  Evidence: `docs/archive/notes/2026-11-11-kcp-stream-vs-go.md` and
-  `docs/archive/notes/2026-11-11-kcp-avx2-parity.md` /
-  `docs/archive/notes/2026-11-11-kcp-sendmmsg.md` — 49 vs 103 MiB/s when first
-  measured (65 vs 99-102 now), CPU per MiB 46.2 ms vs 22.1 ms, and 568,440
-  datagrams per 512 MiB against Go's 534,678 (73,632 outbound acks against
-  18,424). FEC parameters, mtu and mss now
-  match Go's, so neither the lookup tables nor the configuration explain it; a `perf` run on the stripped binary puts ~26% of
-  frpc samples in the `sendto` path and 3.5% in `clock_gettime`, so the cost is
-  per-packet. The small-payload shape is the opposite (394 round trips/s against
-  40), which rules out the KCP core's ARQ in general.
-  Partial fix landed: the parity encode is now AVX2-vectorised
-  (`docs/archive/notes/2026-11-11-kcp-avx2-parity.md`), which is +19% at one
-  flow and +23% at four on the shape above (49 → 58 MiB/s against Go's 103).
-  What is left is the per-packet path, not the parity math.
-  **Done-when:** all three readings exist on the same host — (a) a debuginfo-build
-  profile (not the stripped release binary; the pre-vectorisation profile put
-  16.3% of frps samples in `KcpSession::fec_encode_output`, and the current one
-  has not been re-taken), (b) a per-session `xmit` (RTO retransmissions) and dead-link reading
-  for both sides, and (c) frp-rs's payload per datagram within ~5% of the 1,058 B
-  a 10+3 group at mss 1376 predicts. Then either a fix lands or the note names
-  the measured mechanism instead of the cost.
+  Landed: AVX2 parity (49.1 → 58.5 MiB/s one-flow means), `sendmmsg` for the
+  flush and the tick (mean 61.3), `recvmmsg` batching (58.5 → 64.0, four pairs),
+  one flush per burst of up to four bridge writes (63.9 → 66.5, eight pairs),
+  1400-byte MTU (−4.0% CPU per MiB, six pairs in both orders). Standing
+  numbers: 65-66 vs 99-102 MiB/s one flow, 69 vs 45 CPU-seconds per 2048 MiB,
+  568,440 datagrams per 512 MiB against Go's 534,678.
+
+  Every candidate that reading Go's source suggested is now measured and
+  negative: Go's flush behaviour in three variants — write-delay/tick-only
+  (**24-30 MiB/s**, 2.2-2.8x slower than shipped), 4 MiB UDP socket buffers (no
+  effect), and flushing when an ACK slides the window (~61-63 MiB/s, about 5%
+  slower) — plus the eleven earlier pass/eliminate experiments (copies, yamux
+  window, tokio-vs-blocking relay, ACK batching to the tick):
+  `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. A mixed-binary matrix
+  localises the remainder: with Go as the client the same servers carry
+  80-83 MiB/s, with frp-rs as the client 61-66, so **the client end is the
+  limiter**, not the server, and not the KCP core.
+
+  So the cost is not a call site: it is the steady-state pacing of one session
+  under this driver. The tick-only arms show which direction is wrong to take;
+  they do not identify the right one.
+
+  **Done-when:** either a design with a measured ≥10% win on the same harness
+  lands, or the note above is extended with the scheduler experiment (per-
+  session flush timer decoupled from the receive loop) and its result, so the
+  item states a mechanism rather than a residual.

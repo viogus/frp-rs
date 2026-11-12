@@ -17,13 +17,13 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
-- **KCP: 1400-byte MTU, matching kcp-go.** Production KCP config used
-  `mtu: 1350` while kcp-go (and therefore Go frp) uses 1400, so every KCP
-  datagram carried 1326 bytes of payload instead of 1376. A one-flow bulk
-  stream measures **+3.8% throughput and −6.3% CPU per MiB** (six interleaved
+- **KCP: 1400-byte MTU, above kcp-go's layout.** Production KCP config used
+  `mtu: 1350` (the value Go frp pins) while kcp-go's library default is 1400,
+  so every KCP datagram carried 1326 bytes of payload instead of 1376. A
+  one-flow bulk stream measures **+3.8% throughput and −4.0% CPU per MiB** (six interleaved
   pairs, both orders; `docs/archive/notes/2026-11-11-kcp-mtu-1400.md`). The
   wire is compatible: peers read into a 1500-byte slot and every peer built
-  since 2026-08-13 does, and Go's own default is 1400. **Upgrade both ends
+  since 2026-08-13 does, and kcp-go reads into a 1500-byte slot, so the larger datagram is accepted. **Upgrade both ends
   together**: an frp-rs peer older than 2026-08-13 sizes its receive buffer
   from its own MTU, so it truncates these datagrams (`InvalidSegmentDataSize`,
   then a retransmit loop) instead of degrading gracefully.
