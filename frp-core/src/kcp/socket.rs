@@ -214,6 +214,20 @@ pub(crate) struct KcpSocket {
     peer_addr_index: HashMap<SocketAddr, u32>,
 }
 
+/// Experiment switch: when set, data writes and stream flushes do not drive a
+/// KCP flush; the periodic tick does it instead (kcp-go's `SetWriteDelay(true)`
+/// model). Unset keeps the flush-on-write behaviour.
+fn defer_flush_to_tick() -> bool {
+    use std::sync::LazyLock;
+    static DEFER: LazyLock<bool> = LazyLock::new(|| {
+        matches!(
+            std::env::var("FRP_KCP_DEFER_FLUSH").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    });
+    *DEFER
+}
+
 impl KcpSocket {
     pub fn new(
         socket: Arc<UdpSocket>,
@@ -294,7 +308,11 @@ impl KcpSocket {
                     tracing::debug!(conv, error = %e, "KCP SOCKET: flush carry error");
                 }
             }
-            self.flush_session_output(conv, peer_addr).await
+            if defer_flush_to_tick() {
+                0
+            } else {
+                self.flush_session_output(conv, peer_addr).await
+            }
         } else {
             0
         };
@@ -359,6 +377,9 @@ impl KcpSocket {
         // ending mid-segment would otherwise sit until the 10 ms tick (a 10x
         // ping-pong regression, measured on #611).
         let burst_end = self.write_rx.is_empty();
+        if defer_flush_to_tick() {
+            return;
+        }
         for (conv, addr) in touched {
             if burst_end {
                 if let Some(session) = self.sessions.get_mut(&(conv, addr)) {
@@ -620,7 +641,11 @@ impl KcpSocket {
             self.sessions.insert((conv, addr), session);
         }
 
-        let mut tick = interval(Duration::from_millis(10));
+        let tick_ms = std::env::var("FRP_KCP_TICK_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10);
+        let mut tick = interval(Duration::from_millis(tick_ms));
         // Fixed-size recv buffer: must hold any wire packet from a peer with
         // mtu <= MAX_KCP_MTU (1492 + 8 overhead = 1500 bytes). The local
         // session's mtu only bounds what WE send — sizing the buffer from it
