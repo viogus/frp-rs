@@ -114,7 +114,6 @@ Transport-level settings for the server.
 | Field | Type | Default | Go frp Equivalent | Description |
 |-------|------|---------|-------------------|-------------|
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. When enabled, all proxies share a single TCP connection. |
-| `worker_threads` | `usize` | `1` | — (frp-rs extension) | Tokio worker threads for the client runtime. The client defaults to **one** thread: on a single fat tunnel one worker carried 1.7x the throughput of four (the cost is task migration between workers), and one worker still saturated eight proxies. Raise it only for a client fanning many high-volume tunnels into a big host. Restart-only: the runtime is built before the config is served. |
 | `tcp_mux_keepalive_interval` | `i64` | `30` | `transport.tcpMuxKeepaliveInterval` | Keepalive interval in seconds for mux connections. Serde default is `0`; a zero value is normalized to the 30s default at load time. |
 | `tcp_mux_keepalive_timeout` | `i64` | `0` | — (frp-rs extension) | Dead-session reaper silence bound in seconds. `0` = auto (`3 × keepalive`, floored 30s); `>0` = explicit bound (floored 30s); `<0` = disable the reaper (never close on idle). Not reloadable. |
 | `heartbeat_timeout` | `i64` | `90` | `transport.heartbeatTimeout` | Heartbeat timeout in seconds. Server disconnects the client if no `Ping` received within this interval. When `tcp_mux` is enabled (the default), this is normalized to `-1` (disabled — yamux keepalive covers liveness). |
@@ -313,6 +312,7 @@ enable_control = true
 | `dial_server_keepalive` | `i64` | `7200` | `dialServerKeepalive` | TCP keepalive idle time in seconds for outbound connections to the server. 0 = use the 7200s default (Go parity — not a disable switch). |
 | `connect_server_local_ip` | `string` | `""` | `connectServerLocalIP` | Local IP address to bind when dialing the frp server. Empty = system default. |
 | `tcp_mux` | `bool` | `true` | `transport.tcpMux` | Enable TCP multiplexing (yamux) for work connections. |
+| `worker_threads` | `usize` | `1` | — (frp-rs extension) | Tokio worker threads for the client runtime. The client defaults to **one** thread: on a single fat tunnel one worker carried 1.7x the throughput of four (the cost is task migration between workers), and one worker still saturated eight proxies. Raise it only for a client fanning many high-volume tunnels into a big host. Restart-only: the runtime is built before the config is served. |
 | `tcp_mux_keepalive_timeout` | `i64` | `0` | — (frp-rs extension) | Dead-session reaper silence bound in seconds. `0` = auto (`3 × keepalive`, floored 30s); `>0` = explicit bound (floored 30s); `<0` = disable the reaper (never close on idle). Not reloadable. |
 | `v2` | `bool` | `false` | `transport.wireProtocol = "v2"` | Enable V2 wire protocol framing. Requires `tcp_mux` for yamux multiplexing. |
 
