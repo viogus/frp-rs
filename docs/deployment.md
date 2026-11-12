@@ -1139,28 +1139,38 @@ latency, not throughput — see the note below. For memory-constrained or
 high-fan-out servers, lower it (`FRP_BRIDGE_BUF_KB=8` is a 16 KiB footprint per
 bridge) — the pool ceiling follows the buffer size.
 
-The async runtime's worker-pool size is not a config key, but tokio reads
-`TOKIO_WORKER_THREADS` at startup for both `frps` and `frpc`; unset keeps one
-worker per core. On a single fat tunnel the worker count
-dominates: a 2048 MiB KCP stream through `tcpMux` ran at **64.6 MiB/s on four
-workers against 111.8 on one** (Go frp on the same host: 99–102), with the CPU
-ticks roughly halved, and four independent tunnels were not slower. The cause is
-task migration — a bridged tunnel is a pipeline of tasks, and every hop between
-workers pays a wake and a cache invalidation — so the gain needs the variable set
-on **both ends**: one side alone recovers about half (client only 86, server only
-87.8). Leave it unset for a many-core server carrying many tunnels, where one
-worker serialises the process; the per-session affinity that would keep both
-properties is not implemented yet. Measurements:
-[`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
-
 The mux data path costs ≈11.6 µs more per 32 KiB of frame payload than the plain path, but
 only ~5 µs of a frame's ~23 µs is fixed cost — the rest scales with bytes — so
 frame size is a lever, not a ceiling. That is what the 64 KiB default buys, and
 why going further does not help: the frame is capped at 64 KiB.
+
 Measurements and the frame-cost model:
 [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](archive/notes/2026-11-10-mux-frame-cost.md);
 the default and the knob that overrides it:
 [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](archive/notes/2026-11-10-bridge-buffer-64k-default.md).
+
+The async runtime's worker-pool size is not a config key, but tokio reads
+`TOKIO_WORKER_THREADS` at startup for both `frps` and `frpc`; unset keeps one
+worker per available CPU, and a malformed or zero value makes tokio panic at
+startup. On a single fat tunnel the worker count dominates: a 2048 MiB KCP stream
+through `tcpMux` ran at **64.6 MiB/s on four workers against 111.8 on one** (Go
+frp on the same host: 99–102), with the CPU ticks roughly halved. The effect
+tracks task migration — a bridged tunnel is a pipeline of tasks, and every hop
+between workers pays a wake and a cache miss — so set it on **both** ends: one
+side alone recovers about half (client only 86, server only 87.8). It only helps
+when both ends are frp-rs; a Go frp peer ignores the variable.
+
+```bash
+TOKIO_WORKER_THREADS=1 ./frps -c frps.toml
+TOKIO_WORKER_THREADS=1 ./frpc -c frpc.toml
+```
+
+Four separate `tcp` sessions did not measurably lose from one worker on a
+four-vCPU host (two pairs), but that is not a busy server: beyond four tunnels
+this is unmeasured, and one worker is expected to serialise a many-core server.
+The per-session affinity that would keep both properties is not implemented yet.
+Measurements:
+[`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
 
 **Heartbeat intervals:**
 

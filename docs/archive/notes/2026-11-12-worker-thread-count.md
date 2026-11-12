@@ -7,8 +7,8 @@
 
 One KCP tunnel carried **64-66 MiB/s** on a four-vCPU test VM while Go frp v0.72.0
 carried 99-102 MiB/s on the same host, harness and flow shape (one 2048 MiB
-one-way stream, `tcpMux` + TLS). Four *independent* KCP tunnels on the same build
-reached 106 MiB/s, so the stack was not CPU-bound: only one session was slow.
+one-way stream, `tcpMux` + TLS). The stack was not CPU-bound: one worker thread
+halves the CPU ticks while moving 1.73x the bytes, which is the proof used below.
 
 The wins that were already in the build - AVX2 FEC parity, one `sendmmsg` per
 flush, `recvmmsg`, the segment carry, one flush per write burst, the 1400-byte
@@ -56,7 +56,8 @@ symmetrically.
   passing check rather than published evidence.
 - **Not per-message wakeups.** Coalescing the KCP read path into one channel
   message per wake (branch `perf/kcp-read-coalesce`, three pairs per arm) was
-  62.8 against 63.9 MiB/s means - inside the noise.
+  62.8 against 63.9 MiB/s means - inside the ±7% run-to-run spread this VM shows
+  between identical runs (`docs/archive/notes/2026-11-12-kcp-go-flush-model.md`).
 - **Direction confirmed on macOS.** Four-stream `tcp` + `tcpMux` on a laptop:
   1037 MiB/s at one worker against 837 at four (+24%).
 
@@ -69,7 +70,7 @@ and a cache invalidation on the session state the previous thread had hot. With
 one worker every hop is a local wake on the same core.
 
 Pinning only the KCP driver to its own thread (probe build, `FRP_KCP_DRIVER_THREAD=1`)
-recovered about two-fifths of the gap (84 MiB/s against 64), which is consistent
+recovered about two-fifths of the gap (84.5 MiB/s against 64.6), which is consistent
 with the same mechanism acting per task rather than per process. The profile
 does not discriminate this from lock contention on shared session state: at
 one worker the process uses ~1.1 of 4 cores, and the four-worker profile is 33.6%
@@ -99,6 +100,15 @@ whole process, and this note only shows four tunnels on a four-vCPU host.
 - The numbers are from a loopback harness: absolute MiB/s will differ on real
   links; the ~1.7x single-tunnel ratio and the both-ends requirement are the
   transferable part.
+- The table's cells are single runs. This VM moves by up to ±7% between identical
+  runs, which is why the arms here differ by 73% and why the two-worker cell is
+  called a midpoint rather than a trend; the coalescing probe is the only one
+  reported inside that band.
+- The single-tunnel evidence is KCP. The advice extends to `tcp`/`tcpMux` on the
+  strength of the four-stream macOS row only.
+- The `FRP_KCP_DRIVER_THREAD=1` probe that recovered two-fifths is a throwaway
+  build that is not in the tree, so that row cannot be re-run without
+  re-applying the patch.
 - The real fix - keeping one session's whole pipeline on one thread so that many
   sessions still spread over cores - is not implemented; see `TODO.md`.
 
