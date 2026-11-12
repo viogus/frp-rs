@@ -291,11 +291,49 @@ async fn recv_shutdown_signal(sig: &mut Option<tokio::signal::unix::Signal>) {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("fatal: {info}");
-    }));
+/// Worker threads for the async runtime.
+///
+/// `FRP_WORKER_THREADS=1` puts the whole process on one thread, which removes
+/// the task migration between workers that dominates a single fat tunnel (see
+/// `docs/archive/notes/2026-11-12-worker-thread-count.md`). Unset keeps the
+/// runtime's default (one worker per core). Out-of-range or unparsable values
+/// are ignored with a warning rather than failing startup.
+fn worker_threads_from_env() -> Option<usize> {
+    let raw = std::env::var("FRP_WORKER_THREADS").ok()?;
+    match raw.trim().parse::<usize>() {
+        Ok(n) if (1..=1024).contains(&n) => Some(n),
+        _ => {
+            eprintln!("warning: ignoring FRP_WORKER_THREADS={raw:?} (expected 1..=1024)");
+            None
+        }
+    }
+}
+
+fn main() {
+    let body = async {
+        std::panic::set_hook(Box::new(|info| {
+            eprintln!("fatal: {info}");
+        }));
+        async_main().await
+    };
+    let rt = match worker_threads_from_env() {
+        Some(n) => tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(n)
+            .enable_all()
+            .build(),
+        None => tokio::runtime::Builder::new_multi_thread().enable_all().build(),
+    };
+    let rt = match rt {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("fatal: failed to start the async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    rt.block_on(body);
+}
+
+async fn async_main() {
     let cli = parse_frps_args();
     // mem-profile and mimalloc are mutually exclusive (the #[global_allocator]
     // guards are cfg-exclusive): with both enabled neither allocator is
