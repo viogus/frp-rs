@@ -37,6 +37,37 @@ impl Drop for KcpListener {
     }
 }
 
+
+/// Spawn a socket driver, optionally on a dedicated single-threaded runtime.
+///
+/// With the multi-threaded runtime the driver migrates between workers; each
+/// migration invalidates the receive slots and the session map and takes the
+/// socket lock on another CPU. `FRP_KCP_DRIVER_THREAD=1` pins every driver to
+/// one extra thread (probe build).
+fn spawn_socket_driver<F>(fut: F) -> io::Result<tokio::task::JoinHandle<()>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    use std::sync::OnceLock;
+    static DRIVER_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    if std::env::var("FRP_KCP_DRIVER_THREAD").ok().as_deref() == Some("1") {
+        let rt = DRIVER_RT.get_or_init(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("KCP driver runtime");
+            let handle = rt.handle().clone();
+            std::thread::Builder::new()
+                .name("kcp-driver".into())
+                .spawn(move || handle.block_on(std::future::pending::<()>()))
+                .expect("KCP driver thread");
+            rt
+        });
+        return Ok(rt.spawn(fut));
+    }
+    Ok(tokio::spawn(fut))
+}
+
 impl KcpListener {
     /// Bind a KCP listener on the given address.
     pub async fn bind(addr: &str, config: KcpConfig) -> io::Result<Self> {
@@ -55,7 +86,7 @@ impl KcpListener {
 
         let (kcp_socket, handle, accept_rx) = KcpSocket::new(socket, config);
 
-        let driver = tokio::spawn(async move { kcp_socket.run().await });
+        let driver = spawn_socket_driver(async move { kcp_socket.run().await })?;
 
         let accept_notify_tx = handle.accept_notify_tx.clone();
         Ok(Self {
@@ -210,7 +241,7 @@ pub async fn dial_kcp_with_driver(
     // counter + register channel closure) — closing the UDP socket and
     // freeing the task instead of leaking one per dial for the process
     // lifetime (HIGH leak under reconnect churn).
-    let driver = tokio::spawn(async move { kcp_socket.run().await });
+    let driver = spawn_socket_driver(async move { kcp_socket.run().await })?;
 
     Ok((
         KcpStream::new(
