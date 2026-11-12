@@ -14,6 +14,20 @@ use super::config::KcpConfig;
 const KCP_UDP_RCVBUF: usize = 1_048_576;
 /// UDP socket send buffer size (1 MiB), matching RCVBUF.
 const KCP_UDP_SNDBUF: usize = 1_048_576;
+
+/// Probe override: `FRP_KCP_UDP_BUF_KB` sets both socket buffers (KiB).
+fn udp_socket_buf() -> usize {
+    use std::sync::LazyLock;
+    static BUF: LazyLock<usize> = LazyLock::new(|| {
+        std::env::var("FRP_KCP_UDP_BUF_KB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|kb| (64..=16384).contains(kb))
+            .map(|kb| kb * 1024)
+            .unwrap_or(KCP_UDP_RCVBUF)
+    });
+    *BUF
+}
 use super::session::KcpSession;
 use super::socket::{KcpSocket, KcpSocketHandle};
 use super::stream::KcpStream;
@@ -45,11 +59,11 @@ impl KcpListener {
 
         // Set socket buffer sizes (1 MiB each). ~5x OS default (~212KB on Linux)
         // — enough for KCP bursts without 200-client kernel-memory blowout.
-        if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-            tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
+        if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(udp_socket_buf()) {
+            tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", udp_socket_buf());
         }
-        if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-            tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
+        if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(udp_socket_buf()) {
+            tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", udp_socket_buf());
         }
         let socket = Arc::new(socket);
 
@@ -163,11 +177,11 @@ pub async fn dial_kcp_with_driver(
     // Set socket buffer sizes (1 MiB each), matching the listener — an
     // outbound dial otherwise keeps the OS defaults (~212KB on Linux),
     // which can drop KCP bursts under load.
-    if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-        tracing::debug!(error = %e, "KCP: dial failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
+    if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(udp_socket_buf()) {
+        tracing::debug!(error = %e, "KCP: dial failed to set SO_RCVBUF to {} (continuing with OS default)", udp_socket_buf());
     }
-    if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-        tracing::debug!(error = %e, "KCP: dial failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
+    if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(udp_socket_buf()) {
+        tracing::debug!(error = %e, "KCP: dial failed to set SO_SNDBUF to {} (continuing with OS default)", udp_socket_buf());
     }
     let socket = Arc::new(socket);
 
