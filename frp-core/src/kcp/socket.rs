@@ -419,6 +419,7 @@ impl KcpSocket {
             && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
                 || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
         tracing::trace!(conv = key.0, peer = %src, len = data.len(), is_fec, "KCP SOCKET: recv {} bytes conv={} fec={}", data.len(), key.0, is_fec);
+        let mut ack_flush = false;
         if let Some(session) = self.sessions.get_mut(&key) {
             if let Err(e) = session.input(data) {
                 tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP input error");
@@ -436,6 +437,11 @@ impl KcpSocket {
                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP recv push error");
                     self.to_remove.push(key);
                 }
+                // kcp-go flushes a full round as soon as an inbound packet
+                // slides the send window or trips a fastack (`kcp.go:723-728`):
+                // the ACK opened room, so queued segments should go out now
+                // instead of waiting for the next bridge write or the tick.
+                ack_flush = session.take_ack_flush();
             }
         } else {
             // FEC fallback: parity shards and data shards whose conv
@@ -607,6 +613,9 @@ impl KcpSocket {
                     .or_default()
                     .push_back(now_ms);
             }
+        }
+        if ack_flush {
+            self.flush_session_output(key.0, key.1).await;
         }
     }
 

@@ -185,6 +185,11 @@ pub struct Kcp<Output> {
     mss: usize,
     /// Connection state: 0 = alive, -1 = dead link.
     state: i32,
+    /// Set when an inbound packet slid the send window or triggered a fastack;
+    /// kcp-go flushes immediately in that case (`kcp.go:723-728`) so new
+    /// segments go out as soon as an ACK opens room, instead of waiting for
+    /// the next write or the interval tick.
+    pub(crate) flush_segments: u32,
 
     /// First unacknowledged packet.
     snd_una: u32,
@@ -334,6 +339,7 @@ impl<Output> Kcp<Output> {
             mtu: KCP_MTU_DEF,
             mss: KCP_MTU_DEF - KCP_OVERHEAD,
             state: 0,
+            flush_segments: 0,
             snd_una: 0,
             snd_nxt: 0,
             rcv_nxt: 0,
@@ -646,29 +652,35 @@ impl<Output> Kcp<Output> {
         }
     }
 
-    fn parse_una(&mut self, una: u32) {
+    fn parse_una(&mut self, una: u32) -> bool {
         // frp-rs patch: recycle the discarded segment's payload (F3) — pop
         // while the front is within the una window, same loop semantics.
+        let mut slid = false;
         while let Some(seg) = self
             .snd_buf
             .pop_front_if(|front| timediff(una, front.sn) > 0)
         {
             self.recycle_segment_data(seg);
+            slid = true;
         }
+        slid
     }
 
-    fn parse_fastack(&mut self, sn: u32, ts: u32) {
+    fn parse_fastack(&mut self, sn: u32, ts: u32) -> bool {
         if timediff(sn, self.snd_una) < 0 || timediff(sn, self.snd_nxt) >= 0 {
-            return;
+            return false;
         }
 
+        let mut fastacked = false;
         for seg in &mut self.snd_buf {
             if timediff(sn, seg.sn) < 0 {
                 break;
             } else if sn != seg.sn && timediff(ts, seg.ts) >= 0 {
                 seg.fastack += 1;
+                fastacked = true;
             }
         }
+        fastacked
     }
 
     #[inline]
@@ -787,7 +799,9 @@ impl<Output> Kcp<Output> {
 
             self.rmt_wnd = wnd;
 
-            self.parse_una(una);
+            if self.parse_una(una) {
+                self.flush_segments |= 1;
+            }
             self.shrink_buf();
 
             let mut has_read_data = false;
@@ -889,8 +903,8 @@ impl<Output> Kcp<Output> {
             }
         }
 
-        if flag {
-            self.parse_fastack(max_ack, latest_ts);
+        if flag && self.parse_fastack(max_ack, latest_ts) {
+            self.flush_segments |= 1;
         }
 
         // Congestion window growth (slow start / congestion avoidance).

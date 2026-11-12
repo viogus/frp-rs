@@ -417,6 +417,18 @@ impl KcpSession {
 
     /// Called by driver on each tick. Updates KCP clock, returns output packets.
     /// `now_ms` is a monotonic millisecond timestamp.
+    /// True once per inbound burst that slid the send window or triggered a
+    /// fastack; the caller flushes so newly windowed segments go out at once
+    /// (kcp-go `kcp.go:723-728`), instead of waiting for the next write or
+    /// the interval tick.
+    pub fn take_ack_flush(&mut self) -> bool {
+        if self.kcp.flush_segments == 0 {
+            return false;
+        }
+        self.kcp.flush_segments = 0;
+        true
+    }
+
     pub fn update(&mut self, now_ms: u32) -> io::Result<Vec<Vec<u8>>> {
         if self.shutdown {
             return Ok(Vec::new());
