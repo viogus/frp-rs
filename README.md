@@ -194,10 +194,18 @@ one `recvmmsg` per wakeup, one flush per batch of writes, and a 1400-byte MTU
 (matching kcp-go) have closed part of it. The rest is per-packet cost: frp-rs
 sends 1.06× Go's datagrams (568k against 535k per 512 MiB), and most of the
 remainder is one ack datagram per write (74k against Go's 18k) — batching those
-to the tick was measured and costs 28% of throughput, so it stays. The numbers, the
-evidence that separates them and the unestablished part are in
+to the tick was measured and costs 28% of throughput, so it stays.
+
+A documented knob closes the rest: set `TOKIO_WORKER_THREADS=1` on **both** ends
+and the same stream runs at **111.8 MiB/s** against Go's 99-102, with the CPU
+ticks roughly halved — task migration in the worker pool, not anything in KCP,
+was the limiter. It is off by default because one worker serialises a busy
+server, so it is guidance rather than a new default; see
+[`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md)
+and the runtime-tuning paragraph in [`docs/deployment.md`](docs/deployment.md).
+The numbers, the evidence that separates them and the unestablished part are in
 [`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md`](docs/archive/notes/2026-11-11-kcp-stream-vs-go.md);
-closing it is a tracked TODO, not a claim.
+a per-session affinity design that would keep both properties is a tracked TODO.
 
 [coalesce]: docs/archive/notes/2026-11-09-yamux-inline-write.md
 [udp-reply]: docs/archive/notes/2026-11-08-udp-spare-reuse.md
