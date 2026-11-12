@@ -49,21 +49,26 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     use std::sync::OnceLock;
-    static DRIVER_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    static DRIVER: OnceLock<tokio::runtime::Handle> = OnceLock::new();
     if std::env::var("FRP_KCP_DRIVER_THREAD").ok().as_deref() == Some("1") {
-        let rt = DRIVER_RT.get_or_init(|| {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("KCP driver runtime");
-            let handle = rt.handle().clone();
+        let handle = DRIVER.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
                 .name("kcp-driver".into())
-                .spawn(move || handle.block_on(std::future::pending::<()>()))
+                .spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("KCP driver runtime");
+                    tx.send(rt.handle().clone()).expect("hand over driver handle");
+                    // Drives the runtime (and its IO/time drivers) forever;
+                    // the spawned driver tasks do the real work.
+                    rt.block_on(std::future::pending::<()>());
+                })
                 .expect("KCP driver thread");
-            rt
+            rx.recv().expect("driver runtime start")
         });
-        return Ok(rt.spawn(fut));
+        return Ok(handle.spawn(fut));
     }
     Ok(tokio::spawn(fut))
 }
