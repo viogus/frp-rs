@@ -83,6 +83,10 @@ struct KcpWriter {
 /// repeated reallocation of the outer Vec during the `write()` flush loop.
 const PACKET_POOL_CAPACITY: usize = 64;
 
+/// Largest read deliberately coalesced into one stream wake (see
+/// [`KcpSession::recv_and_push`]).
+const READ_COALESCE_MAX: usize = 64 * 1024;
+
 impl KcpWriter {
     fn new(pool: Arc<ArrayQueue<Vec<u8>>>, fec_prefix: usize) -> Self {
         Self {
@@ -818,6 +822,11 @@ impl KcpSession {
             }
         }
 
+        // Coalesce what is already queued into one channel message: the
+        // reader task wakes once per burst instead of once per KCP message
+        // (a 1400-byte segment used to mean a wake, a read syscall and a
+        // 1.4 KB write further up the stack).
+        let mut acc: Option<Vec<u8>> = None;
         loop {
             match self.kcp.peeksize() {
                 Ok(0) => {
@@ -838,85 +847,76 @@ impl KcpSession {
                     continue;
                 }
                 Ok(size) => {
-                    // Zero-copy recv: kcp.recv writes directly into the
-                    // buffer handed to the read channel — the per-frame
-                    // `recv_buf[..n].to_vec()` copy is gone. The channel
-                    // message owns the allocation. `size` is bounded by the
-                    // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // session.rs:429), so a hostile peer cannot inflate it.
-                    //
-                    // Read-side pool (M4): the buffer is drawn from the
-                    // shared chunk pool (the same pool KcpWriter draws
-                    // output datagrams from, shared socket-wide) and the
-                    // stream returns it after full consumption — mirroring
-                    // the send side, delivered messages no longer cost a
-                    // fresh alloc each. A popped buffer can carry less
-                    // capacity than `size` (it was sized for an earlier
-                    // message), so reserve first — `set_len` below requires
-                    // capacity >= size. Best-effort: an empty pool (or a
-                    // KcpSession::new private pool, never refilled) just
-                    // allocates fresh, identical to pre-pool behavior.
-                    let mut data = chunk_pool_pop(&self.pool, size);
-                    data.reserve(size);
-                    // SAFETY: kcp.recv below fills `[..size]` before
-                    // returning; on error the Vec is returned to the pool
-                    // and `u8` is always-initialized, so the unwritten tail
-                    // is never observed.
-                    #[allow(clippy::uninit_vec)] // sound: u8, filled before read or dropped
-                    unsafe {
-                        data.set_len(size)
-                    };
-                    match self.kcp.recv(&mut data[..size]) {
-                        Ok(n) => {
-                            data.truncate(n);
-                            tracing::trace!(
-                                conv = self.conv,
-                                n,
-                                "KCP SESSION: recv_and_push got {} bytes",
-                                n
-                            );
-                            match self.read_tx.try_send(data) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(d)) => {
-                                    // Save for next tick — data was already
-                                    // consumed from KCP receive queue and ACK'd.
-                                    // Dropping it would cause a permanent byte-stream
-                                    // hole (KCP retransmission won't recover it).
-                                    tracing::debug!(
-                                        conv = self.conv,
-                                        n,
-                                        "KCP SESSION: read_tx full, holding frame ({} bytes) for retry",
-                                        n
-                                    );
-                                    self.pending_read = Some(d);
-                                    return Ok(());
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    self.shutdown = true;
-                                    tracing::debug!(
-                                        conv = self.conv,
-                                        "KCP SESSION: read_tx closed, shutting down conv {}",
-                                        self.conv
-                                    );
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::NotConnected,
-                                        "KCP read channel closed",
-                                    ));
-                                }
+                    let fits = matches!(&acc, Some(v) if v.len() + size <= v.capacity());
+                    if !fits {
+                        if let Some(buf) = acc.take() {
+                            if !self.push_read_frame(buf)? {
+                                return Ok(());
                             }
                         }
+                        // Read-side pool (M4): draw from the shared chunk pool
+                        // so a delivered message does not cost a fresh alloc.
+                        let mut v = chunk_pool_pop(&self.pool, size);
+                        if v.capacity() < READ_COALESCE_MAX {
+                            v.reserve(READ_COALESCE_MAX - v.capacity());
+                        }
+                        acc = Some(v);
+                    }
+                    let v = acc.as_mut().expect("buffer just ensured");
+                    let old = v.len();
+                    // SAFETY: `size` bytes were reserved above; `kcp.recv`
+                    // fills `[..size]` before returning, and on error the
+                    // buffer goes back to the pool (u8 is always initialized,
+                    // the unwritten tail is never observed).
+                    #[allow(clippy::uninit_vec)] // sound: u8, filled before read or dropped
+                    unsafe {
+                        v.set_len(old + size)
+                    };
+                    match self.kcp.recv(&mut v[old..]) {
+                        Ok(n) => v.truncate(old + n),
                         Err(e) => {
-                            // Return the unused pooled buffer before
-                            // failing (its bytes are never observed —
-                            // chunk_pool_push clears on return, so no stale
-                            // data can leak into a later message).
-                            chunk_pool_push(&self.pool, data);
+                            let buf = acc.take().expect("buffer held");
+                            chunk_pool_push(&self.pool, buf);
                             return Err(io::Error::other(e));
                         }
                     }
                 }
-                Err(KcpError::RecvQueueEmpty) => return Ok(()),
+                Err(KcpError::RecvQueueEmpty) => break,
                 Err(e) => return Err(io::Error::other(e)),
+            }
+        }
+        if let Some(buf) = acc.take() {
+            self.push_read_frame(buf)?;
+        }
+        Ok(())
+    }
+
+    /// Hand one buffered read to the stream, or park it for the next call
+    /// when the channel is full. Returns `false` when the frame was parked
+    /// (the caller must stop: the KCP queue preserves order).
+    fn push_read_frame(&mut self, data: Vec<u8>) -> io::Result<bool> {
+        match self.read_tx.try_send(data) {
+            Ok(()) => Ok(true),
+            Err(mpsc::error::TrySendError::Full(d)) => {
+                tracing::debug!(
+                    conv = self.conv,
+                    n = d.len(),
+                    "KCP SESSION: read_tx full, holding frame for retry"
+                );
+                self.pending_read = Some(d);
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.shutdown = true;
+                tracing::debug!(
+                    conv = self.conv,
+                    "KCP SESSION: read_tx closed, shutting down conv {}",
+                    self.conv
+                );
+                Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "KCP read channel closed",
+                ))
             }
         }
     }
@@ -1330,10 +1330,11 @@ mod tests {
                 break;
             }
         }
-        assert_eq!(received.len(), 3);
-        assert_eq!(received[0], b"pkt1");
-        assert_eq!(received[1], b"pkt2");
-        assert_eq!(received[2], b"pkt3");
+        // Reads are coalesced into one channel message (see
+        // `recv_and_push`), so compare the byte stream rather than the
+        // message boundaries: the KCP stream carries bytes, not frames.
+        let joined: Vec<u8> = received.concat();
+        assert_eq!(joined, b"pkt1pkt2pkt3");
     }
 
     #[test]
@@ -1644,7 +1645,7 @@ mod tests {
         while let Ok(data) = rx2.try_recv() {
             got.push(data);
         }
-        let payload_found = got.iter().any(|d| d == b"parity test payload");
+        let payload_found = got.concat().windows(b"parity test payload".len()).any(|w| w == b"parity test payload");
         assert!(
             payload_found,
             "should recover parity test payload, got: {:?}",
