@@ -900,6 +900,12 @@ pub(super) fn normalize_server_config(
                 "tcp_mux_keepalive_timeout",
                 "heartbeat_timeout",
                 "max_pool_count",
+                // Same treatment as the `tcp_mux*` keys: the flat spelling is
+                // the same knob, so it is hoisted rather than left inert. Both
+                // spellings are listed because this pass runs before the
+                // camelCase renames inside `[transport]`.
+                "worker_threads",
+                "workerThreads",
             ],
             "transport",
             &[],

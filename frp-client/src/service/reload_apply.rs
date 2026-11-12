@@ -123,6 +123,23 @@ impl Service {
         ) {
             return Err(reason);
         }
+        // The runtime's worker count is fixed when the process starts, so a
+        // reload cannot apply `transport.workerThreads`. Absorbing the new value
+        // would leave `Self::cfg` claiming a count the live runtime does not
+        // use, so the *running* value is kept and the refusal is reported (the
+        // same shape as the server's restart-only report, minus the risk of
+        // failing an otherwise valid reload that also fixed a proxy).
+        let running_worker_threads = self.cfg.read().await.worker_threads;
+        if let Some(reason) = crate::reload::worker_threads_reload_refusal(
+            running_worker_threads,
+            new_cfg.worker_threads,
+        ) {
+            tracing::warn!(
+                reason = %reason,
+                "reload: keeping the worker count the running runtime was built with"
+            );
+            new_cfg.worker_threads = running_worker_threads;
+        }
         // Source-local enabled filtering, then apply the start allowlist so the
         // reload diff never registers store/config proxies outside `start`.
         new_cfg.proxies.retain(|p| p.enabled);

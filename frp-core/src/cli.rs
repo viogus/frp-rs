@@ -751,8 +751,8 @@ fn svr_config() -> impl Parser<Option<String>> {
 /// [`FrpsRootSlots`].
 ///
 /// **R6(a) (`TODO.md:11218`): this lane does not read the loaded config's `[log]`
-/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:644`) runs before
-/// `collect_config_files` (`frps/src/main.rs:660`), so the effective log level
+/// section.** `init_logging(&cli, None)` (`frps/src/main.rs:657`) runs before
+/// `collect_config_files` (`frps/src/main.rs:673`), so the effective log level
 /// comes from the flags alone. Measured over a config dir whose `frps.toml`
 /// writes `[log] level = "warn"`: `frps --config-dir cfg` and
 /// `frps --config-dir cfg --log-level ""` both log at `info` (11 `INFO` records,

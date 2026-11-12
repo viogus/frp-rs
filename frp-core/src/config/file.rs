@@ -287,7 +287,7 @@ pub(super) fn process_includes(
     // the v1 `includes: Vec<String>` decode and refused the file
     // (`invalid type: integer \`1\`, expected a sequence`, rc 1 in both modes).
     // Scrub the scalar spellings here, while the raw dialect is still visible:
-    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1185-1189`
+    // after the `[common]` hoist at `frp-core/src/config/normalize.rs:1191-1195`
     // the two spellings are indistinguishable, and a `.ini` *without* `[common]`
     // goes down Go's v1 path too, so its type error (`includes = 1` there is rc 1
     // in both modes) must stay.
@@ -318,7 +318,7 @@ pub(super) fn process_includes(
     // `cfg.IncludeConfigFiles`, `pkg/config/legacy/parse.go:50`), so a
     // `[common] includes` has to be expanded even though it sits one table
     // below the top level. Reading it here — before the `[common]` hoist at
-    // `frp-core/src/config/normalize.rs:1185` — is what orders the walk the way
+    // `frp-core/src/config/normalize.rs:1191` — is what orders the walk the way
     // Go orders it (common first, included sections after). The section-less
     // top-level spelling below stays an frp-rs extension: Go skips
     // `ini.DefaultSection` (`pkg/config/legacy/client.go:204`) and ignores it

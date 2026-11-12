@@ -507,8 +507,8 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // `[web_server.tls] enable = true`: the inert-key warning is a `WARN` record
 // emitted on every build right after `init_logging`
 // (`presence.warn_inert_web_server_tls_enable`, called at
-// `frps/src/main.rs:1225`), while the startup marker is an `INFO` record
-// (`frps/src/main.rs:1247`). So
+// `frps/src/main.rs:1238`), while the startup marker is an `INFO` record
+// (`frps/src/main.rs:1260`). So
 // "`web_server.tls.enable has no effect` present **and** `frps (Rust) v` absent"
 // pins the effective level at *exactly* `warn`: `info` would add the marker,
 // `error` would drop the warning.
@@ -657,8 +657,8 @@ fn cli_empty_log_level_does_not_raise_the_files_warn() {
 // `cmd/frps/root.go:112` inits the logger from the *file's* `cfg.Log` — and
 // `frps -c frps.toml --log-level info` over a file with `[log] level = "warn"`
 // therefore prints **0** records. Pre-fix, frp-rs gated only
-// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1200-1202`)
-// while `init_logging` (`frps/src/main.rs:1212`) still read the raw CLI value:
+// `override_server_config` on `cli_overrides_enabled` (`frps/src/main.rs:1213-1215`)
+// while `init_logging` (`frps/src/main.rs:1225`) still read the raw CLI value:
 // measured on that binary the same argv printed **11** `INFO` records (2434 B)
 // and `--log-level debug` printed 11 `INFO` + 3 `DEBUG` (2860 B), while the
 // no-flag control printed 231 B / 0 `INFO` / 1 `WARN` — `level_config` always
@@ -723,8 +723,8 @@ fn cli_nonempty_log_level_flag_does_not_override_the_config_file() {
     }
 
     // Arm 4: `-c` and `--config-dir` **together**. The config-dir branch
-    // (`frps/src/main.rs:643`) is the one that runs, and its
-    // `init_logging(&cli, None)` (`frps/src/main.rs:644`) honours the CLI flags,
+    // (`frps/src/main.rs:656`) is the one that runs, and its
+    // `init_logging(&cli, None)` (`frps/src/main.rs:657`) honours the CLI flags,
     // so `--log-level warn` must still be applied. Masking on
     // `cli.config.is_some()` alone made this arm print 11 `INFO` records
     // (2092 B on this scratch fixture), byte-identical to dropping the flag.
@@ -825,7 +825,7 @@ fn fresh_rotation_file(dir: &TempDir) -> Option<PathBuf> {
 }
 
 /// True when the fresh rotation file already carries the record `frps` writes
-/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1247`).
+/// **after** `init_logging` returns ([`STARTUP_MARKER`], `frps/src/main.rs:1260`).
 ///
 /// Mere existence is not evidence that anything ran: `tracing_appender::rolling::daily`
 /// creates `logs/frps.log.<date>` eagerly when it is constructed
@@ -1174,7 +1174,7 @@ fn readiness_gate_needs_the_appenders_own_record() {
 
 // ── the `-c` lane discards **all four** log flags, not just `--log-level` ───
 //
-// The mask at `frps/src/main.rs:557` withholds four CLI values at once
+// The mask at `frps/src/main.rs:570` withholds four CLI values at once
 // (`log_level`, `log_file`, `log_max_days`, `log_format`), but
 // `cli_nonempty_log_level_flag_does_not_override_the_config_file` above drives
 // `--log-level` only — so a regression that masked just one of the other three

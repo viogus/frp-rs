@@ -300,16 +300,15 @@ fn main() {
     // read from the same file the service will load. Unset keeps tokio's
     // default of one thread per CPU: a server runs many independent tunnels,
     // and `transport.workerThreads = 1` is the lever for a single fat tunnel
-    // (measured 1.7x on the test VM).
+    // (on the test VM one worker measured 89.7-91.2 MiB/s against 65.5-66.6
+    // with one per CPU).
     let worker_threads = match &cli {
-        FrpsCmd::Run(args) => worker_threads_from_args(args),
-        _ => default_worker_threads(),
+        FrpsCmd::Run(args) if !args.show_version => worker_threads_from_args(args),
+        // `verify` has no config to read, but the env var still applies: the
+        // documented precedence has no lane exception.
+        _ => resolve_worker_threads(None, env_worker_threads(), default_worker_threads()),
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(worker_threads)
-        .enable_all()
-        .build()
-    {
+    let runtime = match build_runtime(worker_threads) {
         Ok(runtime) => runtime,
         Err(e) => {
             eprintln!("frps: failed to build the tokio runtime: {e}");
@@ -408,10 +407,24 @@ fn is_regular_file(path: &Path) -> bool {
 
 /// `TOKIO_WORKER_THREADS`, when it names a usable count.
 fn env_worker_threads() -> Option<usize> {
-    std::env::var("TOKIO_WORKER_THREADS")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
+    parse_worker_threads_env(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref())
+}
+
+/// The parsing half of [`env_worker_threads`], split out so the accepted and
+/// rejected spellings can be tested without mutating the process environment.
+fn parse_worker_threads_env(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|n| *n >= 1)
+}
+
+/// Build the runtime with an explicit worker count. Split out so a test can
+/// assert the count reaches tokio: the bug this key exists to fix was a
+/// resolution that was computed correctly and then not applied.
+fn build_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
 }
 
 async fn async_main(cli: FrpsCmd) {
@@ -949,7 +962,7 @@ async fn run(mut cli: FrpsArgs) {
                                 // (`frp-server/src/service.rs:1115`) — so this
                                 // arm means the service stopped for good. The
                                 // single-config path maps any `run()` error to
-                                // `EXIT_RUNTIME` (`frps/src/main.rs:1208-1219`),
+                                // `EXIT_RUNTIME` (`frps/src/main.rs:1339-1350`),
                                 // and this lane carries the same code out,
                                 // pinned on both lanes by
                                 // `config_dir_where_every_service_fails_to_run_exits_like_dash_c`
@@ -1525,14 +1538,54 @@ mod worker_thread_tests {
         }
     }
 
-    fn temp_dir(tag: &str) -> std::path::PathBuf {
+    /// A temp directory that removes itself, including when an assertion in the
+    /// test panics — a bare `remove_dir_all` at the end of the body leaks a
+    /// directory per failing run.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "frp-worker-threads-srv-{}-{tag}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        dir
+        TempDir(dir)
+    }
+
+    /// The env-var parse: only a positive integer counts, and a zero or a
+    /// non-number is ignored rather than handed to tokio (which panics on 0).
+    #[test]
+    fn env_var_parsing_accepts_only_a_positive_integer() {
+        assert_eq!(parse_worker_threads_env(Some("3")), Some(3));
+        assert_eq!(parse_worker_threads_env(Some(" 3 ")), Some(3));
+        assert_eq!(parse_worker_threads_env(Some("0")), None);
+        assert_eq!(parse_worker_threads_env(Some("junk")), None);
+        assert_eq!(parse_worker_threads_env(None), None);
+    }
+
+    /// The resolved count must reach the runtime: a resolution that is computed
+    /// and then dropped was exactly the bug this key fixes.
+    #[test]
+    fn the_resolved_count_reaches_the_runtime() {
+        for n in [1usize, 3] {
+            let runtime = build_runtime(n).expect("build runtime");
+            assert_eq!(runtime.metrics().num_workers(), n);
+        }
     }
 
     /// Precedence is config > `TOKIO_WORKER_THREADS` > default, and a zero that
@@ -1557,7 +1610,6 @@ mod worker_thread_tests {
             .expect("write config");
         let args = run_args(&path.display().to_string(), None);
         assert_eq!(worker_threads_from_args(&args), 2);
-        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
     #[test]
@@ -1568,21 +1620,41 @@ mod worker_thread_tests {
             .expect("write config");
         let args = run_args(&path.display().to_string(), None);
         assert_eq!(worker_threads_from_args(&args), 3);
-        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
-    /// No key anywhere: one worker per CPU, i.e. tokio's own default.
+    /// No key anywhere: one worker per CPU (tokio's own default), or the env
+    /// var when the operator set one. The expectation is derived from the
+    /// concrete parse, not from the helper under test, so deleting env support
+    /// fails this test.
     #[test]
     fn absent_key_falls_back_to_one_per_cpu() {
         let dir = temp_dir("absent");
         let path = dir.join("frps.toml");
         std::fs::write(&path, "bindPort = 7000\n").expect("write config");
         let args = run_args(&path.display().to_string(), None);
-        let expected = env_worker_threads()
-            .unwrap_or_else(default_worker_threads)
-            .max(1);
+        let expected =
+            parse_worker_threads_env(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref())
+                .unwrap_or_else(default_worker_threads);
         assert_eq!(worker_threads_from_args(&args), expected);
-        std::fs::remove_dir_all(&dir).expect("clean temp dir");
+    }
+
+    /// The root spelling is the same knob, not an inert copy: both binaries
+    /// hoist it into `[transport]` (the same treatment `tcpMux` gets), so a
+    /// config written either way sizes the runtime.
+    #[test]
+    fn root_spelling_is_hoisted_into_the_transport_section() {
+        for (spelling, expected) in [("workerThreads", 4), ("worker_threads", 5)] {
+            let dir = temp_dir("root");
+            let path = dir.join("frps.toml");
+            std::fs::write(&path, format!("bindPort = 7000\n{spelling} = {expected}\n"))
+                .expect("write config");
+            let args = run_args(&path.display().to_string(), None);
+            assert_eq!(
+                worker_threads_from_args(&args),
+                expected,
+                "root `{spelling}` must be hoisted into [transport]"
+            );
+        }
     }
 
     /// `--config-dir`: one service starts per file, so the count must come from
@@ -1602,7 +1674,6 @@ mod worker_thread_tests {
         )
         .expect("write b");
         assert_eq!(worker_threads_from_dir(&dir, true), Ok(Some(2)));
-        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 
     #[test]
@@ -1620,6 +1691,5 @@ mod worker_thread_tests {
         .expect("write b");
         let err = worker_threads_from_dir(&dir, true).expect_err("counts disagree");
         assert!(err.contains("conflicting transport.workerThreads"), "{err}");
-        std::fs::remove_dir_all(&dir).expect("clean temp dir");
     }
 }

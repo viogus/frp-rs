@@ -463,9 +463,12 @@ fn web_server_restart_changes(
 /// heartbeat / keepalive / buffer fields by `AppState::new` (from
 /// `Service::with_unsafe_features`), `quic_options` by the QUIC listener in
 /// `Service::run`, and `max_pool_count` from the startup
-/// `ServerConfigSnapshot` at login. None is re-keyed by the reload.
+/// `ServerConfigSnapshot` at login. `worker_threads` is fixed even earlier —
+/// the `frps` binary builds the tokio runtime before this config is served —
+/// which is why it is reported as restart-only rather than reloadable. None is
+/// re-keyed by the reload.
 ///
-/// **What keeps it complete.** Both patterns name all nine fields with no `..`
+/// **What keeps it complete.** Both patterns name all ten fields with no `..`
 /// (the `#[cfg]` on `quic_options` is this crate's own gate, so it matches the
 /// struct exactly).
 ///
@@ -475,7 +478,11 @@ fn web_server_restart_changes(
 /// at `Service::with_unsafe_features`, and `quic_options` is
 /// `unwrap_or_default()` in `Service::run`. An absent `tcp_mux` rewritten as
 /// `tcp_mux = true` therefore reports nothing — correct, since a restart would
-/// change nothing.
+/// change nothing. `worker_threads` is deliberately the opposite: it is compared
+/// as the written `Option` even though its effective value is the binary
+/// default when absent, because that default is a property of the binary (and
+/// `TOKIO_WORKER_THREADS` can override it), not of this config — so
+/// `None -> Some(1)` may still change the runtime and is reported.
 fn transport_restart_changes(
     out: &mut Vec<RestartOnlyChange>,
     old: &ServerTransportConfig,

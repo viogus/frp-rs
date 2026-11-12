@@ -6,7 +6,7 @@
 //! format!("failed to load config: {e}"))?` — the load failure propagates
 //! BEFORE any mutation, so `self.cfg`/`self.proxies` are untouched,
 //! `reload::do_reload` never runs, and the previously running proxies keep
-//! serving. (reload.rs:429-441 is a DIFFERENT arm: the no-changes shortcut
+//! serving. (reload.rs:463-475 is a DIFFERENT arm: the no-changes shortcut
 //! for a config that *loaded fine*.)
 //!
 //! Observability note: `Service::request_reload()` (the SIGUSR1 path) drops

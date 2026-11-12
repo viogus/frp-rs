@@ -1154,6 +1154,11 @@ because tokio fixes the count when the runtime is built. `frpc` defaults to `1`;
 `frps` defaults to one worker per available CPU. Precedence is the config key,
 then `TOKIO_WORKER_THREADS`, then the binary default; with `--config-dir` the
 count must be the same in every file, and a conflict is refused (exit code 2).
+`frpc reload` (and a reload through the admin API) **reports** a changed count as
+`transport.workerThreads: 1 -> 2 (restart required)` and keeps running with the
+count the runtime was built with, rather than reporting success with a config
+that no longer matches the process. On `frps` the key is accepted under
+`[transport]` and also at the top level of the file (hoisted, like `tcpMux`).
 
 ```toml
 # frps.toml
@@ -1162,7 +1167,7 @@ workerThreads = 4      # snake_case `worker_threads` is accepted too
 ```
 
 ```toml
-# frpc.toml — top level (`[transport]` is flattened on the client as well)
+# frpc.toml — top level, or under [transport] (both spellings work on the client)
 workerThreads = 1
 ```
 

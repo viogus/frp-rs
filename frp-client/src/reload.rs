@@ -218,6 +218,40 @@ pub(crate) fn auth_reload_refusal(
     ))
 }
 
+/// Report a reload that changes `transport.workerThreads`.
+///
+/// The count is fixed when the runtime is created, before any config is read,
+/// so a reload cannot apply it. Reporting the change and keeping the *running*
+/// value is what stops the trap this function exists to close: `frpc reload`
+/// would otherwise report success, `Self::cfg` would then hold the new value,
+/// and the live runtime would keep the old one — a config that disagrees with
+/// the process serving it. The reload itself still proceeds, because one
+/// unchanged proxy set should not fail over a key only a restart can apply;
+/// that is the server's restart-only shape (`[name]: old -> new (restart
+/// required)`) rather than the auth refusal, which must not apply anything.
+///
+/// The comparison is on the written option, not on the effective count:
+/// `None` means "the binary default, unless `TOKIO_WORKER_THREADS` says
+/// otherwise", so `None -> Some(1)` can still change the runtime (with the env
+/// var set) and `Some(1) -> None` likewise. Deciding equivalence here would
+/// mean re-deriving that precedence, which this crate cannot see; the same
+/// over-refusal bias as `auth_reload_refusal` applies.
+///
+/// Pinned by `worker_threads_reload_refusal_only_fires_on_a_change`.
+pub(crate) fn worker_threads_reload_refusal(
+    old: Option<usize>,
+    new: Option<usize>,
+) -> Option<String> {
+    if old == new {
+        return None;
+    }
+    Some(
+        "transport.workerThreads. the runtime's worker count is fixed when the process \
+         starts and a reload cannot change it — restart frpc to apply"
+            .to_string(),
+    )
+}
+
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.
 /// Deterministic map serialization for snapshot equality. std HashMap's
@@ -760,6 +794,23 @@ mod tests {
     /// equivalence check by a later reader (see the function's
     /// "What is compared" section for why `None` and `Some(default)` are not
     /// interchangeable).
+    #[test]
+    fn worker_threads_reload_refusal_only_fires_on_a_change() {
+        assert!(worker_threads_reload_refusal(None, None).is_none());
+        assert!(worker_threads_reload_refusal(Some(2), Some(2)).is_none());
+        // Every written change is refused, including None <-> Some(1): with
+        // `TOKIO_WORKER_THREADS` set those two resolve to different counts.
+        for (old, new) in [(None, Some(1)), (Some(1), None), (Some(1), Some(2))] {
+            let reason = worker_threads_reload_refusal(old, new)
+                .unwrap_or_else(|| panic!("{old:?} -> {new:?} must be refused"));
+            assert!(
+                reason.starts_with("transport.workerThreads"),
+                "got {reason:?}"
+            );
+            assert!(reason.contains("restart frpc"), "got {reason:?}");
+        }
+    }
+
     #[test]
     fn auth_reload_refusal_treats_the_section_as_written() {
         // A section that is byte-for-byte the `Default` impl still counts as

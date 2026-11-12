@@ -104,6 +104,8 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "tcp_mux_keepalive_interval",
         "tcpMux",
         "tcpMuxKeepaliveInterval",
+        "worker_threads",
+        "workerThreads",
         "tcp_mux_keepalive_timeout",
         "tcpMuxKeepaliveTimeout",
         "heartbeatTimeout",
