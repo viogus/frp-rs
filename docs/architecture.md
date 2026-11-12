@@ -413,13 +413,12 @@ round trip.
 **Bridging** (`control/bridge.rs`, `assign_work_to_proxy`): after sending
 `StartWorkConn` with proxy metadata (encryption flag, compression flag), the
 server writes any pre-read bytes (from HTTP VHost parsing) and then bridges the
-user connection to the work connection using either
-`tokio::io::copy_bidirectional_with_sizes` with the
-`BUFFER_SIZE` default (plain, overridable via `FRP_BRIDGE_BUF_KB`) or `bridge::bridge_encrypted` (AES-128-CFB
-+ Snappy, streaming — a single random 16-byte IV followed by continuous
-ciphertext, no per-frame length prefix). The client-side plain relay mirrors this
-(`relay_plain_fast` with `splice(2)` on Linux, `copy_bidirectional_with_sizes`
-elsewhere).
+user connection to the work connection using either `frp_core::splice::bridge_splice`
+(`splice(2)`, Linux) / `frp_core::bridge::relay_plain_pooled` (elsewhere) for the
+plain path — pool-buffered, sized by `BUFFER_SIZE` and overridable via
+`FRP_BRIDGE_BUF_KB` — or `bridge::bridge_encrypted` (AES-128-CFB + Snappy,
+streaming — a single random 16-byte IV followed by continuous ciphertext, no
+per-frame length prefix). The client-side plain relay uses the same helpers.
 
 ---
 
@@ -865,7 +864,7 @@ is structural rather than tested.
 
 **Every handoff moves the stream.** There are four of them, one per surface
 (HTTP/1.1 vhost, HTTPS SNI passthrough, tcpmux, h2c) and they all have the same
-shape. `frp-server/src/vhost.rs:709` looks the route's `run_id` up in
+shape. `frp-server/src/vhost.rs:723` looks the route's `run_id` up in
 `run_id_to_ctl_tx`, and `:723` sends `InternalMsg::ProxyUserConn { user_conn:
 wrap(stream), .. }`. The stream is **moved** into the message: after that call
 the vhost task no longer holds a copy, so there is no "listener still owns it"

@@ -200,6 +200,16 @@ pub fn effective_max_accept_rate(max_accept_rate: Option<u32>) -> u32 {
     max_accept_rate.unwrap_or(0)
 }
 
+/// How an unwritten worker count is spelled in a restart-only entry.
+///
+/// `0` is not a legal value — the loader rejects it, and tokio panics on a
+/// zero-worker runtime — so rendering an absent key as `0` would read like a
+/// real previous count. The client's own report says `unset`; the server says
+/// the same thing for the same reason.
+fn written_worker_count(value: Option<usize>) -> String {
+    value.map_or_else(|| "unset".to_string(), |n| n.to_string())
+}
+
 /// Push a change entry when `old != new`.
 fn push<T: PartialEq + Display>(
     out: &mut Vec<RestartOnlyChange>,
@@ -463,9 +473,12 @@ fn web_server_restart_changes(
 /// heartbeat / keepalive / buffer fields by `AppState::new` (from
 /// `Service::with_unsafe_features`), `quic_options` by the QUIC listener in
 /// `Service::run`, and `max_pool_count` from the startup
-/// `ServerConfigSnapshot` at login. None is re-keyed by the reload.
+/// `ServerConfigSnapshot` at login. `worker_threads` is fixed even earlier —
+/// the `frps` binary builds the tokio runtime before this config is served —
+/// which is why it is reported as restart-only rather than reloadable. None is
+/// re-keyed by the reload.
 ///
-/// **What keeps it complete.** Both patterns name all nine fields with no `..`
+/// **What keeps it complete.** Both patterns name all ten fields with no `..`
 /// (the `#[cfg]` on `quic_options` is this crate's own gate, so it matches the
 /// struct exactly).
 ///
@@ -475,7 +488,11 @@ fn web_server_restart_changes(
 /// at `Service::with_unsafe_features`, and `quic_options` is
 /// `unwrap_or_default()` in `Service::run`. An absent `tcp_mux` rewritten as
 /// `tcp_mux = true` therefore reports nothing — correct, since a restart would
-/// change nothing.
+/// change nothing. `worker_threads` is deliberately the opposite: it is compared
+/// as the written `Option` even though its effective value is the binary
+/// default when absent, because that default is a property of the binary (and
+/// `TOKIO_WORKER_THREADS` can override it), not of this config — so
+/// `None -> Some(1)` may still change the runtime and is reported.
 fn transport_restart_changes(
     out: &mut Vec<RestartOnlyChange>,
     old: &ServerTransportConfig,
@@ -490,6 +507,7 @@ fn transport_restart_changes(
         tcp_keepalive: old_tcp_keepalive,
         tcp_send_buffer_size: old_tcp_send_buffer_size,
         tcp_recv_buffer_size: old_tcp_recv_buffer_size,
+        worker_threads: old_worker_threads,
         quic_options: old_quic_options,
     } = old;
     let ServerTransportConfig {
@@ -501,6 +519,7 @@ fn transport_restart_changes(
         tcp_keepalive: new_tcp_keepalive,
         tcp_send_buffer_size: new_tcp_send_buffer_size,
         tcp_recv_buffer_size: new_tcp_recv_buffer_size,
+        worker_threads: new_worker_threads,
         quic_options: new_quic_options,
     } = new;
 
@@ -559,6 +578,13 @@ fn transport_restart_changes(
         old_tcp_recv_buffer_size,
         new_tcp_recv_buffer_size,
         "transport.tcp_recv_buffer_size",
+        any,
+    );
+    push(
+        out,
+        &written_worker_count(*old_worker_threads),
+        &written_worker_count(*new_worker_threads),
+        "transport.worker_threads",
         any,
     );
     #[cfg(feature = "quic")]

@@ -196,11 +196,12 @@ sends 1.06× Go's datagrams (568k against 535k per 512 MiB), and most of the
 remainder is one ack datagram per write (74k against Go's 18k) — batching those
 to the tick was measured and costs 28% of throughput, so it stays.
 
-A documented knob closes the rest: set `TOKIO_WORKER_THREADS=1` on **both** ends
-and the same stream runs at **111.8 MiB/s** against Go's 99-102, with the CPU
-ticks roughly halved — task migration in the worker pool, not anything in KCP,
-was the limiter. It is off by default because one worker serialises a busy
-server, so it is guidance rather than a new default; see
+The rest was the runtime, not KCP: task migration between worker threads was the
+limiter, and `frpc` now defaults to **one** worker thread (`frps` keeps one per
+CPU, since a server hosts many independent tunnels). At that default the same
+stream runs at **89.7-91.2 MiB/s** instead of 65.5-66.6 — +37%, with 28% less
+CPU. Setting `transport.workerThreads = 1` on **both** ends reaches 111.8
+against Go's 99-102. The key is restart-only; see
 [`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md)
 and the runtime-tuning paragraph in [`docs/deployment.md`](docs/deployment.md).
 The numbers, the evidence that separates them and the unestablished part are in

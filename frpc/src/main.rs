@@ -267,12 +267,149 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: frp_core::mem_profile::CountingAlloc = frp_core::mem_profile::CountingAlloc;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     std::panic::set_hook(Box::new(|info| {
         eprintln!("fatal: {info}");
     }));
     let cmd = parse_frpc_args();
+    // The runtime is built before any config is served, so the worker count is
+    // read from the same file the service will load. One thread is the default:
+    // on the test VM a single fat tunnel carried 89.7-91.2 MiB/s against
+    // 65.5-66.6 with one worker per CPU (+37%, and 28% less CPU) — the cost is
+    // task migration between workers, and one worker still saturates a client's
+    // links. `transport.workerThreads` overrides it. (An earlier note quoted
+    // 1.7x: that is the figure when *both* ends run one worker, 111.8 MiB/s;
+    // the shipped one-sided default is the +37% above.)
+    let worker_threads = match &cmd {
+        // `--version` has nothing to do with a config: do not read one for it.
+        FrpcCmd::Run(args) if !args.show_version => worker_threads_from_args(args),
+        // The single-proxy lanes have no config file, but the env var still
+        // applies to them: `frpc tcp` is a first-class long-running mode, and
+        // the documented precedence (config > env > default) has no lane
+        // exception.
+        _ => resolve_worker_threads(None, env_worker_threads(), 1),
+    };
+    let runtime = match build_runtime(worker_threads) {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("frpc: failed to build the tokio runtime: {e}");
+            process::exit(EXIT_RUNTIME);
+        }
+    };
+    runtime.block_on(async_main(cmd));
+}
+
+/// Resolve the runtime's worker count, in precedence order: the config (every
+/// file `--config-dir` will start a service from), then
+/// `TOKIO_WORKER_THREADS`, then the binary default of one.
+///
+/// The services load their config again once they start; this is a read of the
+/// same inputs, needed because tokio fixes its worker count at runtime
+/// creation. `--config-dir` is the lane where "the same file" is not a single
+/// path: the services start one per file, so the count must come from those
+/// files — a count read from `frpc.toml` while the services run `sites/*.toml`
+/// would be silently wrong.
+fn worker_threads_from_args(args: &FrpcRunArgs) -> usize {
+    let configured = match &args.config_dir {
+        Some(dir) => match worker_threads_from_dir(Path::new(dir), args.strict_config) {
+            Ok(value) => value,
+            Err(message) => {
+                eprintln!("frpc: {message}");
+                process::exit(frp_core::EXIT_CONFIG);
+            }
+        },
+        None => {
+            let path = if args.config.is_empty() {
+                "frpc.toml"
+            } else {
+                args.config.as_str()
+            };
+            if is_regular_file(Path::new(path)) {
+                load_client_config(path, args.strict_config)
+                    .ok()
+                    .and_then(|cfg| cfg.worker_threads)
+            } else {
+                None
+            }
+        }
+    };
+    resolve_worker_threads(configured, env_worker_threads(), 1)
+}
+
+/// The count shared by every config file in a `--config-dir` tree. Files that
+/// fail to load are skipped here — the service path reports them with its own
+/// exit code — but two files naming *different* counts are refused, because the
+/// runtime is process-wide and picking one silently would be a coin flip.
+fn worker_threads_from_dir(dir: &Path, strict: bool) -> Result<Option<usize>, String> {
+    let Some(files) = collect_config_files(dir).ok() else {
+        return Ok(None);
+    };
+    let mut chosen: Option<(usize, String)> = None;
+    for path in files {
+        if !is_regular_file(&path) {
+            continue;
+        }
+        let path_str = path.display().to_string();
+        let Ok(cfg) = load_client_config(&path_str, strict) else {
+            continue;
+        };
+        let Some(value) = cfg.worker_threads else {
+            continue;
+        };
+        match &chosen {
+            None => chosen = Some((value, path_str)),
+            Some((seen, first)) if *seen != value => {
+                return Err(format!(
+                    "conflicting transport.workerThreads: {seen} in {first}, {value} in {path_str}; the runtime worker count is process-wide"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(chosen.map(|(value, _)| value))
+}
+
+/// `configured` (config) beats `TOKIO_WORKER_THREADS`, which beats `default`.
+/// The env var stays honoured: tokio honours it only when `worker_threads` is
+/// not called, and both binaries now always call it, so reading it here keeps
+/// the documented knob working instead of silently ignoring it.
+fn resolve_worker_threads(configured: Option<usize>, env: Option<usize>, default: usize) -> usize {
+    configured.or(env).unwrap_or(default).max(1)
+}
+
+/// Reading a path the count is taken from must not block: a FIFO (or any other
+/// non-regular entry) named like a config blocks in `read_to_string` until a
+/// writer opens it, and the count is read **before** logging is initialised, so
+/// blocking here would wedge startup with no diagnostics at all. Such an entry
+/// is therefore skipped — the service lane still opens it, in its own place,
+/// with its own reporting.
+fn is_regular_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// `TOKIO_WORKER_THREADS`, when it names a usable count.
+fn env_worker_threads() -> Option<usize> {
+    parse_worker_threads_env(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref())
+}
+
+/// The parsing half of [`env_worker_threads`], split out so the accepted and
+/// rejected spellings can be tested without mutating the process environment.
+fn parse_worker_threads_env(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+}
+
+/// Build the runtime with an explicit worker count. Split out so a test can
+/// assert the count reaches tokio: the bug this key exists to fix was a
+/// resolution that was computed correctly and then not applied.
+fn build_runtime(worker_threads: usize) -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+}
+
+async fn async_main(cmd: FrpcCmd) {
     // mem-profile and mimalloc are mutually exclusive (the #[global_allocator]
     // guards are cfg-exclusive): with both enabled neither allocator is
     // installed, so the emitter must not run either.
@@ -1182,5 +1319,240 @@ mod tests {
             }
             other => panic!("expected a config error, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod worker_thread_tests {
+    use super::*;
+
+    fn run_args(config: &str, config_dir: Option<&str>) -> FrpcRunArgs {
+        FrpcRunArgs {
+            config: config.to_string(),
+            config_dir: config_dir.map(str::to_string),
+            strict_config: true,
+            allow_unsafe: Vec::new(),
+            show_version: false,
+            log_file: None,
+            log_level: None,
+            log_max_days: None,
+            log_format: None,
+            disable_log_color: false,
+        }
+    }
+
+    /// A temp directory that removes itself, including when an assertion in the
+    /// test panics — a bare `remove_dir_all` at the end of the body leaks a
+    /// directory per failing run.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for TempDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    /// `worker_threads_from_args` reads the process environment, so a test that
+    /// depends on it must not run beside the one that sets it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sets `TOKIO_WORKER_THREADS` and restores the previous value on drop,
+    /// including when an assertion panics.
+    struct ScopedEnv {
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(value: &str) -> Self {
+            let saved = std::env::var_os("TOKIO_WORKER_THREADS");
+            std::env::set_var("TOKIO_WORKER_THREADS", value);
+            Self { saved }
+        }
+
+        fn unset() -> Self {
+            let saved = std::env::var_os("TOKIO_WORKER_THREADS");
+            std::env::remove_var("TOKIO_WORKER_THREADS");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(value) => std::env::set_var("TOKIO_WORKER_THREADS", value),
+                None => std::env::remove_var("TOKIO_WORKER_THREADS"),
+            }
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        let dir =
+            std::env::temp_dir().join(format!("frp-worker-threads-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        TempDir(dir)
+    }
+
+    /// Precedence is config > `TOKIO_WORKER_THREADS` > default, and a zero that
+    /// reached this function is clamped rather than handed to tokio.
+    #[test]
+    fn precedence_is_config_then_env_then_default() {
+        assert_eq!(resolve_worker_threads(None, None, 1), 1);
+        assert_eq!(resolve_worker_threads(None, Some(4), 1), 4);
+        assert_eq!(resolve_worker_threads(Some(2), Some(4), 1), 2);
+        assert_eq!(resolve_worker_threads(Some(0), None, 1), 1);
+        assert_eq!(resolve_worker_threads(None, None, 8), 8);
+    }
+
+    /// `-c file`: the runtime is sized from the file the service will load.
+    #[test]
+    fn single_config_sets_the_count() {
+        let _env = env_lock();
+        let dir = temp_dir("single");
+        let path = dir.join("frpc.toml");
+        std::fs::write(
+            &path,
+            "serverAddr = \"127.0.0.1\"\nserverPort = 7000\nworkerThreads = 3\n",
+        )
+        .expect("write config");
+        let args = run_args(&path.display().to_string(), None);
+        assert_eq!(worker_threads_from_args(&args), 3);
+    }
+
+    /// The env var is the middle rung and it is read from the process
+    /// environment, not just parsed: the previous shape derived its expectation
+    /// from the code under test, so deleting env support still passed on a
+    /// runner that does not export the variable.
+    #[test]
+    fn absent_key_falls_back_to_the_env_var() {
+        let _env = env_lock();
+        let dir = temp_dir("absent");
+        let path = dir.join("frpc.toml");
+        std::fs::write(&path, "serverAddr = \"127.0.0.1\"\n").expect("write config");
+        let args = run_args(&path.display().to_string(), None);
+
+        let scoped = ScopedEnv::set("6");
+        assert_eq!(worker_threads_from_args(&args), 6);
+        drop(scoped);
+
+        let scoped = ScopedEnv::set("0");
+        assert_eq!(
+            worker_threads_from_args(&args),
+            1,
+            "a zero is ignored rather than handed to tokio, so the default applies"
+        );
+        drop(scoped);
+
+        let scoped = ScopedEnv::unset();
+        assert_eq!(worker_threads_from_args(&args), 1);
+        drop(scoped);
+    }
+
+    /// The env-var parse itself: only a positive integer counts, and a zero or
+    /// a non-number is ignored rather than handed to tokio (which panics on 0).
+    #[test]
+    fn env_var_parsing_accepts_only_a_positive_integer() {
+        assert_eq!(parse_worker_threads_env(Some("3")), Some(3));
+        assert_eq!(parse_worker_threads_env(Some(" 3 ")), Some(3));
+        assert_eq!(parse_worker_threads_env(Some("0")), None);
+        assert_eq!(parse_worker_threads_env(Some("junk")), None);
+        assert_eq!(parse_worker_threads_env(Some("")), None);
+        assert_eq!(parse_worker_threads_env(None), None);
+    }
+
+    /// The resolved count must reach the runtime: a resolution that is computed
+    /// and then dropped was exactly the bug this key fixes.
+    #[test]
+    fn the_resolved_count_reaches_the_runtime() {
+        for n in [1usize, 3] {
+            let runtime = build_runtime(n).expect("build runtime");
+            assert_eq!(runtime.metrics().num_workers(), n);
+        }
+    }
+
+    /// `--config-dir`: one service starts per file, so the count must come from
+    /// those files — the regression this test exists for was reading `frpc.toml`
+    /// while the services ran `sites/*.toml`.
+    #[test]
+    fn config_dir_reads_the_files_the_services_start() {
+        let _env = env_lock();
+        let dir = temp_dir("dir");
+        std::fs::write(
+            dir.join("a.toml"),
+            "serverAddr = \"127.0.0.1\"\nworkerThreads = 2\n",
+        )
+        .expect("write a");
+        std::fs::write(
+            dir.join("b.toml"),
+            "serverAddr = \"127.0.0.1\"\nworker_threads = 2\n",
+        )
+        .expect("write b");
+        assert_eq!(worker_threads_from_dir(&dir, true), Ok(Some(2)));
+    }
+
+    #[test]
+    fn config_dir_without_the_key_leaves_the_default() {
+        let _env = env_lock();
+        let dir = temp_dir("dir-absent");
+        std::fs::write(dir.join("a.toml"), "serverAddr = \"127.0.0.1\"\n").expect("write a");
+        assert_eq!(worker_threads_from_dir(&dir, true), Ok(None));
+    }
+
+    /// One process-wide runtime cannot honour two counts: refuse rather than
+    /// pick one silently.
+    #[test]
+    fn config_dir_refuses_disagreeing_counts() {
+        let _env = env_lock();
+        let dir = temp_dir("dir-conflict");
+        std::fs::write(
+            dir.join("a.toml"),
+            "serverAddr = \"127.0.0.1\"\nworkerThreads = 2\n",
+        )
+        .expect("write a");
+        std::fs::write(
+            dir.join("b.toml"),
+            "serverAddr = \"127.0.0.1\"\nworkerThreads = 5\n",
+        )
+        .expect("write b");
+        let err = worker_threads_from_dir(&dir, true).expect_err("counts disagree");
+        assert!(err.contains("conflicting transport.workerThreads"), "{err}");
+    }
+
+    /// A directory entry the probe cannot read as a regular file — a FIFO is
+    /// the case that used to wedge startup before logging existed — is skipped,
+    /// not opened.
+    #[test]
+    fn config_dir_skips_a_fifo_entry() {
+        let _env = env_lock();
+        let dir = temp_dir("dir-fifo");
+        std::fs::write(
+            dir.join("a.toml"),
+            "serverAddr = \"127.0.0.1\"\nworkerThreads = 2\n",
+        )
+        .expect("write a");
+        let fifo = dir.join("z.toml");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !made {
+            return; // no mkfifo on this platform; the integration test covers it
+        }
+        assert_eq!(worker_threads_from_dir(&dir, true), Ok(Some(2)));
     }
 }

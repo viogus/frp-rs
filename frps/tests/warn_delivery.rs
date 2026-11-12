@@ -1706,7 +1706,7 @@ fn a_config_dir_sigusr1_reloads_every_service() {
 /// (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`).
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:820)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_PANIC hook (frps/src/main.rs:951)"
 )]
 #[cfg(unix)]
 #[test]
@@ -1773,7 +1773,7 @@ fn a_config_dir_sigusr1_does_not_count_a_panicking_service() {
 /// name (`FRPS_RELEASE_WARN_DELIVERY_IGNORED`).
 #[cfg_attr(
     not(debug_assertions),
-    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:699)"
+    ignore = "needs the debug_assertions-only FRPS_CFGDIR_TEST_REGISTRATION_DELAY_MS hook (frps/src/main.rs:830)"
 )]
 #[cfg(unix)]
 #[test]

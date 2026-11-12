@@ -997,7 +997,7 @@ impl ConfigPresence {
     /// `normalize_server_config` flattens `[common]` into the top level and then
     /// *synthesizes* `tls_enable = true` from the legacy `[transport.tls]`
     /// section when it carries `force = true`, `certFile` or `keyFile`
-    /// (`frp-core/src/config/normalize.rs:914-933`, `table.entry(…).or_insert(…)`),
+    /// (`frp-core/src/config/normalize.rs:923-940`, `table.entry(…).or_insert(…)`),
     /// so after normalization a written key and a synthesized one are
     /// indistinguishable.
     ///
@@ -1010,7 +1010,7 @@ impl ConfigPresence {
     /// `process_includes` deep-merges before this runs. The `[transport.tls]`
     /// lift renames five Go keys
     /// (`force`/`certFile`/`keyFile`/`trustedCaFile`/`serverName`, the match at
-    /// `frp-core/src/config/normalize.rs:918-927`) and passes every other key
+    /// `frp-core/src/config/normalize.rs:924-933`) and passes every other key
     /// through unchanged, so a literal `tls_enable` written *inside* that section
     /// is hoisted onto the same inert field — a third written spelling, measured
     /// on the v0.71.0 `frps`: `tls_enable = "yes"` there fails with
@@ -1037,8 +1037,8 @@ impl ConfigPresence {
     /// `known_server_keys()`, so the lenient loader silently drops the key and
     /// the strict one refuses it. `[transport.tls] enable` never matches either:
     /// the **server** lift has no `"enable"` arm
-    /// (`frp-core/src/config/normalize.rs:918-927`; only the **client** lift maps
-    /// it, at `frp-core/src/config/normalize.rs:1486-1494`), so it stays a
+    /// (`frp-core/src/config/normalize.rs:924-933`; only the **client** lift maps
+    /// it, at `frp-core/src/config/normalize.rs:1492-1500`), so it stays a
     /// top-level key literally named `enable`. Neither is a documented spelling.
     pub(super) fn server_tls_enable_set_in(value: &toml::Value) -> bool {
         let Some(table) = value.as_table() else {

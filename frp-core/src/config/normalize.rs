@@ -892,6 +892,16 @@ pub(super) fn normalize_server_config(
             "web_server",
             &["web_server_"],
         );
+        // One canonical root spelling for the worker count before it is
+        // hoisted: the field carries a `workerThreads` alias, so a root camel
+        // spelling next to a snake one would hand serde two keys for one field
+        // (`duplicate field`) instead of one setting. Root wins over
+        // `[transport]`, like every other hoisted key.
+        if table.contains_key("worker_threads") {
+            table.remove("workerThreads");
+        } else if let Some(value) = table.remove("workerThreads") {
+            table.insert("worker_threads".to_string(), value);
+        }
         flatten_to_table(
             table,
             &[
@@ -900,6 +910,9 @@ pub(super) fn normalize_server_config(
                 "tcp_mux_keepalive_timeout",
                 "heartbeat_timeout",
                 "max_pool_count",
+                // Same treatment as the `tcp_mux*` keys: the flat spelling is
+                // the same knob, so it is hoisted rather than left inert.
+                "worker_threads",
             ],
             "transport",
             &[],
@@ -1088,6 +1101,7 @@ pub(super) fn normalize_server_config(
                 ("heartbeatTimeout", "heartbeat_timeout"),
                 ("maxPoolCount", "max_pool_count"),
                 ("tcpKeepalive", "tcp_keepalive"),
+                ("workerThreads", "worker_threads"),
             ];
             for (from, to) in RENAMES {
                 if let Some(v) = transport.remove(*from) {
@@ -1432,6 +1446,16 @@ pub(super) fn normalize_client_config(
             }
         }
 
+        // The root spelling is canonicalised before the flatten for the same
+        // reason as on the server: `ClientConfig::worker_threads` accepts the
+        // `workerThreads` alias, and a root camel key plus the flattened snake
+        // one would arrive as two keys for one field and be refused as a
+        // duplicate. Root wins, as it does for every flattened key.
+        if table.contains_key("worker_threads") {
+            table.remove("workerThreads");
+        } else if let Some(value) = table.remove("workerThreads") {
+            table.insert("worker_threads".to_string(), value);
+        }
         // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
         // but Go frp config puts it under [transport])
         if let Some(Value::Table(tr_table)) = table.remove("transport") {
@@ -1449,6 +1473,7 @@ pub(super) fn normalize_client_config(
                         "heartbeatTimeout" => "heartbeat_timeout",
                         "dialServerTimeout" => "dial_server_timeout",
                         "poolCount" => "pool_count",
+                        "workerThreads" => "worker_threads",
                         other => other,
                     };
                     table.entry(flat_key.to_string()).or_insert(v);

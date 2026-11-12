@@ -384,9 +384,20 @@ impl Service {
                     if result.is_ok()
                         && self.visitor_reload_needed.swap(false, Ordering::AcqRel)
                     {
-                        // Visitor changes require a clean session restart.
+                        // Visitor changes require a clean session restart. The
+                        // reply is what the operator and the admin API print,
+                        // so a kept worker count the reload reported has to
+                        // survive this branch: the fixed string this used to
+                        // send told the whole story and then dropped the one
+                        // line saying a key did not take effect.
                         tracing::info!("Visitor config changed — restarting session");
-                        let _ = req.reply.send(Ok("reload success: visitor changes applied on session restart".into()));
+                        let trailer = match &result {
+                            Ok(summary) => crate::reload::restart_required_tail(summary),
+                            Err(_) => "",
+                        };
+                        let _ = req.reply.send(Ok(format!(
+                            "reload success: visitor changes applied on session restart{trailer}"
+                        )));
                         return LoopExit::Reconnect;
                     }
                     let _ = req.reply.send(result);

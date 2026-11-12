@@ -1096,9 +1096,9 @@ jobs:
           log=/tmp/frp-docs-go-column.$$.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=5bbe09e4869528edfc096491ea9cdce6dc7b75025e5a49154fd0c436ac4b1a9c
-          guard_exact=273
-          guard_floor=273
+          guard_pin=2c6b2cc0d625cd8839df4c5a0ef08bf02c1aeadcb1f3f04ee8e3b7af6ea52374
+          guard_exact=275
+          guard_floor=275
           guard_canary='M1 (websocket_port reworded'
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -1171,11 +1171,11 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the docs-go-column fixture did not report 261 checks with no failure line"
-            echo "::error::scripts/tests/docs-go-column.sh must print 261 '  ok' lines, include the M1 witness, and end with 'RESULT: 261 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
+            echo "::error::the docs-go-column fixture did not report 275 checks with no failure line"
+            echo "::error::scripts/tests/docs-go-column.sh must print 275 '  ok' lines, include the M1 witness, and end with 'RESULT: 275 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
-          echo "docs-go-column fixture checks ok: 261 checks hold (floor $guard_floor), M1 witness present, no failure line"
+          echo "docs-go-column fixture checks ok: 275 checks hold (floor $guard_floor), M1 witness present, no failure line"
       - name: Remote-frps reap — fixture checks
         # TODO.md "`scripts/tests/remote-frps-reap.sh` runs in no CI job"
         # (`:9959` when it was filed): the suite drives
@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=0a69792d1b07a1bfc93131dab7bc94dae7f49fb56d001638a822760b50dbece3
+          guard_data_pin=06f84752bfe52f2e14bd4836cbc71dcce160ed6e2f3874fa85d900c6609eca2f
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2145,8 +2145,8 @@ jobs:
       # at "Run frpc CLI tests (admin address resolution)", which is the only
       # step that runs `cargo test -p frpc` and therefore the only place a count
       # for the package as a whole can live. Re-derived on this tree with
-      # `cargo test -p frpc -- --list` (111 `: test` lines), which decomposes as
-      # the bin's 8 inline unit tests (`cargo test -p frpc --bin frpc --
+      # `cargo test -p frpc -- --list` (120 `: test` lines), which decomposes as
+      # the bin's 17 inline unit tests (`cargo test -p frpc --bin frpc --
       # --list`) plus 103 integration tests over 8 files: admin_cli.rs 25,
       # admin_config_get_warning.rs 0 (it compiles to no tests in this feature
       # set — its `Running` line is still required as a target witness, see the
@@ -2156,7 +2156,7 @@ jobs:
       # counted nothing: deleting any of those files left the lane green, which
       # is why the step now keeps a per-target witness list as well as the
       # total.
-      FRPC_CLI_TESTS: "111"
+      FRPC_CLI_TESTS: "120"
       # Absolute floor under the declared count above, for the reason spelled
       # out at `FRPS_CLI_TESTS_FLOOR`: the equality check cannot tell a
       # legitimate count from a test deleted together with its literal. This
@@ -2195,15 +2195,15 @@ jobs:
         # (TODO.md `--config-dir` residue item 7), and until this step existed
         # that pin executed in no CI lane. The count is asserted for the reason
         # the steps below document: a bare `cargo test --bin frps` cannot tell
-        # "1 passed" from "0 ran" — with the module's only `#[test]` deleted this
-        # step printed `running 0 tests` / `test result: ok. 0 passed; 0 failed`
-        # and still exited 0. The literal is this **bin** target's own count, not
+        # "10 passed" from "0 ran" — with the module's tests deleted this step
+        # printed `running 0 tests` / `test result: ok. 0 passed; 0 failed` and
+        # still exited 0. The literal is this **bin** target's own count, not
         # `FRPS_CLI_TESTS` (that env var counts the integration target
         # `frps/tests/cli_exit_codes.rs`), so adding or removing a test in this
         # inline module moves only the single literal in this step.
         #
         # The guard is not count-only. Round 4 measured two mutants that a count
-        # of 1 cannot see: renaming the test (still one test, still green) and
+        # of 10 cannot see: renaming the test (still one test, still green) and
         # returning early as the body's first statement (one test, `1 passed`,
         # zero assertions). So the step also greps the exact list entry and the
         # pin's `--nocapture` completion marker, which is printed only after
@@ -2229,12 +2229,12 @@ jobs:
           list=/tmp/frps-bin-unit-tests.$$.list
           cargo test -p frps --bin frps --all-features --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_floor=1
+          n_floor=10
           named=$(grep -E -c "^${expected}: test$" "$list" || true)
           status=0
           grep -q "Running unittests src/main.rs" "$log.plain" || status=1
-          grep -q "test result: ok. 1 passed; 0 failed" "$log.plain" || status=1
-          [ "$n" = "1" ] || status=1
+          grep -q "test result: ok. 10 passed; 0 failed" "$log.plain" || status=1
+          [ "$n" = "10" ] || status=1
           [ "$n" -ge "$n_floor" ] || status=1
           [ "$named" = "1" ] || status=1
           grep -q "$marker" "$log.plain" || status=1
@@ -2256,9 +2256,9 @@ jobs:
             echo "::error::frps bin unit-test guard failed (status=$status, file=$n, named=$named, log=$log, sabotage=$sabotage)"
             if [ -n "$n" ] && [ "$n" != "1" ]; then
               if [ "$n" -lt "1" ]; then
-                echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1 — its tests were deleted or the module was disabled; restore them rather than lowering this literal"
+                echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 10 — its tests were deleted or the module was disabled; restore them rather than lowering this literal"
               else
-                echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 1: move the single literal in this shell step from 1 to $n"
+                echo "::error::the inline test module in frps/src/main.rs lists $n tests, this step expects 10: move the single literal in this shell step from 10 to $n"
               fi
             fi
             if [ "$named" != "1" ]; then
@@ -2273,7 +2273,7 @@ jobs:
             cat "$log.plain"
             exit 1
           fi
-          echo "frps bin unit-test guard ok: $n tests listed (expected 1, ${expected}, floor 1), marker seen, 0 failed, sabotage reds it"
+          echo "frps bin unit-test guard ok: $n tests listed (expected 10, ${expected}, floor 10), marker seen, 0 failed, sabotage reds it"
       - name: Run the OTel exporter regression test (the `--lib` sweep cannot see it)
         # `frp-core/tests/otel_export.rs` is `#![cfg(feature = "otel")]`, and the
         # all-features step above is `--lib`-only, so without this step the one
@@ -2922,7 +2922,7 @@ jobs:
       - name: Run frpc's log-completion spawn test (the client control)
         # `frpc/tests/log_completion.rs` is the **control** for the empty-CLI-value
         # rule the `frps` log-completion step below pins. The client has never
-        # overlaid its flags onto the loaded config — `frpc/src/main.rs:384-388`
+        # overlaid its flags onto the loaded config — `frpc/src/main.rs:521-525`
         # passes `cli.log_level` straight to `resolve_log_level` — so "an empty
         # `--log-level` leaves the file's `[log] level` alone" is the outcome it
         # has always had, on both the `-c` and the `--config-dir` lane. The file
@@ -3415,11 +3415,11 @@ jobs:
           echo "frpc admin config-GET guard ok: $n tests listed (expected $want, floor $want_floor), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
-        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:561`)
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:698`)
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
-        # `:562` survived every lane in CI. Same three-check guard shape as its
+        # `:699` survived every lane in CI. Same three-check guard shape as its
         # siblings, with the admin build already warm from the step above.
         shell: bash
         run: |

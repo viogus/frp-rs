@@ -104,6 +104,8 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "tcp_mux_keepalive_interval",
         "tcpMux",
         "tcpMuxKeepaliveInterval",
+        "worker_threads",
+        "workerThreads",
         "tcp_mux_keepalive_timeout",
         "tcpMuxKeepaliveTimeout",
         "heartbeatTimeout",
@@ -250,6 +252,8 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         // to top level) plus Go camelCase aliases that serde accepts but
         // normalization does not rename away.
         "heartbeat_timeout",
+        "worker_threads",
+        "workerThreads",
         "heartbeatTimeout",
         "udp_packet_size",
         "udpPacketSize",
@@ -636,6 +640,8 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
         "transport" => &[
             "tcp_mux",
             "tcpMux",
+            "worker_threads",
+            "workerThreads",
             "tcp_mux_keepalive_interval",
             "tcpMuxKeepaliveInterval",
             "tcp_mux_keepalive_timeout",

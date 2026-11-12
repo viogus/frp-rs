@@ -17,6 +17,14 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- `frpc` now runs its tokio runtime on **one worker thread** by default
+  (previously one per CPU): a 2048 MiB KCP stream through `tcpMux` measures
+  89.7-91.2 MiB/s against 65.5-66.6 — **+37%**, CPU −28% — because a bridged
+  tunnel is a pipeline of tasks and every hop between workers pays a wake and a
+  cache miss. `frps` keeps one worker per CPU, since a server hosts many
+  independent tunnels. Both binaries accept `transport.workerThreads` (restart-only,
+  since tokio fixes its worker count at startup); one worker on both ends reaches
+  111.8 MiB/s, and a Go frp peer is unaffected.
 - **KCP: 1400-byte MTU, above kcp-go's layout.** Production KCP config used
   `mtu: 1350` (the value Go frp pins) while kcp-go's library default is 1400,
   so every KCP datagram carried 1326 bytes of payload instead of 1376. A
@@ -28,14 +36,12 @@ User-facing release notes for frp-rs.
   from its own MTU, so it truncates these datagrams (`InvalidSegmentDataSize`,
   then a retransmit loop) instead of degrading gracefully.
 
-- **Runtime worker count dominates a single fat tunnel** — no code change, a
-  documented tuning knob. Set tokio's `TOKIO_WORKER_THREADS=1` on both ends and a
-  2048 MiB KCP stream through `tcpMux` runs at **111.8 MiB/s instead of 64.6**
-  (Go frp on the same host: 99-102) with the CPU ticks roughly halved; one end
-  alone recovers about half the gain. The default is unchanged (one worker per
-  available CPU): the workaround serialises the process, four separate sessions
-  showed no measurable loss in two pairs, and anything beyond four tunnels is
-  unmeasured. See
+- **Runtime worker count dominates a single fat tunnel.** A 2048 MiB KCP stream
+  through `tcpMux` runs at **111.8 MiB/s with one worker on both ends instead of
+  64.6** (Go frp on the same host: 99-102), with the CPU ticks roughly halved;
+  one end alone recovers about half the gain — which is why the client default is
+  now one worker. `TOKIO_WORKER_THREADS` still works when no config names a
+  count, and `transport.workerThreads` takes precedence over it. See
   [`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md).
 
 ### Fixes

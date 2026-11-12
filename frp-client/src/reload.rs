@@ -218,6 +218,69 @@ pub(crate) fn auth_reload_refusal(
     ))
 }
 
+/// Render a reload that changes `transport.workerThreads`.
+///
+/// The count is fixed when the runtime is created, before any config is read,
+/// so a reload cannot apply it. The caller keeps the *running* value and puts
+/// this line in the reload's response: without it a file whose only edit was
+/// this key came back as `reload success: no changes detected`, which is the
+/// trap this function exists to close. The reload itself still proceeds,
+/// because an otherwise unchanged proxy set should not fail over a key only a
+/// restart can apply — that is the server's restart-only shape (`name: old ->
+/// new (restart required)`) rather than the auth refusal, which must not apply
+/// anything.
+///
+/// The comparison is on the written option, not on the effective count: `None`
+/// means "the binary default, unless `TOKIO_WORKER_THREADS` says otherwise", so
+/// `None -> Some(1)` can still change the runtime (with the env var set) and
+/// `Some(1) -> None` likewise. Deciding equivalence here would mean re-deriving
+/// that precedence, which this crate cannot see; the same over-refusal bias as
+/// `auth_reload_refusal` applies. `None` renders as `unset` rather than as a
+/// number, because which number an absent key resolves to is the resolver's
+/// answer (binary default or env var), not this crate's.
+///
+/// The label a kept worker count is reported under. The reload reply is
+/// rewritten by one lane (the visitor-restart branch in
+/// `frp-client/src/service/message_loop.rs`), and it has to find this line
+/// again rather than drop it, so the label lives here.
+pub(crate) const WORKER_THREADS_REPORT_LABEL: &str = "transport.workerThreads:";
+
+/// The restart-required tail of a reload reply, if the reload kept a worker
+/// count: `; transport.workerThreads: 1 -> 2 (restart required)`.
+///
+/// Used by the lane that replaces the reply with its own message — a visitor
+/// change forces a session restart, and that branch used to return a fixed
+/// string, which dropped the report with it.
+pub(crate) fn restart_required_tail(reply: &str) -> &str {
+    match reply.find(WORKER_THREADS_REPORT_LABEL) {
+        Some(at) => {
+            let start = reply[..at].rfind("; ").unwrap_or(at);
+            &reply[start..]
+        }
+        None => "",
+    }
+}
+
+/// Pinned by `worker_threads_reload_report_only_fires_on_a_change`.
+pub(crate) fn worker_threads_reload_report(
+    old: Option<usize>,
+    new: Option<usize>,
+) -> Option<String> {
+    if old == new {
+        return None;
+    }
+    Some(format!(
+        "{WORKER_THREADS_REPORT_LABEL} {} -> {} (restart required)",
+        written_worker_threads(old),
+        written_worker_threads(new)
+    ))
+}
+
+/// How the reload summary spells a written worker count (`None` = key absent).
+fn written_worker_threads(value: Option<usize>) -> String {
+    value.map_or_else(|| "unset".to_string(), |n| n.to_string())
+}
+
 /// Build a config snapshot string for reload change detection.
 /// Includes all fields that matter for proxy registration and plugin config.
 /// Deterministic map serialization for snapshot equality. std HashMap's
@@ -754,6 +817,46 @@ mod tests {
         assert!(auth_reload_refusal(Some(&auth("token", "t")), None)
             .expect("removed")
             .starts_with("[auth] section removed"));
+    }
+
+    #[test]
+    fn worker_threads_reload_report_only_fires_on_a_change() {
+        assert!(worker_threads_reload_report(None, None).is_none());
+        assert!(worker_threads_reload_report(Some(2), Some(2)).is_none());
+        assert_eq!(
+            worker_threads_reload_report(Some(1), Some(2)).as_deref(),
+            Some("transport.workerThreads: 1 -> 2 (restart required)")
+        );
+        // Every changed written value is reported, including None <-> Some(1):
+        // with `TOKIO_WORKER_THREADS` set those two resolve to different counts.
+        for (old, new) in [(None, Some(1)), (Some(1), None)] {
+            let report = worker_threads_reload_report(old, new)
+                .unwrap_or_else(|| panic!("{old:?} -> {new:?} must be reported"));
+            assert!(report.contains("unset"), "got {report:?}");
+            assert!(report.ends_with("(restart required)"), "got {report:?}");
+        }
+    }
+
+    /// The lane that replaces the reply (visitor restart) must be able to find
+    /// the kept-worker-count line, and a reply without one must yield nothing
+    /// rather than a stray fragment.
+    #[test]
+    fn the_restart_tail_is_the_worker_count_line_only() {
+        assert_eq!(
+            restart_required_tail(
+                "reload success: reload: +1 added; \
+                 transport.workerThreads: 1 -> 2 (restart required)"
+            ),
+            "; transport.workerThreads: 1 -> 2 (restart required)"
+        );
+        assert_eq!(
+            restart_required_tail("reload success: no changes detected"),
+            ""
+        );
+        assert_eq!(
+            restart_required_tail("transport.workerThreads: unset -> 1 (restart required)"),
+            "transport.workerThreads: unset -> 1 (restart required)"
+        );
     }
 
     /// The deliberate over-refusal, pinned so it is not "fixed" into an
