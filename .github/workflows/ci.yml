@@ -167,7 +167,7 @@ jobs:
           log=/tmp/frp-repo-health-fixtures.$$.log
           status=0
           guard_file=scripts/tests/repo-health-fixtures.sh
-          guard_pin=2c6b2cc0d625cd8839df4c5a0ef08bf02c1aeadcb1f3f04ee8e3b7af6ea52374
+          guard_pin=70f7329c18be220cf6541ce7853d8d4aadea9bd070818cd5565ccf433e9b7cf3
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -1096,7 +1096,7 @@ jobs:
           log=/tmp/frp-docs-go-column.$$.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=5bbe09e4869528edfc096491ea9cdce6dc7b75025e5a49154fd0c436ac4b1a9c
+          guard_pin=2c6b2cc0d625cd8839df4c5a0ef08bf02c1aeadcb1f3f04ee8e3b7af6ea52374
           guard_exact=275
           guard_floor=275
           guard_canary='M1 (websocket_port reworded'
