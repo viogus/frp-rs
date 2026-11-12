@@ -2145,8 +2145,8 @@ jobs:
       # at "Run frpc CLI tests (admin address resolution)", which is the only
       # step that runs `cargo test -p frpc` and therefore the only place a count
       # for the package as a whole can live. Re-derived on this tree with
-      # `cargo test -p frpc -- --list` (111 `: test` lines), which decomposes as
-      # the bin's 8 inline unit tests (`cargo test -p frpc --bin frpc --
+      # `cargo test -p frpc -- --list` (120 `: test` lines), which decomposes as
+      # the bin's 17 inline unit tests (`cargo test -p frpc --bin frpc --
       # --list`) plus 103 integration tests over 8 files: admin_cli.rs 25,
       # admin_config_get_warning.rs 0 (it compiles to no tests in this feature
       # set — its `Running` line is still required as a target witness, see the
@@ -2156,7 +2156,7 @@ jobs:
       # counted nothing: deleting any of those files left the lane green, which
       # is why the step now keeps a per-target witness list as well as the
       # total.
-      FRPC_CLI_TESTS: "111"
+      FRPC_CLI_TESTS: "120"
       # Absolute floor under the declared count above, for the reason spelled
       # out at `FRPS_CLI_TESTS_FLOOR`: the equality check cannot tell a
       # legitimate count from a test deleted together with its literal. This
