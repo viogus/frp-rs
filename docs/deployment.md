@@ -1149,26 +1149,35 @@ Measurements and the frame-cost model:
 the default and the knob that overrides it:
 [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
-The async runtime's worker-pool size is not a config key, but tokio reads
-`TOKIO_WORKER_THREADS` at startup for both `frps` and `frpc`; unset keeps one
-worker per available CPU, and a malformed or zero value makes tokio panic at
-startup. On a single fat tunnel the worker count dominates: a 2048 MiB KCP stream
-through `tcpMux` ran at **64.6 MiB/s on four workers against 111.8 on one** (Go
-frp on the same host: 99–102), with the CPU ticks roughly halved. The effect
-tracks task migration — a bridged tunnel is a pipeline of tasks, and every hop
-between workers pays a wake and a cache miss — so set it on **both** ends: one
-side alone recovers about half (client only 86, server only 87.8). It only helps
-when both ends are frp-rs; a Go frp peer ignores the variable.
+The runtime's worker-pool size is `transport.workerThreads` — **restart-only**,
+because tokio fixes the count when the runtime is built. `frpc` defaults to `1`;
+`frps` defaults to one worker per available CPU. Precedence is the config key,
+then `TOKIO_WORKER_THREADS`, then the binary default; with `--config-dir` the
+count must be the same in every file, and a conflict is refused (exit code 2).
 
-```bash
-TOKIO_WORKER_THREADS=1 ./frps -c frps.toml
-TOKIO_WORKER_THREADS=1 ./frpc -c frpc.toml
+```toml
+# frps.toml
+[transport]
+workerThreads = 4      # snake_case `worker_threads` is accepted too
 ```
+
+```toml
+# frpc.toml — top level (`[transport]` is flattened on the client as well)
+workerThreads = 1
+```
+
+On a single fat tunnel the worker count dominates: a 2048 MiB KCP stream through
+`tcpMux` ran at **65.5–66.6 MiB/s with one worker per core against 89.7–91.2 at
+the shipped default** (+37%, CPU −28%), and **111.8 with one worker on both
+ends** (Go frp on the same host: 99–102). The effect tracks task migration — a
+bridged tunnel is a pipeline of tasks, and every hop between workers pays a wake
+and a cache miss. It only helps when both ends are frp-rs; a Go frp peer ignores
+it.
 
 Four separate `tcp` sessions did not measurably lose from one worker on a
 four-vCPU host (two pairs), but that is not a busy server: beyond four tunnels
-this is unmeasured, and one worker is expected to serialise a many-core server.
-The per-session affinity that would keep both properties is not implemented yet.
+this is unmeasured, and one worker is expected to serialise a many-core server
+— which is why only the client default changed.
 Measurements:
 [`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
 

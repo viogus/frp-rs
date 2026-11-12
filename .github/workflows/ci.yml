@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=8c194a42829b9f11260f11a67d250a7d169b394e98b45ca97483adeec00beff8
+          guard_data_pin=b4cfabdfc112bc303646c483c1c407ae21e1deb616d13ceb91e4bdc61c8c21d1
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2922,7 +2922,7 @@ jobs:
       - name: Run frpc's log-completion spawn test (the client control)
         # `frpc/tests/log_completion.rs` is the **control** for the empty-CLI-value
         # rule the `frps` log-completion step below pins. The client has never
-        # overlaid its flags onto the loaded config — `frpc/src/main.rs:424-428`
+        # overlaid its flags onto the loaded config — `frpc/src/main.rs:504-508`
         # passes `cli.log_level` straight to `resolve_log_level` — so "an empty
         # `--log-level` leaves the file's `[log] level` alone" is the outcome it
         # has always had, on both the `-c` and the `--config-dir` lane. The file
@@ -3415,11 +3415,11 @@ jobs:
           echo "frpc admin config-GET guard ok: $n tests listed (expected $want, floor $want_floor), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
-        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:601`)
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:681`)
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
-        # `:602` survived every lane in CI. Same three-check guard shape as its
+        # `:682` survived every lane in CI. Same three-check guard shape as its
         # siblings, with the admin build already warm from the step above.
         shell: bash
         run: |

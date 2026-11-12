@@ -101,8 +101,6 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "web_server_tls_key_file",
         "enable_prometheus",
         "tcp_mux",
-        "worker_threads",
-        "workerThreads",
         "tcp_mux_keepalive_interval",
         "tcpMux",
         "tcpMuxKeepaliveInterval",
@@ -640,6 +638,8 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
         "transport" => &[
             "tcp_mux",
             "tcpMux",
+            "worker_threads",
+            "workerThreads",
             "tcp_mux_keepalive_interval",
             "tcpMuxKeepaliveInterval",
             "tcp_mux_keepalive_timeout",

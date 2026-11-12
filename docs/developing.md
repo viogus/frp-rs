@@ -186,20 +186,20 @@ grep -rn '"tcp"' frp-core/src frp-server/src frp-client/src
 ### 2.2 Config parsing and the type allow-lists
 
 **One struct serves every proxy type.** `ProxyConfig` is
-`frp-core/src/config/client.rs:685`; there is no per-type config struct and no
+`frp-core/src/config/client.rs:1086`; there is no per-type config struct and no
 per-type parser. All types share the same fields, exactly as Go frp does, so a
 type that reuses `local_ip`/`local_port`/`remote_port` needs **no struct change**.
 Add a field only for a genuinely new knob, and then follow the house rules:
 
 - `#[serde(default, alias = "camelCaseName")]` so the Go spelling still parses
   (e.g. the `proxyProtocolVersion` alias on `proxy_protocol_version` at
-  `frp-core/src/config/client.rs:1009`).
+  `frp-core/src/config/client.rs:1010`).
 - **snake_case on the wire.** `NewProxy`'s JSON keys must stay snake_case
   (`http_user`, `host_header_rewrite`, …). A camelCase wire key is *silently
   ignored* by Go frp — the config is accepted and the setting is dropped. This is
   the single most expensive compatibility bug class in this repository.
 - The client plugin config struct is separate: `PluginConfig` at
-  `frp-core/src/config/server.rs:1425`.
+  `frp-core/src/config/server.rs:1442`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
 `fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1339`) checks
@@ -477,7 +477,7 @@ work-connection side lives in `frp-client/src/work_conn.rs`.
 `ProxyConfig` by hand (in a test, or in code) and `enabled` is **`false`**:
 
 ```rust
-// frp-core/src/config/client.rs:779
+// frp-core/src/config/client.rs:780
 #[serde(default = "default_true")]
 pub enabled: bool,
 ```
@@ -778,7 +778,7 @@ spelling is the snake_case `tcp_mux` of the Rust `write_frpc_config` branch
 (`scripts/compat-test.sh:1128-1204`). What *is* dropped, silently, is the **top-level**
 camelCase key: `tcpMux = false` written at the top level is accepted by the
 config parser whether or not a `[transport]` table is present, but it has no serde
-alias on `tcp_mux` (`frp-core/src/config/client.rs:321-322`), so the client keeps the default
+alias on `tcp_mux` (`frp-core/src/config/client.rs:331-332`), so the client keeps the default
 `tcp_mux = true` and the server rejects the first frame with `invalid V1 msg
 length: 144116287587483648 (max: 10240), raw header: 000200010000000000`. A plain
 mismatch — server `tcp_mux = false`, client snake_case `tcp_mux = true` — fails
@@ -2289,7 +2289,7 @@ through and completed, so a file's `[log]` values survive a deliberately empty f
 `--log-format` still writes through on that lane because it is an frp-rs-only flag
 with no Go completion to mirror (`TODO.md` residue R2 records the remaining adjacent
 divergence — R1, the `-c`-only lane's non-empty log flag, is closed by the mask at
-`frps/src/main.rs:483`, which withholds all four log flags there).
+`frps/src/main.rs:557`, which withholds all four log flags there).
 
 Measured against Go frp **v0.71.0** (darwin/arm64) and frp-rs (base `80199f4`),
 cwd holding a `frps.toml`, one free control port and one free dashboard port per
@@ -2435,12 +2435,12 @@ That row has since **changed** with the strict-mode array recursion
 `proxies[0].RemotePort`), because `check_strict` walks the
 `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]` elements with one exact-match key
 set per **struct** (`PROXY_KNOWN_KEYS` and friends in
-`frp-core/src/config/strict.rs:278`). Non-strict mode still drops the keys
+`frp-core/src/config/strict.rs:276`). Non-strict mode still drops the keys
 (rc 0, `remote_port: 0`, `local_port: 80`).
 
 - **Strict mode does not refuse everywhere: it walks only the tables it has a
   key list for.** `section_known_keys`
-  (`frp-core/src/config/strict.rs:549`) has nine arms, plus the top level
+  (`frp-core/src/config/strict.rs:547`) has nine arms, plus the top level
   `check_strict` is entered with and, since the array recursion, the proxy /
   visitor / client-plugin / visitor-plugin / http-plugin element sets. Each
   walked position is listed here with a capitalised key measured as refused at
@@ -4120,7 +4120,7 @@ work; a bug fix on a frozen surface never needs an unfreeze.
   Wintun (`wintun.dll`) integration *and* can test on a Windows host; this
   repo's CI does not exercise vnet on Windows.
 - **Non-default XTCP data plane (KCP+yamux)** — selected by `protocol = "kcp"`;
-  the default is QUIC (`frp-core/src/config/client.rs:1045`,
+  the default is QUIC (`frp-core/src/config/client.rs:1046`,
   `docs/config.md:673`). Unfreeze if a case is reported that the QUIC plane
   cannot serve (for example a hole punch where the QUIC handshake never
   completes but KCP does).

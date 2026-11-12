@@ -75,7 +75,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// first being `frps uses command line arguments for config`. frp-rs has no counterpart
 /// lane — without `-c` it still reads `./frps.toml` (a missing file exits 1),
 /// and `--config-dir` takes the `init_logging(&cli, None)` path
-/// (`frps/src/main.rs:570`). `frpc`'s Go run path binds no `--log-level` flag at
+/// (`frps/src/main.rs:644`). `frpc`'s Go run path binds no `--log-level` flag at
 /// all (`Error: unknown flag: --log-level`, rc 1), so the two binaries can be
 /// compared on the value they resolve but not on the flag surface.
 ///
@@ -83,7 +83,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// Before the fix, on the config above `frps -c frps.toml --log-level info`
 /// printed 11 `INFO` records where Go prints **0**: frp-rs gated only
 /// `override_server_config` on `cli_overrides_enabled`
-/// (`frps/src/main.rs:1126-1128`), while `init_logging` (`:1138`, defined at `:465`)
+/// (`frps/src/main.rs:1200-1202`), while `init_logging` (`:1212`, defined at `:539`)
 /// still read the raw CLI value. `init_logging` now masks the four CLI log flags
 /// (`--log-level`, `--log-file`, `--log-max-days`, `--log-format`) whenever a
 /// `-c` config was loaded, so the file's `[log]` section is authoritative there

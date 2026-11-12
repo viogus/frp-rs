@@ -331,8 +331,9 @@ pub struct ClientConfig {
     #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
     /// Tokio worker-thread count for the client runtime. Unset = the
-    /// client binary's default (one thread, which measured 1.7x the
-    /// throughput of four on a single fat tunnel); `Some(n)` overrides it.
+    /// client binary's default (one thread: a single fat tunnel measured
+    /// 89.7-91.2 MiB/s against 65.5-66.6 with one per CPU); `Some(n)`
+    /// overrides it.
     /// Restart-only: the runtime is built before the config is served.
     #[serde(
         default,

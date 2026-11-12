@@ -78,20 +78,18 @@ syscalls plus 22% scheduler wakeups, which fits both stories.
 
 ## What ships
 
-Nothing in frp-rs needs to change for this: the runtime reads tokio's own
-`TOKIO_WORKER_THREADS` when it starts, in both `frps` and `frpc`. Unset keeps the
-runtime default (one worker per core). No config-file key, no wire change — Go
-frp ignores environment variables it does not know, and nothing about the
-protocol moves. A `FRP_WORKER_THREADS` alias was prototyped and dropped: both
-binaries are plain `#[tokio::main]`, so the alias meant wrapping `main` in a
-hand-built runtime, which re-numbers every source citation that points into
-`frps/src/main.rs` and `frpc/src/main.rs` - a large diff for a second name for a
-knob tokio already owns.
+Status: **shipped** as `transport.workerThreads` (PR #619), restart-only.
+`frpc` defaults to one worker, `frps` to one per available CPU; the config key
+beats `TOKIO_WORKER_THREADS`, which still works when no config names a count.
+Earlier drafts of this note said "no config-file key" — that was true before the
+key landed and is kept here only as history. A `FRP_WORKER_THREADS` alias was
+dropped in favour of tokio's own variable name.
 
 Guidance: for a single fat tunnel - bulk transfer over `kcp`, `tcp` or `tcpMux` -
-set `TOKIO_WORKER_THREADS=1` on **both** ends. For a server carrying many
-independent tunnels on many cores, leave it unset: one worker serialises the
-whole process, and this note only shows four tunnels on a four-vCPU host.
+set `workerThreads = 1` on **both** ends (111.8 MiB/s). The client-side default
+alone gets 89.7-91.2 (+37%). For a server carrying many independent tunnels on
+many cores, leave `frps` at its default: one worker serialises the whole
+process, and this note only shows four tunnels on a four-vCPU host.
 
 ## Limits
 

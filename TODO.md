@@ -12947,9 +12947,10 @@ kept out of the main P2 list so that adding them does not renumber every later
   driver recovered about a third of the gap; setting the knob on one end alone
   recovers about half each way (client only 86.0, server only 87.8).
 
-  `TOKIO_WORKER_THREADS=1` is the workaround, and it is documented, but it
-  serialises the whole process: fine for the four-tunnel test, wrong for a
-  many-core server carrying hundreds.
+  `frpc` now defaults to one worker (`transport.workerThreads`), which recovers
+  +37% on the one-flow arm; setting it to 1 on both ends reaches 111.8. It
+  serialises the process, so it is the default only on the client side: fine for
+  the four-tunnel test, wrong for a many-core server carrying hundreds.
 
   **Done-when:** a per-session affinity design (shard each session's pipeline
   onto one of N runtime threads) is measured interleaved against the current

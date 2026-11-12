@@ -326,6 +326,14 @@ async fn each_restart_only_group_is_named() {
             &[],
         ),
         (
+            // The runtime is built before the config is served, so a change
+            // here can only take effect on restart.
+            "transport.worker_threads",
+            "[transport]\nworker_threads = 2\n",
+            "[transport]\nworker_threads = 3\n",
+            &[],
+        ),
+        (
             // Flipping `tcp_mux` also moves the *completed* `heartbeat_timeout`
             // (`-1` with the mux on, `90` with it off), which is a real second
             // difference and therefore an expected second line.
