@@ -91,6 +91,23 @@ fn test_parse_server_worker_threads() {
             "the root spelling must win in {mixed:?}"
         );
     }
+    // Both spellings of the *same* level: the canonicalisation drops the
+    // camelCase key instead of handing serde two keys for one field. Serde
+    // used to error here ("duplicate field"); the loader now resolves it the
+    // way every other root/`[transport]` collision resolves — the
+    // `snake_case` spelling wins — and the docs say so.
+    for (both, expected) in [
+        ("bindPort = 7000\nworkerThreads = 4\nworker_threads = 5", 5),
+        ("bindPort = 7000\nworker_threads = 5\nworkerThreads = 4", 5),
+    ] {
+        let cfg: ServerConfig = load_server_config_from_str(both)
+            .unwrap_or_else(|error| panic!("{both:?} must load: {error}"));
+        assert_eq!(
+            cfg.transport.worker_threads,
+            Some(expected),
+            "the snake_case spelling must win in {both:?}"
+        );
+    }
 }
 
 #[test]

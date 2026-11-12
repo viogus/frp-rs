@@ -239,6 +239,28 @@ pub(crate) fn auth_reload_refusal(
 /// number, because which number an absent key resolves to is the resolver's
 /// answer (binary default or env var), not this crate's.
 ///
+/// The label a kept worker count is reported under. The reload reply is
+/// rewritten by one lane (the visitor-restart branch in
+/// `frp-client/src/service/message_loop.rs`), and it has to find this line
+/// again rather than drop it, so the label lives here.
+pub(crate) const WORKER_THREADS_REPORT_LABEL: &str = "transport.workerThreads:";
+
+/// The restart-required tail of a reload reply, if the reload kept a worker
+/// count: `; transport.workerThreads: 1 -> 2 (restart required)`.
+///
+/// Used by the lane that replaces the reply with its own message — a visitor
+/// change forces a session restart, and that branch used to return a fixed
+/// string, which dropped the report with it.
+pub(crate) fn restart_required_tail(reply: &str) -> &str {
+    match reply.find(WORKER_THREADS_REPORT_LABEL) {
+        Some(at) => {
+            let start = reply[..at].rfind("; ").unwrap_or(at);
+            &reply[start..]
+        }
+        None => "",
+    }
+}
+
 /// Pinned by `worker_threads_reload_report_only_fires_on_a_change`.
 pub(crate) fn worker_threads_reload_report(
     old: Option<usize>,
@@ -248,7 +270,7 @@ pub(crate) fn worker_threads_reload_report(
         return None;
     }
     Some(format!(
-        "transport.workerThreads: {} -> {} (restart required)",
+        "{WORKER_THREADS_REPORT_LABEL} {} -> {} (restart required)",
         written_worker_threads(old),
         written_worker_threads(new)
     ))
@@ -797,10 +819,6 @@ mod tests {
             .starts_with("[auth] section removed"));
     }
 
-    /// The deliberate over-refusal, pinned so it is not "fixed" into an
-    /// equivalence check by a later reader (see the function's
-    /// "What is compared" section for why `None` and `Some(default)` are not
-    /// interchangeable).
     #[test]
     fn worker_threads_reload_report_only_fires_on_a_change() {
         assert!(worker_threads_reload_report(None, None).is_none());
@@ -819,6 +837,32 @@ mod tests {
         }
     }
 
+    /// The lane that replaces the reply (visitor restart) must be able to find
+    /// the kept-worker-count line, and a reply without one must yield nothing
+    /// rather than a stray fragment.
+    #[test]
+    fn the_restart_tail_is_the_worker_count_line_only() {
+        assert_eq!(
+            restart_required_tail(
+                "reload success: reload: +1 added; \
+                 transport.workerThreads: 1 -> 2 (restart required)"
+            ),
+            "; transport.workerThreads: 1 -> 2 (restart required)"
+        );
+        assert_eq!(
+            restart_required_tail("reload success: no changes detected"),
+            ""
+        );
+        assert_eq!(
+            restart_required_tail("transport.workerThreads: unset -> 1 (restart required)"),
+            "transport.workerThreads: unset -> 1 (restart required)"
+        );
+    }
+
+    /// The deliberate over-refusal, pinned so it is not "fixed" into an
+    /// equivalence check by a later reader (see the function's
+    /// "What is compared" section for why `None` and `Some(default)` are not
+    /// interchangeable).
     #[test]
     fn auth_reload_refusal_treats_the_section_as_written() {
         // A section that is byte-for-byte the `Default` impl still counts as

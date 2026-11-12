@@ -864,7 +864,7 @@ is structural rather than tested.
 
 **Every handoff moves the stream.** There are four of them, one per surface
 (HTTP/1.1 vhost, HTTPS SNI passthrough, tcpmux, h2c) and they all have the same
-shape. `frp-server/src/vhost.rs:709` looks the route's `run_id` up in
+shape. `frp-server/src/vhost.rs:723` looks the route's `run_id` up in
 `run_id_to_ctl_tx`, and `:723` sends `InternalMsg::ProxyUserConn { user_conn:
 wrap(stream), .. }`. The stream is **moved** into the message: after that call
 the vhost task no longer holds a copy, so there is no "listener still owns it"

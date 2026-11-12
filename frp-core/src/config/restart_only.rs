@@ -200,6 +200,16 @@ pub fn effective_max_accept_rate(max_accept_rate: Option<u32>) -> u32 {
     max_accept_rate.unwrap_or(0)
 }
 
+/// How an unwritten worker count is spelled in a restart-only entry.
+///
+/// `0` is not a legal value — the loader rejects it, and tokio panics on a
+/// zero-worker runtime — so rendering an absent key as `0` would read like a
+/// real previous count. The client's own report says `unset`; the server says
+/// the same thing for the same reason.
+fn written_worker_count(value: Option<usize>) -> String {
+    value.map_or_else(|| "unset".to_string(), |n| n.to_string())
+}
+
 /// Push a change entry when `old != new`.
 fn push<T: PartialEq + Display>(
     out: &mut Vec<RestartOnlyChange>,
@@ -572,8 +582,8 @@ fn transport_restart_changes(
     );
     push(
         out,
-        &old_worker_threads.unwrap_or(0),
-        &new_worker_threads.unwrap_or(0),
+        &written_worker_count(*old_worker_threads),
+        &written_worker_count(*new_worker_threads),
         "transport.worker_threads",
         any,
     );

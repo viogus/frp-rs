@@ -1162,7 +1162,9 @@ refused (exit code 2). `frpc reload` (and a reload through the admin API)
 written renders as `unset` — and keeps running with the count the runtime was
 built with, rather than reporting success with a config that no longer matches
 the process. On `frps` the key is accepted under
-`[transport]` and also at the top level of the file (hoisted, like `tcpMux`).
+`[transport]` and also at the top level of the file (hoisted, like `tcpMux`;
+the top level wins over `[transport]`, and writing both spellings at the top
+level uses `worker_threads`).
 
 ```toml
 # frps.toml
