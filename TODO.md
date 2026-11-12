@@ -12929,3 +12929,30 @@ kept out of the main P2 list so that adding them does not renumber every later
   lands, or the note above is extended with the scheduler experiment (per-
   session flush timer decoupled from the receive loop) and its result, so the
   item states a mechanism rather than a residual.
+---
+
+## P2 — structural (scheduling)
+
+- [ ] **One session's pipeline migrates between runtime workers** — `docs/archive/notes/2026-11-12-worker-thread-count.md`
+
+  On a four-vCPU VM a single KCP tunnel through `tcpMux` carries 64.6 MiB/s on
+  the default worker pool against **111.8 MiB/s on one worker** (Go frp on the
+  same host: 99-102), with the CPU ticks roughly halved. The mechanism is task
+  migration: a bridged tunnel is a pipeline of tasks — bridge halves, yamux
+  stream, yamux connection, KCP write queue, KCP socket driver — and each hop
+  between workers pays a wake, an IPI and a cold cache. The evidence points there
+  rather than at lock contention (the four-worker profile is 33.6% syscalls plus
+  22% scheduler wakeups while the process uses ~1.1 of 4 cores), but nothing
+  measures migration directly. Pinning only the KCP
+  driver recovered about a third of the gap; setting the knob on one end alone
+  recovers about half each way (client only 86.0, server only 87.8).
+
+  `TOKIO_WORKER_THREADS=1` is the workaround, and it is documented, but it
+  serialises the whole process: fine for the four-tunnel test, wrong for a
+  many-core server carrying hundreds.
+
+  **Done-when:** a per-session affinity design (shard each session's pipeline
+  onto one of N runtime threads) is measured interleaved against the current
+  build on the note's 4-vCPU VM: one flow ≥100 MiB/s (today 64.6) **and** eight
+  independent `tcp` sessions at ≥2.5× the one-flow rate (today four sessions
+  total 2.3-2.4 GiB/s), with the compat suite green against Go frp.
