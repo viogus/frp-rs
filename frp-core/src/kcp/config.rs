@@ -117,7 +117,10 @@ mod tests {
         // MTU pins the wire framing: kcp-go's library default is 1400 (Go frp
         // pins 1350), so a datagram carries 1376 bytes of payload. Peers read into a 1500-byte
         // slot, so this is accepted by any peer built since 2026-08-13.
-        assert_eq!(aggressive.mtu, 1400, "server default is kcp-go's library mtu");
+        assert_eq!(
+            aggressive.mtu, 1400,
+            "server default is kcp-go's library mtu"
+        );
         assert_eq!(
             aggressive_client.mtu, 1400,
             "client default is kcp-go's library mtu"
