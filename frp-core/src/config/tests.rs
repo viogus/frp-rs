@@ -71,6 +71,56 @@ fn test_parse_server_worker_threads() {
     assert!(
         load_server_config_from_str("bindPort = 7000\n[transport]\nworkerThreads = 0").is_err()
     );
+    // The root spelling is the same knob (hoisted into `[transport]`), and a
+    // file that writes it at both levels resolves to the root value instead of
+    // handing serde two keys for one field.
+    let cfg: ServerConfig =
+        load_server_config_from_str("bindPort = 7000\nworkerThreads = 4").unwrap();
+    assert_eq!(cfg.transport.worker_threads, Some(4));
+    for mixed in [
+        "bindPort = 7000\nworkerThreads = 4\n[transport]\nworkerThreads = 2",
+        "bindPort = 7000\nworker_threads = 4\n[transport]\nworkerThreads = 2",
+        "bindPort = 7000\nworkerThreads = 4\n[transport]\nworker_threads = 2",
+        "bindPort = 7000\nworker_threads = 4\n[transport]\nworker_threads = 2",
+    ] {
+        let cfg: ServerConfig = load_server_config_from_str(mixed)
+            .unwrap_or_else(|error| panic!("{mixed:?} must load: {error}"));
+        assert_eq!(
+            cfg.transport.worker_threads,
+            Some(4),
+            "the root spelling must win in {mixed:?}"
+        );
+    }
+}
+
+#[test]
+fn test_parse_client_worker_threads_mixed_spellings() {
+    // `ClientConfig::worker_threads` carries the `workerThreads` alias, so a
+    // root camel key plus the `[transport]`-flattened snake one used to arrive
+    // as two keys for one field (`duplicate field`) instead of one setting.
+    for mixed in [
+        "server_addr = '127.0.0.1'\nworkerThreads = 4\n[transport]\nworkerThreads = 2",
+        "server_addr = '127.0.0.1'\nworker_threads = 4\n[transport]\nworkerThreads = 2",
+        "server_addr = '127.0.0.1'\nworkerThreads = 4\n[transport]\nworker_threads = 2",
+        "server_addr = '127.0.0.1'\nworker_threads = 4\n[transport]\nworker_threads = 2",
+    ] {
+        let cfg: ClientConfig = load_client_config_from_str(mixed)
+            .unwrap_or_else(|error| panic!("{mixed:?} must load: {error}"));
+        assert_eq!(
+            cfg.worker_threads,
+            Some(4),
+            "the root spelling must win in {mixed:?}"
+        );
+    }
+    // Both spellings under `[transport]` alone still work.
+    for single in [
+        "server_addr = '127.0.0.1'\n[transport]\nworkerThreads = 2",
+        "server_addr = '127.0.0.1'\n[transport]\nworker_threads = 2",
+    ] {
+        let cfg: ClientConfig = load_client_config_from_str(single)
+            .unwrap_or_else(|error| panic!("{single:?} must load: {error}"));
+        assert_eq!(cfg.worker_threads, Some(2), "in {single:?}");
+    }
 }
 
 #[test]

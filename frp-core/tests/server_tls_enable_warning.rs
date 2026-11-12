@@ -43,7 +43,7 @@
 //! **Why a written key warns but a synthesized one does not.** The server
 //! normalizer *synthesizes* `tls_enable = true` from the legacy
 //! `[transport.tls]` section when it carries `force = true`, `certFile` or
-//! `keyFile` (`frp-core/src/config/normalize.rs:920-939`,
+//! `keyFile` (`frp-core/src/config/normalize.rs:923-940`,
 //! `table.entry("tls_enable").or_insert(…)`) — a Go-shaped input, not a user
 //! writing the frp-rs-only field. After normalization the two are
 //! indistinguishable, so `ConfigPresence::server_tls_enable_set_in` reads the

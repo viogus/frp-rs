@@ -126,17 +126,18 @@ impl Service {
         // The runtime's worker count is fixed when the process starts, so a
         // reload cannot apply `transport.workerThreads`. Absorbing the new value
         // would leave `Self::cfg` claiming a count the live runtime does not
-        // use, so the *running* value is kept and the refusal is reported (the
-        // same shape as the server's restart-only report, minus the risk of
-        // failing an otherwise valid reload that also fixed a proxy).
+        // use, so the *running* value is kept and the change is reported in the
+        // reload's response — the server's restart-only shape, minus the risk of
+        // failing an otherwise valid reload that also fixed a proxy.
         let running_worker_threads = self.cfg.read().await.worker_threads;
-        if let Some(reason) = crate::reload::worker_threads_reload_refusal(
+        let worker_threads_report = crate::reload::worker_threads_reload_report(
             running_worker_threads,
             new_cfg.worker_threads,
-        ) {
+        );
+        if let Some(report) = &worker_threads_report {
             tracing::warn!(
-                reason = %reason,
-                "reload: keeping the worker count the running runtime was built with"
+                report = %report,
+                "reload: keeping the worker count the running runtime was built with; the count is fixed when the runtime is built, so this needs a restart of the process"
             );
             new_cfg.worker_threads = running_worker_threads;
         }
@@ -196,7 +197,7 @@ impl Service {
             let merged = delta.new_config;
             *self.cfg.write().await = merged;
             *self.proxies.write().await = Arc::new(self.cfg.read().await.proxies.clone());
-            return Ok(delta.summary);
+            return Ok(with_restart_report(delta.summary, worker_threads_report));
         }
 
         // Visitor listeners are session-scoped; a visitor change requires a
@@ -635,7 +636,23 @@ impl Service {
 
         let summary = changes.join("; ");
         tracing::info!(summary = %summary, "Config reload summary: {}", summary);
-        Ok(format!("reload success: {summary}"))
+        Ok(with_restart_report(
+            format!("reload success: {summary}"),
+            worker_threads_report,
+        ))
+    }
+}
+
+/// Append a restart-required line to the reload's response.
+///
+/// The response is what `frpc reload`, the admin API's `PUT /api/v2/config` and
+/// the log line all show, so a key the reload kept at its running value has to
+/// appear there — a response that says only "no changes detected" is how the
+/// operator learns nothing.
+fn with_restart_report(summary: String, report: Option<String>) -> String {
+    match report {
+        Some(report) => format!("{summary}; {report}"),
+        None => summary,
     }
 }
 
@@ -696,4 +713,29 @@ pub(crate) fn filter_active_visitors(
     };
     active.retain(|v| v.enabled);
     active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::with_restart_report;
+
+    /// The reply is what `frpc reload`, the admin API and the log line show, so
+    /// a count the reload kept at its running value has to appear in it — a
+    /// reply that says only "no changes detected" is how the operator learns
+    /// nothing. A summary without a kept key is passed through unchanged.
+    #[test]
+    fn the_restart_report_is_appended_to_the_reply() {
+        assert_eq!(
+            with_restart_report(
+                "reload success: no changes detected".to_string(),
+                Some("transport.workerThreads: 1 -> 2 (restart required)".to_string()),
+            ),
+            "reload success: no changes detected; \
+             transport.workerThreads: 1 -> 2 (restart required)"
+        );
+        assert_eq!(
+            with_restart_report("reload success: added a".to_string(), None),
+            "reload success: added a"
+        );
+    }
 }

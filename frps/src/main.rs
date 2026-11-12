@@ -1557,6 +1557,45 @@ mod worker_thread_tests {
         }
     }
 
+    /// `worker_threads_from_args` reads the process environment, so a test that
+    /// depends on it must not run beside the one that sets it.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Sets `TOKIO_WORKER_THREADS` and restores the previous value on drop,
+    /// including when an assertion panics.
+    struct ScopedEnv {
+        saved: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnv {
+        fn set(value: &str) -> Self {
+            let saved = std::env::var_os("TOKIO_WORKER_THREADS");
+            std::env::set_var("TOKIO_WORKER_THREADS", value);
+            Self { saved }
+        }
+
+        fn unset() -> Self {
+            let saved = std::env::var_os("TOKIO_WORKER_THREADS");
+            std::env::remove_var("TOKIO_WORKER_THREADS");
+            Self { saved }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            match self.saved.take() {
+                Some(value) => std::env::set_var("TOKIO_WORKER_THREADS", value),
+                None => std::env::remove_var("TOKIO_WORKER_THREADS"),
+            }
+        }
+    }
+
     fn temp_dir(tag: &str) -> TempDir {
         let dir = std::env::temp_dir().join(format!(
             "frp-worker-threads-srv-{}-{tag}",
@@ -1604,6 +1643,7 @@ mod worker_thread_tests {
     /// refuse it there while silently accepting an inert top-level key.
     #[test]
     fn transport_section_sets_the_count() {
+        let _env = env_lock();
         let dir = temp_dir("section");
         let path = dir.join("frps.toml");
         std::fs::write(&path, "bindPort = 7000\n[transport]\nworkerThreads = 2\n")
@@ -1614,6 +1654,7 @@ mod worker_thread_tests {
 
     #[test]
     fn snake_case_spelling_sets_the_count() {
+        let _env = env_lock();
         let dir = temp_dir("snake");
         let path = dir.join("frps.toml");
         std::fs::write(&path, "bindPort = 7000\n[transport]\nworker_threads = 3\n")
@@ -1623,19 +1664,24 @@ mod worker_thread_tests {
     }
 
     /// No key anywhere: one worker per CPU (tokio's own default), or the env
-    /// var when the operator set one. The expectation is derived from the
-    /// concrete parse, not from the helper under test, so deleting env support
-    /// fails this test.
+    /// var when the operator set one. The variable is really set here — an
+    /// expectation derived from the code under test passes with env support
+    /// deleted, which is what the earlier shape did.
     #[test]
     fn absent_key_falls_back_to_one_per_cpu() {
+        let _env = env_lock();
         let dir = temp_dir("absent");
         let path = dir.join("frps.toml");
         std::fs::write(&path, "bindPort = 7000\n").expect("write config");
         let args = run_args(&path.display().to_string(), None);
-        let expected =
-            parse_worker_threads_env(std::env::var("TOKIO_WORKER_THREADS").ok().as_deref())
-                .unwrap_or_else(default_worker_threads);
-        assert_eq!(worker_threads_from_args(&args), expected);
+
+        let scoped = ScopedEnv::set("3");
+        assert_eq!(worker_threads_from_args(&args), 3);
+        drop(scoped);
+
+        let scoped = ScopedEnv::unset();
+        assert_eq!(worker_threads_from_args(&args), default_worker_threads());
+        drop(scoped);
     }
 
     /// The root spelling is the same knob, not an inert copy: both binaries
@@ -1643,6 +1689,7 @@ mod worker_thread_tests {
     /// config written either way sizes the runtime.
     #[test]
     fn root_spelling_is_hoisted_into_the_transport_section() {
+        let _env = env_lock();
         for (spelling, expected) in [("workerThreads", 4), ("worker_threads", 5)] {
             let dir = temp_dir("root");
             let path = dir.join("frps.toml");
@@ -1662,6 +1709,7 @@ mod worker_thread_tests {
     /// while the services ran `sites/*.toml`.
     #[test]
     fn config_dir_reads_the_files_the_services_start() {
+        let _env = env_lock();
         let dir = temp_dir("dir");
         std::fs::write(
             dir.join("a.toml"),
@@ -1678,6 +1726,7 @@ mod worker_thread_tests {
 
     #[test]
     fn config_dir_refuses_disagreeing_counts() {
+        let _env = env_lock();
         let dir = temp_dir("dir-conflict");
         std::fs::write(
             dir.join("a.toml"),

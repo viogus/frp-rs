@@ -1152,12 +1152,16 @@ the default and the knob that overrides it:
 The runtime's worker-pool size is `transport.workerThreads` — **restart-only**,
 because tokio fixes the count when the runtime is built. `frpc` defaults to `1`;
 `frps` defaults to one worker per available CPU. Precedence is the config key,
-then `TOKIO_WORKER_THREADS`, then the binary default; with `--config-dir` the
-count must be the same in every file, and a conflict is refused (exit code 2).
-`frpc reload` (and a reload through the admin API) **reports** a changed count as
-`transport.workerThreads: 1 -> 2 (restart required)` and keeps running with the
-count the runtime was built with, rather than reporting success with a config
-that no longer matches the process. On `frps` the key is accepted under
+then `TOKIO_WORKER_THREADS`, then the binary default — for the lanes that start a
+bridge runtime; `verify`, `reload`, `status`, `stop` and `--version` never
+consult the file, so they size their runtime from the variable or the default.
+With `--config-dir` the count must be the same in every file, and a conflict is
+refused (exit code 2). `frpc reload` (and a reload through the admin API)
+**appends** a changed count to its reply as
+`transport.workerThreads: 1 -> 2 (restart required)` — a value that was not
+written renders as `unset` — and keeps running with the count the runtime was
+built with, rather than reporting success with a config that no longer matches
+the process. On `frps` the key is accepted under
 `[transport]` and also at the top level of the file (hoisted, like `tcpMux`).
 
 ```toml

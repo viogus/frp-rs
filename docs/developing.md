@@ -484,7 +484,7 @@ pub enabled: bool,
 
 The serde default only applies to *deserialization*. A derived `Default` — i.e.
 `..Default::default()` — leaves it `false`, and `filter_active_proxies`
-(`frp-client/src/service/reload_apply.rs:636`) ends with `active.retain(|p| p.enabled)`. The
+(`frp-client/src/service/reload_apply.rs:639-642`) ends with `active.retain(|p| p.enabled)`. The
 proxy is then never registered at all. There is no error: the client logs in,
 pools work connections, and the only symptom is `Connection refused` on the
 remote port. Set `enabled: true` explicitly in every hand-built `ProxyConfig`.

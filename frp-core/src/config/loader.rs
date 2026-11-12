@@ -997,7 +997,7 @@ impl ConfigPresence {
     /// `normalize_server_config` flattens `[common]` into the top level and then
     /// *synthesizes* `tls_enable = true` from the legacy `[transport.tls]`
     /// section when it carries `force = true`, `certFile` or `keyFile`
-    /// (`frp-core/src/config/normalize.rs:920-939`, `table.entry(…).or_insert(…)`),
+    /// (`frp-core/src/config/normalize.rs:923-940`, `table.entry(…).or_insert(…)`),
     /// so after normalization a written key and a synthesized one are
     /// indistinguishable.
     ///
