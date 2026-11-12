@@ -12906,25 +12906,24 @@ kept out of the main P2 list so that adding them does not renumber every later
   Landed: AVX2 parity (49.1 → 58.5 MiB/s one-flow means), `sendmmsg` for the
   flush and the tick (mean 61.3), `recvmmsg` batching (58.5 → 64.0, four pairs),
   one flush per burst of up to four bridge writes (63.9 → 66.5, eight pairs),
-  1400-byte MTU (−6.3% CPU per MiB, six pairs in both orders). Standing
+  1400-byte MTU (−4.0% CPU per MiB, six pairs in both orders). Standing
   numbers: 65-66 vs 99-102 MiB/s one flow, 69 vs 45 CPU-seconds per 2048 MiB,
   568,440 datagrams per 512 MiB against Go's 534,678.
 
-  Seventeen further experiments are measured and negative, including every
-  candidate that reading Go's source suggested — most recently Go's own flush
-  model (`SetWriteDelay(true)`: flush only at the window or the 20 ms tick),
-  which runs the same stream at **27-32 MiB/s**, 2.0-2.4x *slower* than the
-  shipped per-write flush, and 4 MiB UDP socket buffers (no effect):
+  Every candidate that reading Go's source suggested is now measured and
+  negative: Go's flush behaviour in three variants — write-delay/tick-only
+  (**24-30 MiB/s**, 2.2-2.8x slower than shipped), 4 MiB UDP socket buffers (no
+  effect), and flushing when an ACK slides the window (~61-63 MiB/s, about 5%
+  slower) — plus the eleven earlier pass/eliminate experiments (copies, yamux
+  window, tokio-vs-blocking relay, ACK batching to the tick):
   `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. A mixed-binary matrix
   localises the remainder: with Go as the client the same servers carry
   80-83 MiB/s, with frp-rs as the client 61-66, so **the client end is the
-  limiter**, not the server, and not the KCP core (small-payload round trips
-  are 442/s against Go's 48/s).
+  limiter**, not the server, and not the KCP core.
 
   So the cost is not a call site: it is the steady-state pacing of one session
-  under this driver. Closing it means rebuilding the driver around a different
-  scheduler (kcp-go's timer flush plus per-session goroutine) with no evidence
-  yet that the rebuild wins.
+  under this driver. The tick-only arms show which direction is wrong to take;
+  they do not identify the right one.
 
   **Done-when:** either a design with a measured ≥10% win on the same harness
   lands, or the note above is extended with the scheduler experiment (per-
