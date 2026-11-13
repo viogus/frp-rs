@@ -59,6 +59,13 @@ async fn test_relay_byte_exact_bidirectional() {
     let addr: SocketAddr = format!("127.0.0.1:{bind_port}").parse().unwrap();
     let proxy_addr: SocketAddr = format!("127.0.0.1:{proxy_port}").parse().unwrap();
 
+    // On Linux the server must take the zero-copy arm for this shape: the work
+    // connection is a drained `PreRead` wrapper and the user connection is raw
+    // TCP. Before the wrapper delegation the arm was unreachable on the server
+    // side, so this counts rather than trusts — both arms relay the same bytes.
+    #[cfg(target_os = "linux")]
+    let splice_calls_before = frp_core::splice::bridge_splice_calls();
+
     // Provider logs in and registers a tcp proxy listening on proxy_port.
     let (mut provider, resp) = login_with_test_token(addr).await.expect("provider login");
     let run_id = resp.run_id.expect("run_id");
@@ -149,6 +156,13 @@ async fn test_relay_byte_exact_bidirectional() {
         .expect("work write");
     let got = read_exact_n(&mut user, down_payload.len()).await;
     assert_eq!(got, down_payload, "work→user relay corrupted bytes");
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        frp_core::splice::bridge_splice_calls() > splice_calls_before,
+        "the relay fell back to the userspace copy loop: a drained PreRead work \
+         connection must still reach splice(2) on the server side"
+    );
 
     drop(user);
     drop(work_conn);

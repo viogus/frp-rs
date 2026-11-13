@@ -432,9 +432,14 @@ impl IoStream {
     }
 
     /// Return a reference to the underlying `TcpStream` if this transport is
-    /// raw TCP. Returns `None` for PreRead (has unconsumed bytes that cannot
-    /// be spliced), TLS, KCP, WebSocket, yamux, cipher, and other wrapped
-    /// transports.
+    /// raw TCP. Returns `None` for a wrapper that still holds unread bytes
+    /// (a `PreRead`/`BufferedRead` prefix cannot be spliced past), TLS, KCP,
+    /// WebSocket, yamux, cipher, and other wrapped transports.
+    ///
+    /// A byte-replay wrapper whose prefix is fully consumed *does* answer
+    /// with the inner stream: it holds no state the socket cannot supply, so
+    /// the server's sniffed work connection still reaches the zero-copy
+    /// bridge.
     ///
     /// Useful for zero-copy fast paths (e.g. `splice(2)`) that only work
     /// with raw kernel TCP sockets.
@@ -3351,7 +3356,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2267).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (transport/mod.rs:2332).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

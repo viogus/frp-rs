@@ -19,7 +19,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=610 weak=138 ambiguous=2 excluded=101 foreign_reported=1155 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=6d79d81b8a8cce6b ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
+#   pins: checked=610 weak=137 ambiguous=2 excluded=101 foreign_reported=1155 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=624509e96ffbf570 ambiguous_set=fbd8449054b4b1a2 excluded_set=45f4a33fe80fa510
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2384	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2384	1524
@@ -341,7 +341,7 @@ frp-core/src/mux.rs	1149	-	7c87f29371148fd1	-	shorthand	vendor/yamux/README-FRP-
 frp-core/src/mux.rs	814	-	0f68b8c7fd8369f9	-	absolute	vendor/yamux/README-FRP-RS.md	frp-core/src/mux.rs:814	396
 frp-core/src/mux.rs	908	-	e6e173e9879e8709	-	shorthand	vendor/yamux/README-FRP-RS.md	:908	397
 frp-core/src/mux.rs	912	-	00fd77d6b376df8a	-	shorthand	vendor/yamux/README-FRP-RS.md	:912	397
-frp-core/src/transport/mod.rs	2267	-	019e0dbb9b972bfb	-	absolute	frp-core/src/transport/mod.rs	transport/mod.rs:2267	3354
+frp-core/src/transport/mod.rs	2332	-	ece8f0b0300abc24	-	absolute	frp-core/src/transport/mod.rs	transport/mod.rs:2332	3359
 frp-core/src/transport/websocket.rs	27	-	f9e4dee11859dcee	-	absolute	frp-core/src/mux.rs	frp-core/src/transport/websocket.rs:27	425
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	docs/developing.md	frp-core/src/unsafe_features.rs:10	2478
 frp-core/src/unsafe_features.rs	10	-	3b685bc8a77dc810	-	absolute	frp-core/src/config/tests.rs	frp-core/src/unsafe_features.rs:10	13231

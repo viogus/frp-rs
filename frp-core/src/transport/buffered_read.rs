@@ -64,6 +64,35 @@ impl Transport for BufferedReadTransport {
     fn peer_addr(&self) -> Option<SocketAddr> {
         self.inner.peer_addr()
     }
+
+    /// Delegate the raw-TCP fast path once the buffered prefix is consumed.
+    ///
+    /// Same rule as `PreReadTransport`: a wrapper holding no unread bytes is
+    /// transparent, so a plain TCP work connection can still reach the
+    /// zero-copy `splice(2)` bridge on the server side.
+    fn try_tcp(&self) -> Option<&tokio::net::TcpStream> {
+        if self.pos >= self.buf.len() {
+            self.inner.try_tcp()
+        } else {
+            None
+        }
+    }
+
+    fn try_tcp_mut(&mut self) -> Option<&mut tokio::net::TcpStream> {
+        if self.pos >= self.buf.len() {
+            self.inner.try_tcp_mut()
+        } else {
+            None
+        }
+    }
+
+    fn into_tcp(self: Box<Self>) -> Option<tokio::net::TcpStream> {
+        if self.pos >= self.buf.len() {
+            self.inner.into_tcp()
+        } else {
+            None
+        }
+    }
     fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> io::Result<Box<dyn Transport>> {
         // Buffered bytes are preserved inside the returned Cipher wrapper;
         // they will be replayed before encrypted reads begin.
@@ -102,6 +131,18 @@ mod tests {
     use super::*;
     use crate::cipher_stream::CipherStream;
 
+    /// A connected loopback TCP pair — the only transport whose raw-TCP fast
+    /// path (`splice(2)`) is worth probing here.
+    async fn tcp_pair() -> (tokio::net::TcpStream, tokio::net::TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        (client, server)
+    }
+
     /// Build a `BufferedReadTransport` over an in-memory duplex wrapped in a
     /// `CipherStream` (itself a `Transport`), with `pos` bytes of the buffer
     /// consumed.
@@ -110,6 +151,56 @@ mod tests {
         let inner: Box<dyn Transport> =
             Box::new(CipherStream::new(duplex, [0u8; 16]).expect("rng"));
         Box::new(BufferedReadTransport::new(buf, pos, inner))
+    }
+
+    #[tokio::test]
+    async fn drained_buffer_forwards_the_raw_tcp_fast_path() {
+        // The server wraps the plain TCP work connection in a BufferedRead
+        // after the V2-magic sniff. While bytes remain buffered the raw-TCP
+        // fast path must stay hidden; once they are consumed the wrapper is
+        // transparent, so `splice(2)` can engage instead of the copy loop.
+        let (client, peer) = tcp_pair().await;
+        let mut drained = Box::new(BufferedReadTransport::new(
+            b"abc".to_vec(),
+            3,
+            Box::new(client) as Box<dyn Transport>,
+        ));
+        assert!(
+            drained.try_tcp().is_some(),
+            "a fully consumed buffer must expose the raw TCP stream"
+        );
+        assert!(
+            drained.try_tcp_mut().is_some(),
+            "a fully consumed buffer must expose the mutable fast path"
+        );
+        assert!(
+            drained.into_tcp().is_some(),
+            "a fully consumed buffer must hand out the raw TCP stream"
+        );
+        drop(peer);
+    }
+
+    #[tokio::test]
+    async fn unread_buffer_hides_the_raw_tcp_fast_path() {
+        let (client, peer) = tcp_pair().await;
+        let mut pending = Box::new(BufferedReadTransport::new(
+            b"abc".to_vec(),
+            1,
+            Box::new(client) as Box<dyn Transport>,
+        ));
+        assert!(
+            pending.try_tcp().is_none(),
+            "unread buffered bytes cannot be spliced past"
+        );
+        assert!(
+            pending.try_tcp_mut().is_none(),
+            "the mutable fast path must apply the same replay guard"
+        );
+        assert!(
+            pending.into_tcp().is_none(),
+            "peeling must not discard unread buffered bytes"
+        );
+        drop(peer);
     }
 
     #[test]

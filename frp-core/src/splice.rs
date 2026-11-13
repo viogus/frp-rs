@@ -466,6 +466,21 @@ pub async fn bridge_splice(
     bridge_splice_with_linger(user, work, crate::bridge::HALF_CLOSE_LINGER_TIMEOUT).await
 }
 
+/// Bridged connections this process has driven through [`bridge_splice`].
+///
+/// Test support only. The zero-copy arm is indistinguishable from the userspace
+/// copy loop by its output, and it sat unreachable for months because nothing
+/// asserted that it ran — a plain `tcp` proxy tests identically either way. A
+/// Linux-only server test pins the count so a future bridging change cannot
+/// silently restore the copy loop.
+#[doc(hidden)]
+pub fn bridge_splice_calls() -> u64 {
+    BRIDGE_SPLICE_CALLS.load(Ordering::Relaxed)
+}
+
+/// One increment per bridged connection, not per `splice(2)` call.
+static BRIDGE_SPLICE_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// [`bridge_splice`] with an injectable half-close linger, so tests can pin
 /// the abandon-a-stalled-peer behaviour without waiting out the production
 /// window.
@@ -474,6 +489,7 @@ async fn bridge_splice_with_linger(
     work: tokio::net::TcpStream,
     linger: Duration,
 ) -> io::Result<(u64, u64)> {
+    BRIDGE_SPLICE_CALLS.fetch_add(1, Ordering::Relaxed);
     // Step 1: Deregister from tokio's reactor and transfer fd ownership.
     // `into_std()` may reset the fd to blocking mode; AsyncFd requires
     // non-blocking fds for correct epoll edge-triggered behavior.
