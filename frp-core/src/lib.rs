@@ -5,6 +5,7 @@ pub mod backoff;
 pub mod bandwidth;
 pub mod base64;
 pub mod bridge;
+pub mod bridge_shard;
 pub mod buffer_pool;
 pub mod cipher_stream;
 pub mod cli;

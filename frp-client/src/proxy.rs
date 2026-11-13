@@ -422,7 +422,7 @@ async fn relay_plain_fast_inner(
     // so the transport cannot change.
     if work.try_tcp().is_some() {
         let work = work.into_tcp().expect("try_tcp confirmed raw TCP above");
-        match frp_core::splice::bridge_splice(local, work).await {
+        match frp_core::bridge_shard::on_shard(frp_core::splice::bridge_splice(local, work)).await {
             Ok((to_work, to_local)) => {
                 metrics.bytes_in.fetch_add(to_work, Ordering::Relaxed);
                 metrics.bytes_out.fetch_add(to_local, Ordering::Relaxed);

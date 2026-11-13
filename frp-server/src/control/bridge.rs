@@ -105,7 +105,9 @@ async fn relay_plain_fast_inner(
         let work = work_conn
             .into_tcp()
             .expect("try_tcp confirmed raw TCP above");
-        match frp_core::splice::bridge_splice(user, work).await {
+        // Optional bridge sharding: a dedicated shard thread keeps this
+        // session's copy pipeline off the shared worker pool (`FRP_BRIDGE_SHARD`).
+        match frp_core::bridge_shard::on_shard(frp_core::splice::bridge_splice(user, work)).await {
             Ok((a, b)) => {
                 metrics.record_traffic(a, b);
             }
