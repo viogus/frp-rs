@@ -12857,6 +12857,16 @@ other.
 
   **Done (2026-11-07).** Both planes now wrap their transport in the same `ActivityIo`/`WriteStall` the control/data mux uses — `frp-core/src/xtcp_p2p.rs` (P2P stream before `.compat()`) and `frp-core/src/xtcp_session.rs` (`ReadActivity`-wrapped KCP stream) — and each driver's `select!` gained a `biased` arm on the force-close channel that `write_stall_watchdog` fires at the deadline (10 s by default, `crate::mux::DEFAULT_WRITE_DEADLINE`; the tunnel driver takes it as a parameter so tests can shorten it). The watchdog and the `wait_force_close` semantics are the ones already pinned by the mux tests; the new `a_stalled_tunnel_transport_tears_the_session_down` pins the **wiring** — marked stall + 200 ms deadline ⇒ `session.is_alive()` flips false inside 2 s, red at the 2 s bound with the select arm removed.
 
+## P3 — measured but not adopted
+
+- **rustls `ChunkVecBuffer` per-record allocation (4th TLS lever).** Recycling
+  the drained chunk removes `Vec::<u8>::resize` from frpc's flush path (7.2% of
+  samples) and measured +5.3% on a one-flow TLS stream, but it is neutral at
+  four flows and costs up to ~32 KiB per connection, so it was not adopted.
+  Patch and numbers: `docs/archive/notes/2026-11-11-tls-record-read-size.md` §6;
+  branch `perf/tls-send-buffer-reuse`. Revisit only if a per-connection budget
+  that allows ~32 KiB appears (e.g. if TLS records get pooled elsewhere).
+
 ## P2 — structural (throughput-floor follow-ups)
 
 Filed by the protocol-matrix throughput-floor change (`scripts/protocol-matrix.floors`);
