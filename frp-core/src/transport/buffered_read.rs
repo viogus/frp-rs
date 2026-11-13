@@ -160,7 +160,7 @@ mod tests {
         // fast path must stay hidden; once they are consumed the wrapper is
         // transparent, so `splice(2)` can engage instead of the copy loop.
         let (client, peer) = tcp_pair().await;
-        let drained = Box::new(BufferedReadTransport::new(
+        let mut drained = Box::new(BufferedReadTransport::new(
             b"abc".to_vec(),
             3,
             Box::new(client) as Box<dyn Transport>,
@@ -168,6 +168,10 @@ mod tests {
         assert!(
             drained.try_tcp().is_some(),
             "a fully consumed buffer must expose the raw TCP stream"
+        );
+        assert!(
+            drained.try_tcp_mut().is_some(),
+            "a fully consumed buffer must expose the mutable fast path"
         );
         assert!(
             drained.into_tcp().is_some(),
@@ -179,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn unread_buffer_hides_the_raw_tcp_fast_path() {
         let (client, peer) = tcp_pair().await;
-        let pending = Box::new(BufferedReadTransport::new(
+        let mut pending = Box::new(BufferedReadTransport::new(
             b"abc".to_vec(),
             1,
             Box::new(client) as Box<dyn Transport>,
@@ -187,6 +191,10 @@ mod tests {
         assert!(
             pending.try_tcp().is_none(),
             "unread buffered bytes cannot be spliced past"
+        );
+        assert!(
+            pending.try_tcp_mut().is_none(),
+            "the mutable fast path must apply the same replay guard"
         );
         assert!(
             pending.into_tcp().is_none(),

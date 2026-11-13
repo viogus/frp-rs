@@ -3,7 +3,8 @@
 **Date:** 2026-11-13
 **Status:** Fixed — drained `PreRead`/`BufferedRead` wrappers now forward the
 raw-TCP fast path. Plain `tcp` proxies (`tcp_mux = false`, `transport.tls.enable =
-false`) move 1.7-2.0x more bytes.
+false`) move 1.7-1.9x more bytes on one flow, 1.9-2.0x with eight sessions on one
+worker, and 1.1-1.5x with eight sessions on four workers.
 
 ## Symptom
 
@@ -16,8 +17,9 @@ and the server issued none — it ran the userspace copy loop (`sendto` +
 
 ## Root cause
 
-The server wraps every accepted connection stream in a byte-replay wrapper
-before it reaches the bridge:
+The server wraps the V1 work connection in a byte-replay wrapper before it
+reaches the bridge, because it is sniffed for the V2 magic and the connection
+type first:
 
 | side | transport before the bridge | `try_tcp()` |
 | --- | --- | --- |
@@ -25,16 +27,18 @@ before it reaches the bridge:
 | server user conn | `IoStream::Tcp` | `Some` |
 | **server work conn** | `IoStream::PreRead` / `IoStream::BufferedRead` | **`None` → copy loop** |
 
-The work connection is sniffed for the V2 magic and the connection type before
-the proxy bridge sees it, so it always arrives wrapped. Both wrappers used the
-default `Transport` implementations of `try_tcp`/`try_tcp_mut`/`into_tcp`,
-which return `None` — correct for a wrapper with bytes still to replay, but
-wrong once those bytes are spent: `into_split` already applied exactly that
-rule (it refuses only when `pos < len`).
+Both wrappers used the default `Transport` implementations of
+`try_tcp`/`try_tcp_mut`/`into_tcp`, which return `None` — correct for a wrapper
+with bytes still to replay, but wrong once those bytes are spent: `into_split`
+already applied exactly that rule (it refuses only when `pos < len`).
 
 `relay_plain_fast_inner` requires *both* sides to be raw TCP before it calls
 `frp_core::splice::bridge_splice`, so the server half never qualified and the
-fast path was unreachable in every configuration — not just this one.
+fast path was unreachable for V1 work connections — the shape every default
+client uses (`v2 = false`). Two shapes were never affected: a V2 work
+connection arrives as a bare `IoStream::Tcp` (the V2 magic branch returns the
+stream unwrapped), and with `tcp_mux = true` the work connection is an
+`IoStream::Yamux`, which no wrapper hides and no `splice(2)` can cross.
 
 ## Fix
 
@@ -48,10 +52,22 @@ fn try_tcp(&self) -> Option<&tokio::net::TcpStream> {
 }
 ```
 
-(`into_tcp` uses the same guard; `PreReadTransport::fully_drained()` is
-`pos >= pre_read.len()`, `BufferedReadTransport` compares `pos >= buf.len()`.)
+(`try_tcp_mut` and `into_tcp` use the same guard; `PreReadTransport::fully_drained()`
+is `pos >= pre_read.len()`, `BufferedReadTransport` compares `pos >= buf.len()`.)
 Nothing is dropped: a drained wrapper holds no bytes, and an undrained one
 still refuses, so the copy loop keeps running whenever replay is pending.
+
+The mutable variant matters on a second path: it is how the server-side
+WebSocket writer picks its vectored frame write
+(`frp-core/src/transport/websocket.rs`), which was likewise unreachable for an
+accepted connection while the GET-upgrade prefix sat in a `PreRead`. Writes were
+never buffered by the wrapper, so forwarding it carries no replay concern, and
+the path is the same one the client side already used.
+
+`relay_integrity.rs` now asserts the consequence instead of the shape: on Linux
+it counts `frp_core::splice::bridge_splice` calls around a real bridged
+connection and fails if the userspace copy loop ran, so a future plumbing change
+cannot silently restore it.
 
 ## Measurements
 

@@ -173,11 +173,11 @@ impl WsByteStream {
 /// Downcast the erased inner stream to a raw `TcpStream`, if the innermost
 /// transport is raw TCP — the same downcast the splice(2) fast path uses
 /// (`IoStream::try_tcp_mut`, which returns `None` for TLS/QUIC/KCP-wrapped
-/// streams and for the leftover-`BufferedRead` accept variant). Server
-/// accept paths box an `IoStream`, so the erased `Box<dyn AsyncReadWrite>`
-/// is peeled via `Any` first (the trait is `'static`); client-side
-/// `PrependStream` boxes yield `None`, which is fine — the client path never
-/// uses this.
+/// streams and for a `PreRead`/`BufferedRead` accept variant that still holds
+/// unread bytes). Server accept paths box an `IoStream`, so the erased
+/// `Box<dyn AsyncReadWrite>` is peeled via `Any` first (the trait is
+/// `'static`); client-side `PrependStream` boxes yield `None`, which is fine
+/// — the client path never uses this.
 fn inner_tcp_mut(inner: &mut Box<dyn AsyncReadWrite>) -> Option<&mut TcpStream> {
     // Trait upcast `dyn AsyncReadWrite` → `dyn Any` (supertrait; trait
     // upcasting is stable since Rust 1.86), then downcast to the concrete

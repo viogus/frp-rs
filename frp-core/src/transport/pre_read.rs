@@ -128,6 +128,7 @@ impl Transport for PreReadTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     /// A connected loopback TCP pair — the only transport whose raw-TCP fast
     /// path (`splice(2)`) is worth probing here.
@@ -143,17 +144,29 @@ mod tests {
 
     #[tokio::test]
     async fn drained_prefix_forwards_the_raw_tcp_fast_path() {
-        // The server's plain TCP work connection arrives here after the
-        // connection-type sniff; before this delegation the splice fast path
-        // could never engage on the server side of a plain TCP proxy.
+        // The server's work connection arrives here after the connection-type
+        // sniff with the sniffed bytes still to be replayed, and the work-conn
+        // reader consumes that prefix before the bridge picks the connection.
+        // The state the fast path has to recognise is therefore `pos == len > 0`
+        // — a non-empty prefix read to exhaustion, not an empty one.
         let (client, peer) = tcp_pair().await;
         let mut drained = Box::new(PreReadTransport::new(
-            Vec::new(),
+            b"FRP\x00\x00\x00\x00".to_vec(),
             Box::new(client) as Box<dyn Transport>,
         ));
         assert!(
+            drained.try_tcp().is_none(),
+            "bytes still waiting to be replayed cannot be spliced past"
+        );
+        let mut replayed = [0u8; 7];
+        drained
+            .read_exact(&mut replayed)
+            .await
+            .expect("replay prefix");
+        assert_eq!(&replayed, b"FRP\x00\x00\x00\x00");
+        assert!(
             drained.try_tcp().is_some(),
-            "an empty pre-read prefix must expose the raw TCP stream"
+            "a consumed pre-read prefix must expose the raw TCP stream"
         );
         assert!(drained.try_tcp_mut().is_some());
         assert!(drained.into_tcp().is_some());
@@ -163,13 +176,17 @@ mod tests {
     #[tokio::test]
     async fn unread_prefix_hides_the_raw_tcp_fast_path() {
         let (client, peer) = tcp_pair().await;
-        let pending = Box::new(PreReadTransport::new(
+        let mut pending = Box::new(PreReadTransport::new(
             b"V2".to_vec(),
             Box::new(client) as Box<dyn Transport>,
         ));
         assert!(
             pending.try_tcp().is_none(),
             "bytes still waiting to be replayed cannot be spliced past"
+        );
+        assert!(
+            pending.try_tcp_mut().is_none(),
+            "the mutable fast path must apply the same replay guard"
         );
         assert!(pending.into_tcp().is_none());
         drop(peer);
