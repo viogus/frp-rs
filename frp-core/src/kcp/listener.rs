@@ -22,7 +22,7 @@ enum DriverSource {
     /// registered, and the receiver resolves when the driver has returned.
     Thread(
         tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<bool>,
     ),
 }
 
@@ -115,23 +115,76 @@ impl KcpListener {
 pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let (stream, driver) = dial_kcp_with_driver(addr, config).await?;
     // Detach the driver: it self-exits once the stream is dropped (see
-    // KcpSocket::run). The JoinHandle is deliberately dropped — aborting
-    // it here would kill the connection before its first probe is sent
-    // (audit round 5 tried this and it broke dial→accept).
+    // KcpSocket::run). The handle is deliberately dropped — aborting it here
+    // would kill the connection before its first probe is sent (audit round 5
+    // tried this and it broke dial→accept). Dropping it also costs nothing: on
+    // the thread path the handle is a plain receiver, not a parked task.
     drop(driver);
     Ok(stream)
 }
 
-/// Like [`dial_kcp`], but returns a handle that resolves when the socket
-/// driver has exited (after the last stream is dropped the driver terminates
-/// itself — see `KcpSocket::run`). The driver lives on its own thread when
-/// [`super::driver_thread::driver_thread_wanted`] is true and on the caller's
-/// runtime otherwise; the returned handle covers both, so a test observes the
-/// real driver either way. Production uses [`dial_kcp`], which detaches it.
+/// A dialed connection's socket driver, as something to await.
+///
+/// Resolves once the driver has exited: `true` for a clean exit, `false` if it
+/// panicked or the thread went away without reporting. Both driver placements
+/// (own thread, caller's runtime) are covered, so a test observes the real
+/// driver either way rather than a placeholder that always completes.
+#[must_use = "dropping the handle detaches the driver, which is what production wants; a test that awaits it wants the value"]
+pub struct DriverHandle {
+    inner: DriverWait,
+}
+
+enum DriverWait {
+    /// Driver spawned on the caller's runtime.
+    Task(tokio::task::JoinHandle<()>),
+    /// Driver hosted on its own thread; fired when that thread's runtime
+    /// returns (the socket is already closed by then).
+    Thread(tokio::sync::oneshot::Receiver<bool>),
+}
+
+impl DriverHandle {
+    fn task(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            inner: DriverWait::Task(handle),
+        }
+    }
+
+    fn thread(exited: tokio::sync::oneshot::Receiver<bool>) -> Self {
+        Self {
+            inner: DriverWait::Thread(exited),
+        }
+    }
+}
+
+impl std::future::Future for DriverHandle {
+    /// `true` when the driver exited on its own terms.
+    type Output = bool;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        match &mut self.get_mut().inner {
+            DriverWait::Task(handle) => std::pin::Pin::new(handle)
+                .poll(cx)
+                .map(|joined| joined.is_ok()),
+            DriverWait::Thread(exited) => std::pin::Pin::new(exited)
+                .poll(cx)
+                .map(|signalled| signalled.unwrap_or(false)),
+        }
+    }
+}
+
+/// Like [`dial_kcp`], but returns a [`DriverHandle`] that resolves when the
+/// socket driver has exited (after the last stream is dropped the driver
+/// terminates itself — see `KcpSocket::run`). The driver lives on its own
+/// thread when [`super::driver_thread::driver_thread_wanted`] is true and on
+/// the caller's runtime otherwise. Dropping the handle instead detaches the
+/// driver, which is what [`dial_kcp`] does.
 pub async fn dial_kcp_with_driver(
     addr: &str,
     config: KcpConfig,
-) -> io::Result<(KcpStream, tokio::task::JoinHandle<()>)> {
+) -> io::Result<(KcpStream, DriverHandle)> {
     // Go parity: kcp-go's `Dial(raddr string)` resolves its argument with
     // `net.ResolveUDPAddr`, so a hostname is a valid dial target here too —
     // rejecting it with a bare parse error was an frp-rs-only restriction that
@@ -235,17 +288,16 @@ pub async fn dial_kcp_with_driver(
     // freeing the task instead of leaking one per dial for the process
     // lifetime (HIGH leak under reconnect churn).
     let driver = match driver_source {
-        DriverSource::Task(kcp_socket) => tokio::spawn(async move { kcp_socket.run().await }),
+        DriverSource::Task(kcp_socket) => {
+            DriverHandle::task(tokio::spawn(async move { kcp_socket.run().await }))
+        }
         DriverSource::Thread(go, done) => {
             // Release the driver thread now that the session is registered.
-            // The thread ends on its own when the driver exits; this task only
-            // reports that exit (it resolves when the thread's runtime
-            // returns), so awaiting the handle in tests observes the real
-            // driver rather than a placeholder.
+            // The thread ends on its own when the driver exits; the handle is
+            // a bare receiver, so a production dial (which drops it) spawns
+            // nothing to watch a thread nobody is watching.
             let _ = go.send(());
-            tokio::spawn(async move {
-                let _ = done.await;
-            })
+            DriverHandle::thread(done)
         }
     };
 

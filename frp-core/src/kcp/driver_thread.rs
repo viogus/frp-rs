@@ -171,16 +171,21 @@ pub(crate) async fn bind_driver(addr: &str, config: KcpConfig) -> std::io::Resul
 /// Bind a dial socket on a private runtime, hand its handle back to the
 /// caller (which registers the session first), then run the driver there for
 /// as long as it lives. The returned sender must be used to release the
-/// driver — dropping it unblocks the thread too. The returned receiver
-/// resolves once the thread has returned, so a caller (the tests) can observe
-/// the driver's exit and prove it does not leak.
+/// driver — dropping it unblocks the thread too. The returned receiver resolves
+/// when the driver's runtime has returned (its socket is closed by then; the
+/// OS thread finishes unwinding immediately afterwards) with `true` for a clean
+/// exit, so a caller can observe the driver and prove it does not leak.
 pub(crate) async fn dial_driver(
     bind_addr: &str,
     config: KcpConfig,
-) -> std::io::Result<(KcpSocketHandle, oneshot::Sender<()>, oneshot::Receiver<()>)> {
+) -> std::io::Result<(
+    KcpSocketHandle,
+    oneshot::Sender<()>,
+    oneshot::Receiver<bool>,
+)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<std::io::Result<KcpSocketHandle>>(1);
     let (go_tx, go_rx) = oneshot::channel::<()>();
-    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel::<bool>();
     let bind_addr = bind_addr.to_string();
     let thread = std::thread::Builder::new()
         .name("frp-kcp-driver".to_string())
@@ -189,7 +194,7 @@ pub(crate) async fn dial_driver(
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
-                    let _ = done_tx.send(());
+                    let _ = done_tx.send(false);
                     return;
                 }
             };
@@ -216,7 +221,7 @@ pub(crate) async fn dial_driver(
             // thread handle itself is detached on purpose — the driver stops
             // itself (see `KcpSocket::run`), and joining here would block the
             // caller's runtime on a thread that may outlive a dropped stream.
-            let _ = done_tx.send(());
+            let _ = done_tx.send(true);
         })?;
     drop(thread);
     let handle = handshake(ready_rx).await?;

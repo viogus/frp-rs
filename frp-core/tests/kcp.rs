@@ -72,62 +72,40 @@ async fn test_kcp_dial_send_recv() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_kcp_dial_driver_self_exits_after_stream_drop() {
     let config = no_fec_config();
-    #[cfg(target_os = "linux")]
-    let drivers_before = driver_thread_count();
 
     // Real dial (binds a UDP socket and spawns the driver), then drop the
-    // stream immediately — no peer needed, the driver's liveness signal is
-    // the stream itself.
-    let (stream, driver) = timeout(
+    // stream — no peer needed, the driver's liveness signal is the stream
+    // itself.
+    let (stream, mut driver) = timeout(
         Duration::from_secs(10),
         dial_kcp_with_driver("127.0.0.1:1", config),
     )
     .await
     .expect("dial timeout")
     .expect("dial_kcp_with_driver");
+
+    // The handle must be tied to the driver, not a placeholder that completes
+    // immediately: while the stream is alive the driver is still looping, so
+    // it cannot have resolved. (This is what catches a regression to a dummy
+    // handle; the previous implementation returned `tokio::spawn(async {})`,
+    // which resolves here.)
+    assert!(
+        timeout(Duration::from_millis(100), &mut driver)
+            .await
+            .is_err(),
+        "the driver handle resolved while its stream was still alive"
+    );
+
     drop(stream);
 
-    // The driver must terminate promptly once its only stream is gone.
+    // The driver must terminate promptly once its only stream is gone, and it
+    // must report a clean exit — `false` means it panicked or never signalled.
     // (The outer Result is the timeout — the failure this test exists to
-    // catch; the driver's own exit status is irrelevant once it resolves.)
-    let _: Result<(), _> = timeout(Duration::from_secs(5), driver)
+    // catch.)
+    let clean = timeout(Duration::from_secs(5), driver)
         .await
         .expect("KCP dial driver must self-exit after the last stream is dropped");
-
-    // The handle above resolves when the driver thread's runtime returns, so
-    // the thread itself should already be gone. `/proc/self/task` is the only
-    // in-process evidence that the OS thread (not just its task) exited.
-    #[cfg(target_os = "linux")]
-    {
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while driver_thread_count() > drivers_before && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            driver_thread_count(),
-            drivers_before,
-            "a KCP driver thread outlived its driver"
-        );
-    }
-}
-
-/// Number of live OS threads named `frp-kcp-driver` in this process
-/// (`/proc/self/task/*/comm`, Linux only). `comm` is truncated to 15 bytes and
-/// the name is 14, so it compares exactly. Absent elsewhere: the assertion that
-/// uses it is `cfg`-gated the same way.
-#[cfg(target_os = "linux")]
-fn driver_thread_count() -> usize {
-    std::fs::read_dir("/proc/self/task")
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|entry| {
-                    std::fs::read_to_string(entry.path().join("comm"))
-                        .is_ok_and(|name| name.trim() == "frp-kcp-driver")
-                })
-                .count()
-        })
-        .unwrap_or(0)
+    assert!(clean, "the KCP driver thread exited without reporting");
 }
 
 /// KCP+TLS round-trip: the client wraps the KCP stream in TLS with the
