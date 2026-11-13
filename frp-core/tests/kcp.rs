@@ -72,6 +72,8 @@ async fn test_kcp_dial_send_recv() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_kcp_dial_driver_self_exits_after_stream_drop() {
     let config = no_fec_config();
+    #[cfg(target_os = "linux")]
+    let drivers_before = driver_thread_count();
 
     // Real dial (binds a UDP socket and spawns the driver), then drop the
     // stream immediately — no peer needed, the driver's liveness signal is
@@ -91,6 +93,41 @@ async fn test_kcp_dial_driver_self_exits_after_stream_drop() {
     let _: Result<(), _> = timeout(Duration::from_secs(5), driver)
         .await
         .expect("KCP dial driver must self-exit after the last stream is dropped");
+
+    // The handle above resolves when the driver thread's runtime returns, so
+    // the thread itself should already be gone. `/proc/self/task` is the only
+    // in-process evidence that the OS thread (not just its task) exited.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while driver_thread_count() > drivers_before && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            driver_thread_count(),
+            drivers_before,
+            "a KCP driver thread outlived its driver"
+        );
+    }
+}
+
+/// Number of live OS threads named `frp-kcp-driver` in this process
+/// (`/proc/self/task/*/comm`, Linux only). `comm` is truncated to 15 bytes and
+/// the name is 14, so it compares exactly. Absent elsewhere: the assertion that
+/// uses it is `cfg`-gated the same way.
+#[cfg(target_os = "linux")]
+fn driver_thread_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    std::fs::read_to_string(entry.path().join("comm"))
+                        .is_ok_and(|name| name.trim() == "frp-kcp-driver")
+                })
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 /// KCP+TLS round-trip: the client wraps the KCP stream in TLS with the

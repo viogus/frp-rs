@@ -137,10 +137,12 @@ Harness: `/root/bench/kcpu-ab.sh <srv_workers> <cli_workers> 1024` (one
 For comparison, Go frp v0.72.0 on the same host and the same `abbench` client
 moves 108-113 MiB/s on this shape.
 
-The threads are per socket and per live connection: a server with one KCP
-listener gains one thread, a client gains one per live KCP connection, and the
-thread exits when its driver does (five client reconnects leave the server's
-thread count unchanged).
+The threads are per socket: a server with one KCP listener gains one thread,
+and a client gains one per live KCP connection **only when its runtime has more
+than one worker** — the default `frpc` runtime has one, so a default client
+creates none (the driver keeps the only thread it already owns). The thread
+exits when its driver does (five client reconnects leave the server's thread
+count unchanged).
 
 ## Reproduce
 

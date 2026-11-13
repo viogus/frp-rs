@@ -10,11 +10,6 @@ use tokio::sync::mpsc;
 use super::config::KcpConfig;
 use super::driver_thread::DriverThread;
 
-/// UDP socket receive buffer size (1 MiB). ~5x the OS default (~212KB on Linux),
-/// enough to absorb KCP bursts without 200-client memory blowout.
-const KCP_UDP_RCVBUF: usize = 1_048_576;
-/// UDP socket send buffer size (1 MiB), matching RCVBUF.
-const KCP_UDP_SNDBUF: usize = 1_048_576;
 use super::session::KcpSession;
 use super::socket::{KcpSocket, KcpSocketHandle};
 use super::stream::KcpStream;
@@ -24,10 +19,10 @@ enum DriverSource {
     /// Spawned as a task on the caller's runtime (the default).
     Task(Box<KcpSocket>),
     /// Hosted on its own thread; the sender releases it once the session is
-    /// registered.
+    /// registered, and the receiver resolves when the driver has returned.
     Thread(
         tokio::sync::oneshot::Sender<()>,
-        std::thread::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
     ),
 }
 
@@ -59,7 +54,7 @@ impl KcpListener {
     /// Bind a KCP listener on the given address.
     pub async fn bind(addr: &str, config: KcpConfig) -> io::Result<Self> {
         if super::driver_thread::driver_thread_wanted() {
-            let bound = super::driver_thread::bind_driver(addr, config)?;
+            let bound = super::driver_thread::bind_driver(addr, config).await?;
             let accept_notify_tx = bound.handle.accept_notify_tx.clone();
             return Ok(Self {
                 local_addr: bound.local_addr,
@@ -73,14 +68,9 @@ impl KcpListener {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
 
-        // Set socket buffer sizes (1 MiB each). ~5x OS default (~212KB on Linux)
-        // — enough for KCP bursts without 200-client kernel-memory blowout.
-        if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-            tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
-        }
-        if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-            tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
-        }
+        // 1 MiB each (~5x OS default on Linux) — enough for KCP bursts
+        // without 200 idle clients pinning kernel memory.
+        super::socket::tune_udp_buffers(&socket);
         let socket = Arc::new(socket);
 
         let (kcp_socket, handle, accept_rx) = KcpSocket::new(socket, config);
@@ -132,11 +122,12 @@ pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     Ok(stream)
 }
 
-/// Like [`dial_kcp`], but returns the socket driver's `JoinHandle` so the
-/// caller can observe driver self-exit (after the last stream is dropped
-/// the driver terminates itself — see `KcpSocket::run`). Production uses
-/// [`dial_kcp`], which detaches the handle; tests use this to prove the
-/// driver does not leak.
+/// Like [`dial_kcp`], but returns a handle that resolves when the socket
+/// driver has exited (after the last stream is dropped the driver terminates
+/// itself — see `KcpSocket::run`). The driver lives on its own thread when
+/// [`super::driver_thread::driver_thread_wanted`] is true and on the caller's
+/// runtime otherwise; the returned handle covers both, so a test observes the
+/// real driver either way. Production uses [`dial_kcp`], which detaches it.
 pub async fn dial_kcp_with_driver(
     addr: &str,
     config: KcpConfig,
@@ -199,20 +190,14 @@ pub async fn dial_kcp_with_driver(
     // A multi-worker runtime hosts the driver on its own thread, with the
     // socket bound *inside* it so its registration belongs to that runtime.
     let (driver_source, handle) = if super::driver_thread::driver_thread_wanted() {
-        let (handle, go, thread) = super::driver_thread::dial_driver(bind_addr, config.clone())?;
-        (DriverSource::Thread(go, thread), handle)
+        let (handle, go, done) =
+            super::driver_thread::dial_driver(bind_addr, config.clone()).await?;
+        (DriverSource::Thread(go, done), handle)
     } else {
         let socket = UdpSocket::bind(bind_addr).await?;
-
-        // Set socket buffer sizes (1 MiB each), matching the listener — an
-        // outbound dial otherwise keeps the OS defaults (~212KB on Linux),
-        // which can drop KCP bursts under load.
-        if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-            tracing::debug!(error = %e, "KCP: dial failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
-        }
-        if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-            tracing::debug!(error = %e, "KCP: dial failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
-        }
+        // Matching the listener — an outbound dial otherwise keeps the OS
+        // defaults (~212KB on Linux), which can drop KCP bursts under load.
+        super::socket::tune_udp_buffers(&socket);
         let socket = Arc::new(socket);
         let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
         (DriverSource::Task(Box::new(kcp_socket)), handle)
@@ -251,14 +236,16 @@ pub async fn dial_kcp_with_driver(
     // lifetime (HIGH leak under reconnect churn).
     let driver = match driver_source {
         DriverSource::Task(kcp_socket) => tokio::spawn(async move { kcp_socket.run().await }),
-        DriverSource::Thread(go, thread) => {
+        DriverSource::Thread(go, done) => {
             // Release the driver thread now that the session is registered.
-            // The thread ends on its own when the driver exits; the join
-            // handle is dropped rather than awaited (awaiting it would block
-            // this runtime on a UDP socket's lifetime).
+            // The thread ends on its own when the driver exits; this task only
+            // reports that exit (it resolves when the thread's runtime
+            // returns), so awaiting the handle in tests observes the real
+            // driver rather than a placeholder.
             let _ = go.send(());
-            drop(thread);
-            tokio::spawn(async {})
+            tokio::spawn(async move {
+                let _ = done.await;
+            })
         }
     };
 

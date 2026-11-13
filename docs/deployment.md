@@ -1192,6 +1192,15 @@ this is unmeasured, and one worker is expected to serialise a many-core server
 Measurements:
 [`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
 
+A KCP socket's driver also leaves the worker pool when the runtime has more than
+one worker: each socket gets a private single-threaded runtime with the socket
+bound inside it, which is worth **+26–29 %** on one `tcpMux` session at `frps`
+four workers and **+46 %** when both ends use four
+([`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md)
+§ Driver thread). A single-worker runtime is left alone, so a default `frpc`
+creates no extra thread. `FRP_KCP_DRIVER_RUNTIME=0` turns it off (bisecting a
+KCP throughput regression), `=1` forces it on.
+
 **Heartbeat intervals:**
 
 ```toml

@@ -32,7 +32,10 @@ User-facing release notes for frp-rs.
   configuration — and server CPU 1.41 → 0.91 cores; four workers on both ends
   goes 77.5 → 114.9 MiB/s (+48%). A single-worker runtime is left alone
   (measured 125.1/121.9 MiB/s, unchanged), and Go frp on the same host moves
-  108-113 MiB/s. `FRP_KCP_DRIVER_RUNTIME=0` restores the shared-pool behaviour.
+  108-113 MiB/s. The thread is only created when the runtime has more than one
+  worker, so the default client (one worker) never creates one and pays
+  nothing; `FRP_KCP_DRIVER_RUNTIME=0` restores the shared-pool behaviour on the
+  server.
 
 - `frpc` now runs its tokio runtime on **one worker thread** by default
   (previously one per CPU): a 2048 MiB KCP stream through `tcpMux` measures

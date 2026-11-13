@@ -9,13 +9,13 @@
 //! send queues, KCP window) is re-warmed on every migration. Parking the
 //! driver on a private current-thread runtime keeps it on one OS thread for
 //! its whole life, so the rest of the process can use as many workers as the
-//! relay side wants:
-//!
-//! | workerThreads (srv/cli) | shared pool | own driver thread |
-//! |-------------------------|-------------|-------------------|
-//! | 4 / 1                   | 94.2 MiB/s  | 119.4 MiB/s       |
-//! | 4 / 4                   | 76.8 MiB/s  | 111.9 MiB/s       |
-//! | 1 / 1                   | 116.3 MiB/s | not used (1 worker) |
+//! relay side wants. Measured effect of the change, medians of interleaved
+//! pairs on that host: `4/1` (the shipped default) 93.8 → 121.4 MiB/s with
+//! server CPU 1.42 → 0.94 cores, `4/4` 77.5 → 114.9, `1/1` unchanged at
+//! 125.1/121.9 (no thread is created there). Go frp v0.72.0 moves 108-113 on
+//! the same shape. The authoritative table lives in
+//! `docs/archive/notes/2026-11-12-worker-thread-count.md` — cite it rather than
+//! restating numbers here.
 //!
 //! The socket must be *bound inside* that runtime: a `tokio::net::UdpSocket`
 //! registers with the reactor that was current when it was created, and a
@@ -29,13 +29,8 @@ use tokio::runtime::Builder;
 use tokio::sync::{mpsc, oneshot};
 
 use super::config::KcpConfig;
-use super::socket::{KcpSocket, KcpSocketHandle};
+use super::socket::{tune_udp_buffers, KcpSocket, KcpSocketHandle};
 use super::stream::KcpStream;
-
-/// UDP socket receive buffer size (1 MiB), matching the listener.
-const KCP_UDP_RCVBUF: usize = 1_048_576;
-/// UDP socket send buffer size (1 MiB), matching the listener.
-const KCP_UDP_SNDBUF: usize = 1_048_576;
 
 /// Whether this socket's driver should get its own thread.
 ///
@@ -67,6 +62,10 @@ impl Drop for DriverThread {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
         }
+        // Bounded by one `select!` wake of the driver: the runtime hosts only
+        // the driver task, whose stop arm is always enabled. Do not spawn any
+        // other task on that runtime — an unrelated task would make this join
+        // unbounded, and it runs on whichever worker drops the listener.
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -86,16 +85,32 @@ fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 fn tune(socket: &UdpSocket) {
-    if let Err(e) = socket2::SockRef::from(socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-        tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
-    }
-    if let Err(e) = socket2::SockRef::from(socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-        tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
+    tune_udp_buffers(socket);
+}
+
+/// Wait for the driver thread's bind handshake without parking a runtime
+/// worker.
+///
+/// The thread resolves the bind address on its own runtime, so the wait is a
+/// DNS lookup in the worst case; blocking a worker for that would be a new
+/// class of stall (the old `UdpSocket::bind(addr).await` was async end to end).
+async fn handshake<T: Send + 'static>(
+    rx: std::sync::mpsc::Receiver<std::io::Result<T>>,
+) -> std::io::Result<T> {
+    let received = tokio::task::spawn_blocking(move || rx.recv())
+        .await
+        .map_err(|e| std::io::Error::other(format!("KCP driver handshake failed: {e}")))?;
+    match received {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(std::io::Error::other(
+            "KCP driver thread exited before binding",
+        )),
     }
 }
 
 /// Bind `addr` on a private runtime and host its driver there.
-pub(crate) fn bind_driver(addr: &str, config: KcpConfig) -> std::io::Result<BoundDriver> {
+pub(crate) async fn bind_driver(addr: &str, config: KcpConfig) -> std::io::Result<BoundDriver> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<
         std::io::Result<(
             std::net::SocketAddr,
@@ -141,15 +156,7 @@ pub(crate) fn bind_driver(addr: &str, config: KcpConfig) -> std::io::Result<Boun
                 }
             });
         })?;
-    let (local_addr, handle, accept_rx) = match ready_rx.recv() {
-        Ok(Ok(parts)) => parts,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(std::io::Error::other(
-                "KCP driver thread exited before binding",
-            ))
-        }
-    };
+    let (local_addr, handle, accept_rx) = handshake(ready_rx).await?;
     Ok(BoundDriver {
         local_addr,
         handle,
@@ -164,17 +171,16 @@ pub(crate) fn bind_driver(addr: &str, config: KcpConfig) -> std::io::Result<Boun
 /// Bind a dial socket on a private runtime, hand its handle back to the
 /// caller (which registers the session first), then run the driver there for
 /// as long as it lives. The returned sender must be used to release the
-/// driver — dropping it unblocks the thread too.
-pub(crate) fn dial_driver(
+/// driver — dropping it unblocks the thread too. The returned receiver
+/// resolves once the thread has returned, so a caller (the tests) can observe
+/// the driver's exit and prove it does not leak.
+pub(crate) async fn dial_driver(
     bind_addr: &str,
     config: KcpConfig,
-) -> std::io::Result<(
-    KcpSocketHandle,
-    oneshot::Sender<()>,
-    std::thread::JoinHandle<()>,
-)> {
+) -> std::io::Result<(KcpSocketHandle, oneshot::Sender<()>, oneshot::Receiver<()>)> {
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<std::io::Result<KcpSocketHandle>>(1);
     let (go_tx, go_rx) = oneshot::channel::<()>();
+    let (done_tx, done_rx) = oneshot::channel::<()>();
     let bind_addr = bind_addr.to_string();
     let thread = std::thread::Builder::new()
         .name("frp-kcp-driver".to_string())
@@ -183,6 +189,7 @@ pub(crate) fn dial_driver(
                 Ok(rt) => rt,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
+                    let _ = done_tx.send(());
                     return;
                 }
             };
@@ -205,15 +212,13 @@ pub(crate) fn dial_driver(
                 let _ = go_rx.await;
                 kcp_socket.run().await;
             });
+            // The driver is done; tell whoever is watching the handle. The
+            // thread handle itself is detached on purpose — the driver stops
+            // itself (see `KcpSocket::run`), and joining here would block the
+            // caller's runtime on a thread that may outlive a dropped stream.
+            let _ = done_tx.send(());
         })?;
-    let handle = match ready_rx.recv() {
-        Ok(Ok(handle)) => handle,
-        Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(std::io::Error::other(
-                "KCP driver thread exited before binding",
-            ))
-        }
-    };
-    Ok((handle, go_tx, thread))
+    drop(thread);
+    let handle = handshake(ready_rx).await?;
+    Ok((handle, go_tx, done_rx))
 }
