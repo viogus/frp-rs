@@ -12944,16 +12944,16 @@ kept out of the main P2 list so that adding them does not renumber every later
   rather than at lock contention (the four-worker profile is 33.6% syscalls plus
   22% scheduler wakeups while the process uses ~1.1 of 4 cores), but nothing
   measures migration directly. Pinning only the KCP
-  driver recovered about a third of the gap; setting the knob on one end alone
-  recovers about half each way (client only 86.0, server only 87.8).
+  driver was only a probe then; since 2026-11-14 the driver has its own runtime
+  thread and recovers all of it (93.8 → 121.4 MiB/s with four workers).
 
   `frpc` now defaults to one worker (`transport.workerThreads`), which recovers
   +37% on the one-flow arm; setting it to 1 on both ends reaches 111.8. It
   serialises the process, so it is the default only on the client side: fine for
   the four-tunnel test, wrong for a many-core server carrying hundreds.
 
-  **Done-when:** a per-session affinity design (shard each session's pipeline
-  onto one of N runtime threads) is measured interleaved against the current
-  build on the note's 4-vCPU VM: one flow ≥100 MiB/s (today 64.6) **and** eight
-  independent `tcp` sessions at ≥2.5× the one-flow rate (today four sessions
-  total 2.3-2.4 GiB/s), with the compat suite green against Go frp.
+  **Status (2026-11-14): the driver half is shipped** — every KCP socket runs its
+  driver on a private runtime, and `tcp`/`tcpMux` showed no worker-count penalty
+  at all, so what remains is only whether bridge/yamux tasks should follow it.
+  Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
+  2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).

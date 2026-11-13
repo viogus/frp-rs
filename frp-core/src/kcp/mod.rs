@@ -5,6 +5,7 @@
 //! correction (GF(2^8) Vandermonde).
 
 mod config;
+mod driver_thread;
 mod listener;
 pub mod protocol;
 pub mod session;
