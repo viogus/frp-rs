@@ -84,6 +84,7 @@ async fn relay_plain_fast(
     work_conn: IoStream,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
+    eprintln!("DBG server bridge: user={:?} work={:?}", user_conn, work_conn);
     relay_plain_fast_inner(user_conn, work_conn, metrics).await
 }
 

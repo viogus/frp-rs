@@ -405,6 +405,7 @@ async fn relay_plain_fast(
     name: &str,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
+    eprintln!("DBG client bridge: local=tcp work={:?}", work);
     relay_plain_fast_inner(local, work, name, metrics).await
 }
 
