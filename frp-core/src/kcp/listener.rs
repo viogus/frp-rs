@@ -8,15 +8,23 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 use super::config::KcpConfig;
+use super::driver_thread::DriverThread;
 
-/// UDP socket receive buffer size (1 MiB). ~5x the OS default (~212KB on Linux),
-/// enough to absorb KCP bursts without 200-client memory blowout.
-const KCP_UDP_RCVBUF: usize = 1_048_576;
-/// UDP socket send buffer size (1 MiB), matching RCVBUF.
-const KCP_UDP_SNDBUF: usize = 1_048_576;
 use super::session::KcpSession;
 use super::socket::{KcpSocket, KcpSocketHandle};
 use super::stream::KcpStream;
+
+/// Where the dial path's socket driver runs.
+enum DriverSource {
+    /// Spawned as a task on the caller's runtime (the default).
+    Task(Box<KcpSocket>),
+    /// Hosted on its own thread; the sender releases it once the session is
+    /// registered, and the receiver resolves when the driver has returned.
+    Thread(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<bool>,
+    ),
+}
 
 pub struct KcpListener {
     local_addr: SocketAddr,
@@ -24,7 +32,9 @@ pub struct KcpListener {
     _handle: KcpSocketHandle,
     /// The UDP socket event-loop task. Aborted on drop so closing the
     /// listener also stops the driver explicitly (audit round 5, LOW 2.3).
-    _driver: tokio::task::JoinHandle<()>,
+    _driver: Option<tokio::task::JoinHandle<()>>,
+    /// Set when the driver runs on its own thread (see `driver_thread`).
+    _driver_thread: Option<DriverThread>,
     accept_rx: mpsc::Receiver<KcpStream>,
     /// Back-channel: notify the socket driver when a session has been
     /// accepted, so it stops being subject to the unaccepted timeout.
@@ -33,24 +43,34 @@ pub struct KcpListener {
 
 impl Drop for KcpListener {
     fn drop(&mut self) {
-        self._driver.abort();
+        if let Some(driver) = self._driver.take() {
+            driver.abort();
+        }
+        // `DriverThread`'s own drop signals and joins the thread.
     }
 }
 
 impl KcpListener {
     /// Bind a KCP listener on the given address.
     pub async fn bind(addr: &str, config: KcpConfig) -> io::Result<Self> {
+        if super::driver_thread::driver_thread_wanted() {
+            let bound = super::driver_thread::bind_driver(addr, config).await?;
+            let accept_notify_tx = bound.handle.accept_notify_tx.clone();
+            return Ok(Self {
+                local_addr: bound.local_addr,
+                _handle: bound.handle,
+                _driver: None,
+                _driver_thread: Some(bound.guard),
+                accept_rx: bound.accept_rx,
+                accept_notify_tx,
+            });
+        }
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
 
-        // Set socket buffer sizes (1 MiB each). ~5x OS default (~212KB on Linux)
-        // — enough for KCP bursts without 200-client kernel-memory blowout.
-        if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-            tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
-        }
-        if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-            tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
-        }
+        // 1 MiB each (~5x OS default on Linux) — enough for KCP bursts
+        // without 200 idle clients pinning kernel memory.
+        super::socket::tune_udp_buffers(&socket);
         let socket = Arc::new(socket);
 
         let (kcp_socket, handle, accept_rx) = KcpSocket::new(socket, config);
@@ -61,7 +81,8 @@ impl KcpListener {
         Ok(Self {
             local_addr,
             _handle: handle,
-            _driver: driver,
+            _driver: Some(driver),
+            _driver_thread: None,
             accept_rx,
             accept_notify_tx,
         })
@@ -94,22 +115,76 @@ impl KcpListener {
 pub async fn dial_kcp(addr: &str, config: KcpConfig) -> io::Result<KcpStream> {
     let (stream, driver) = dial_kcp_with_driver(addr, config).await?;
     // Detach the driver: it self-exits once the stream is dropped (see
-    // KcpSocket::run). The JoinHandle is deliberately dropped — aborting
-    // it here would kill the connection before its first probe is sent
-    // (audit round 5 tried this and it broke dial→accept).
+    // KcpSocket::run). The handle is deliberately dropped — aborting it here
+    // would kill the connection before its first probe is sent (audit round 5
+    // tried this and it broke dial→accept). Dropping it also costs nothing: on
+    // the thread path the handle is a plain receiver, not a parked task.
     drop(driver);
     Ok(stream)
 }
 
-/// Like [`dial_kcp`], but returns the socket driver's `JoinHandle` so the
-/// caller can observe driver self-exit (after the last stream is dropped
-/// the driver terminates itself — see `KcpSocket::run`). Production uses
-/// [`dial_kcp`], which detaches the handle; tests use this to prove the
-/// driver does not leak.
+/// A dialed connection's socket driver, as something to await.
+///
+/// Resolves once the driver has exited: `true` for a clean exit, `false` if it
+/// panicked or the thread went away without reporting. Both driver placements
+/// (own thread, caller's runtime) are covered, so a test observes the real
+/// driver either way rather than a placeholder that always completes.
+#[must_use = "dropping the handle detaches the driver, which is what production wants; a test that awaits it wants the value"]
+pub struct DriverHandle {
+    inner: DriverWait,
+}
+
+enum DriverWait {
+    /// Driver spawned on the caller's runtime.
+    Task(tokio::task::JoinHandle<()>),
+    /// Driver hosted on its own thread; fired when that thread's runtime
+    /// returns (the socket is already closed by then).
+    Thread(tokio::sync::oneshot::Receiver<bool>),
+}
+
+impl DriverHandle {
+    fn task(handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            inner: DriverWait::Task(handle),
+        }
+    }
+
+    fn thread(exited: tokio::sync::oneshot::Receiver<bool>) -> Self {
+        Self {
+            inner: DriverWait::Thread(exited),
+        }
+    }
+}
+
+impl std::future::Future for DriverHandle {
+    /// `true` when the driver exited on its own terms.
+    type Output = bool;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<bool> {
+        match &mut self.get_mut().inner {
+            DriverWait::Task(handle) => std::pin::Pin::new(handle)
+                .poll(cx)
+                .map(|joined| joined.is_ok()),
+            DriverWait::Thread(exited) => std::pin::Pin::new(exited)
+                .poll(cx)
+                .map(|signalled| signalled.unwrap_or(false)),
+        }
+    }
+}
+
+/// Like [`dial_kcp`], but returns a [`DriverHandle`] that resolves when the
+/// socket driver has exited (after the last stream is dropped the driver
+/// terminates itself — see `KcpSocket::run`). The driver lives on its own
+/// thread when [`super::driver_thread::driver_thread_wanted`] is true and on
+/// the caller's runtime otherwise. Dropping the handle instead detaches the
+/// driver, which is what [`dial_kcp`] does.
 pub async fn dial_kcp_with_driver(
     addr: &str,
     config: KcpConfig,
-) -> io::Result<(KcpStream, tokio::task::JoinHandle<()>)> {
+) -> io::Result<(KcpStream, DriverHandle)> {
     // Go parity: kcp-go's `Dial(raddr string)` resolves its argument with
     // `net.ResolveUDPAddr`, so a hostname is a valid dial target here too —
     // rejecting it with a bare parse error was an frp-rs-only restriction that
@@ -158,26 +233,28 @@ pub async fn dial_kcp_with_driver(
     } else {
         "[::]:0"
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
-
-    // Set socket buffer sizes (1 MiB each), matching the listener — an
-    // outbound dial otherwise keeps the OS defaults (~212KB on Linux),
-    // which can drop KCP bursts under load.
-    if let Err(e) = socket2::SockRef::from(&socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
-        tracing::debug!(error = %e, "KCP: dial failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
-    }
-    if let Err(e) = socket2::SockRef::from(&socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
-        tracing::debug!(error = %e, "KCP: dial failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
-    }
-    let socket = Arc::new(socket);
-
     // Clamp the MTU ONCE so the socket AND the session agree: KcpSocket::new
     // clamps its internal copy, but KcpSession::new reads config.mtu directly
     // (kcp.set_mtu), so passing the raw config would let the dial session
     // emit `mtu + KCP_WIRE_OVERHEAD`-byte FEC wire packets that the receiver's
     // fixed 1500-byte driver recv buffer would truncate.
     let config = config.clamped();
-    let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
+
+    // A multi-worker runtime hosts the driver on its own thread, with the
+    // socket bound *inside* it so its registration belongs to that runtime.
+    let (driver_source, handle) = if super::driver_thread::driver_thread_wanted() {
+        let (handle, go, done) =
+            super::driver_thread::dial_driver(bind_addr, config.clone()).await?;
+        (DriverSource::Thread(go, done), handle)
+    } else {
+        let socket = UdpSocket::bind(bind_addr).await?;
+        // Matching the listener — an outbound dial otherwise keeps the OS
+        // defaults (~212KB on Linux), which can drop KCP bursts under load.
+        super::socket::tune_udp_buffers(&socket);
+        let socket = Arc::new(socket);
+        let (kcp_socket, handle, _accept_rx) = KcpSocket::new(socket, config.clone());
+        (DriverSource::Task(Box::new(kcp_socket)), handle)
+    };
     let (read_tx, read_rx) = mpsc::channel(256);
     let session = KcpSession::with_chunk_pool(
         conv,
@@ -210,7 +287,19 @@ pub async fn dial_kcp_with_driver(
     // counter + register channel closure) — closing the UDP socket and
     // freeing the task instead of leaking one per dial for the process
     // lifetime (HIGH leak under reconnect churn).
-    let driver = tokio::spawn(async move { kcp_socket.run().await });
+    let driver = match driver_source {
+        DriverSource::Task(kcp_socket) => {
+            DriverHandle::task(tokio::spawn(async move { kcp_socket.run().await }))
+        }
+        DriverSource::Thread(go, done) => {
+            // Release the driver thread now that the session is registered.
+            // The thread ends on its own when the driver exits; the handle is
+            // a bare receiver, so a production dial (which drops it) spawns
+            // nothing to watch a thread nobody is watching.
+            let _ = go.send(());
+            DriverHandle::thread(done)
+        }
+    };
 
     Ok((
         KcpStream::new(

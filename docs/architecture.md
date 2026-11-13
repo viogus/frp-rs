@@ -707,6 +707,15 @@ Write backpressure uses an `Arc<AtomicUsize>` shared between `KcpSocket` and
 Verified: KCP+TLS+tcpMux+CipherStream all working (RTT ~76ms). Integration test
 with real UDP sockets: `frp-core/tests/kcp.rs`.
 
+The driver runs on a **private single-threaded runtime** (`frp-core/src/kcp/driver_thread.rs`)
+whenever the ambient runtime has more than one worker: it is the only task that
+touches the UDP socket, and on a shared pool it migrated between workers and
+re-warmed its session table, send queues and window on every hop — 20% of a
+session's throughput for ~60% more CPU. The socket is bound *inside* that
+runtime, because a socket registered with another reactor costs a cross-reactor
+wakeup per burst (30% slower). `FRP_KCP_DRIVER_RUNTIME=0` restores the shared
+pool. Measurements: [`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
+
 **TcpMux** (`frp-core/src/mux.rs`): server and client mode, keepalive, stream
 accept/spawn via `server_mux`/`client_mux`. A double-poll pattern flushes pending
 frames to the socket. A zero keepalive interval is normalized to the 30s default

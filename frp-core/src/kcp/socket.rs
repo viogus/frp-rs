@@ -128,6 +128,28 @@ const MAX_SESSION_CREATES_PER_IP_PER_WINDOW: usize = 32;
 /// `KcpConfig::clamped`), so 1500 bytes covers every legitimately-sized packet.
 pub(crate) const DRIVER_RECV_BUF_SIZE: usize = 1500;
 
+/// UDP socket receive buffer size (1 MiB). ~5x the OS default (~212KB on Linux),
+/// enough to absorb KCP bursts without 200-client memory blowout.
+const KCP_UDP_RCVBUF: usize = 1_048_576;
+
+/// UDP socket send buffer size (1 MiB), matching [`KCP_UDP_RCVBUF`].
+const KCP_UDP_SNDBUF: usize = 1_048_576;
+
+/// Raise a KCP socket's kernel buffers to [`KCP_UDP_RCVBUF`]/[`KCP_UDP_SNDBUF`].
+///
+/// Failure is not fatal — the OS default still works, just with less burst
+/// tolerance — so this logs at debug and continues. Every socket this crate
+/// hands to a driver goes through here, whether the driver runs on the caller's
+/// runtime or on its own thread (see [`super::driver_thread`]).
+pub(crate) fn tune_udp_buffers(socket: &UdpSocket) {
+    if let Err(e) = socket2::SockRef::from(socket).set_recv_buffer_size(KCP_UDP_RCVBUF) {
+        tracing::debug!(error = %e, "KCP: failed to set SO_RCVBUF to {} (continuing with OS default)", KCP_UDP_RCVBUF);
+    }
+    if let Err(e) = socket2::SockRef::from(socket).set_send_buffer_size(KCP_UDP_SNDBUF) {
+        tracing::debug!(error = %e, "KCP: failed to set SO_SNDBUF to {} (continuing with OS default)", KCP_UDP_SNDBUF);
+    }
+}
+
 pub(crate) enum WriteRequest {
     Data(Vec<u8>),
     Flush(tokio::sync::oneshot::Sender<()>),

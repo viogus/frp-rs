@@ -19,6 +19,24 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **KCP: the socket driver runs on its own thread, so KCP stops losing throughput
+  as the process gains workers.** The task that owns the UDP socket was scheduled
+  on the shared worker pool; on a multi-worker runtime it migrated between
+  threads and re-warmed its session table, send queues and window on every hop,
+  which cost 20% of one session's throughput while burning ~60% more CPU (the
+  penalty appeared at the *second* worker and did not grow after that). Each KCP
+  socket now gets a private single-threaded runtime, with the socket bound
+  inside it (a socket registered in another reactor only pays an extra wakeup).
+  One 1024 MiB session through `tcpMux`: **93.8 → 121.4 MiB/s (+29%) with
+  `frps` at its default four workers** and one on the client — the shipped
+  configuration — and server CPU 1.41 → 0.91 cores; four workers on both ends
+  goes 77.5 → 114.9 MiB/s (+48%). A single-worker runtime is left alone
+  (measured 125.1/121.9 MiB/s, unchanged), and Go frp on the same host moves
+  108-113 MiB/s. The thread is only created when the runtime has more than one
+  worker, so the default client (one worker) never creates one and pays
+  nothing; `FRP_KCP_DRIVER_RUNTIME=0` restores the shared-pool behaviour on the
+  server.
+
 - `frpc` now runs its tokio runtime on **one worker thread** by default
   (previously one per CPU): a 2048 MiB KCP stream through `tcpMux` measures
   89.7-91.2 MiB/s against 65.5-66.6 — **+37%**, CPU −28% — because a bridged

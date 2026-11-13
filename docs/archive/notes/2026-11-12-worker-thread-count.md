@@ -104,11 +104,45 @@ process, and this note only shows four tunnels on a four-vCPU host.
   reported inside that band.
 - The single-tunnel evidence is KCP. The advice extends to `tcp`/`tcpMux` on the
   strength of the four-stream macOS row only.
-- The `FRP_KCP_DRIVER_THREAD=1` probe that recovered two-fifths is a throwaway
-  build that is not in the tree, so that row cannot be re-run without
-  re-applying the patch.
-- The real fix - keeping one session's whole pipeline on one thread so that many
-  sessions still spread over cores - is not implemented; see `TODO.md`.
+- The `FRP_KCP_DRIVER_THREAD=1` probe that recovered two-fifths was a throwaway
+  build; it has since been replaced by the shipped design described under
+  [Driver thread](#driver-thread-2026-11-14) below, which recovers all of the gap.
+- Keeping one session's *whole* pipeline on one thread (bridge, yamux, driver)
+  is still not implemented; only the driver is pinned. `TODO.md` § P2 carries
+  what remains of that idea.
+
+## Driver thread (2026-11-14)
+
+The partial probe above (pinning only the driver) was made into a shipped
+mechanism: every KCP socket now runs its driver on a private current-thread
+runtime, on its own OS thread, with the UDP socket **bound inside** that
+runtime. Binding matters — a `tokio::net::UdpSocket` registers with the reactor
+that is current when it is created, and a driver polling a socket owned by
+another reactor pays one cross-reactor wakeup per burst: measured 30% *slower*
+than the shared pool (`4/1` 85.8-89.7 MiB/s), which is why the naive version of
+this change was rejected.
+
+The thread is created only when the ambient runtime has more than one worker
+(`FRP_KCP_DRIVER_RUNTIME=1|0` overrides). A single-worker runtime already owns
+its only thread, and adding a second one measured 2% slower.
+
+| `workerThreads` (srv/cli) | shared pool | own driver thread | server CPU |
+|---|---|---|---|
+| 4 / 1 (shipped) | 93.8 MiB/s | **121.4** | 1.41 → 0.91 cores |
+| 4 / 4 | 77.5 | **114.9** | 1.50 → 0.96 |
+| 1 / 1 | 116.3 | not used | — |
+
+Harness: `/root/bench/kcpu-ab.sh <srv_workers> <cli_workers> 1024` (one
+`tcpMux` session, medians of three interleaved pairs, 4-vCPU EPYC-Milan VM).
+For comparison, Go frp v0.72.0 on the same host and the same `abbench` client
+moves 108-113 MiB/s on this shape.
+
+The threads are per socket: a server with one KCP listener gains one thread,
+and a client gains one per live KCP connection **only when its runtime has more
+than one worker** — the default `frpc` runtime has one, so a default client
+creates none (the driver keeps the only thread it already owns). The thread
+exits when its driver does (five client reconnects leave the server's thread
+count unchanged).
 
 ## Reproduce
 
