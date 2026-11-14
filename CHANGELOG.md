@@ -19,6 +19,16 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **KCP: one `read` now returns every segment the session has queued, not just
+  the first.** `KcpStream::poll_read` handed back a single channel message per
+  call, and a channel message is one KCP segment (~1.4 KiB at the production
+  MTU), even though the bridge asks for 64 KiB. Each bridge read therefore
+  copied one segment and returned, so the peer's write side saw a stream of
+  1.4 KiB writes. The read path now keeps pulling while the caller's buffer has
+  room. A 768 MiB stream with `tcpMux = false` on a 4-vCPU Linux VM moves
+  **56-58 → 66-69 MiB/s (+18%)** and four concurrent flows 95 → 101-105; the
+  `tcpMux` rows are unchanged (123.7 vs 124.4 MiB/s), and the buffer edge is
+  still honoured — an oversized segment's tail is kept for the next call.
 - **KCP: the socket driver runs on its own thread, so KCP stops losing throughput
   as the process gains workers.** The task that owns the UDP socket was scheduled
   on the shared worker pool; on a multi-worker runtime it migrated between

@@ -147,12 +147,18 @@ impl AsyncRead for KcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Drain buffered data first
+        // Bytes handed to the caller by this call. Kept local so a
+        // coalescing pass reports one total instead of one per segment.
+        let mut filled = 0usize;
+
+        // Drain the buffered remainder of a message the previous call could
+        // not fit, before asking the session for more.
         if self.read_pos < self.read_buffer.len() {
             let remaining = &self.read_buffer[self.read_pos..];
-            let n = remaining.len().min(buf.remaining());
-            buf.put_slice(&remaining[..n]);
-            self.read_pos += n;
+            let take = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..take]);
+            self.read_pos += take;
+            filled += take;
             if self.read_pos == self.read_buffer.len() {
                 // Fully drained (M4): this buffer was the oversized tail of
                 // a channel message stashed by the partial-consume arm —
@@ -162,39 +168,31 @@ impl AsyncRead for KcpStream {
                 let drained = std::mem::take(&mut self.read_buffer);
                 chunk_pool_push(&self.chunk_pool, drained);
             }
-            self.read_count += n as u64;
-            KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-            #[cfg(debug_assertions)]
-            KCP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
-            #[cfg(debug_assertions)]
-            if tracing::level_enabled!(tracing::Level::DEBUG) {
-                tracing::debug!(
-                    conv = self.conv,
-                    n = n,
-                    total = self.read_count,
-                    "KCP read: {} bytes (total={})",
-                    n,
-                    self.read_count,
-                );
-            }
-            return Poll::Ready(Ok(()));
         }
 
-        match self.read_rx.poll_recv(cx) {
-            Poll::Ready(Some(data)) => {
-                let n = data.len().min(buf.remaining());
-                // Capture hex preview before data may be moved into read_buffer.
-                #[cfg(debug_assertions)]
-                let hex_preview = if n > 0 {
-                    Some(crate::hex_encode(&data[..n.min(16)]))
-                } else {
-                    None
-                };
-                buf.put_slice(&data[..n]);
-                if n < data.len() {
-                    self.read_buffer = data;
-                    self.read_pos = n;
-                } else {
+        // Coalesce: the session delivers one KCP segment per channel message
+        // (~1376 bytes at the production MTU of 1400), while the callers that
+        // matter hand us a much larger buffer — the bridge hands out 64 KiB.
+        // Returning after the first segment made every bridge read a
+        // one-segment copy, and the far side then paid a second pass over the
+        // same bytes. Keep pulling while the caller has room and the channel
+        // still holds segments.
+        //
+        // Returning `Ready` after a `Pending` poll is allowed and the waker
+        // stays registered, so a caller that gets data still gets woken for
+        // the next segment.
+        while buf.remaining() > 0 {
+            match self.read_rx.poll_recv(cx) {
+                Poll::Ready(Some(data)) => {
+                    let take = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..take]);
+                    filled += take;
+                    if take < data.len() {
+                        // Oversized message: stash the tail for the next call.
+                        self.read_buffer = data;
+                        self.read_pos = take;
+                        break;
+                    }
                     // Fully consumed (M4): recycle the channel buffer into
                     // the shared chunk pool instead of dropping it —
                     // `KcpSession::recv_and_push` pops pooled buffers, so
@@ -204,47 +202,53 @@ impl AsyncRead for KcpStream {
                     // later message.
                     chunk_pool_push(&self.chunk_pool, data);
                 }
-                self.read_count += n as u64;
-                KCP_READ_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-                #[cfg(debug_assertions)]
-                KCP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
-                #[cfg(debug_assertions)]
-                if tracing::level_enabled!(tracing::Level::DEBUG) {
-                    tracing::debug!(
-                        conv = self.conv,
-                        n = n,
-                        total = self.read_count,
-                        first_hex = hex_preview.unwrap_or_default(),
-                        "KCP read: {} bytes (total={})",
-                        n,
-                        self.read_count,
-                    );
+                Poll::Ready(None) => {
+                    if filled > 0 {
+                        break;
+                    }
+                    // If session is dead, return an error instead of EOF so
+                    // the bridge fails fast rather than hanging.
+                    return Poll::Ready(if !self.session_alive.load(Ordering::Acquire) {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "KCP session removed",
+                        ))
+                    } else {
+                        Ok(()) // EOF
+                    });
                 }
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(None) => {
-                // If session is dead, return an error instead of EOF so the
-                // bridge fails fast rather than hanging.
-                if !self.session_alive.load(Ordering::Acquire) {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "KCP session removed",
-                    )))
-                } else {
-                    Poll::Ready(Ok(())) // EOF
-                }
-            }
-            Poll::Pending => {
-                if !self.session_alive.load(Ordering::Acquire) {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::NotConnected,
-                        "KCP session removed",
-                    )))
-                } else {
-                    Poll::Pending
+                Poll::Pending => {
+                    if filled > 0 {
+                        break;
+                    }
+                    return if !self.session_alive.load(Ordering::Acquire) {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotConnected,
+                            "KCP session removed",
+                        )))
+                    } else {
+                        Poll::Pending
+                    };
                 }
             }
         }
+
+        self.read_count += filled as u64;
+        KCP_READ_BYTES.fetch_add(filled as u64, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        KCP_READ_CALLS.fetch_add(1, Ordering::Relaxed);
+        #[cfg(debug_assertions)]
+        if tracing::level_enabled!(tracing::Level::DEBUG) {
+            tracing::debug!(
+                conv = self.conv,
+                n = filled,
+                total = self.read_count,
+                "KCP read: {} bytes (total={})",
+                filled,
+                self.read_count,
+            );
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -479,5 +483,74 @@ impl AsyncWrite for KcpStream {
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.shutdown = true;
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream wired to a caller-controlled read channel. Everything the
+    /// read path touches is inert here: no writer task, no session.
+    fn stream_reading_from(read_rx: mpsc::Receiver<Vec<u8>>) -> KcpStream {
+        let (write_tx, _write_rx) = mpsc::channel(8);
+        KcpStream::new(
+            7,
+            "127.0.0.1:1".parse().unwrap(),
+            write_tx,
+            read_rx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Notify::new()),
+            Arc::new(ArrayQueue::new(8)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicUsize::new(0)),
+        )
+    }
+
+    fn poll_once(stream: &mut KcpStream, buf: &mut [u8]) -> (Poll<io::Result<()>>, usize) {
+        let mut read_buf = ReadBuf::new(buf);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let poll = Pin::new(stream).poll_read(&mut cx, &mut read_buf);
+        (poll, read_buf.filled().len())
+    }
+
+    #[tokio::test]
+    async fn poll_read_coalesces_every_queued_segment() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut stream = stream_reading_from(rx);
+        for _ in 0..3 {
+            tx.send(vec![7u8; 100]).await.unwrap();
+        }
+        let mut buf = [0u8; 1024];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(
+            filled, 300,
+            "one poll must hand over every segment the session already queued, \
+             not just the first: the bridge asks for 64 KiB and a segment is ~1.4 KiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_read_stops_at_the_buffer_edge_and_keeps_the_tail() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut stream = stream_reading_from(rx);
+        tx.send(vec![1u8; 10]).await.unwrap();
+        tx.send(vec![2u8; 100]).await.unwrap();
+
+        let mut buf = [0u8; 50];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(filled, 50, "the caller's buffer is the only limit");
+        assert_eq!(&buf[..10], &[1u8; 10], "first segment must come first");
+
+        let mut buf = [0u8; 100];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(filled, 60, "the stashed tail must survive to the next poll");
+        assert_eq!(&buf[..60], &[2u8; 60]);
     }
 }
