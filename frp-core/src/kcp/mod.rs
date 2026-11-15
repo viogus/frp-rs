@@ -39,7 +39,10 @@ pub fn default_kcp_config() -> KcpConfig {
             resend: 2,
             nc: true,
         },
-        wnd_size: (1024, 1024),
+        // Upper bound for the driver's load-dependent autotune (see
+        // `kcp::socket::desired_window`): a lone busy session uses it all,
+        // several sessions share it down to a 1024-segment floor.
+        wnd_size: (4096, 4096),
         mtu: 1400,
         // Go frp v0.69.1 ListenKcp() uses kcp.ListenWithOptions(addr, nil, 10, 3).
         // FEC IS enabled by default for KCP in Go frp. Match this for compat.
@@ -59,7 +62,10 @@ pub fn default_kcp_client_config() -> KcpConfig {
             resend: 2,
             nc: true,
         },
-        wnd_size: (1024, 1024),
+        // Upper bound for the driver's load-dependent autotune (see
+        // `kcp::socket::desired_window`): a lone busy session uses it all,
+        // several sessions share it down to a 1024-segment floor.
+        wnd_size: (4096, 4096),
         mtu: 1400,
         // Go frp v0.69.1 ListenKcp() uses FEC (10,3). Client must match
         // server-side defaults or FEC-wrapped packets will be unparseable.

@@ -135,6 +135,36 @@ const KCP_UDP_RCVBUF: usize = 1_048_576;
 /// UDP socket send buffer size (1 MiB), matching [`KCP_UDP_RCVBUF`].
 const KCP_UDP_SNDBUF: usize = 1_048_576;
 
+/// Segments of in-flight data shared among the sessions that are busy.
+///
+/// One busy session is handed the whole budget; several share it. See
+/// [`desired_window`] for why the window is not simply a fixed value.
+const AUTO_WINDOW_BUDGET: u16 = 2048;
+
+/// Narrowest window the driver will advertise, in segments.
+const AUTO_WINDOW_FLOOR: u16 = 1024;
+
+/// A session counts as busy if it saw traffic within this many milliseconds.
+const ACTIVE_WINDOW_MS: u32 = 250;
+
+/// Window (segments) to advertise when `active` sessions are moving data.
+///
+/// KCP paces one connection at roughly `window × segment / interval`, so a
+/// lone session needs a *wide* window to fill the link: at a 20 ms tick with
+/// ~1376-byte segments, 1024 segments cap a single flow near 70 MiB/s while
+/// 2048 reaches ~90. Several concurrent sessions are not paced that way — the
+/// driver's per-tick flush scan is the limit, and it grows with the window
+/// (measured: four flows lose ~25% of their throughput at 2048 and burn ~40%
+/// more CPU). So the budget is divided among the sessions that are busy: one
+/// busy session gets it all, four get the floor and behave exactly as before.
+///
+/// `cap` is the configured `KcpConfig::wnd_size`, treated as an upper bound.
+fn desired_window(active: usize, cap: u16) -> u16 {
+    let cap = cap.max(AUTO_WINDOW_FLOOR);
+    let busy = active.clamp(1, AUTO_WINDOW_BUDGET as usize) as u16;
+    (AUTO_WINDOW_BUDGET / busy).clamp(AUTO_WINDOW_FLOOR.min(cap), cap)
+}
+
 /// Raise a KCP socket's kernel buffers to [`KCP_UDP_RCVBUF`]/[`KCP_UDP_SNDBUF`].
 ///
 /// Failure is not fatal — the OS default still works, just with less burst
@@ -632,6 +662,21 @@ impl KcpSocket {
         }
     }
 
+    /// Busy sessions: those with unacked data queued or recent inbound traffic.
+    ///
+    /// Idle sessions (a control connection between heartbeats, a proxy nobody
+    /// is using) must not dilute the window budget — otherwise two idle
+    /// sessions would halve the window of the one session carrying traffic.
+    fn busy_sessions(&self, now_ms: u32) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| {
+                session.wait_snd() > 0
+                    || session.last_inbound_ms().saturating_add(ACTIVE_WINDOW_MS) >= now_ms
+            })
+            .count()
+    }
+
     pub async fn run(mut self) {
         // Drain any pending registrations sent before the driver was spawned.
         // This prevents a race where recv_from fires before register_tx is processed,
@@ -659,6 +704,16 @@ impl KcpSocket {
             tokio::select! {
                 _ = tick.tick() => {
                     let now_ms = self.start.elapsed().as_millis() as u32;
+                    // Resize the window by load: one busy session is paced by
+                    // its window, several are paced by the driver. Sessions are
+                    // checked, not just the target: a session created after the
+                    // last change starts at the configured cap.
+                    let window = desired_window(self.busy_sessions(now_ms), self.config.wnd_size.1);
+                    for session in self.sessions.values_mut() {
+                        if session.rcv_wnd() != window || session.snd_wnd() != window {
+                            session.set_window(window);
+                        }
+                    }
                     // Re-send packets queued by a full send buffer.
                     self.drain_pending_udp();
                     self.to_remove.clear();
@@ -1462,6 +1517,43 @@ mod recv_batch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window has to follow load, not a constant: one busy session gets
+    /// the whole budget (it is the one being paced by its window), several
+    /// share it and never fall below the floor the old fixed window used, so
+    /// a busy server behaves exactly as before.
+    #[test]
+    fn desired_window_sizes_by_busy_session_count() {
+        assert_eq!(desired_window(0, 4096), 2048, "no traffic yet: full budget");
+        assert_eq!(
+            desired_window(1, 4096),
+            2048,
+            "one busy session takes it all"
+        );
+        assert_eq!(desired_window(2, 4096), 1024, "two split the budget");
+        assert_eq!(desired_window(4, 4096), 1024, "four land on the floor");
+        assert_eq!(
+            desired_window(64, 4096),
+            1024,
+            "busy servers keep the old window"
+        );
+    }
+
+    /// The configured window is an upper bound: an operator who narrows it
+    /// keeps the narrow window, and a configured value below the floor cannot
+    /// wedge the autotune into an unusable size.
+    #[test]
+    fn desired_window_respects_the_configured_cap() {
+        assert_eq!(desired_window(1, 1024), 1024, "cap below the budget wins");
+        assert_eq!(desired_window(1, 4096), 2048);
+        assert_eq!(desired_window(1, 2048), 2048, "cap equal to the budget");
+        assert_eq!(
+            desired_window(1, 512),
+            1024,
+            "cap below the floor is raised to it"
+        );
+        assert_eq!(desired_window(3, 512), 1024, "the floor still applies");
+    }
 
     /// The rate-limit trim uses `now.wrapping_sub(ts) > WINDOW` (same
     /// convention as `session_created_at` cleanup) so the u32-ms clock's

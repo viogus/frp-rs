@@ -337,6 +337,30 @@ impl KcpSession {
         self.kcp.wait_snd()
     }
 
+    /// Window the driver currently has this session at, in segments.
+    ///
+    /// The driver autotunes this by load (see `socket::desired_window`), so it
+    /// can differ from `KcpConfig::wnd_size`.
+    pub fn rcv_wnd(&self) -> u16 {
+        self.kcp.rcv_wnd()
+    }
+
+    /// Window this session may keep in flight, in segments.
+    pub fn snd_wnd(&self) -> u16 {
+        self.kcp.snd_wnd()
+    }
+
+    /// Apply the driver's load-tuned window: both how much this session may
+    /// advertise (receive) and how much it may keep in flight (send).
+    ///
+    /// The send side has to follow, or the configured cap alone would let a
+    /// busy server keep `MAX(wnd_size)` segments in flight per session — the
+    /// exact configuration that was measured to cost four flows ~25% of their
+    /// throughput. `Kcp` clamps both to its own minimums.
+    pub fn set_window(&mut self, wnd: u16) {
+        self.kcp.set_wndsize(wnd, wnd);
+    }
+
     /// Common FEC encode logic for both update() and force_flush().
     /// Processes output packets through FEC encoding (if enabled), or returns
     /// them directly if FEC is disabled.

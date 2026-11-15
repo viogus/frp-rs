@@ -19,6 +19,21 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **KCP single-stream throughput: +40% when one session is carrying the
+  traffic.** A KCP flow paces itself at `window × segment / tick` — with the
+  fixed 1024-segment window and a 20 ms tick that is ~68 MiB/s, which is why a
+  lone `tcpMux = false` stream sat behind Go frp (75-77) while the same engine
+  moved 120 MiB/s through `tcpMux`. The driver now sizes the window from load:
+  one busy session gets the whole 2048-segment budget (**68 → 95 MiB/s**, 1.24x
+  Go frp v0.72.0), several share it down to the old 1024-segment floor, so a
+  server carrying many sessions behaves exactly as before (4 flows 113-119
+  MiB/s, unchanged; `tcpMux` rows unchanged). Widening the window
+  unconditionally is *not* a free win — four flows lose ~25% of their
+  throughput and burn ~40% more CPU — which is what the load-based sizing
+  avoids. The configured KCP window is now an upper bound. Knob sweep and the
+  two implementation pitfalls are in
+  [`docs/archive/notes/2026-11-15-kcp-window-autotune.md`](docs/archive/notes/2026-11-15-kcp-window-autotune.md).
+
 - **KCP: the socket driver runs on its own thread, so KCP stops losing throughput
   as the process gains workers.** The task that owns the UDP socket was scheduled
   on the shared worker pool; on a multi-worker runtime it migrated between
