@@ -29,13 +29,14 @@ pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 /// KcpStream::poll_write applies backpressure (returns Poll::Pending). Bounds
 /// memory when a stalled peer (remote window 0, never ACKing) would otherwise
 /// let the KCP send queue grow without limit.
-/// Roughly 2x the default 1024-segment send window: with the default MSS of
-/// ~1376 bytes this caps un-acked + queued data at ~2.7 MiB per session, far
-/// above the healthy steady-state occupancy (snd_buf drains to the window,
-/// snd_queue drains every flush), so normal full-window throughput is untouched.
+/// 2x the widest window the autotune can pick ([`AUTO_WINDOW_BUDGET`]): with a
+/// ~1376-byte MSS this caps un-acked + queued data at ~5.6 MiB per session, so
+/// a session running its full window still has a window's worth of write-ahead
+/// queue (snd_buf drains to the window, snd_queue drains every flush). At 1x it
+/// would gate as soon as the window filled, which removes that headroom.
 /// Keep it below a single `Kcp`'s practical ceiling; it is a memory bound, not
 /// a flow-control signal (KCP's own window remains the flow-control authority).
-pub(crate) const KCP_SND_BACKLOG_THRESHOLD: usize = 2048;
+pub(crate) const KCP_SND_BACKLOG_THRESHOLD: usize = 4096;
 
 /// Max recycled write chunks kept in the per-socket chunk pool. Each chunk
 /// is a reused bridge-write buffer (one `BUFFER_SIZE`, 64 KiB by default), so
@@ -135,34 +136,46 @@ const KCP_UDP_RCVBUF: usize = 1_048_576;
 /// UDP socket send buffer size (1 MiB), matching [`KCP_UDP_RCVBUF`].
 const KCP_UDP_SNDBUF: usize = 1_048_576;
 
-/// Segments of in-flight data shared among the sessions that are busy.
+/// Window (segments) a lone busy session is given.
 ///
-/// One busy session is handed the whole budget; several share it. See
+/// The driver advertises this when exactly one session on it is moving data and
+/// falls back to [`AUTO_WINDOW_FLOOR`] as soon as a second one is. See
 /// [`desired_window`] for why the window is not simply a fixed value.
 const AUTO_WINDOW_BUDGET: u16 = 2048;
 
-/// Narrowest window the driver will advertise, in segments.
+/// Window (segments) advertised whenever more than one session is busy — the
+/// value every session ran before the window became load-aware.
 const AUTO_WINDOW_FLOOR: u16 = 1024;
 
-/// A session counts as busy if it saw traffic within this many milliseconds.
-const ACTIVE_WINDOW_MS: u32 = 250;
+/// A session counts as busy if it moved payload within this many milliseconds.
+pub(crate) const ACTIVE_WINDOW_MS: u32 = 250;
 
 /// Window (segments) to advertise when `active` sessions are moving data.
 ///
 /// KCP paces one connection at roughly `window × segment / interval`, so a
 /// lone session needs a *wide* window to fill the link: at a 20 ms tick with
 /// ~1376-byte segments, 1024 segments cap a single flow near 70 MiB/s while
-/// 2048 reaches ~90. Several concurrent sessions are not paced that way — the
-/// driver's per-tick flush scan is the limit, and it grows with the window
-/// (measured: four flows lose ~25% of their throughput at 2048 and burn ~40%
-/// more CPU). So the budget is divided among the sessions that are busy: one
-/// busy session gets it all, four get the floor and behave exactly as before.
+/// 2048 measured 95 (the sweep ran 79.6-101.5, because the driver's per-tick
+/// flush scan — not the window — becomes the limit). Several concurrent
+/// sessions are not paced that way: the scan is the limit and it grows with the
+/// window (four flows lose ~25% of their throughput at 2048 and burn ~40% more
+/// CPU), so they keep the 1024 floor and behave exactly as before.
 ///
-/// `cap` is the configured `KcpConfig::wnd_size`, treated as an upper bound.
+/// The policy is therefore binary: one busy session gets
+/// [`AUTO_WINDOW_BUDGET`], anything more gets [`AUTO_WINDOW_FLOOR`]. It is not
+/// a shared budget — 200 busy sessions still get 1024 each, which is what they
+/// had before.
+///
+/// `cap` is the configured `KcpConfig::wnd_size` element, an upper bound *above*
+/// the floor: a configuration narrower than [`AUTO_WINDOW_FLOOR`] is raised to
+/// it, because a narrower window cannot carry a saturating flow at all.
 fn desired_window(active: usize, cap: u16) -> u16 {
     let cap = cap.max(AUTO_WINDOW_FLOOR);
-    let busy = active.clamp(1, AUTO_WINDOW_BUDGET as usize) as u16;
-    (AUTO_WINDOW_BUDGET / busy).clamp(AUTO_WINDOW_FLOOR.min(cap), cap)
+    if active <= 1 {
+        AUTO_WINDOW_BUDGET.min(cap)
+    } else {
+        AUTO_WINDOW_FLOOR
+    }
 }
 
 /// Raise a KCP socket's kernel buffers to [`KCP_UDP_RCVBUF`]/[`KCP_UDP_SNDBUF`].
@@ -479,7 +492,7 @@ impl KcpSocket {
                 // stamp for the accepted-session reaper
                 // (M11) before delivering the data.
                 let now_ms = self.start.elapsed().as_millis() as u32;
-                session.note_inbound(now_ms);
+                session.note_inbound(now_ms, data.len());
                 // Deliver received data to the stream
                 // immediately instead of waiting for the
                 // next 10ms tick (Go kcp-go reads on
@@ -609,7 +622,7 @@ impl KcpSocket {
                 // admission packet — an accepted session
                 // that never receives more data is idle
                 // from its creation instant.
-                session.note_inbound(now_ms);
+                session.note_inbound(now_ms, data.len());
                 // Share the session's send-queue backlog counter with the
                 // stream so poll_write can gate on a stalled peer (window 0)
                 // instead of letting snd_queue grow without bound.
@@ -648,6 +661,11 @@ impl KcpSocket {
                 self.peer_addr_index.insert(key.1, key.0);
                 self.sessions.insert(key, session);
                 let now_ms = self.start.elapsed().as_millis() as u32;
+                // Seed the newcomer at the load-appropriate window instead of
+                // letting it run the configured cap until the next tick (which
+                // would briefly advertise and buffer 4x the old bound).
+                let window = desired_window(self.busy_sessions(now_ms), self.config.wnd_size.1);
+                self.sync_windows(window);
                 self.session_created_at.insert(key, now_ms);
                 // Charge the rate counters only now that the
                 // session is actually created and queued — the
@@ -662,19 +680,45 @@ impl KcpSocket {
         }
     }
 
-    /// Busy sessions: those with unacked data queued or recent inbound traffic.
+    /// Sessions on this driver that are actually moving payload.
     ///
-    /// Idle sessions (a control connection between heartbeats, a proxy nobody
-    /// is using) must not dilute the window budget — otherwise two idle
-    /// sessions would halve the window of the one session carrying traffic.
+    /// Keepalives must not count: yamux pings every 10 s and the app heartbeat
+    /// every 30 s, so a datagram recency test would mark N/40 + N/120 of the
+    /// idle sessions busy and — on a server with a few dozen clients — pin the
+    /// driver at the floor forever. A session therefore counts only when it
+    /// moved at least one MTU of payload inside the window (a keepalive is tens
+    /// of bytes), or when it has data queued *and* is still being acked; a peer
+    /// that stopped ACKing is not "busy", it is stalled.
+    ///
+    /// `wrapping_sub` is the file's convention for clock arithmetic: the driver
+    /// clock is a `u32` of milliseconds and wraps after ~49.7 days.
     fn busy_sessions(&self, now_ms: u32) -> usize {
+        let data_floor = self.config.mtu as u32;
         self.sessions
             .values()
             .filter(|session| {
-                session.wait_snd() > 0
-                    || session.last_inbound_ms().saturating_add(ACTIVE_WINDOW_MS) >= now_ms
+                let acked_recently =
+                    now_ms.wrapping_sub(session.last_inbound_ms()) <= ACTIVE_WINDOW_MS;
+                (acked_recently && session.wait_snd() > 0)
+                    || session.data_window_bytes(now_ms) >= data_floor
             })
             .count()
+    }
+
+    /// Push `window` to every session that disagrees, returning how many moved.
+    ///
+    /// Comparing each session — rather than caching the last applied target —
+    /// is what catches a session created after the last change: it starts at
+    /// the configured cap and would otherwise keep it.
+    fn sync_windows(&mut self, window: u16) -> usize {
+        let mut moved = 0;
+        for session in self.sessions.values_mut() {
+            if session.rcv_wnd() != window || session.snd_wnd() != window {
+                session.set_window(window);
+                moved += 1;
+            }
+        }
+        moved
     }
 
     pub async fn run(mut self) {
@@ -705,15 +749,11 @@ impl KcpSocket {
                 _ = tick.tick() => {
                     let now_ms = self.start.elapsed().as_millis() as u32;
                     // Resize the window by load: one busy session is paced by
-                    // its window, several are paced by the driver. Sessions are
-                    // checked, not just the target: a session created after the
-                    // last change starts at the configured cap.
+                    // its window, several are paced by the driver.
+                    // `.1` is the advertised receive bound and the cap for both
+                    // directions — `set_window` equalizes the pair.
                     let window = desired_window(self.busy_sessions(now_ms), self.config.wnd_size.1);
-                    for session in self.sessions.values_mut() {
-                        if session.rcv_wnd() != window || session.snd_wnd() != window {
-                            session.set_window(window);
-                        }
-                    }
+                    self.sync_windows(window);
                     // Re-send packets queued by a full send buffer.
                     self.drain_pending_udp();
                     self.to_remove.clear();
@@ -928,6 +968,9 @@ impl KcpSocket {
                     self.conv_index.insert(conv, addr);
                     self.peer_addr_index.insert(addr, conv);
                     self.sessions.insert(key, session);
+                    let now_ms = self.start.elapsed().as_millis() as u32;
+                    let window = desired_window(self.busy_sessions(now_ms), self.config.wnd_size.1);
+                    self.sync_windows(window);
                 }
             }
         }
@@ -1519,9 +1562,10 @@ mod tests {
     use super::*;
 
     /// The window has to follow load, not a constant: one busy session gets
-    /// the whole budget (it is the one being paced by its window), several
-    /// share it and never fall below the floor the old fixed window used, so
-    /// a busy server behaves exactly as before.
+    /// the whole budget (it is the one being paced by its window); from the
+    /// second one on, the driver (not the window) is the limit, so every
+    /// session keeps the floor — the value the old fixed window used — and a
+    /// busy server behaves exactly as before.
     #[test]
     fn desired_window_sizes_by_busy_session_count() {
         assert_eq!(desired_window(0, 4096), 2048, "no traffic yet: full budget");
@@ -1542,6 +1586,9 @@ mod tests {
     /// The configured window is an upper bound: an operator who narrows it
     /// keeps the narrow window, and a configured value below the floor cannot
     /// wedge the autotune into an unusable size.
+    /// The configured window is an upper bound *above* the floor: narrowing it
+    /// below [`AUTO_WINDOW_FLOOR`] is raised, because a window that narrow
+    /// cannot carry a saturating flow and the floor is the old fixed value.
     #[test]
     fn desired_window_respects_the_configured_cap() {
         assert_eq!(desired_window(1, 1024), 1024, "cap below the budget wins");
@@ -1553,6 +1600,67 @@ mod tests {
             "cap below the floor is raised to it"
         );
         assert_eq!(desired_window(3, 512), 1024, "the floor still applies");
+    }
+
+    /// A session created *after* the last resize must still be corrected: it
+    /// is constructed at the configured cap, so a target-only comparison would
+    /// leave it there forever. This is the bug the per-session compare exists
+    /// to catch.
+    #[test]
+    fn sync_windows_corrects_sessions_created_after_the_last_change() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let config = KcpConfig {
+                wnd_size: (4096, 4096),
+                ..KcpConfig::default()
+            };
+            let (mut driver, _handle, _accept_rx) =
+                KcpSocket::new(std::sync::Arc::new(socket), config.clone());
+            let pool = driver.chunk_pool.clone();
+            let make = |conv: u32| {
+                let (read_tx, _read_rx) = mpsc::channel(4);
+                KcpSession::with_chunk_pool(
+                    conv,
+                    format!("127.0.0.1:{}", 9000 + conv).parse().unwrap(),
+                    config.clone(),
+                    read_tx,
+                    pool.clone(),
+                )
+            };
+            for conv in [1u32, 2] {
+                driver.sessions.insert(
+                    (conv, format!("127.0.0.1:{}", 9000 + conv).parse().unwrap()),
+                    make(conv),
+                );
+            }
+            // Two busy sessions: the floor.
+            assert_eq!(driver.sync_windows(desired_window(2, 4096)), 2);
+            for session in driver.sessions.values() {
+                assert_eq!(session.rcv_wnd(), 1024, "existing sessions take the floor");
+                assert_eq!(session.snd_wnd(), 1024, "both bounds move together");
+            }
+            // A third session appears at the configured cap (4096).
+            let conv = 3u32;
+            driver.sessions.insert(
+                (conv, format!("127.0.0.1:{}", 9000 + conv).parse().unwrap()),
+                make(conv),
+            );
+            let newcomer =
+                &driver.sessions[&(conv, format!("127.0.0.1:{}", 9000 + conv).parse().unwrap())];
+            assert_eq!(
+                newcomer.rcv_wnd(),
+                4096,
+                "constructed at the configured cap"
+            );
+            driver.sync_windows(desired_window(3, 4096));
+            let newcomer =
+                &driver.sessions[&(conv, format!("127.0.0.1:{}", 9000 + conv).parse().unwrap())];
+            assert_eq!(newcomer.rcv_wnd(), 1024, "the next tick corrects it");
+        });
     }
 
     /// The rate-limit trim uses `now.wrapping_sub(ts) > WINDOW` (same
@@ -1718,7 +1826,7 @@ mod tests {
             read_tx,
             driver.chunk_pool.clone(),
         );
-        session.note_inbound(1000); // driver stamped the first inbound packet
+        session.note_inbound(1000, 1400); // driver stamped the first inbound packet
         let alive = session.alive_handle();
         let (snd_backlog, snd_notify) = session.snd_backlog_handle();
         let stream = KcpStream::new(

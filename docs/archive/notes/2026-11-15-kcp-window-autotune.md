@@ -2,7 +2,8 @@
 
 **Date:** 2026-11-15
 **Status:** Shipped (PR #623). One `tcpMux = false` KCP flow goes from **68 to
-95 MiB/s** on the measurement VM; two, four and muxed flows are unchanged.
+108-112 MiB/s** on the measurement VM; two, four and muxed flows stay within
+run-to-run spread.
 
 ## Symptom
 
@@ -44,20 +45,38 @@ Two conclusions:
 
 ## The change
 
-The driver now sizes the window from load, every tick:
+The driver advertises the wide window when exactly one of its sessions is moving
+payload, and the old 1024 otherwise:
 
-    window = clamp(2048 / busy_sessions, 1024, configured_cap)
+    cap    = max(configured_cap, 1024)      // below the floor is raised
+    window = cap.min(2048) if busy <= 1 else 1024
 
-`busy` counts the sessions in this driver that have unacked data queued or
-inbound traffic within the last 250 ms, so idle control connections and unused
-proxies do not dilute the budget. The configured `wnd_size` becomes an upper
-bound and is raised to 4096 by default; the 1024 floor is the old fixed value,
-so a busy server keeps exactly the behaviour it had.
+This is deliberately not a shared budget: `2048 / busy` with a 1024 floor is the
+same function for every `busy >= 2`, and pretending otherwise ("several share
+it") would misdescribe 200 busy sessions each keeping 1024 — which is exactly
+what they had before. What changed is the 0/1 boundary, where the pacing formula
+binds.
+
+`busy` is payload-based, not datagram-based. The first version tested "inbound
+datagram within 250 ms", which yamux pings satisfy (one every 10 s per idle
+session), so on a server with a few dozen idle clients the count hovered at 2
+and the loaded session flapped between 2048 and 1024 every few seconds — each
+shrink drops in-flight segments past the new window and costs a retransmit
+burst. Sessions now carry a payload counter: a session is busy when it received
+at least one MTU inside the window, or has data queued *and* is still being
+acked. Pings and heartbeats are tens of bytes, so they never qualify; a peer
+that stopped ACKing is not busy either, it is stalled.
 
 Both directions follow: `Kcp::set_wndsize(wnd, wnd)`. Only the receive window
 is advertised on the wire, but the send side has to move with it, or the
 configured cap alone lets a busy server hold 4096 segments per session — see
-the first pitfall below.
+the first pitfall below. The configured `wnd_size` is an upper bound above the
+floor; it is an internal field, not a TOML key, and a value narrower than 1024
+is raised to it.
+
+A newly created session is seeded at the current window rather than left at the
+configured 4096 until the next tick (which would let it advertise and buffer 4x
+the old per-session bound for one interval).
 
 ## Result
 
@@ -65,16 +84,21 @@ Same harness, `tcpMux = false`, `ssh gc`, 4 vCPU EPYC-Milan, interleaved:
 
 | shape | before | after |
 | --- | --- | --- |
-| 1 flow, 768 MiB | 67.7 / 67.9 / 68.0 | **95.0 / 95.0 / 95.6** (+40%) |
-| 2 flows, 1024 MiB | 93.9 / 99.1 | 101.3 / 102.2 |
-| 4 flows, 1024 MiB | 113.0 / 116.2 / 119.3 | 113.0 / 116.0 / 125.0 |
-| 1 flow through `tcpMux`, 512 MiB | 115.4 / 116.6 / 122.5 | 109.8 / 119.8 / 121.4 |
+| 1 flow, 768 MiB | 67.8 / 68.1 / 67.9 | **108.3 / 110.2 / 112.1** (+60%) |
+| 2 flows, 1024 MiB | 95.2 / 112.2 | 99.2 / 107.2 (spread, not an effect: two busy sessions also get 1024) |
+| 4 flows, 1024 MiB | 105.2 / 107.7 / 109.9 | 108.8 / 114.1 / 120.0 |
+| 1 flow through `tcpMux`, 512 MiB (6 interleaved pairs) | 114.0-124.4 | 117.3-121.1 |
 
-Server CPU for the single-flow case rises from 666-690 to 726-772 ticks per
-768 MiB (about +9%), which is the cost of putting more data in flight; the
-four-flow case stays at 904-1006 against 954-1006.
+Server CPU for the single-flow case is unchanged — 690-717 ticks per 768 MiB
+before, 694-711 after — because the wider window fills the same tick with more
+payload rather than more work per payload. The 2-, 4- and `tcpMux` rows
+move inside the ~8-10% spread those shapes already showed, and the 2-flow row
+cannot move by construction: at two busy sessions the window is the old 1024.
 
-Against Go frp v0.72.0 the muxless single flow moves from 0.9x to **1.24x**.
+Against Go frp v0.72.0 the muxless single flow moves from 0.9x to **1.4x** —
+but only when both ends are frp-rs. Go sets `SetWindowSize(1024, 1024)` on both
+directions of its KCP conns, so a Rust-Go pair stays at 1024 both ways and sees
+no change from this work.
 
 ## Pitfalls found while building it
 
@@ -90,16 +114,35 @@ Against Go frp v0.72.0 the muxless single flow moves from 0.9x to **1.24x**.
 - The first implementation also kept an `applied_window` field as a
   "changed?" flag. It was removed once the per-session comparison replaced it;
   a flag that can disagree with the sessions is a bug waiting to happen.
+- **The wait-queue bound had to grow with the ceiling.** `KCP_SND_BACKLOG_THRESHOLD`
+  was 2048 — 2x the old 1024 window, so a session at full window still had a
+  window of write-ahead queue. With a 2048 ceiling that margin became 1x: the
+  gate would fire as soon as the window filled and remove the headroom the
+  high-BDP case needs. It is now 4096 (~5.6 MiB per stalled session).
+- **Clock arithmetic wraps.** The driver clock is `u32` milliseconds (~49.7
+  days). An `last_inbound + 250 >= now` test is true forever after the wrap for
+  any session stamped before it, so every session would count as busy and the
+  autotune would silently degrade to the old behaviour for the rest of the
+  process's life. The test is `now.wrapping_sub(last_inbound) <= 250`, matching
+  the reaper's convention.
 
 ## Limits
 
-- The budget (2048 segments) and the floor (1024) are constants tuned on this
-  VM's 4 vCPU / loopback. They are not derived from link capacity, so a
-  satellite-link or high-BDP deployment may want a different shape; the
-  configured `wnd_size` still caps it.
-- The controller keys on *busy sessions per driver*, which is a proxy for "is
-  the driver the limit". It cannot tell a wide-bandwidth single flow from a
-  narrow one; both get 2048.
+- The budget (2048) and the floor (1024) are constants tuned on this VM's 4 vCPU
+  / loopback. They are not derived from link capacity, so a satellite or
+  high-BDP deployment may want a different shape; the configured `wnd_size` caps
+  the budget but not the floor.
+- The rule keys on *busy sessions per driver*, which is a proxy for "is the
+  driver the limit". It cannot tell a wide-bandwidth single flow from a narrow
+  one; both get 2048. One driver serves every client of a listening socket
+  (`frp-core/src/kcp/listener.rs:76`), so on a server the decision is made per
+  port, not per client — which is why the payload test matters.
+- Shrinking a window mid-flight can cost a retransmit burst: segments already
+  sent beyond the new window are dropped and resent. KCP self-heals (the receive
+  window reopens once the app drains, `KCP_ASK_TELL`), and the retransmit is
+  bounded by the RTO, but a driver whose busy count oscillates at the 250 ms
+  boundary would pay it repeatedly. The payload test makes that unlikely; it is
+  not impossible (a flow that pauses for 250 ms exactly).
 - What it does not do: touch the tick interval (10 ms helps single flow and
   costs four flows — same trade, worse), or make the flush scan cheaper. The
   scan is O(in-flight segments) per tick and is the reason the wide window is

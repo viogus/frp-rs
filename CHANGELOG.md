@@ -23,15 +23,22 @@ User-facing release notes for frp-rs.
   traffic.** A KCP flow paces itself at `window × segment / tick` — with the
   fixed 1024-segment window and a 20 ms tick that is ~68 MiB/s, which is why a
   lone `tcpMux = false` stream sat behind Go frp (75-77) while the same engine
-  moved 120 MiB/s through `tcpMux`. The driver now sizes the window from load:
-  one busy session gets the whole 2048-segment budget (**68 → 95 MiB/s**, 1.24x
-  Go frp v0.72.0), several share it down to the old 1024-segment floor, so a
-  server carrying many sessions behaves exactly as before (4 flows 113-119
-  MiB/s, unchanged; `tcpMux` rows unchanged). Widening the window
-  unconditionally is *not* a free win — four flows lose ~25% of their
-  throughput and burn ~40% more CPU — which is what the load-based sizing
-  avoids. The configured KCP window is now an upper bound. Knob sweep and the
-  two implementation pitfalls are in
+  moved 120 MiB/s through `tcpMux`. The driver now advertises the wider
+  2048-segment window when exactly one of its sessions is moving payload, and
+  keeps the old 1024 for every other case (**68 → 108-112 MiB/s, +60%**, at
+  unchanged server CPU, and 1.4x the Go frp v0.72.0 measurement on the same
+  host); two flows, four flows and the `tcpMux` rows are within run-to-run
+  spread. "Moving payload" means
+  at least one MTU inside a 250 ms window, so keepalives cannot claim the wide
+  window and idle clients cannot take it from a busy one. Widening
+  unconditionally is *not* a free win — four flows lose ~25% of their throughput
+  and burn ~40% more CPU — which is what the load test avoids. The per-session
+  write-ahead bound grew with the ceiling (2048 → 4096 segments) so a session
+  at full window keeps a window of queued writes. The gain needs
+  frp-rs on **both** ends: Go frp pins 1024 on both directions of a KCP
+  connection, so a mixed pair is unchanged. The KCP window is now an upper bound
+  on the autotune above the 1024-segment floor. Knob sweep, the two
+  implementation pitfalls and the limits are in
   [`docs/archive/notes/2026-11-15-kcp-window-autotune.md`](docs/archive/notes/2026-11-15-kcp-window-autotune.md).
 
 - **KCP: the socket driver runs on its own thread, so KCP stops losing throughput
