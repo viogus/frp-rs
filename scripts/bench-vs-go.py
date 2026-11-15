@@ -123,7 +123,7 @@ def describe_run(resolved):
         capture_output=True, text=True, check=False,
     ).stdout.strip()
     host = f"{platform.node()} {platform.machine()} {os.cpu_count()} cpus"
-    workers = f"{WORKERS}" if WORKERS else "shipped-default"
+    workers = f"{WORKERS}" if WORKERS else "unset (binary default; frpc ships 1)"
     print(
         f"# commit={commit}{' (dirty)' if dirty else ''} host={host} mib={MIB} blocks={BLOCKS} "
         f"rs_client_workers={workers}"
@@ -211,9 +211,24 @@ def measure(impl, proto, tls, mux, flows, directory):
     server, client = write_configs(directory, proto, tls, mux, impl)
     server_log = open(os.path.join(directory, "frps.log"), "w")
     client_log = open(os.path.join(directory, "frpc.log"), "w")
-    frps = subprocess.Popen([os.path.join(binaries, "frps"), "-c", server], stdout=server_log, stderr=server_log)
+    # A stray TOKIO_WORKER_THREADS in the caller's environment would size the rs
+    # client differently from the count the header reports; the config key beats
+    # the variable, but an unset key would silently take it.
+    child_env = dict(os.environ)
+    child_env.pop("TOKIO_WORKER_THREADS", None)
+    frps = subprocess.Popen(
+        [os.path.join(binaries, "frps"), "-c", server],
+        stdout=server_log,
+        stderr=server_log,
+        env=child_env,
+    )
     subprocess.run(["sleep", "0.6"], check=False)
-    frpc = subprocess.Popen([os.path.join(binaries, "frpc"), "-c", client], stdout=client_log, stderr=client_log)
+    frpc = subprocess.Popen(
+        [os.path.join(binaries, "frpc"), "-c", client],
+        stdout=client_log,
+        stderr=client_log,
+        env=child_env,
+    )
     try:
         if not wait_port(REMOTE):
             print(f"  ! {proto} tls={tls} mux={mux} flows={flows} {impl}: did not come up", file=sys.stderr)

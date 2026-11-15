@@ -5,7 +5,7 @@
 At the shipped defaults — `frpc` runs one worker thread, the Go release runs one
 per CPU — 20 of 24 rows are faster, 2 are indistinguishable, and 2 are behind;
 both deficits are TLS without `tcpMux` at four flows. Given one client worker per
-CPU, the same run leaves **no row behind** (20 faster, 4 indistinguishable) and
+CPU, the same run leaves **no row behind** (19 faster, 5 indistinguishable) and
 those two rows read 1.19x and 1.47x. The client worker count, not the TLS path,
 was the difference.
 
@@ -122,8 +122,14 @@ and same binaries:
 | `frpc` worker threads | frp-rs MiB/s | client CPU | note |
 | ---: | ---: | ---: | --- |
 | 1 (shipped) | 860.8 / 890.0 / 906.0 | 0.92-0.96 cores | Table A's 855.4 |
+| 2 | 1267.3 (n=4, 1170.1-1371.4) | not sampled | already at the plateau |
+| 3 | 1239.8 (n=4, 1201.6-1403.2) | not sampled | |
 | 4 | 1292.0 / 1539.4 | 1.40-1.52 cores | Table B's 1293.3 |
 | Go (GOMAXPROCS 4) | 1022.8 / 1030.3 | 1.52-1.55 cores | reference |
+
+The effect is a step at the first extra thread and then flat: two workers already
+reach 1267 MiB/s, so the missing middle is not a gradual curve and "four" is not
+a tuned endpoint — any value ≥ 2 behaves like four on this shape.
 
 Two independent readings agree that frp-rs was not CPU-bound under the shipped
 default: at one worker it moved 861-906 MiB/s using **under one core**, while Go
@@ -132,16 +138,23 @@ not the TLS path, the record framing, or a per-connection cost.
 
 This also explains the shape of Table A's four-flow column. The four-flow to
 one-flow scaling factor is 0.85-1.24 for frp-rs in every shape and 1.13-1.85 for
-Go; the identity `quotient(4 flows) = quotient(1 flow) × scale_rs / scale_go`
-reproduces all six `tcp` rows to within 0.02%, i.e. no row in the four-flow
-column carries information independent of the one-flow column plus that scaling
-term. Under Table A the whole column is "one client thread against four".
+Go on the `tcp` and `websocket` shapes (Go's `kcp` and `quic` rows barely scale
+at all, 0.83-1.10). The identity
+`quotient(4 flows) = quotient(1 flow) × scale_rs / scale_go` holds of course —
+it is the same four medians rearranged, so it shows how the four-flow ratio
+decomposes rather than adding evidence. The decomposition does reproduce the four
+`tcp` shapes from their one-flow ratios to within 0.02%, which is all it claims.
+Under Table A the whole four-flow column is "one client thread against four".
 
-The earlier note in this archive, `2026-11-15-kcp-window-autotune.md`, had already
-measured the same effect on eight independent sessions without `tcpMux`:
-645 MiB/s at one worker, 1201 at four. It was recorded as a rationale for
-`frps` keeping one worker per CPU; it was not connected to this matrix until the
-review of this note asked whether the two arms had equal parallelism.
+The two archive notes that had already recorded this effect and were not
+connected to this matrix until the review of this note asked about parallelism:
+`2026-11-13-splice-wrapper-peel.md` measured eight independent sessions without
+`tcpMux` at 1227/1201 MiB/s on one worker, 2266/2465 after the peel, and
+2105/2548 → 2867/3122 at four workers; `2026-11-12-worker-thread-count.md`
+measured four separate `tcp` sessions at 2362/2283 against 2470/2811. Both were
+read at the time as "one worker is fine for many sessions"; at one worker on this
+shape the cap is real and the earlier readings were taken on shapes where one
+thread was not the limit.
 
 ## Rep-size cross-check against the README table
 
@@ -151,20 +164,23 @@ harness (2 blocks, 4 flows), under both worker settings:
 
 | README row | README (frp-rs / Go) | shipped defaults | `WORKERS=4` | verdict at `WORKERS=4` |
 | --- | --- | --- | --- | --- |
-| `tcpMux` + TLS (default) | 562 / 399 (+41%) | 619.0 / 422.1 = 1.47x | 576.3 / 426.4 = 1.37x | rs faster |
-| `tcpMux`, TLS off | 970 / 647 (+50%) | 795.0 / 684.2 = 1.15x | 1022.3 / 675.8 = 1.50x | rs faster |
-| no `tcpMux`, TLS on | 1298 / 956 (+36%) | 865.5 / 1029.4 = 0.84x | **1314.8 / 1046.5 = 1.27x** | rs faster |
-| no `tcpMux`, TLS off | 2168 / 1650 (+31%) | 2851.9 / 1746.4 = 1.67x | 3104.9 / 1636.3 = 1.88x | rs faster |
+| `tcpMux` + TLS (default) | 562 / 399 (+41%) | 619.0 / 422.1 | 576.3 / 426.4 | rs faster |
+| `tcpMux`, TLS off | 970 / 647 (+50%) | 795.0 / 684.2 | 1022.3 / 675.8 | rs faster |
+| no `tcpMux`, TLS on | 1298 / 956 (+36%) | 865.5 / 1029.4 | **1314.8 / 1046.5** | rs faster |
+| no `tcpMux`, TLS off | 2168 / 1650 (+31%) | 2851.9 / 1746.4 | 3104.9 / 1636.3 | rs faster |
 
-At the README's rep size with equal client parallelism every row lands within
-10% of the published figure (default +2.5%/+6.9%, `tcpMux`-off no-TLS
-+5.4%/+4.5%, no-`tcpMux` TLS-on +1.3%/+9.5%, no-`tcpMux` no-TLS +43%/-0.8% —
-the one large move is frp-rs's own gain from the splice peel). **The README is
-not retracted and needed no re-measurement: it was right.** What was wrong was
-this harness's earlier reading of it, which used a 1024 MiB rep and a
-single-threaded client. `README.md:166` states its own method ("two repeats"),
-which cannot resolve 10% — that limitation is real, but the numbers themselves
-stand.
+The cells are the two medians; their ratios are 1.37x, 1.15x/1.50x, 0.84x/1.26x
+and 1.67x/1.88x respectively (median block ratios; the raw lines below carry the
+per-block ratios and the quotient of the medians, which differ by up to 2% where
+the medians are noisy). At the README's rep size with equal client parallelism
+**three of the four rows land within 10%** of the published figure (default
++2.5%/+6.9%, `tcpMux`-off no-TLS +5.4%/+4.5%, no-`tcpMux` TLS-on +1.3%/+9.5%)
+and the fourth is `no tcpMux`, TLS off: +43.2% on the frp-rs side (its own gain
+from the splice peel) and −0.8% on Go. **The README is not retracted and needed
+no re-measurement: it was right.** What was wrong was this harness's earlier
+reading of it, which used a 1024 MiB rep and a single-threaded client.
+`README.md:166` states its own method ("two repeats"), which cannot resolve 10% —
+that limitation is real, but the numbers themselves stand.
 
 An earlier draft of this note claimed the README used "a different load
 generator". That was wrong: the README rows came from `abbench` as well
@@ -198,17 +214,20 @@ why: `kcp`, TLS off, no `tcpMux`, 1 flow was recorded as 0.84x behind in
 - 1024 MiB per rep, except the cross-check table (8192 MiB). Absolute numbers are
   not comparable across rep sizes; the ratios mostly are — the no-mux TLS row
   reads 0.81x at 1024 MiB and 0.84x at 8192 MiB under the same worker setting.
-- The rows are noisy: `rs` sample spread reaches 49% (`tcp` no-mux no-TLS, one
-  flow) and `go` spread reaches 54%. Two Go samples in particular decide two
-  rows — 44.1 MiB/s in `kcp` TLS-off no-mux (median 75.3) and 54.4 MiB/s in
-  `kcp` TLS-on no-mux (median 106.8) — so those two rows' verdicts are the
-  softest in the table and should be raised to more blocks before they are
-  quoted.
-- Two rows carry a single catastrophically low `rs` sample: `websocket`, TLS on,
-  `tcpMux` on at one and four flows bottomed at 87.2 and 102.2 MiB/s against
-  medians of 421.5 and 486.1. That is an intermittent stall in that shape, not
-  measurement noise of the usual size; it is why both rows print
-  `indistinguishable` and it is tracked as a follow-up rather than explained.
+- The rows are noisy: `rs` sample spread reaches 49% in Table A (`tcp` no-mux
+  no-TLS, one flow) and 86% in Table B (the stalled sample below); `go` spread
+  reaches 54%. Two Go samples in particular decide two rows — 44.1 MiB/s in
+  `kcp` TLS-off no-mux (median 75.3) and 54.4 MiB/s in `kcp` TLS-on no-mux
+  (median 106.8) — so those two rows' verdicts are the softest in the table and
+  should be raised to more blocks before they are quoted.
+- Two Table B rows carry a single catastrophically low `rs` sample: `websocket`,
+  TLS on, `tcpMux` on at one and four flows bottomed at 87.2 and 102.2 MiB/s
+  against medians of 421.5 and 486.1. Re-run in isolation at 12 samples the same
+  shape stalled once — the two processes sat at **zero CPU for 7.5 s** and then
+  finished at 92.7 MiB/s — so this is an intermittent stall in that path, not
+  ordinary noise; it is tracked in `TODO.md` and both rows are counted as
+  `indistinguishable`, which is the honest verdict but understates frp-rs when
+  the stall does not fire.
 - A row that straddles 1.0 is not evidence of equality either; it is evidence
   that this harness at this rep count cannot separate the two. Raising `BLOCKS`
   settles one row at a time.
@@ -220,9 +239,12 @@ why: `kcp`, TLS off, no `tcpMux`, 1 flow was recorded as 0.84x behind in
 
 ## Raw records
 
-The per-row lines the harness printed, reformatted for width (`quotient=` is
-kept, the trailing verdict is the `[verdict]` at the end of each SUMMARY line in
-the harness output). Table A, shipped defaults:
+The per-row lines the harness printed, reformatted for width. Table A's block was
+written before the harness emitted `quotient=`, so those lines carry only the
+three block ratios; Table B's and the `WORKERS=4` cross-check lines carry both.
+The verdicts are not part of these lines — they are the `[verdict]` at the end of
+the corresponding SUMMARY line in the harness output, repeated in the tables
+above. Table A, shipped defaults:
 
     tcp tls=false mux=false flows=1  rs=2235.8 n=6 (1774.9-2872.2, 49%)  go=1025.0 n=6 (901.1-1194.0)  ratios=[1.87, 2.06, 2.60]
     tcp tls=false mux=true  flows=1  rs=922.0  n=6 (798.4-982.3, 20%)   go=499.4  n=6 (467.7-529.2)   ratios=[1.82, 1.85, 1.78]

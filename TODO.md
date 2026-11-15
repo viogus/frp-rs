@@ -12998,9 +12998,14 @@ flow), but four independent TLS connections on one client thread measured
 four workers — and Go's 1030 MiB/s at 1.52-1.55 cores. The default therefore
 decides the four-flow column of the comparison table
 (`docs/archive/notes/2026-11-16-rust-vs-go-throughput.md`, Tables A and B), and
-the eight-independent-session measurement in
-`docs/archive/notes/2026-11-12-worker-thread-count.md` is the same effect on
-`tcp`.
+the one-worker cost shows up on independent sessions too: eight `tcp_mux = false`
+sessions measured 1227/1201 MiB/s on one worker and 2105/2548 at four, both
+rising to 2266/2465 and 2867/3122 once the server-side splice path was reachable
+(`docs/archive/notes/2026-11-13-splice-wrapper-peel.md`). The four-session
+measurement in `docs/archive/notes/2026-11-12-worker-thread-count.md` did not
+show it (2362/2283 against 2470/2811, 14% spread) — at four connections on
+loopback the ceiling was the client's own disk-to-socket path, not the thread
+count.
 
 Nothing is broken — the knob exists, is documented, and is restart-only. What is
 missing is guidance: a deployment with many independent connections and
