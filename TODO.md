@@ -12901,14 +12901,28 @@ kept out of the main P2 list so that adding them does not renumber every later
   withdrawn "+23%" stays retracted in
   `docs/archive/notes/2026-11-10-real-host-throughput.md` section 6.
 
-- [ ] **KCP bulk streams are ~1.5x behind Go (2.1x before the AVX2 parity pass).**
+- [ ] **KCP bulk streams: closed out 2026-11-15 — parity with TLS on, behind with it off.**
 
-  Landed: AVX2 parity (49.1 → 58.5 MiB/s one-flow means), `sendmmsg` for the
-  flush and the tick (mean 61.3), `recvmmsg` batching (58.5 → 64.0, four pairs),
-  one flush per burst of up to four bridge writes (63.9 → 66.5, eight pairs),
-  1400-byte MTU (−4.0% CPU per MiB, six pairs in both orders). Standing
-  numbers: 65-66 vs 99-102 MiB/s one flow, 69 vs 45 CPU-seconds per 2048 MiB,
-  568,440 datagrams per 512 MiB against Go's 534,678.
+  Settled by `docs/archive/notes/2026-11-15-kcp-window-autotune.md`: with the
+  server's KCP driver moved to its own runtime thread
+  (`docs/archive/notes/2026-11-12-worker-thread-count.md`) and the window sized
+  by load, one `tcpMux = false` flow measures 111.5 against Go frp v0.72.0's
+  106.7 MiB/s on the same TLS-enabled shape (1.04×, same host, medians of
+  three). The earlier "~1.5x behind" read came from comparing frp-rs with TLS
+  **on** against Go with TLS **off**; the like-for-like TLS-off row is 63.8
+  against 76.2 MiB/s (0.84×), and the mixed-binary 61-66 vs 80-83 band below was
+  taken on that same TLS-off shape, so the "client end is the limiter"
+  conclusion holds only for that configuration. Remaining lever with evidence:
+  raw KCP streams hand the bridge one ~1376-byte segment per read while TLS and
+  yamux hand it 16-64 KiB, which is what the withdrawn read-coalescing probe
+  (#622) targeted — it was measured on the TLS+`tcpMux` shape, where coalescing
+  had already happened, so it never tested the row that needs it.
+
+  Landed before that, still standing: AVX2 parity (49.1 → 58.5 MiB/s one-flow
+  means), `sendmmsg` for the flush and the tick (mean 61.3), `recvmmsg` batching
+  (58.5 → 64.0, four pairs), one flush per burst of up to four bridge writes
+  (63.9 → 66.5, eight pairs), 1400-byte MTU (−4.0% CPU per MiB, six pairs in
+  both orders), 568,440 datagrams per 512 MiB against Go's 534,678.
 
   Every candidate that reading Go's source suggested is now measured and
   negative: Go's flush behaviour in three variants — write-delay/tick-only
@@ -12916,19 +12930,16 @@ kept out of the main P2 list so that adding them does not renumber every later
   effect), and flushing when an ACK slides the window (~61-63 MiB/s, about 5%
   slower) — plus the eleven earlier pass/eliminate experiments (copies, yamux
   window, tokio-vs-blocking relay, ACK batching to the tick):
-  `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. A mixed-binary matrix
-  localises the remainder: with Go as the client the same servers carry
-  80-83 MiB/s, with frp-rs as the client 61-66, so **the client end is the
-  limiter**, not the server, and not the KCP core.
+  `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. That mixed-binary
+  matrix was taken on the TLS-**off** shape: with Go as the client the same
+  servers carry 80-83 MiB/s, with frp-rs as the client 61-66, so the client end
+  is the limiter *there* — not the server, and not the KCP core.
 
-  So the cost is not a call site: it is the steady-state pacing of one session
-  under this driver. The tick-only arms show which direction is wrong to take;
-  they do not identify the right one.
-
-  **Done-when:** either a design with a measured ≥10% win on the same harness
-  lands, or the note above is extended with the scheduler experiment (per-
-  session flush timer decoupled from the receive loop) and its result, so the
-  item states a mechanism rather than a residual.
+  **Done-when:** met on the TLS-on shape (parity, 1.04×). Still open for the
+  TLS-off shape: either a design with a measured ≥10% win on the same harness
+  lifts 63.8 toward Go's 76.2, or the note above is extended with the read-
+  coalescing re-test on that shape and its result, so the item states a
+  mechanism rather than a residual.
 ---
 
 ## P2 — structural (scheduling)
