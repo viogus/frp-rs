@@ -12989,6 +12989,18 @@ the stall or shows it was a one-off, and if it reproduces, the profile of a
 stalled rep names the wait (bridge copy, yamux frame, or the WebSocket framing
 write) instead of leaving it as a spread figure.
 
+First narrowing (2026-11-16, 12 reps of the ws + TLS + `tcpMux` shape at
+`WORKERS=4`, one client flow, 1024 MiB): two stalls reproduced, 10.9 s and 12.3 s
+against a 2.3 s normal rep. Sampling `ss -tinH` every 0.25 s during the stall
+showed the user-facing socket on frps carrying **12-15 MB in its send queue**
+(`0 12128885 127.0.0.1:41524 127.0.0.1:19056` and successors, a queue that grows
+monotonically through the stall) while the tunnel connection at `19100` stayed
+empty — i.e. the server accepted the upload bytes but stopped draining the
+connection toward the bridge, and both processes sat at zero CPU rather than
+spinning. That points at a lost wakeup on the server side of the WebSocket +
+TLS + yamux path (the failure shape `scripts/protocol-matrix.sh` was written to
+catch), not at slow copying.
+
 ## P3 — measured: the one-worker `frpc` default bounds multi-connection throughput
 
 `frpc` ships `transport.workerThreads = 1`; the Go release runs one thread per
