@@ -2,13 +2,14 @@
 
 **Date:** 2026-11-15
 **Status:** Shipped (PR #623). One `tcpMux = false` KCP flow goes from **68 to
-108-112 MiB/s** on the measurement VM; two, four and muxed flows stay within
+108-114 MiB/s** on the measurement VM; two, four and muxed flows stay within
 run-to-run spread.
 
 ## Symptom
 
 The Rust-vs-Go matrix left exactly one row behind: a single KCP stream with
-`transport.tcpMux = false`, at 68 MiB/s against Go frp v0.72.0's 75-77. Every
+`transport.tcpMux = false`, at 68 MiB/s against Go frp v0.72.0's ~107 on the
+same TLS-enabled shape — 0.64x. Every
 other shape led, and the same KCP engine moved 120 MiB/s through `tcpMux`.
 
 ## Where the ceiling comes from
@@ -95,8 +96,20 @@ payload rather than more work per payload. The 2-, 4- and `tcpMux` rows
 move inside the ~8-10% spread those shapes already showed, and the 2-flow row
 cannot move by construction: at two busy sessions the window is the old 1024.
 
-Against Go frp v0.72.0 the muxless single flow moves from 0.9x to **1.4x** —
-but only when both ends are frp-rs. Go sets `SetWindowSize(1024, 1024)` on both
+Against Go frp v0.72.0 the muxless single flow moves from 0.64x to **parity**:
+111.5 against 106.7 MiB/s (medians of three, same host, same shape, TLS enabled
+on both sides). An earlier version of this note quoted 0.9x to 1.4x by pairing
+frp-rs's TLS-on number with Go's TLS-*off* one; the like-for-like pairs are:
+
+| shape | frp-rs | Go frp v0.72.0 | ratio |
+| --- | --- | --- | --- |
+| 1 flow, 768 MiB, `tcpMux = false`, TLS on | 110.3 / 111.5 / 113.7 | 102.3 / 106.7 / 107.7 | 1.04x |
+| 1 flow, 768 MiB, `tcpMux = false`, `transport.tls.enable = false` | 62.9 / 63.8 / 66.1 | 74.3 / 76.2 / 77.2 | 0.84x |
+
+The window is 2048 in both builds of the TLS-off row, so pacing is not the
+explanation there; see Limits.
+
+The gain also only appears when both ends are frp-rs. Go sets `SetWindowSize(1024, 1024)` on both
 directions of its KCP conns, so a Rust-Go pair stays at 1024 both ways and sees
 no change from this work.
 
@@ -128,6 +141,13 @@ no change from this work.
 
 ## Limits
 
+- **With `transport.tls.enable = false` both builds are slower and frp-rs is
+  behind.** Same shape, one 768 MiB flow: frp-rs 63.8 against Go 76.2 MiB/s
+  (0.84x), while both reach ~107-112 with TLS enabled. The window is 2048 on
+  both sides in that row, so this is not window pacing. The likely cause —
+  unverified — is that the TLS deframer and yamux both hand the bridge 16-64 KiB
+  chunks while a raw KCP stream hands it one ~1376-byte segment per read, so the
+  bridge pays its per-read cost four to fifty times as often.
 - The budget (2048) and the floor (1024) are constants tuned on this VM's 4 vCPU
   / loopback. They are not derived from link capacity, so a satellite or
   high-BDP deployment may want a different shape; the configured `wnd_size` caps
