@@ -1083,9 +1083,8 @@ impl AsyncWrite for WsByteStream {
             drain_completed,
             ..
         } = this;
-        let needs_flush_local = *needs_flush;
         let raw = inner;
-        if needs_flush_local {
+        if *needs_flush {
             let remaining = &write_buf[*write_pos..];
             match Pin::new(raw.as_mut()).poll_write(cx, remaining) {
                 Poll::Ready(Ok(0)) => {
@@ -1094,34 +1093,41 @@ impl AsyncWrite for WsByteStream {
                     // not a self-wake spin.
                     *needs_flush = false;
                     *drain_completed = false;
-                    Poll::Ready(Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")))
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero",
+                    )));
                 }
                 Poll::Ready(Ok(n)) => {
                     *write_pos += n;
-                    if *write_pos >= write_buf.len() {
-                        *write_pos = 0;
-                        *needs_flush = false;
-                        // poll_flush has no buf to consume, so record that
-                        // the frame completed; the next poll_write consumes
-                        // the caller's re-polled buf (returning the recorded
-                        // payload length) instead of re-sending it.
-                        *drain_completed = true;
-                        Poll::Ready(Ok(()))
-                    } else {
+                    if *write_pos < write_buf.len() {
                         cx.waker().wake_by_ref();
-                        Poll::Pending
+                        return Poll::Pending;
                     }
+                    *write_pos = 0;
+                    *needs_flush = false;
+                    // poll_flush has no buf to consume, so record that the
+                    // frame completed; the next poll_write consumes the
+                    // caller's re-polled buf (returning the recorded payload
+                    // length) instead of re-sending it.
+                    *drain_completed = true;
                 }
                 Poll::Ready(Err(e)) => {
                     *needs_flush = false;
                     *drain_completed = false;
-                    Poll::Ready(Err(e))
+                    return Poll::Ready(Err(e));
                 }
-                Poll::Pending => Poll::Pending,
+                Poll::Pending => return Poll::Pending,
             }
-        } else {
-            Poll::Ready(Ok(()))
         }
+        // Always flush the inner stream, even when no frame bytes remain here.
+        // A TLS inner accepts plaintext into its own buffer and only its flush
+        // pushes those records onto the socket; returning `Ready(Ok(()))` at
+        // this point let the last record sit in userspace while both ends
+        // waited for data — the intermittent stall the interleaved benchmark
+        // hit on the websocket + TLS + tcpMux shape (both processes at zero
+        // CPU with nothing in flight, repaired only by the next write).
+        Pin::new(raw.as_mut()).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1748,6 +1754,117 @@ mod tests {
             Poll::Ready(Err(e)) => assert_eq!(e.kind(), io::ErrorKind::WriteZero),
             other => panic!("expected WriteZero error, got {other:?}"),
         }
+    }
+
+    /// AsyncWrite stub that accepts a fixed fraction of each write and counts
+    /// how often its flush is called, so a wrapper that swallows the flush is
+    /// detectable.
+    struct FlushCountingSink {
+        flushes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        half: bool,
+    }
+
+    impl AsyncRead for FlushCountingSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FlushCountingSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = if self.half {
+                (buf.len() / 2).max(1)
+            } else {
+                buf.len()
+            };
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.flushes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A TLS inner stream holds plaintext it has accepted but not yet written
+    /// until its own flush runs, so `WsByteStream::poll_flush` must always
+    /// reach the inner stream — even with no frame bytes left here. Returning
+    /// `Ready(Ok(()))` without it was the websocket + TLS stall: the last
+    /// record sat in the rustls buffer while both ends waited for data.
+    #[test]
+    fn flush_reaches_the_inner_stream_with_nothing_pending() {
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = FlushCountingSink {
+            flushes: flushes.clone(),
+            half: false,
+        };
+        let mut ws = WsByteStream::from_raw(Box::new(sink), false);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        assert!(matches!(
+            Pin::new(&mut ws).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "poll_flush returned without flushing the inner stream"
+        );
+    }
+
+    /// The same contract on the drain path: a partially written frame is
+    /// finished by `poll_flush`, and after the last byte the inner stream is
+    /// still flushed (a TLS inner needs that to push the record).
+    #[test]
+    fn flush_reaches_the_inner_stream_after_draining_a_partial_frame() {
+        let flushes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = FlushCountingSink {
+            flushes: flushes.clone(),
+            half: true,
+        };
+        let mut ws = WsByteStream::from_raw(Box::new(sink), false);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let buf = vec![0x5Au8; 64];
+
+        // The inner accepts only half of the frame, so the write parks with a
+        // pending drain.
+        assert!(matches!(
+            Pin::new(&mut ws).poll_write(&mut cx, &buf),
+            Poll::Pending
+        ));
+
+        // Drain to completion; the completing call must still flush the inner.
+        let mut polls = 0;
+        loop {
+            match Pin::new(&mut ws).poll_flush(&mut cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Pending => {
+                    polls += 1;
+                    assert!(polls < 32, "flush never completed");
+                }
+                Poll::Ready(Err(e)) => panic!("unexpected flush error: {e}"),
+            }
+        }
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the drain path completed without exactly one flush of the inner stream"
+        );
     }
 
     /// Regression test for the duplicate-frame bug: after a partial write,
