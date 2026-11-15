@@ -19,6 +19,20 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **Raw KCP streams: +37% and past Go, by handing the bridge every queued
+  segment.** `KcpStream::poll_read` used to return after one channel message,
+  i.e. one ~1376-byte segment, while the bridge asked for 64 KiB — so the
+  naked path (no TLS, no `tcpMux`) paid its per-read cost four to fifty times
+  more often than the wrapped ones. It now drains everything the session has
+  queued into the caller's buffer: nine interleaved pairs on a 4-vCPU VM
+  (768 MiB, one flow, `tcpMux = false`, TLS off) measured **63.0 → 86.4 MiB/s
+  (+37%)**, which moves that row from 0.84x against Go frp v0.72.0 (76.2 MiB/s)
+  to **1.13x**. Four flows, the TLS-on row and both `tcpMux` rows measure
+  unchanged (within their 4-8% spread). The earlier attempt at this (#622) was
+  withdrawn for measuring nothing because it ran on the TLS + `tcpMux` shape,
+  where the wrapper had already coalesced the reads; see
+  [`docs/archive/notes/2026-11-15-kcp-read-coalescing.md`](docs/archive/notes/2026-11-15-kcp-read-coalescing.md).
+
 - **KCP single-stream throughput: +60% when one session is carrying the
   traffic.** A KCP flow paces itself at `window × segment / tick` — with the
   fixed 1024-segment window and a 20 ms tick that is ~68 MiB/s, which is why a

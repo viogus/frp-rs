@@ -162,7 +162,9 @@ no change from this work.
   bridge pays its per-read cost four to fifty times as often. Collapsing queued
   segments into one read is the change PR #622 tried; that probe ran on the
   TLS+`tcpMux` shape, where yamux had already coalesced, so it never tested this
-  row.
+  row. **Confirmed and shipped since:** coalescing on this shape measures
+  63.0 → 86.4 MiB/s (+37%, nine interleaved pairs), 1.13x Go — see
+  `docs/archive/notes/2026-11-15-kcp-read-coalescing.md`.
 - Do not read the TLS-off number as a regression from this work: it is the same
   band as the pre-change baseline for that shape, and the autotune's own arms
   were measured with TLS on (the only shape this note was opened for).

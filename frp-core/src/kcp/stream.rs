@@ -181,9 +181,25 @@ impl AsyncRead for KcpStream {
         // Returning `Ready` after a `Pending` poll is allowed and the waker
         // stays registered, so a caller that gets data still gets woken for
         // the next segment.
+        // First segment of this call, for the debug log below: enough to tell
+        // an app payload from framing debris when a stream stalls, and cheap
+        // because it is capped at eight bytes once per call.
+        #[cfg(debug_assertions)]
+        let mut first_hex = [0u8; 16];
+        #[cfg(debug_assertions)]
+        let mut first_len = 0usize;
+
         while buf.remaining() > 0 {
             match self.read_rx.poll_recv(cx) {
                 Poll::Ready(Some(data)) => {
+                    #[cfg(debug_assertions)]
+                    if first_len == 0 && !data.is_empty() {
+                        let n = data.len().min(8);
+                        for (slot, byte) in first_hex.iter_mut().zip(&data[..n]) {
+                            *slot = *byte;
+                        }
+                        first_len = n;
+                    }
                     let take = data.len().min(buf.remaining());
                     buf.put_slice(&data[..take]);
                     filled += take;
@@ -243,6 +259,7 @@ impl AsyncRead for KcpStream {
                 conv = self.conv,
                 n = filled,
                 total = self.read_count,
+                first = %crate::hex_encode(&first_hex[..first_len]),
                 "KCP read: {} bytes (total={})",
                 filled,
                 self.read_count,
@@ -521,9 +538,11 @@ mod tests {
     async fn poll_read_coalesces_every_queued_segment() {
         let (tx, rx) = mpsc::channel(8);
         let mut stream = stream_reading_from(rx);
-        for _ in 0..3 {
-            tx.send(vec![7u8; 100]).await.unwrap();
-        }
+        // Distinct payloads: identical ones would let a duplicated or
+        // reordered segment pass the length assertion below.
+        tx.send(vec![1u8; 100]).await.unwrap();
+        tx.send(vec![2u8; 100]).await.unwrap();
+        tx.send(vec![3u8; 100]).await.unwrap();
         let mut buf = [0u8; 1024];
         let (poll, filled) = poll_once(&mut stream, &mut buf);
         assert!(matches!(poll, Poll::Ready(Ok(()))));
@@ -531,6 +550,66 @@ mod tests {
             filled, 300,
             "one poll must hand over every segment the session already queued, \
              not just the first: the bridge asks for 64 KiB and a segment is ~1.4 KiB"
+        );
+        assert_eq!(&buf[..100], &[1u8; 100], "segments must keep their order");
+        assert_eq!(&buf[100..200], &[2u8; 100], "no duplication or reordering");
+        assert_eq!(&buf[200..300], &[3u8; 100], "and the last one arrives");
+    }
+
+    #[tokio::test]
+    async fn poll_read_returns_queued_bytes_before_eof() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut stream = stream_reading_from(rx);
+        tx.send(vec![4u8; 100]).await.unwrap();
+        tx.send(vec![5u8; 100]).await.unwrap();
+        drop(tx); // the session closed after queueing two segments
+
+        let mut buf = [0u8; 1024];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(
+            filled, 200,
+            "a closed channel must not turn queued bytes into an early EOF"
+        );
+
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(filled, 0, "the drain comes before the close is reported");
+    }
+
+    #[tokio::test]
+    async fn poll_read_leaves_the_waker_registered_after_a_coalesced_read() {
+        struct CountWake(Arc<AtomicUsize>);
+        impl std::task::Wake for CountWake {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let (tx, rx) = mpsc::channel(8);
+        let mut stream = stream_reading_from(rx);
+        tx.send(vec![9u8; 32]).await.unwrap();
+
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = std::task::Waker::from(Arc::new(CountWake(wakes.clone())));
+        let mut cx = Context::from_waker(&waker);
+
+        // First poll coalesces the queued segment, then parks on the empty
+        // channel. That parking poll is the one that has to leave the waker
+        // registered, so the next segment wakes the reader instead of
+        // stranding it — the reason the loop cannot bail out on `filled > 0`.
+        let mut buf = [0u8; 1024];
+        let mut read_buf = ReadBuf::new(&mut buf);
+        let poll = Pin::new(&mut stream).poll_read(&mut cx, &mut read_buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(read_buf.filled().len(), 32);
+        assert_eq!(wakes.load(Ordering::Relaxed), 0);
+
+        tx.send(vec![8u8; 16]).await.unwrap();
+        assert_eq!(
+            wakes.load(Ordering::Relaxed),
+            1,
+            "the coalescing loop must leave the channel's waker registered"
         );
     }
 
