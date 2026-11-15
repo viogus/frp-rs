@@ -12912,11 +12912,14 @@ kept out of the main P2 list so that adding them does not renumber every later
   **on** against Go with TLS **off**; the like-for-like TLS-off row is 63.8
   against 76.2 MiB/s (0.84×), and the mixed-binary 61-66 vs 80-83 band below was
   taken on that same TLS-off shape, so the "client end is the limiter"
-  conclusion holds only for that configuration. Remaining lever with evidence:
-  raw KCP streams hand the bridge one ~1376-byte segment per read while TLS and
-  yamux hand it 16-64 KiB, which is what the withdrawn read-coalescing probe
-  (#622) targeted — it was measured on the TLS+`tcpMux` shape, where coalescing
-  had already happened, so it never tested the row that needs it.
+  conclusion holds only for that configuration. Closed out on the TLS-off row
+  too: raw KCP streams handed the bridge one ~1376-byte segment per read while
+  TLS and yamux handed it 16-64 KiB, so collapsing the queued segments into one
+  read (2026-11-15) measures 63.0 → 86.4 MiB/s (+37%, means of nine interleaved
+  pairs), i.e. 1.14× Go — see
+  `docs/archive/notes/2026-11-15-kcp-read-coalescing.md`. The earlier probe
+  (#622) came up empty because it ran at `tcpMux = false` with TLS left on,
+  where the rustls deframer had already coalesced the reads.
 
   Landed before that, still standing: AVX2 parity (49.1 → 58.5 MiB/s one-flow
   means), `sendmmsg` for the flush and the tick (mean 61.3), `recvmmsg` batching
@@ -12935,11 +12938,11 @@ kept out of the main P2 list so that adding them does not renumber every later
   servers carry 80-83 MiB/s, with frp-rs as the client 61-66, so the client end
   is the limiter *there* — not the server, and not the KCP core.
 
-  **Done-when:** met on the TLS-on shape (parity, 1.04×). Still open for the
-  TLS-off shape: either a design with a measured ≥10% win on the same harness
-  lifts 63.8 toward Go's 76.2, or the note above is extended with the read-
-  coalescing re-test on that shape and its result, so the item states a
-  mechanism rather than a residual.
+  **Done-when:** met on both shapes — TLS on is parity (1.04×) and TLS off is
+  now ahead (1.13×). What remains is not a KCP item: with TLS off the whole
+  shape is still slower than the same engine with TLS on (86 against 111
+  MiB/s), which is the read-granularity cost the coalescing reduced but did not
+  remove.
 ---
 
 ## P2 — structural (scheduling)
