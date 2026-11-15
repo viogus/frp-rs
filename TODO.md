@@ -12992,10 +12992,10 @@ write) instead of leaving it as a spread figure.
 First narrowing (2026-11-16, 12 reps of the ws + TLS + `tcpMux` shape at
 `WORKERS=4`, one client flow, 1024 MiB): two stalls reproduced, 10.9 s and 12.3 s
 against a 2.3 s normal rep. Sampling `ss -tinH` every 0.25 s during the stall
-showed the user-facing socket on frps carrying **12-15 MB in its send queue**
-(`0 12128885 127.0.0.1:41524 127.0.0.1:19056` and successors, a queue that grows
-monotonically through the stall) while the tunnel connection at `19100` stayed
-empty — i.e. the server accepted the upload bytes but stopped draining the
+showed the client's outbound socket to the echo sink carrying **12-15 MB in its
+send queue** (`0 12128885 127.0.0.1:41524 127.0.0.1:19056` and successors, a queue
+that grows monotonically through the stall) while the tunnel connection at `19100`
+stayed empty — i.e. the server accepted the upload bytes but stopped draining the
 connection toward the bridge, and both processes sat at zero CPU rather than
 spinning. That points at a lost wakeup on the server side of the WebSocket +
 TLS + yamux path (the failure shape `scripts/protocol-matrix.sh` was written to
@@ -13009,15 +13009,19 @@ TCP stream that is harmless; over TLS it strands the record layer — `tokio-rus
 holds the ciphertext it could not write, the writable wake re-polls the writer,
 the WebSocket layer answers "already flushed", and the tunnel sits with an empty
 socket in both directions while both processes are at zero CPU. The stall clears
-on the next unrelated write, and the yamux keepalive at 10 s is why it lasted
-8-10 s. The flush now always delegates to the inner stream. Evidence: `ss -tinH`
+on the next unrelated write; vendored yamux's 10 s RTT ping
+(`vendor/yamux/src/connection/rtt.rs:24`, a ping frame is a write) is the only
+timer with that cadence, which is why it lasted ~7.5-10 s. The flush now always delegates to the inner stream. Evidence: `ss -tinH`
 at a stall showed the user-facing socket on frps with ~956 KB received and unread
 and the tunnel carrying `0 0` both ways; `gdb` showed every worker parked in
 `epoll_wait`/futex. Repro rate before the fix was 6 of 58 reps of the
 `websocket` / TLS / `tcpMux` shape (2 of 10, 2 of 12, 1 of 16, 1 of 20 across
-sessions), and 0 of 44 after it; the same run of `tcp` + TLS and of `websocket`
-without TLS never stalled (0 of 10 each), which is why the trigger is the
-combination and not either layer. Two regression tests
+sessions), and 0 of 44 after it. `tcp` + TLS and `websocket` without TLS never
+stalled (0 of 10 each), which is consistent with the mechanism but does not
+prove it on its own — at a 10 % baseline rate ten clean reps is a 35 % outcome.
+What does prove it is the code: the bare `tcp` work connection is a
+`tokio-rustls` stream whose own `poll_flush` pushes the records, and `websocket`
+without TLS wraps a raw `TcpStream`, where a `Ready` flush is harmless. Two regression tests
 (`flush_reaches_the_inner_stream_with_nothing_pending`,
 `flush_reaches_the_inner_stream_after_draining_a_partial_frame`) fail on the old
 code and pass on the new one. Note:

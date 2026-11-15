@@ -1860,9 +1860,10 @@ mod tests {
                 Poll::Ready(Err(e)) => panic!("unexpected flush error: {e}"),
             }
         }
-        assert!(
-            flushes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "the drain path completed without flushing the inner stream"
+        assert_eq!(
+            flushes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the drain path completed without exactly one flush of the inner stream"
         );
     }
 
