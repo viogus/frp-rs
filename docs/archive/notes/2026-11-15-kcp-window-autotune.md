@@ -2,14 +2,15 @@
 
 **Date:** 2026-11-15
 **Status:** Shipped (PR #623). One `tcpMux = false` KCP flow goes from **68 to
-108-112 MiB/s** on the measurement VM; two, four and muxed flows stay within
+108-114 MiB/s** on the measurement VM; two, four and muxed flows stay within
 run-to-run spread.
 
 ## Symptom
 
 The Rust-vs-Go matrix left exactly one row behind: a single KCP stream with
-`transport.tcpMux = false`, at 68 MiB/s against Go frp v0.72.0's 75-77. Every
-other shape led, and the same KCP engine moved 120 MiB/s through `tcpMux`.
+`transport.tcpMux = false`, at 68 MiB/s against Go frp v0.72.0's ~107 on the
+same TLS-enabled shape — 0.64x. Every other shape led, and the same KCP engine
+moved 120 MiB/s through `tcpMux`.
 
 ## Where the ceiling comes from
 
@@ -17,7 +18,7 @@ KCP paces a connection by its window and its tick interval:
 
     window × segment ÷ interval  =  1024 × 1376 B ÷ 20 ms  ≈  68 MiB/s
 
-which is where both builds sat. Sweeping the knobs on the four-vCPU VM
+which is where frp-rs sat. Sweeping the knobs on the four-vCPU VM
 (768 MiB single flow / 1024 MiB four flows, `tcpMux = false`, medians or full
 ranges of 2-3 reps):
 
@@ -95,8 +96,26 @@ payload rather than more work per payload. The 2-, 4- and `tcpMux` rows
 move inside the ~8-10% spread those shapes already showed, and the 2-flow row
 cannot move by construction: at two busy sessions the window is the old 1024.
 
-Against Go frp v0.72.0 the muxless single flow moves from 0.9x to **1.4x** —
-but only when both ends are frp-rs. Go sets `SetWindowSize(1024, 1024)` on both
+Against Go frp v0.72.0 the muxless single flow moves from 0.64x to **parity**:
+111.5 against 106.7 MiB/s (medians of three, same host, same shape, TLS enabled
+on both sides). The earlier Result row (108.3 / 110.2 / 112.1) is the batch
+measured while the change was being validated; the 110.3 / 111.5 / 113.7 triple
+below was re-measured in the same session as the Go column, on both binaries at
+`6178c8e0` with the shipped defaults (frps one worker per CPU, frpc one), and it
+is the one quoted elsewhere. An earlier version of this note quoted 0.9x to 1.4x
+by pairing frp-rs's TLS-on number with Go's TLS-*off* one; the like-for-like
+pairs are:
+
+| shape | frp-rs | Go frp v0.72.0 | ratio |
+| --- | --- | --- | --- |
+| 1 flow, 768 MiB, `tcpMux = false`, TLS on | 110.3 / 111.5 / 113.7 | 102.3 / 106.7 / 107.7 | 1.04x |
+| 1 flow, 768 MiB, `tcpMux = false`, `transport.tls.enable = false` | 62.9 / 63.8 / 66.1 | 74.3 / 76.2 / 77.2 | 0.84x |
+
+In the TLS-off row the window is 2048 at both frp-rs ends, so frp-rs being behind
+is not explained by its own window setting — but Go runs that row at its own
+pinned 1024, so it is not a window-controlled comparison either; see Limits.
+
+The gain also only appears when both ends are frp-rs. Go sets `SetWindowSize(1024, 1024)` on both
 directions of its KCP conns, so a Rust-Go pair stays at 1024 both ways and sees
 no change from this work.
 
@@ -128,6 +147,25 @@ no change from this work.
 
 ## Limits
 
+- **With `transport.tls.enable = false` both builds are slower and frp-rs is
+  behind.** Same shape, one 768 MiB flow: frp-rs 63.8 against Go 76.2 MiB/s
+  (0.84x), while both reach ~107-112 with TLS enabled. Two things make that row
+  different from every other one here. First, turning TLS *off* costs frp-rs
+  ~40% on this shape, the opposite of the usual relation (TLS normally costs
+  ~40%; see the throughput table in `README.md`), so the TLS-off row is not the
+  cheap baseline it is elsewhere. Second, the window is 2048 at both frp-rs ends
+  in that row but Go runs it at its own pinned 1024, so the comparison is
+  unregulated on our side and regulated on theirs — if anything that credits Go
+  with doing more per window. The likely cause of the inversion — unverified —
+  is read granularity: the TLS deframer and yamux hand the bridge 16-64 KiB
+  chunks while a raw KCP stream hands it one ~1376-byte segment per read, so the
+  bridge pays its per-read cost four to fifty times as often. Collapsing queued
+  segments into one read is the change PR #622 tried; that probe ran on the
+  TLS+`tcpMux` shape, where yamux had already coalesced, so it never tested this
+  row.
+- Do not read the TLS-off number as a regression from this work: it is the same
+  band as the pre-change baseline for that shape, and the autotune's own arms
+  were measured with TLS on (the only shape this note was opened for).
 - The budget (2048) and the floor (1024) are constants tuned on this VM's 4 vCPU
   / loopback. They are not derived from link capacity, so a satellite or
   high-BDP deployment may want a different shape; the configured `wnd_size` caps

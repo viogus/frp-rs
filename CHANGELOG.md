@@ -19,15 +19,21 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
-- **KCP single-stream throughput: +40% when one session is carrying the
+- **KCP single-stream throughput: +60% when one session is carrying the
   traffic.** A KCP flow paces itself at `window × segment / tick` — with the
   fixed 1024-segment window and a 20 ms tick that is ~68 MiB/s, which is why a
-  lone `tcpMux = false` stream sat behind Go frp (75-77) while the same engine
-  moved 120 MiB/s through `tcpMux`. The driver now advertises the wider
+  lone `tcpMux = false` stream sat far behind Go frp's ~107 on the same
+  TLS-enabled shape, while the same engine moved 120 MiB/s through `tcpMux`.
+  The driver now advertises the wider
   2048-segment window when exactly one of its sessions is moving payload, and
-  keeps the old 1024 for every other case (**68 → 108-112 MiB/s, +60%**, at
-  unchanged server CPU, and 1.4x the Go frp v0.72.0 measurement on the same
-  host); two flows, four flows and the `tcpMux` rows are within run-to-run
+  keeps the old 1024 for every other case (**68 → 108-114 MiB/s, +60%**, at
+  unchanged server CPU, which brings that row to **parity** with Go frp v0.72.0 —
+  111.5 against 106.7 MiB/s, same host, same shape, TLS enabled on both ends);
+  with `transport.tls.enable = false` that row stays behind at 63.8 against
+  76.2 MiB/s (0.84x), because turning TLS off costs frp-rs ~40% on a raw KCP
+  stream — the opposite of the usual relation, and unverified beyond the read
+  granularity the note records. Two flows, four flows and
+  the `tcpMux` rows are within run-to-run
   spread. "Moving payload" means
   at least one MTU inside a 250 ms window, so keepalives cannot claim the wide
   window and idle clients cannot take it from a busy one. Widening
