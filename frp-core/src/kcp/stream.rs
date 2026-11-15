@@ -166,6 +166,10 @@ impl AsyncRead for KcpStream {
                 // `chunk_pool_push` clears the payload, so no stale bytes
                 // can leak into a later message.
                 let drained = std::mem::take(&mut self.read_buffer);
+                // `read_pos` is only meaningful while a tail is stashed;
+                // keeping it at the old length with an empty buffer would
+                // make `0 <= read_pos <= len` false.
+                self.read_pos = 0;
                 chunk_pool_push(&self.chunk_pool, drained);
             }
         }
@@ -173,19 +177,17 @@ impl AsyncRead for KcpStream {
         // Coalesce: the session delivers one KCP segment per channel message
         // (~1376 bytes at the production MTU of 1400), while the callers that
         // matter hand us a much larger buffer — the bridge hands out 64 KiB.
-        // Returning after the first segment made every bridge read a
-        // one-segment copy, and the far side then paid a second pass over the
-        // same bytes. Keep pulling while the caller has room and the channel
-        // still holds segments.
         //
         // Returning `Ready` after a `Pending` poll is allowed and the waker
         // stays registered, so a caller that gets data still gets woken for
         // the next segment.
-        // First segment of this call, for the debug log below: enough to tell
-        // an app payload from framing debris when a stream stalls, and cheap
-        // because it is capped at eight bytes once per call.
+        // First segment received by this call, for the debug log below: enough
+        // to tell an app payload from framing debris when a stream stalls, and
+        // cheap because it is capped at eight bytes once per call. Note that a
+        // stashed tail drained above is not "first": this is the first *new*
+        // segment when the channel has one.
         #[cfg(debug_assertions)]
-        let mut first_hex = [0u8; 16];
+        let mut first = [0u8; 8];
         #[cfg(debug_assertions)]
         let mut first_len = 0usize;
 
@@ -194,10 +196,8 @@ impl AsyncRead for KcpStream {
                 Poll::Ready(Some(data)) => {
                     #[cfg(debug_assertions)]
                     if first_len == 0 && !data.is_empty() {
-                        let n = data.len().min(8);
-                        for (slot, byte) in first_hex.iter_mut().zip(&data[..n]) {
-                            *slot = *byte;
-                        }
+                        let n = data.len().min(first.len());
+                        first[..n].copy_from_slice(&data[..n]);
                         first_len = n;
                     }
                     let take = data.len().min(buf.remaining());
@@ -259,7 +259,7 @@ impl AsyncRead for KcpStream {
                 conv = self.conv,
                 n = filled,
                 total = self.read_count,
-                first = %crate::hex_encode(&first_hex[..first_len]),
+                first = %crate::hex_encode(&first[..first_len]),
                 "KCP read: {} bytes (total={})",
                 filled,
                 self.read_count,
@@ -508,20 +508,30 @@ mod tests {
     use super::*;
 
     /// A stream wired to a caller-controlled read channel. Everything the
-    /// read path touches is inert here: no writer task, no session.
+    /// read path touches is inert here: no writer task, no session. The
+    /// `alive_streams` counter starts at one because `Drop` decrements it, and
+    /// its documented meaning is "an observed zero implies this stream is
+    /// gone".
     fn stream_reading_from(read_rx: mpsc::Receiver<Vec<u8>>) -> KcpStream {
+        stream_reading_from_with_session(read_rx, true)
+    }
+
+    fn stream_reading_from_with_session(
+        read_rx: mpsc::Receiver<Vec<u8>>,
+        session_alive: bool,
+    ) -> KcpStream {
         let (write_tx, _write_rx) = mpsc::channel(8);
         KcpStream::new(
             7,
             "127.0.0.1:1".parse().unwrap(),
             write_tx,
             read_rx,
-            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(1)),
             Arc::new(Notify::new()),
             Arc::new(ArrayQueue::new(8)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(Notify::new()),
-            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(session_alive)),
             Arc::new(AtomicUsize::new(0)),
         )
     }
@@ -631,5 +641,52 @@ mod tests {
         assert!(matches!(poll, Poll::Ready(Ok(()))));
         assert_eq!(filled, 60, "the stashed tail must survive to the next poll");
         assert_eq!(&buf[..60], &[2u8; 60]);
+    }
+
+    #[tokio::test]
+    async fn poll_read_drains_the_tail_before_new_segments() {
+        // Stash a tail, then queue a fresh segment: the next poll must hand
+        // back the tail first and only then the new bytes, and the accounting
+        // must move by the call's total rather than by the first message's.
+        let (tx, rx) = mpsc::channel(8);
+        let mut stream = stream_reading_from(rx);
+        tx.send(vec![1u8; 40]).await.unwrap();
+        tx.send(vec![2u8; 50]).await.unwrap();
+
+        let mut buf = [0u8; 60];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(filled, 60, "40 of segment 1 plus 20 of segment 2");
+
+        tx.send(vec![3u8; 20]).await.unwrap();
+        let before = stream.read_count;
+        let mut buf = [0u8; 100];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert!(matches!(poll, Poll::Ready(Ok(()))));
+        assert_eq!(filled, 50, "30 stashed tail bytes plus the new 20");
+        assert_eq!(&buf[..30], &[2u8; 30], "the tail comes out first");
+        assert_eq!(&buf[30..50], &[3u8; 20], "then the newly queued segment");
+        assert_eq!(
+            stream.read_count - before,
+            50,
+            "accounting must follow the call's total, not one message"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_read_reports_a_dead_session_instead_of_eof() {
+        let (tx, rx) = mpsc::channel(8);
+        let mut stream = stream_reading_from_with_session(rx, false);
+        drop(tx);
+
+        let mut buf = [0u8; 64];
+        let (poll, filled) = poll_once(&mut stream, &mut buf);
+        assert_eq!(filled, 0);
+        match poll {
+            Poll::Ready(Err(err)) => {
+                assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+            }
+            other => panic!("a dead session must fail fast, got {other:?}"),
+        }
     }
 }

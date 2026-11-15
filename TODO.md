@@ -12915,11 +12915,11 @@ kept out of the main P2 list so that adding them does not renumber every later
   conclusion holds only for that configuration. Closed out on the TLS-off row
   too: raw KCP streams handed the bridge one ~1376-byte segment per read while
   TLS and yamux handed it 16-64 KiB, so collapsing the queued segments into one
-  read (2026-11-15) measures 63.0 → 86.4 MiB/s (+37%, nine interleaved pairs),
-  i.e. 1.13× Go — see
+  read (2026-11-15) measures 63.0 → 86.4 MiB/s (+37%, means of nine interleaved
+  pairs), i.e. 1.14× Go — see
   `docs/archive/notes/2026-11-15-kcp-read-coalescing.md`. The earlier probe
-  (#622) came up empty because it ran on the TLS+`tcpMux` shape, where the
-  wrapper had already coalesced.
+  (#622) came up empty because it ran at `tcpMux = false` with TLS left on,
+  where the rustls deframer had already coalesced the reads.
 
   Landed before that, still standing: AVX2 parity (49.1 → 58.5 MiB/s one-flow
   means), `sendmmsg` for the flush and the tick (mean 61.3), `recvmmsg` batching
