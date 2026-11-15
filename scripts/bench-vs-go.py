@@ -35,6 +35,11 @@
 #   FLOWS    flow counts to test, default "1 4"
 #   SHAPES   semicolon list of `<proto> <tls> <tcpMux>`, default the matrix below
 #   REPO     repo root recorded in the header, default the script's parent
+#   WORKERS  frp-rs client `transport.workerThreads` for the `rs` arm only
+#            (unset = whatever the binary ships, which is 1 for frpc). The Go
+#            arm has no equivalent and always runs GOMAXPROCS threads, so any
+#            multi-flow row compares unequal parallelism unless this is set to
+#            the host's CPU count; the header records which was used.
 #
 # Exit codes: 0 every row measured every block, 1 some samples or rows were
 # dropped (the table still prints, with `dropped=`), 2 a required binary or the
@@ -57,6 +62,7 @@ BENCH = os.environ.get("BENCH", "/root/bench/abbench")
 MIB = int(os.environ.get("MIB", "512"))
 BLOCKS = int(os.environ.get("BLOCKS", "3"))
 FLOWS = [int(f) for f in os.environ.get("FLOWS", "1 4").split()]
+WORKERS = os.environ.get("WORKERS", "").strip()
 SHAPES = os.environ.get(
     "SHAPES",
     "tcp false false;tcp false true;tcp true false;tcp true true;"
@@ -117,7 +123,11 @@ def describe_run(resolved):
         capture_output=True, text=True, check=False,
     ).stdout.strip()
     host = f"{platform.node()} {platform.machine()} {os.cpu_count()} cpus"
-    print(f"# commit={commit}{' (dirty)' if dirty else ''} host={host} mib={MIB} blocks={BLOCKS}")
+    workers = f"{WORKERS}" if WORKERS else "shipped-default"
+    print(
+        f"# commit={commit}{' (dirty)' if dirty else ''} host={host} mib={MIB} blocks={BLOCKS} "
+        f"rs_client_workers={workers}"
+    )
     for key in sorted(resolved):
         print(f"# {key} sha256={resolved[key]}")
     print(f"# bench={BENCH}", flush=True)
@@ -143,7 +153,7 @@ def server_port(proto):
     return {"kcp": KCP_BIND, "quic": QUIC_BIND}.get(proto, TCP_BIND)
 
 
-def write_configs(directory, proto, tls, mux):
+def write_configs(directory, proto, tls, mux, impl):
     server = os.path.join(directory, "s.toml")
     client = os.path.join(directory, "c.toml")
     # bindPort always stays on the TCP port: a client that ignored
@@ -159,16 +169,28 @@ def write_configs(directory, proto, tls, mux):
             f"transport.tcpMux = {mux}\n"
             f'log.level = "warn"\n'
         )
+    # The transport knobs live in a `[transport]` table rather than as dotted
+    # keys so that `workerThreads` can be added without a TOML redefinition
+    # clash; frp-rs and the Go release read both spellings.
+    client_transport = (
+        f'[transport]\n'
+        f'protocol = "{proto}"\n'
+        f"tcpMux = {mux}\n"
+        f"tls.enable = {tls}\n"
+    )
+    # Only the frp-rs arm takes the override: the Go release has no such key
+    # and would refuse the config.
+    if WORKERS and impl == "rs":
+        client_transport += f"workerThreads = {WORKERS}\n"
     with open(client, "w") as handle:
         handle.write(
             f'serverAddr = "127.0.0.1"\n'
             f"serverPort = {server_port(proto)}\n"
             f'auth.token = "{TOKEN}"\n'
             f"loginFailExit = true\n"
-            f'transport.protocol = "{proto}"\n'
-            f"transport.tcpMux = {mux}\n"
-            f"transport.tls.enable = {tls}\n"
             f'log.level = "warn"\n'
+            f"{client_transport}"
+            f"\n"
             f"[[proxies]]\n"
             f'name = "bench"\n'
             f'type = "tcp"\n'
@@ -186,7 +208,7 @@ def measure(impl, proto, tls, mux, flows, directory):
     kill("frpc")
     kill(os.path.basename(BENCH))
     subprocess.run(["sleep", "0.4"], check=False)
-    server, client = write_configs(directory, proto, tls, mux)
+    server, client = write_configs(directory, proto, tls, mux, impl)
     server_log = open(os.path.join(directory, "frps.log"), "w")
     client_log = open(os.path.join(directory, "frpc.log"), "w")
     frps = subprocess.Popen([os.path.join(binaries, "frps"), "-c", server], stdout=server_log, stderr=server_log)
@@ -222,7 +244,13 @@ def measure(impl, proto, tls, mux, flows, directory):
             fields = lines[-1].split()
             if "MiB/s" not in fields:
                 return None
-            return float(fields[fields.index("MiB/s") - 1])
+            value = float(fields[fields.index("MiB/s") - 1])
+            # A stream that completes without moving bytes is the failure class
+            # this bench exists to catch, not a slow sample.
+            if value <= 0.0:
+                print(f"  ! {proto} tls={tls} mux={mux} flows={flows} {impl}: zero throughput", file=sys.stderr)
+                return None
+            return value
         finally:
             sink.kill()
             sink.wait()
@@ -279,13 +307,17 @@ def main():
                     continue
                 rs_median = statistics.median(rs_values)
                 go_median = statistics.median(go_values)
-                spread = (max(rs_values) - min(rs_values)) / rs_median * 100.0
+                def spread_pct(values, median):
+                    return (max(values) - min(values)) / median * 100.0 if median else 0.0
+
+                spread = spread_pct(rs_values, rs_median)
+                go_spread = spread_pct(go_values, go_median)
                 quotient = rs_median / go_median
                 rows.append((proto, tls, mux, flows, rs_median, go_median, ratios, verdict_text))
                 print(
                     f"{proto:10s} tls={tls:5s} mux={mux:5s} flows={flows}  "
                     f"rs={rs_median:8.1f} n={len(rs_values)} ({min(rs_values):.1f}-{max(rs_values):.1f}, {spread:.0f}%)  "
-                    f"go={go_median:8.1f} n={len(go_values)} ({min(go_values):.1f}-{max(go_values):.1f})  "
+                    f"go={go_median:8.1f} n={len(go_values)} ({min(go_values):.1f}-{max(go_values):.1f}, {go_spread:.0f}%)  "
                     f"quotient={quotient:.2f}  ratios={[round(r, 2) for r in ratios]}  {verdict_text}",
                     flush=True,
                 )
@@ -295,10 +327,15 @@ def main():
         if rs_median is None:
             print(f"{proto} tls={tls} mux={mux} flows={flows}: {verdict_text}")
             continue
-        detail = f", ratios {[round(r, 2) for r in ratios]}" if ratios else ""
+        if ratios:
+            detail = f", ratios {[round(r, 2) for r in ratios]}"
+            head = f"{statistics.median(ratios):.2f}x"
+        else:
+            detail = ""
+            head = "n/a"
         print(
             f"{proto} tls={tls} mux={mux} flows={flows}: "
-            f"{rs_median:.1f} vs {go_median:.1f} = {statistics.median(ratios):.2f}x  [{verdict_text}{detail}]"
+            f"{rs_median:.1f} vs {go_median:.1f} = {head}  [{verdict_text}{detail}]"
         )
     print(f"\ndropped={dropped}")
     return 0 if dropped == 0 else 1

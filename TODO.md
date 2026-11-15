@@ -12972,35 +12972,41 @@ kept out of the main P2 list so that adding them does not renumber every later
   Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
   2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
 
-## P1 — measured: TLS without `tcpMux` at four flows is behind Go
+## P2 — measured: `websocket` + TLS + `tcpMux` stalls intermittently
 
 Evidence (2026-11-16, `scripts/bench-vs-go.py`, 4 vCPU EPYC-Milan, commit
-`1e113d9a`, interleaved `rs,go,go,rs` with the orientation flipped per block,
-6 samples per arm): with TLS on and `tcpMux = false` at four flows, frp-rs moves
-855.4 MiB/s against Go frp v0.72.0's 1036.6 — **0.81x on `tcp` and 0.95x on
-`websocket`**, the only two rows in the 24-row matrix that lose. Block ratios are
-`[0.81, 0.88, 0.81]` (tcp) and `[0.90, 0.95, 0.99]` (websocket); at 8192 MiB per
-rep the tcp row reproduces at 0.84x with a 1% spread, so this is not drift.
-One flow is *ahead* on the same shape (1.20x), so the deficit appears only when
-four TLS connections share the process — consistent with a per-connection cost
-that does not parallelise (the bridge's TLS write path is one `sendto` per record,
-where the four-flow muxed row batches 42 KiB per syscall).
+`1e113d9a`, 6 samples per arm at 1024 MiB): the `websocket` / TLS / `tcpMux`
+shape produced one sample at **87.2 MiB/s** at one flow (median 421.5, spread
+86%, block ratios `[0.83, 1.47, 0.84]`) and one at **102.2 MiB/s** at four flows
+(median 486.1, spread 85%, ratios `[1.39, 1.31, 0.78]`). Every other shape's
+sample spread is under 50% and most are under 20%, so this is not ordinary noise:
+something in that path occasionally stalls a whole rep. Both rows currently print
+`indistinguishable`, which understates frp-rs when the stall does not fire.
 
-Done when: `scripts/bench-vs-go.py` with `SHAPES='tcp true false;websocket true false'`
-and `FLOWS='4'` reports `rs faster` on both rows, with the perf delta explained
-by a profile rather than asserted, and the default (`tcpMux` on) rows unchanged.
+Done when: a run of at least 12 blocks on
+`SHAPES='websocket true true;websocket true false' FLOWS='1 4'` either reproduces
+the stall or shows it was a one-off, and if it reproduces, the profile of a
+stalled rep names the wait (bridge copy, yamux frame, or the WebSocket framing
+write) instead of leaving it as a spread figure.
 
-## P1 — measured: two README performance rows do not reproduce
+## P3 — measured: the one-worker `frpc` default bounds multi-connection throughput
 
-`README.md`'s table (8192 MiB per run, four flows) records `tcpMux`, TLS off at
-970 MiB/s and no-`tcpMux`, TLS on at 1298 MiB/s for frp-rs. Re-measured at the
-same rep size with `scripts/bench-vs-go.py`: 795.0 and 865.5 MiB/s — 18% and 33%
-lower — while the other two rows reproduce (default 619 against 562, no-mux
-TLS-off 2851.9 against 2168, that one higher since the splice peel landed). The
-harnesses differ (the README rows came from `scripts/ab-matrix.sh`'s stream
-generator, not `abbench`), so nothing is retracted; the README's two no-mux rows
-are simply unverified by the current harness and one of them is the row Go wins.
+`frpc` ships `transport.workerThreads = 1`; the Go release runs one thread per
+CPU. While a tunnel is a single pipeline this costs nothing (`tcpMux` on, or one
+flow), but four independent TLS connections on one client thread measured
+861-906 MiB/s at 0.92-0.96 cores against 1292-1539 MiB/s at 1.40-1.52 cores with
+four workers — and Go's 1030 MiB/s at 1.52-1.55 cores. The default therefore
+decides the four-flow column of the comparison table
+(`docs/archive/notes/2026-11-16-rust-vs-go-throughput.md`, Tables A and B), and
+the eight-independent-session measurement in
+`docs/archive/notes/2026-11-12-worker-thread-count.md` is the same effect on
+`tcp`.
 
-Done when: the two rows are re-measured with `scripts/bench-vs-go.py`, and
-either the README table is updated from the result or the discrepancy between the
-two load generators is explained and recorded.
+Nothing is broken — the knob exists, is documented, and is restart-only. What is
+missing is guidance: a deployment with many independent connections and
+`tcpMux = false` should set it, and nothing in `docs/deployment.md` says so.
+
+Done when `docs/deployment.md`'s `transport.workerThreads` section states the
+trade-off with these numbers (one worker for muxed or single-connection traffic,
+one per CPU for many independent connections), and `README.md`'s performance
+table says which worker count its rows used.

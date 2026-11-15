@@ -19,16 +19,20 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
-- **Against Go frp v0.72.0, measured interleaved: 20 of 24 shapes faster, 2
-  indistinguishable, 2 behind.** Both deficits are the same shape — TLS without
-  `tcpMux` at four flows, 0.81x on `tcp` and 0.95x on `websocket` — and both were
-  new measurements, not reversals of published wins. The default path
-  (`tcpMux` + TLS) leads 1.56x at one flow and 1.45x at four; plain `tcp` leads
-  2.06x. The same run retracted five earlier "losing rows" as harness drift: they
-  came from matrices that measured all reps of one arm before the other, so host
-  drift landed entirely on the second arm. The harness now alternates the arms
-  inside every block and only calls a row a win or a loss when every block ratio
-  lands on the same side of 1.0; see
+- **Against Go frp v0.72.0, measured interleaved: no row is behind once both
+  sides get equal parallelism.** At the shipped defaults (`frpc` runs one worker,
+  the Go release runs one per CPU) 20 of 24 rows are faster, 2 are
+  indistinguishable, and 2 are behind — both TLS without `tcpMux` at four flows
+  (0.81x on `tcp`, 0.95x on `websocket`). Giving `frpc` four workers, i.e. one per
+  CPU like Go, moves those two rows to **1.19x and 1.47x** and leaves no losing
+  row at all: the deficit was the shipped one-worker client default, not the TLS
+  path. The default path (`tcpMux` + TLS) leads 1.56x at one flow and 1.45x at
+  four; plain `tcp` leads 2.06x. The same run re-measured five earlier rows that
+  had been read from arm-ordered matrices; only the `tcp`/TLS-off/`tcpMux`
+  four-flow row was drift, one had been a mis-paired row, one moved from parity
+  to a small loss, and one win only shrank. The harness now alternates the arms
+  inside every block, prints the client worker count, and only calls a row a win
+  or a loss when every block ratio lands on the same side of 1.0; see
   [`docs/archive/notes/2026-11-16-rust-vs-go-throughput.md`](docs/archive/notes/2026-11-16-rust-vs-go-throughput.md).
 
 - **Raw KCP streams: +37% and past Go, by handing the bridge every queued
