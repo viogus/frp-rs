@@ -12971,3 +12971,59 @@ kept out of the main P2 list so that adding them does not renumber every later
   at all, so what remains is only whether bridge/yamux tasks should follow it.
   Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
   2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
+
+## P2 — measured: `websocket` + TLS + `tcpMux` stalls intermittently
+
+Evidence (2026-11-16, `scripts/bench-vs-go.py`, 4 vCPU EPYC-Milan, commit
+`1e113d9a`, 6 samples per arm at 1024 MiB): the `websocket` / TLS / `tcpMux`
+shape produced one sample at **87.2 MiB/s** at one flow (median 421.5, spread
+86%, block ratios `[0.83, 1.47, 0.84]`) and one at **102.2 MiB/s** at four flows
+(median 486.1, spread 85%, ratios `[1.39, 1.31, 0.78]`). Every other shape's
+sample spread is under 50% and most are under 20%, so this is not ordinary noise:
+something in that path occasionally stalls a whole rep. Both rows currently print
+`indistinguishable`, which understates frp-rs when the stall does not fire.
+
+Done when: a run of at least 12 blocks on
+`SHAPES='websocket true true;websocket true false' FLOWS='1 4'` either reproduces
+the stall or shows it was a one-off, and if it reproduces, the profile of a
+stalled rep names the wait (bridge copy, yamux frame, or the WebSocket framing
+write) instead of leaving it as a spread figure.
+
+First narrowing (2026-11-16, 12 reps of the ws + TLS + `tcpMux` shape at
+`WORKERS=4`, one client flow, 1024 MiB): two stalls reproduced, 10.9 s and 12.3 s
+against a 2.3 s normal rep. Sampling `ss -tinH` every 0.25 s during the stall
+showed the user-facing socket on frps carrying **12-15 MB in its send queue**
+(`0 12128885 127.0.0.1:41524 127.0.0.1:19056` and successors, a queue that grows
+monotonically through the stall) while the tunnel connection at `19100` stayed
+empty — i.e. the server accepted the upload bytes but stopped draining the
+connection toward the bridge, and both processes sat at zero CPU rather than
+spinning. That points at a lost wakeup on the server side of the WebSocket +
+TLS + yamux path (the failure shape `scripts/protocol-matrix.sh` was written to
+catch), not at slow copying.
+
+## P3 — measured: the one-worker `frpc` default bounds multi-connection throughput
+
+`frpc` ships `transport.workerThreads = 1`; the Go release runs one thread per
+CPU. While a tunnel is a single pipeline this costs nothing (`tcpMux` on, or one
+flow), but four independent TLS connections on one client thread measured
+861-906 MiB/s at 0.92-0.96 cores against 1292-1539 MiB/s at 1.40-1.52 cores with
+four workers — and Go's 1030 MiB/s at 1.52-1.55 cores. The default therefore
+decides the four-flow column of the comparison table
+(`docs/archive/notes/2026-11-16-rust-vs-go-throughput.md`, Tables A and B), and
+the one-worker cost shows up on independent sessions too: eight `tcp_mux = false`
+sessions measured 1227/1201 MiB/s on one worker and 2105/2548 at four, both
+rising to 2266/2465 and 2867/3122 once the server-side splice path was reachable
+(`docs/archive/notes/2026-11-13-splice-wrapper-peel.md`). The four-session
+measurement in `docs/archive/notes/2026-11-12-worker-thread-count.md` did not
+show it (2362/2283 against 2470/2811, 14% spread) — at four connections on
+loopback the ceiling was the client's own disk-to-socket path, not the thread
+count.
+
+Nothing is broken — the knob exists, is documented, and is restart-only. What is
+missing is guidance: a deployment with many independent connections and
+`tcpMux = false` should set it, and nothing in `docs/deployment.md` says so.
+
+Done when `docs/deployment.md`'s `transport.workerThreads` section states the
+trade-off with these numbers (one worker for muxed or single-connection traffic,
+one per CPU for many independent connections), and `README.md`'s performance
+table says which worker count its rows used.
