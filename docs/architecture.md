@@ -716,6 +716,21 @@ runtime, because a socket registered with another reactor costs a cross-reactor
 wakeup per burst (30% slower). `FRP_KCP_DRIVER_RUNTIME=0` restores the shared
 pool. Measurements: [`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
 
+The window is **sized by load** (`kcp::socket::desired_window`): a KCP flow paces
+itself at `window × segment / tick`, so a lone session moving payload is given
+the 2048-segment budget (~68 → 95 MiB/s on a 4-vCPU VM) while two or more busy
+sessions keep the 1024-segment floor — at that point the driver's per-tick flush
+scan, not the window, is the limit, and a wide window there costs throughput.
+"Busy" is payload-based, not datagram-based: a session counts only once it moved
+at least an MTU inside a 250 ms window (or has data queued *and* is still being
+acked), so yamux pings and heartbeats cannot take the wide window away from a
+client that needs it. Both bounds move together — the receive window is what
+gets advertised, the send window follows. A session created while the driver is
+tuned is seeded at the current window rather than running the configured cap
+until the next tick. The gain needs frp-rs on both ends: Go frp pins 1024 in
+both directions of a KCP connection. Measurements:
+[`docs/archive/notes/2026-11-15-kcp-window-autotune.md`](archive/notes/2026-11-15-kcp-window-autotune.md).
+
 **TcpMux** (`frp-core/src/mux.rs`): server and client mode, keepalive, stream
 accept/spawn via `server_mux`/`client_mux`. A double-poll pattern flushes pending
 frames to the socket. A zero keepalive interval is normalized to the 30s default

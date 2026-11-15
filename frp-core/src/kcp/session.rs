@@ -152,6 +152,10 @@ pub struct KcpSession {
     /// whose read channel has closed and which stays silent past
     /// ACCEPTED_SESSION_REAP_GRACE_MS is removed by the tick arm.
     last_rx_ms: u32,
+    /// Start of the current payload-activity window (driver clock, ms).
+    data_window_start_ms: u32,
+    /// Payload bytes received since `data_window_start_ms`.
+    data_window_bytes: u32,
     shutdown: bool,
     /// Frame that couldn't be delivered to the read channel on the previous
     /// tick because the channel was full. Must be flushed before consuming
@@ -281,6 +285,8 @@ impl KcpSession {
             read_tx,
             pool: chunk_pool,
             last_rx_ms: 0,
+            data_window_start_ms: 0,
+            data_window_bytes: 0,
             shutdown: false,
             pending_read: None,
             pending_shards: Vec::new(),
@@ -335,6 +341,30 @@ impl KcpSession {
     /// window's worth of segments).
     pub fn wait_snd(&self) -> usize {
         self.kcp.wait_snd()
+    }
+
+    /// Window the driver currently has this session at, in segments.
+    ///
+    /// The driver autotunes this by load (see `socket::desired_window`), so it
+    /// can differ from `KcpConfig::wnd_size`.
+    pub fn rcv_wnd(&self) -> u16 {
+        self.kcp.rcv_wnd()
+    }
+
+    /// Window this session may keep in flight, in segments.
+    pub fn snd_wnd(&self) -> u16 {
+        self.kcp.snd_wnd()
+    }
+
+    /// Apply the driver's load-tuned window: both how much this session may
+    /// advertise (receive) and how much it may keep in flight (send).
+    ///
+    /// The send side has to follow, or the configured cap alone would let a
+    /// busy server keep `MAX(wnd_size)` segments in flight per session — the
+    /// exact configuration that was measured to cost four flows ~25% of their
+    /// throughput. `Kcp` clamps both to its own minimums.
+    pub fn set_window(&mut self, wnd: u16) {
+        self.kcp.set_wndsize(wnd, wnd);
     }
 
     /// Common FEC encode logic for both update() and force_flush().
@@ -843,7 +873,7 @@ impl KcpSession {
                     // `recv_buf[..n].to_vec()` copy is gone. The channel
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // session.rs:429), so a hostile peer cannot inflate it.
+                    // protocol.rs:59), so a hostile peer cannot inflate it.
                     //
                     // Read-side pool (M4): the buffer is drawn from the
                     // shared chunk pool (the same pool KcpWriter draws
@@ -935,8 +965,29 @@ impl KcpSession {
     /// Stamp the driver-clock time of the last successfully processed
     /// inbound packet (M11 idle reaper feed). Called by the KcpSocket driver
     /// on every input() success, including the first packet at creation.
-    pub fn note_inbound(&mut self, driver_clock_ms: u32) {
+    pub fn note_inbound(&mut self, driver_clock_ms: u32, bytes: usize) {
         self.last_rx_ms = driver_clock_ms;
+        if driver_clock_ms.wrapping_sub(self.data_window_start_ms)
+            > crate::kcp::socket::ACTIVE_WINDOW_MS
+        {
+            self.data_window_start_ms = driver_clock_ms;
+            self.data_window_bytes = 0;
+        }
+        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
+        self.data_window_bytes = self.data_window_bytes.saturating_add(bytes);
+    }
+
+    /// Payload bytes received inside the current activity window (`0` once the
+    /// window has lapsed) — the driver's test for "this session carries data",
+    /// as opposed to a keepalive.
+    pub fn data_window_bytes(&self, driver_clock_ms: u32) -> u32 {
+        if driver_clock_ms.wrapping_sub(self.data_window_start_ms)
+            > crate::kcp::socket::ACTIVE_WINDOW_MS
+        {
+            0
+        } else {
+            self.data_window_bytes
+        }
     }
 
     /// Driver-clock ms of the last inbound packet (0 before the first).

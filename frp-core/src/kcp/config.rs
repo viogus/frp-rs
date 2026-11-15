@@ -50,7 +50,13 @@ pub struct KcpConfig {
     pub mtu: usize,
     /// No-delay / retransmit / congestion parameters.
     pub nodelay: KcpNoDelayConfig,
-    /// Send and receive window sizes.
+    /// Upper bound for the send and receive windows, in segments.
+    ///
+    /// The driver sizes the live window from load
+    /// (`kcp::socket::desired_window`) and overwrites both elements with the
+    /// same value each tick, so on a socket driven by frp this pair only caps
+    /// what the autotune may pick; the receive element (`.1`) is the one it
+    /// reads. A value below the 1024-segment floor is raised to it.
     pub wnd_size: (u16, u16),
     /// Number of FEC data shards (0 = FEC disabled).
     pub data_shards: usize,
@@ -98,8 +104,10 @@ mod tests {
     fn production_default_differs_from_trait_default_on_wire_relevant_knobs() {
         // Production KCP paths (client/server dial/listen, XTCP hole-punch
         // sessions, nathole) build their config from `default_kcp_config()`,
-        // which matches Go frp v0.69.1's aggressive ListenKcp() defaults:
-        // nodelay=1/interval=20/resend=2/nc=1 with FEC (10,3) and mtu 1400.
+        // which matches Go frp v0.69.1's aggressive ListenKcp() defaults —
+        // nodelay=1/interval=20/resend=2/nc=1 with FEC (10,3) and mtu 1400 —
+        // except the window: Go pins 1024, frp-rs treats its configured value
+        // as the autotune's upper bound (see `wnd_size`).
         // `KcpConfig::default()` stays the conservative kcp-go library
         // defaults (nodelay=0, interval=40, no FEC). The split is pin:
         // swapping one for the other would silently disable FEC — a Go peer
@@ -141,7 +149,12 @@ mod tests {
         assert!(aggressive.nodelay.nc, "Go frp nc=1");
         assert_eq!((aggressive.data_shards, aggressive.parity_shards), (10, 3));
         assert_eq!(aggressive.mtu, 1400);
-        assert_eq!(aggressive.wnd_size, (1024, 1024));
+        assert_eq!(
+            aggressive.wnd_size,
+            (4096, 4096),
+            "the configured window is the autotune's cap, so it must cover the \
+             2048-segment budget"
+        );
 
         // The client dial helper must stay wire-identical to the server-side
         // defaults, or FEC-shard counts would diverge per direction.
