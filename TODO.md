@@ -13027,9 +13027,14 @@ without TLS wraps a raw `TcpStream`, where a `Ready` flush is harmless. Two regr
 code and pass on the new one. Note:
 `docs/archive/notes/2026-11-16-websocket-tls-stall.md`.
 
-Remaining (not blocking): re-measure the two `indistinguishable` rows of
-`docs/archive/notes/2026-11-16-rust-vs-go-throughput.md` now that the stall no
-longer fires — their medians were computed with stalled samples in the tail.
+Done-when met: after the fix, the two affected rows re-measured on the same host
+and harness (`scripts/bench-vs-go.py`, 1024 MiB, 3 blocks, n=6 per arm,
+`dropped=0`) come out as `websocket` + TLS + `tcpMux` **1.58x** at one flow
+(472.1 vs 305.1 MiB/s) and **1.32x** at four (490.6 vs 366.0), with the no-`tcpMux`
+TLS rows at 1.28x and 0.95x. The four-flow `tcpMux` row was `indistinguishable`
+only because the stalled samples sat in its tail; the remaining 0.95x row is the
+separate one-worker-client trade-off (see P3 below), not this bug. Numbers in
+`docs/archive/notes/2026-11-16-websocket-tls-stall.md` § Limits.
 
 ## P3 — measured: the one-worker `frpc` default bounds multi-connection throughput
 

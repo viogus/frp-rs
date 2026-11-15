@@ -154,7 +154,19 @@ non-empty remainder is still `WriteZero`.
   single non-delegating write-path implementation, `frp-core/src/xtcp_p2p.rs:815`,
   drains into a raw UDP socket and has no inner stream, so it cannot strand a
   buffered layer.
-- The interleaved comparison's two affected rows are counted as
-  `indistinguishable` with the stall present; with the fix the medians move
-  together and the rows should be re-measured before the numbers are quoted
-  again.
+- The interleaved comparison's two affected rows carried the stall in their
+  tails, so they printed `indistinguishable`. Re-measured after the fix on the
+  same host, same harness (`scripts/bench-vs-go.py`, 1024 MiB, 3 blocks, n=6 per
+  arm, `dropped=0`):
+
+  | shape | shipped defaults (frpc 1 worker) | `WORKERS=4` |
+  | --- | --- | --- |
+  | `websocket` + TLS + `tcpMux`, 1 flow | 472.1 vs 305.1 = **1.58x** | 459.9 vs 299.0 = 1.56x |
+  | `websocket` + TLS, no `tcpMux`, 1 flow | 623.5 vs 510.8 = **1.28x** | 686.0 vs 516.2 = 1.37x |
+  | `websocket` + TLS + `tcpMux`, 4 flows | 490.6 vs 366.0 = **1.32x** | 490.8 vs 358.9 = 1.33x |
+  | `websocket` + TLS, no `tcpMux`, 4 flows | 828.9 vs 859.7 = 0.95x (`indistinguishable`) | 1225.2 vs 937.6 = 1.27x |
+
+  So the four-flow `tcpMux` row was `indistinguishable` **because** of the
+  stalled samples and is now a clear 1.32x; the four-flow no-`tcpMux` row stays
+  at parity with the shipped one-worker client, which is the separate
+  `transport.workerThreads` trade-off recorded in `TODO.md`, not this bug.
