@@ -12971,3 +12971,36 @@ kept out of the main P2 list so that adding them does not renumber every later
   at all, so what remains is only whether bridge/yamux tasks should follow it.
   Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
   2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
+
+## P1 — measured: TLS without `tcpMux` at four flows is behind Go
+
+Evidence (2026-11-16, `scripts/bench-vs-go.py`, 4 vCPU EPYC-Milan, commit
+`1e113d9a`, interleaved `rs,go,go,rs` with the orientation flipped per block,
+6 samples per arm): with TLS on and `tcpMux = false` at four flows, frp-rs moves
+855.4 MiB/s against Go frp v0.72.0's 1036.6 — **0.81x on `tcp` and 0.95x on
+`websocket`**, the only two rows in the 24-row matrix that lose. Block ratios are
+`[0.81, 0.88, 0.81]` (tcp) and `[0.90, 0.95, 0.99]` (websocket); at 8192 MiB per
+rep the tcp row reproduces at 0.84x with a 1% spread, so this is not drift.
+One flow is *ahead* on the same shape (1.20x), so the deficit appears only when
+four TLS connections share the process — consistent with a per-connection cost
+that does not parallelise (the bridge's TLS write path is one `sendto` per record,
+where the four-flow muxed row batches 42 KiB per syscall).
+
+Done when: `scripts/bench-vs-go.py` with `SHAPES='tcp true false;websocket true false'`
+and `FLOWS='4'` reports `rs faster` on both rows, with the perf delta explained
+by a profile rather than asserted, and the default (`tcpMux` on) rows unchanged.
+
+## P1 — measured: two README performance rows do not reproduce
+
+`README.md`'s table (8192 MiB per run, four flows) records `tcpMux`, TLS off at
+970 MiB/s and no-`tcpMux`, TLS on at 1298 MiB/s for frp-rs. Re-measured at the
+same rep size with `scripts/bench-vs-go.py`: 795.0 and 865.5 MiB/s — 18% and 33%
+lower — while the other two rows reproduce (default 619 against 562, no-mux
+TLS-off 2851.9 against 2168, that one higher since the splice peel landed). The
+harnesses differ (the README rows came from `scripts/ab-matrix.sh`'s stream
+generator, not `abbench`), so nothing is retracted; the README's two no-mux rows
+are simply unverified by the current harness and one of them is the row Go wins.
+
+Done when: the two rows are re-measured with `scripts/bench-vs-go.py`, and
+either the README table is updated from the result or the discrepancy between the
+two load generators is explained and recorded.
