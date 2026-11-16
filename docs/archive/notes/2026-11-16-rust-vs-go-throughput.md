@@ -2,8 +2,8 @@
 
 **Date:** 2026-11-16
 **Status:** Settled for the shapes below, on one host, for **two configurations**.
-At the shipped defaults — `frpc` runs one worker thread, the Go release runs one
-per CPU — 20 of 24 rows are faster, 2 are indistinguishable, and 2 are behind;
+At the defaults shipped at the time of the run — `frpc` ran one worker thread,
+the Go release runs one per CPU — 20 of 24 rows are faster, 2 are indistinguishable, and 2 are behind;
 both deficits are TLS without `tcpMux` at four flows. Given one client worker per
 CPU, the same run leaves **no row behind** (19 faster, 5 indistinguishable) and
 those two rows read 1.19x and 1.47x. The client worker count, not the TLS path,
@@ -39,7 +39,12 @@ TCP port, so a few rows were not the comparison they claimed to be.
 
 Host: `greencloud-tyo`, AMD EPYC-Milan, 4 vCPU, x86-64.
 
-## Table A — shipped defaults (`frpc` one worker, Go one per CPU)
+## Table A — defaults at the time (`frpc` one worker, Go one per CPU)
+
+Since `perf/worker-threads-default` the client also uses one worker per CPU, so
+Table A describes a configuration that no longer ships; it is kept because it is
+what the retraction of the earlier rows was argued from, and Table B is now the
+shipped shape.
 
 | shape | flows | frp-rs | go frp | ratio | quotient | verdict |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
