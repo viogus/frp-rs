@@ -18,8 +18,10 @@ a single fat KCP stream at **89.7-91.2 MiB/s on one worker against 65.5-66.6 wit
 one per core** on a client sharing four cores with its server, and made one
 thread the client default. Two later changes removed that penalty:
 
-- [`2026-11-14-kcp-driver-thread.md`](2026-11-14-kcp-driver-thread.md) moved each
-  KCP socket driver onto its own runtime thread (+26% at four workers).
+- `perf/kcp-driver-thread` (PR #621, recorded in
+  [`2026-11-12-worker-thread-count.md`](2026-11-12-worker-thread-count.md) §
+  "Driver thread") moved each KCP socket driver onto its own runtime thread (+26%
+  at four workers).
 - [`2026-11-15-kcp-window-autotune.md`](2026-11-15-kcp-window-autotune.md) sized
   the KCP window by load (+60% on a lone stream at four workers).
 
@@ -49,7 +51,8 @@ With both ends at their defaults on one shared four-core host — which is what 
 laptop or a single lab box sees, and the shape the shipped change produces —
 four-flow `tcp`+`tcpMux` reads **1025.7 against 723.6** for the old client
 default, TLS without mux **1103.5 against 828.5**, and single-stream KCP 113.1
-against 121.6 (-7%, the one row that pays). The full series for that host:
+against 121.6 (-7%) and KCP without `tcpMux` 100.4 against 106.0 (-5%) — the
+only rows that pay. The full series for that host:
  `tcp` + `tcpMux` four
 flows 723.6 / 949.1 / 1137.1 / 1025.7 at 1-4 client workers, `tcp` + TLS four
 flows 828.5 / 1253.0 / 1338.9 / 1103.5, `websocket` + TLS + `tcpMux` four flows

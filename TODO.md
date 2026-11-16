@@ -12961,10 +12961,11 @@ kept out of the main P2 list so that adding them does not renumber every later
   driver was only a probe then; since 2026-11-14 the driver has its own runtime
   thread and recovers all of it (93.8 → 121.4 MiB/s with four workers).
 
-  `frpc` now defaults to one worker (`transport.workerThreads`), which recovers
-  +37% on the one-flow arm; setting it to 1 on both ends reaches 111.8. It
-  serialises the process, so it is the default only on the client side: fine for
-  the four-tunnel test, wrong for a many-core server carrying hundreds.
+  `frpc` defaulted to one worker until 2026-11-16 (it now uses one per CPU,
+  `transport.workerThreads` overrides it), which recovered +37% on the one-flow
+  arm; one worker on both ends still reaches 111.8. A single worker serialises
+  the process: right for one fat tunnel, wrong for a many-core server carrying
+  hundreds — see `docs/archive/notes/2026-11-16-worker-thread-default.md`.
 
   **Status (2026-11-14): the driver half is shipped** — every KCP socket runs its
   driver on a private runtime, and `tcp`/`tcpMux` showed no worker-count penalty
@@ -13038,7 +13039,7 @@ separate one-worker-client trade-off (see P3 below), not this bug. Numbers in
 
 ## P3 — resolved: the one-worker `frpc` default bounded multi-connection throughput
 
-`frpc` ships `transport.workerThreads = 1`; the Go release runs one thread per
+`frpc` shipped `transport.workerThreads = 1`; the Go release runs one thread per
 CPU. While a tunnel is a single pipeline this costs nothing (`tcpMux` on, or one
 flow), but four independent TLS connections on one client thread measured
 861-906 MiB/s at 0.92-0.96 cores against 1292-1539 MiB/s at 1.40-1.52 cores with

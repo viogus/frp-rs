@@ -197,12 +197,14 @@ remainder is one ack datagram per write (74k against Go's 18k) — batching thos
 to the tick was measured and costs 28% of throughput, so it stays.
 
 The rest was the runtime, not KCP: task migration between worker threads was the
-limiter, and `frpc` now defaults to **one** worker thread (`frps` keeps one per
-CPU, since a server hosts many independent tunnels). At that default the same
-stream runs at **89.7-91.2 MiB/s** instead of 65.5-66.6 — +37%, with 28% less
-CPU. Setting `transport.workerThreads = 1` on **both** ends reaches 111.8
-against Go's 99-102. The key is restart-only; see
-[`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md)
+limiter. Both binaries now default to one worker per CPU, like Go's `GOMAXPROCS`,
+because each bridged connection runs on one thread; pinning a client to a single
+worker (`transport.workerThreads = 1`) is still the right choice for one fat
+tunnel on a busy machine, where the same 2048 MiB stream runs at
+**89.7-91.2 MiB/s** instead of 65.5-66.6 — +37%, with 28% less CPU. One worker on
+**both** ends reaches 111.8 against Go's 99-102. The key is restart-only; see
+[`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md),
+[`docs/archive/notes/2026-11-16-worker-thread-default.md`](docs/archive/notes/2026-11-16-worker-thread-default.md)
 and the runtime-tuning paragraph in [`docs/deployment.md`](docs/deployment.md).
 The numbers, the evidence that separates them and the unestablished part are in
 [`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md`](docs/archive/notes/2026-11-11-kcp-stream-vs-go.md);

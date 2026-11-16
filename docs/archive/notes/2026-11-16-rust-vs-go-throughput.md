@@ -115,8 +115,8 @@ workers they are 1.19x and 1.47x.
 
 ## Why the two tables differ: the client worker count
 
-`frpc` ships `transport.workerThreads = 1` (one client thread regardless of CPU
-count; `frps` takes one per CPU). The Go release runs `GOMAXPROCS` threads. Table
+`frpc` shipped `transport.workerThreads = 1` at the time of the run (one client
+thread regardless of CPU count; `frps` takes one per CPU). The Go release runs `GOMAXPROCS` threads. Table
 A therefore compares one client thread against four, which costs nothing while a
 tunnel is a single pipeline (`tcpMux` on, or one flow) and costs a lot when four
 independent connections share one thread.

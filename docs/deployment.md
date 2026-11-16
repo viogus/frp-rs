@@ -1186,20 +1186,23 @@ traffic:
   **819 → 988 MiB/s through `tcpMux`** and **854 → 1167 MiB/s through TLS**
   going from one client worker to one per CPU, and `websocket` + TLS + `tcpMux`
   472 → 495.
-- **One fat tunnel prefers a single worker.** A 2048 MiB KCP stream through
-  `tcpMux` measured **89.7–91.2 MiB/s with one worker against 65.5–66.6 with one
-  per core** on a client that shared four cores with its server (+37% at one
-  worker, 28% less CPU); the effect is task migration — every hop between workers
-  costs a wake and a cache miss. On ends that do not share cores the single-stream
-  rows are flat instead (119.3 → 119.4, 104.7 → 101.0 at two workers), so this
-  matters most on a busy laptop or a client co-located with other work.
+- **One fat tunnel prefers a single worker on a busy machine.** Before the KCP
+  driver thread and window autotune landed, one worker on one side measured
+  **89.7–91.2 MiB/s against 65.5–66.6 with one per core** (+37%, 28% less CPU) on
+  a client sharing four cores with its server; the effect is task migration —
+  every hop between workers costs a wake and a cache miss. Those two changes
+  removed most of the penalty: on ends that do not share cores the single-stream
+  rows are now flat (119.3 → 119.4, 104.7 → 101.0 at two workers), and on a shared
+  four-core host the cost is 5-7%. Pin one worker when a laptop client carries one
+  fat tunnel alongside other work.
 
 The default is one per CPU because the many-connection case is the common one and
 the single-stream penalty only shows on a crowded host; set `workerThreads = 1`
 for a single fat tunnel on a busy machine. Either way this only affects frp-rs on
 both ends — a Go frp peer ignores the key.
 Measurements:
-[`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
+[`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md)
+and [`docs/archive/notes/2026-11-16-worker-thread-default.md`](archive/notes/2026-11-16-worker-thread-default.md).
 
 A KCP socket's driver also leaves the worker pool when the runtime has more than
 one worker: each socket gets a private single-threaded runtime with the socket

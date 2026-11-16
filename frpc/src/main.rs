@@ -276,14 +276,15 @@ fn main() {
     // read from the same file the service will load. The default is one thread
     // per CPU, like this crate's server and like Go's `GOMAXPROCS`: a single
     // worker caps every multi-connection proxy, because each proxy's bridge
-    // lives on one thread. Measured on two separated hosts, four parallel `tcp`
-    // connections through `tcpMux` went 707 → 838 MiB/s from one worker to one
-    // per CPU (+18%), TLS without `tcpMux` 860 → 1057 (+23%), and the
-    // single-stream KCP rows stayed flat (119.3 → 121.3, 106.0 → 104.7) — the
-    // reason an earlier version of this default was one thread (the KCP
-    // single-stream penalty) has since been removed by the driver-thread and
-    // window-autotune changes. `transport.workerThreads` overrides it, and a
-    // lone fat tunnel can still be given a single worker on purpose.
+    // lives on one thread. With the two ends on different cores, four parallel
+    // `tcp` connections went 819 → 988 MiB/s through `tcpMux` from one worker to
+    // one per CPU (+21%) and 854 → 1167 through TLS without `tcpMux` (+37%),
+    // while the single-stream KCP rows stayed flat (119.3 → 119.4, 104.7 →
+    // 101.0). The reason an earlier version of this default was one thread — a
+    // 26% single-stream KCP penalty — has since been removed by the driver
+    // thread and the window autotune. `transport.workerThreads` overrides it,
+    // and a lone fat tunnel on a busy client can still be pinned to one worker.
+    // Measurements: `docs/archive/notes/2026-11-16-worker-thread-default.md`.
     let worker_threads = match &cmd {
         // `--version` has nothing to do with a config: do not read one for it.
         FrpcCmd::Run(args) if !args.show_version => worker_threads_from_args(args),
@@ -305,7 +306,7 @@ fn main() {
 
 /// Resolve the runtime's worker count, in precedence order: the config (every
 /// file `--config-dir` will start a service from), then
-/// `TOKIO_WORKER_THREADS`, then the binary default of one.
+/// `TOKIO_WORKER_THREADS`, then the binary default of one per available CPU.
 ///
 /// The services load their config again once they start; this is a read of the
 /// same inputs, needed because tokio fixes its worker count at runtime
@@ -343,10 +344,11 @@ fn worker_threads_from_args(args: &FrpcRunArgs) -> usize {
 /// The default worker count: one per CPU.
 ///
 /// A single worker caps every multi-connection proxy, since each proxy's bridge
-/// runs on one thread; measured on separated hosts, four parallel `tcp`
-/// connections gained 18% through `tcpMux` and 23% through TLS going from one
-/// worker to one per CPU, while single-stream KCP rows were flat. The server
+/// runs on one thread: with the two ends on different cores, four parallel `tcp`
+/// connections gained 21% through `tcpMux` and 37% through TLS going from one
+/// worker to one per CPU, while the single-stream KCP rows were flat. The server
 /// and Go's `GOMAXPROCS` use the same rule.
+/// Measurements: `docs/archive/notes/2026-11-16-worker-thread-default.md`.
 fn default_worker_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
@@ -1478,6 +1480,17 @@ mod worker_thread_tests {
         let scoped = ScopedEnv::unset();
         assert_eq!(worker_threads_from_args(&args), default_worker_threads());
         drop(scoped);
+    }
+
+    /// The default is a property of the machine, not a constant: a build that
+    /// pinned it to one thread again would pass every other test in this module.
+    #[test]
+    fn the_default_is_one_worker_per_cpu() {
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        assert_eq!(default_worker_threads(), expected);
     }
 
     /// The env-var parse itself: only a positive integer counts, and a zero or
