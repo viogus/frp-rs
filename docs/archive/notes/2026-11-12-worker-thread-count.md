@@ -79,7 +79,10 @@ syscalls plus 22% scheduler wakeups, which fits both stories.
 ## What ships
 
 Status: **shipped** as `transport.workerThreads` (PR #619), restart-only.
-`frpc` defaults to one worker, `frps` to one per available CPU; the config key
+**Superseded 2026-11-16:** the client default is now one worker per CPU — see
+[`2026-11-16-worker-thread-default.md`](2026-11-16-worker-thread-default.md).
+As written below, the client defaulted to one worker and the server to one per
+available CPU; the config key
 beats `TOKIO_WORKER_THREADS`, which still works when no config names a count.
 Earlier drafts of this note said "no config-file key" — that was true before the
 key landed and is kept here only as history. A `FRP_WORKER_THREADS` alias was

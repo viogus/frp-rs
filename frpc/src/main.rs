@@ -273,13 +273,18 @@ fn main() {
     }));
     let cmd = parse_frpc_args();
     // The runtime is built before any config is served, so the worker count is
-    // read from the same file the service will load. One thread is the default:
-    // on the test VM a single fat tunnel carried 89.7-91.2 MiB/s against
-    // 65.5-66.6 with one worker per CPU (+37%, and 28% less CPU) — the cost is
-    // task migration between workers, and one worker still saturates a client's
-    // links. `transport.workerThreads` overrides it. (An earlier note quoted
-    // 1.7x: that is the figure when *both* ends run one worker, 111.8 MiB/s;
-    // the shipped one-sided default is the +37% above.)
+    // read from the same file the service will load. The default is one thread
+    // per CPU, like this crate's server and like Go's `GOMAXPROCS`: a single
+    // worker caps every multi-connection proxy, because each proxy's bridge
+    // lives on one thread. With the two ends on different cores, four parallel
+    // `tcp` connections went 819 → 988 MiB/s through `tcpMux` from one worker to
+    // one per CPU (+21%) and 854 → 1167 through TLS without `tcpMux` (+37%),
+    // while the single-stream KCP rows stayed flat (119.3 → 119.4, 104.7 →
+    // 101.0). The reason an earlier version of this default was one thread — a
+    // 26% single-stream KCP penalty — has since been removed by the driver
+    // thread and the window autotune. `transport.workerThreads` overrides it,
+    // and a lone fat tunnel on a busy client can still be pinned to one worker.
+    // Measurements: `docs/archive/notes/2026-11-16-worker-thread-default.md`.
     let worker_threads = match &cmd {
         // `--version` has nothing to do with a config: do not read one for it.
         FrpcCmd::Run(args) if !args.show_version => worker_threads_from_args(args),
@@ -287,7 +292,7 @@ fn main() {
         // applies to them: `frpc tcp` is a first-class long-running mode, and
         // the documented precedence (config > env > default) has no lane
         // exception.
-        _ => resolve_worker_threads(None, env_worker_threads(), 1),
+        _ => resolve_worker_threads(None, env_worker_threads(), default_worker_threads()),
     };
     let runtime = match build_runtime(worker_threads) {
         Ok(runtime) => runtime,
@@ -301,7 +306,7 @@ fn main() {
 
 /// Resolve the runtime's worker count, in precedence order: the config (every
 /// file `--config-dir` will start a service from), then
-/// `TOKIO_WORKER_THREADS`, then the binary default of one.
+/// `TOKIO_WORKER_THREADS`, then the binary default of one per available CPU.
 ///
 /// The services load their config again once they start; this is a read of the
 /// same inputs, needed because tokio fixes its worker count at runtime
@@ -333,7 +338,22 @@ fn worker_threads_from_args(args: &FrpcRunArgs) -> usize {
             }
         }
     };
-    resolve_worker_threads(configured, env_worker_threads(), 1)
+    resolve_worker_threads(configured, env_worker_threads(), default_worker_threads())
+}
+
+/// The default worker count: one per CPU.
+///
+/// A single worker caps every multi-connection proxy, since each proxy's bridge
+/// runs on one thread: with the two ends on different cores, four parallel `tcp`
+/// connections gained 21% through `tcpMux` and 37% through TLS going from one
+/// worker to one per CPU, while the single-stream KCP rows were flat. The server
+/// and Go's `GOMAXPROCS` use the same rule.
+/// Measurements: `docs/archive/notes/2026-11-16-worker-thread-default.md`.
+fn default_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// The count shared by every config file in a `--config-dir` tree. Files that
@@ -1438,7 +1458,7 @@ mod worker_thread_tests {
     /// from the code under test, so deleting env support still passed on a
     /// runner that does not export the variable.
     #[test]
-    fn absent_key_falls_back_to_the_env_var() {
+    fn absent_key_falls_back_to_one_per_cpu() {
         let _env = env_lock();
         let dir = temp_dir("absent");
         let path = dir.join("frpc.toml");
@@ -1452,14 +1472,25 @@ mod worker_thread_tests {
         let scoped = ScopedEnv::set("0");
         assert_eq!(
             worker_threads_from_args(&args),
-            1,
+            default_worker_threads(),
             "a zero is ignored rather than handed to tokio, so the default applies"
         );
         drop(scoped);
 
         let scoped = ScopedEnv::unset();
-        assert_eq!(worker_threads_from_args(&args), 1);
+        assert_eq!(worker_threads_from_args(&args), default_worker_threads());
         drop(scoped);
+    }
+
+    /// The default is a property of the machine, not a constant: a build that
+    /// pinned it to one thread again would pass every other test in this module.
+    #[test]
+    fn the_default_is_one_worker_per_cpu() {
+        let expected = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+        assert_eq!(default_worker_threads(), expected);
     }
 
     /// The env-var parse itself: only a positive integer counts, and a zero or

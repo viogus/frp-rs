@@ -19,9 +19,26 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **The client now defaults to one worker per core, like the server and Go.**
+  `frpc` used to build a single-threaded runtime, which caps every
+  multi-connection proxy — each bridged connection lives on one thread, so four
+  independent connections queued behind one. Measured with the two ends on
+  different cores (server two workers on two cores, client two on the other two),
+  four parallel `tcp` connections went **819 → 988 MiB/s through `tcpMux`
+  (+21%)** and **854 → 1167 MiB/s through TLS without `tcpMux` (+37%)**, with
+  `websocket` + TLS + `tcpMux` 472 → 495 (+5%); the single-stream KCP rows stayed
+  flat (119.3 → 119.4, 104.7 → 101.0). On a host where both ends share four
+  cores the single-stream KCP rows pay 5-7% instead, which is why the knob is
+  unchanged: `transport.workerThreads = 1` restores the old behaviour, and that
+  is the right setting for one fat tunnel on a busy client. The old default
+  existed because a single KCP stream was slower on a crowded runtime; the
+  driver-thread and window-autotune changes below removed that penalty and left
+  the multi-connection cost behind it. Measurements:
+  [`docs/archive/notes/2026-11-16-worker-thread-default.md`](docs/archive/notes/2026-11-16-worker-thread-default.md).
+
 - **Against Go frp v0.72.0, measured interleaved: no row is behind once both
-  sides get equal parallelism.** At the shipped defaults (`frpc` runs one worker,
-  the Go release runs one per CPU) 20 of 24 rows are faster, 2 are
+  sides get equal parallelism.** At the previously shipped defaults (`frpc` ran
+  one worker, the Go release runs one per CPU) 20 of 24 rows are faster, 2 are
   indistinguishable, and 2 are behind — both TLS without `tcpMux` at four flows
   (0.81x on `tcp`, 0.95x on `websocket`). Giving `frpc` four workers, i.e. one per
   CPU like Go, moves those two rows to **1.19x and 1.47x** and leaves no losing
@@ -88,23 +105,15 @@ User-facing release notes for frp-rs.
   socket now gets a private single-threaded runtime, with the socket bound
   inside it (a socket registered in another reactor only pays an extra wakeup).
   One 1024 MiB session through `tcpMux`: **93.8 → 121.4 MiB/s (+29%) with
-  `frps` at its default four workers** and one on the client — the shipped
-  configuration — and server CPU 1.41 → 0.91 cores; four workers on both ends
+  `frps` at its default four workers** and one on the client — the client
+  configuration at the time — and server CPU 1.41 → 0.91 cores; four workers on both ends
   goes 77.5 → 114.9 MiB/s (+48%). A single-worker runtime is left alone
   (measured 125.1/121.9 MiB/s, unchanged), and Go frp on the same host moves
   108-113 MiB/s. The thread is only created when the runtime has more than one
-  worker, so the default client (one worker) never creates one and pays
-  nothing; `FRP_KCP_DRIVER_RUNTIME=0` restores the shared-pool behaviour on the
-  server.
+  worker, so a client pinned to one worker never creates one and pays nothing —
+  a default client now has more than one and does get one;
+  `FRP_KCP_DRIVER_RUNTIME=0` restores the shared-pool behaviour on the server.
 
-- `frpc` now runs its tokio runtime on **one worker thread** by default
-  (previously one per CPU): a 2048 MiB KCP stream through `tcpMux` measures
-  89.7-91.2 MiB/s against 65.5-66.6 — **+37%**, CPU −28% — because a bridged
-  tunnel is a pipeline of tasks and every hop between workers pays a wake and a
-  cache miss. `frps` keeps one worker per CPU, since a server hosts many
-  independent tunnels. Both binaries accept `transport.workerThreads` (restart-only,
-  since tokio fixes its worker count at startup); one worker on both ends reaches
-  111.8 MiB/s, and a Go frp peer is unaffected.
 - **KCP: 1400-byte MTU, above kcp-go's layout.** Production KCP config used
   `mtu: 1350` (the value Go frp pins) while kcp-go's library default is 1400,
   so every KCP datagram carried 1326 bytes of payload instead of 1376. A
@@ -119,8 +128,10 @@ User-facing release notes for frp-rs.
 - **Runtime worker count dominates a single fat tunnel.** A 2048 MiB KCP stream
   through `tcpMux` runs at **111.8 MiB/s with one worker on both ends instead of
   64.6** (Go frp on the same host: 99-102), with the CPU ticks roughly halved;
-  one end alone recovers about half the gain — which is why the client default is
-  now one worker. `TOKIO_WORKER_THREADS` still works when no config names a
+  one end alone recovers about half the gain — which is why the client
+  default was one worker until the driver thread and the window autotune removed
+  that penalty (see the one-per-CPU entry above: single-stream KCP is now flat
+  across worker counts). `TOKIO_WORKER_THREADS` still works when no config names a
   count, and `transport.workerThreads` takes precedence over it. See
   [`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md).
 

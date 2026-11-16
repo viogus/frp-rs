@@ -4768,7 +4768,7 @@ fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
     // Go's `--mux string` names the multiplexer — it is **not** the port. The
     // same spelling means the same thing in frp-server's SSH gateway
     // (`frp-server/src/ssh_gateway/args.rs:692`), and `ProxyConfig::multiplexer`
-    // (frp-core/src/config/client.rs:735) is where it lands. A literal
+    // (frp-core/src/config/client.rs:736) is where it lands. A literal
     // `--mux-port`→`--mux` rename would have rendered `--mux int` and rejected
     // Go's string value; this is the flag Go actually has.
     let mux = long("mux").argument::<String>("MUX").optional();
