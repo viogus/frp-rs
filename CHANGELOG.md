@@ -19,9 +19,26 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **The client now defaults to one worker per core, like the server and Go.**
+  `frpc` used to build a single-threaded runtime, which caps every
+  multi-connection proxy — each bridged connection lives on one thread, so four
+  independent connections queued behind one. Measured with the two ends on
+  different cores (server two workers on two cores, client two on the other two),
+  four parallel `tcp` connections went **819 → 988 MiB/s through `tcpMux`
+  (+21%)** and **854 → 1167 MiB/s through TLS without `tcpMux` (+37%)**, with
+  `websocket` + TLS + `tcpMux` 472 → 495 (+5%); the single-stream KCP rows stayed
+  flat (119.3 → 119.4, 104.7 → 101.0). On a host where both ends share four
+  cores the single-stream KCP rows pay 5-7% instead, which is why the knob is
+  unchanged: `transport.workerThreads = 1` restores the old behaviour, and that
+  is the right setting for one fat tunnel on a busy client. The old default
+  existed because a single KCP stream was slower on a crowded runtime; the
+  driver-thread and window-autotune changes below removed that penalty and left
+  the multi-connection cost behind it. Measurements:
+  [`docs/archive/notes/2026-11-16-worker-thread-default.md`](docs/archive/notes/2026-11-16-worker-thread-default.md).
+
 - **Against Go frp v0.72.0, measured interleaved: no row is behind once both
-  sides get equal parallelism.** At the shipped defaults (`frpc` runs one worker,
-  the Go release runs one per CPU) 20 of 24 rows are faster, 2 are
+  sides get equal parallelism.** At the previously shipped defaults (`frpc` ran
+  one worker, the Go release runs one per CPU) 20 of 24 rows are faster, 2 are
   indistinguishable, and 2 are behind — both TLS without `tcpMux` at four flows
   (0.81x on `tcp`, 0.95x on `websocket`). Giving `frpc` four workers, i.e. one per
   CPU like Go, moves those two rows to **1.19x and 1.47x** and leaves no losing

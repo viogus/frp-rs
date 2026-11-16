@@ -330,10 +330,11 @@ pub struct ClientConfig {
     pub connect_server_local_ip: String,
     #[serde(default = "default_tcp_mux")]
     pub tcp_mux: bool,
-    /// Tokio worker-thread count for the client runtime. Unset = the
-    /// client binary's default (one thread: a single fat tunnel measured
-    /// 89.7-91.2 MiB/s against 65.5-66.6 with one per CPU); `Some(n)`
-    /// overrides it.
+    /// Tokio worker-thread count for the client runtime. Unset = one thread
+    /// per CPU, like the server (`frpc` used to default to a single thread,
+    /// which capped every multi-connection proxy: four parallel connections
+    /// measured 707 → 838 MiB/s through `tcpMux` and 860 → 1057 through TLS
+    /// when the count went from one to one per CPU); `Some(n)` overrides it.
     /// Restart-only: the runtime is built before the config is served.
     #[serde(
         default,

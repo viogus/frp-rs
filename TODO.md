@@ -13036,7 +13036,7 @@ only because the stalled samples sat in its tail; the remaining 0.95x row is the
 separate one-worker-client trade-off (see P3 below), not this bug. Numbers in
 `docs/archive/notes/2026-11-16-websocket-tls-stall.md` § Limits.
 
-## P3 — measured: the one-worker `frpc` default bounds multi-connection throughput
+## P3 — resolved: the one-worker `frpc` default bounded multi-connection throughput
 
 `frpc` ships `transport.workerThreads = 1`; the Go release runs one thread per
 CPU. While a tunnel is a single pipeline this costs nothing (`tcpMux` on, or one
@@ -13054,11 +13054,11 @@ show it (2362/2283 against 2470/2811, 14% spread) — at four connections on
 loopback the ceiling was the client's own disk-to-socket path, not the thread
 count.
 
-Nothing is broken — the knob exists, is documented, and is restart-only. What is
-missing is guidance: a deployment with many independent connections and
-`tcpMux = false` should set it, and nothing in `docs/deployment.md` says so.
-
-Done when `docs/deployment.md`'s `transport.workerThreads` section states the
-trade-off with these numbers (one worker for muxed or single-connection traffic,
-one per CPU for many independent connections), and `README.md`'s performance
-table says which worker count its rows used.
+**Resolved 2026-11-16** by making one-per-CPU the client default: with the ends on
+different cores, four parallel `tcp` connections went 819 → 988 MiB/s through
+`tcpMux` (+21%) and 854 → 1167 through TLS (+37%), while the single-stream KCP
+rows stayed flat (119.3 → 119.4, 104.7 → 101.0). `transport.workerThreads = 1`
+remains the documented choice for one fat tunnel on a busy client, and
+`docs/deployment.md` now states both sides of the trade-off with these numbers.
+Entry point:
+`docs/archive/notes/2026-11-16-worker-thread-default.md`.

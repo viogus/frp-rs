@@ -1150,8 +1150,8 @@ the default and the knob that overrides it:
 [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](archive/notes/2026-11-10-bridge-buffer-64k-default.md).
 
 The runtime's worker-pool size is `transport.workerThreads` — **restart-only**,
-because tokio fixes the count when the runtime is built. `frpc` defaults to `1`;
-`frps` defaults to one worker per available CPU. Precedence is the config key,
+because tokio fixes the count when the runtime is built. Both binaries default to
+one worker per available CPU, like Go's `GOMAXPROCS`. Precedence is the config key,
 then `TOKIO_WORKER_THREADS`, then the binary default — for the lanes that start a
 bridge runtime; `verify`, `reload`, `status`, `stop` and `--version` never
 consult the file, so they size their runtime from the variable or the default.
@@ -1174,21 +1174,30 @@ workerThreads = 4      # snake_case `worker_threads` is accepted too
 
 ```toml
 # frpc.toml — top level, or under [transport] (both spellings work on the client)
-workerThreads = 1
+workerThreads = 1     # pin one thread for a single fat tunnel
 ```
 
-On a single fat tunnel the worker count dominates: a 2048 MiB KCP stream through
-`tcpMux` ran at **65.5–66.6 MiB/s with one worker per core against 89.7–91.2 at
-the shipped default** (+37%, CPU −28%), and **111.8 with one worker on both
-ends** (Go frp on the same host: 99–102). The effect tracks task migration — a
-bridged tunnel is a pipeline of tasks, and every hop between workers pays a wake
-and a cache miss. It only helps when both ends are frp-rs; a Go frp peer ignores
-it.
+The count decides two different things, so the right value depends on the
+traffic:
 
-Four separate `tcp` sessions did not measurably lose from one worker on a
-four-vCPU host (two pairs), but that is not a busy server: beyond four tunnels
-this is unmeasured, and one worker is expected to serialise a many-core server
-— which is why only the client default changed.
+- **Many independent connections want one worker per core.** Each bridged
+  connection lives on one thread, so a single-threaded client queues them. With
+  the ends on separate cores, four parallel `tcp` connections measured
+  **819 → 988 MiB/s through `tcpMux`** and **854 → 1167 MiB/s through TLS**
+  going from one client worker to one per CPU, and `websocket` + TLS + `tcpMux`
+  472 → 495.
+- **One fat tunnel prefers a single worker.** A 2048 MiB KCP stream through
+  `tcpMux` measured **89.7–91.2 MiB/s with one worker against 65.5–66.6 with one
+  per core** on a client that shared four cores with its server (+37% at one
+  worker, 28% less CPU); the effect is task migration — every hop between workers
+  costs a wake and a cache miss. On ends that do not share cores the single-stream
+  rows are flat instead (119.3 → 119.4, 104.7 → 101.0 at two workers), so this
+  matters most on a busy laptop or a client co-located with other work.
+
+The default is one per CPU because the many-connection case is the common one and
+the single-stream penalty only shows on a crowded host; set `workerThreads = 1`
+for a single fat tunnel on a busy machine. Either way this only affects frp-rs on
+both ends — a Go frp peer ignores the key.
 Measurements:
 [`docs/archive/notes/2026-11-12-worker-thread-count.md`](archive/notes/2026-11-12-worker-thread-count.md).
 
