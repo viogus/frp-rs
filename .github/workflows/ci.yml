@@ -2156,7 +2156,7 @@ jobs:
       # counted nothing: deleting any of those files left the lane green, which
       # is why the step now keeps a per-target witness list as well as the
       # total.
-      FRPC_CLI_TESTS: "120"
+      FRPC_CLI_TESTS: "121"
       # Absolute floor under the declared count above, for the reason spelled
       # out at `FRPS_CLI_TESTS_FLOOR`: the equality check cannot tell a
       # legitimate count from a test deleted together with its literal. This
