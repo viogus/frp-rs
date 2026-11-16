@@ -45,8 +45,12 @@ medians of three, Go frp v0.72.0 measured on the same host for reference.
 | KCP + `tcpMux`, one flow | 119.3 | 119.4 (flat) | 97.1 |
 | KCP + TLS, no mux, one flow | 104.7 | 101.0 (-3.5%) | 99.4 |
 
-With both ends on the same four cores and the server at its default four workers
-(`wcpu` sweep, medians of three), the same shape set reads: `tcp` + `tcpMux` four
+With both ends at their defaults on one shared four-core host — which is what a
+laptop or a single lab box sees, and the shape the shipped change produces —
+four-flow `tcp`+`tcpMux` reads **1025.7 against 723.6** for the old client
+default, TLS without mux **1103.5 against 828.5**, and single-stream KCP 113.1
+against 121.6 (-7%, the one row that pays). The full series for that host:
+ `tcp` + `tcpMux` four
 flows 723.6 / 949.1 / 1137.1 / 1025.7 at 1-4 client workers, `tcp` + TLS four
 flows 828.5 / 1253.0 / 1338.9 / 1103.5, `websocket` + TLS + `tcpMux` four flows
 453.2 / 542.3 / 450.5 / 485.8, KCP one flow 121.6 / 115.2 / 112.8 / 113.1, KCP +
