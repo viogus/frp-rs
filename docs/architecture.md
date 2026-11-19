@@ -88,19 +88,22 @@ frp-rs/
                           hoist_tests.rs, help_doc_tests.rs
       admin_auth.rs       HTTP Basic Auth middleware (admin API / dashboard)
       auth.rs             MD5 token authentication + OIDC verification
+                          (tests in auth/tests.rs + auth/oidc_impl/tests.rs)
       bridge.rs           Encrypted/compressed data bridge (streaming CFB)
+                          (tests in bridge/tests.rs)
       cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt (CipherReader/CipherWriter)
       config/             TOML/YAML/JSON/INI config structs + Go→Rust compat normalization
       config_store.rs     Runtime config store (client proxy/visitor CRUD)
       encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
       crypto.rs           V2 AEAD algorithms (AES-256-GCM / XChaCha20-Poly1305)
       v2_handshake.rs     V2 ClientHello/ServerHello + capability negotiation
-      kcp/                KCP transport (protocol, mod, session, socket, stream, listener, config)
+      kcp/                KCP transport (protocol, mod, session, socket, stream, listener,
+                          config; protocol's tests in kcp/protocol/tests.rs)
       kcp_compat.rs       KCP interop helpers
       metrics.rs          ProxyMetricsRegistry + ConnGuard (per-proxy counters)
-      msg.rs              Wire protocol message structs
+      msg.rs              Wire protocol message structs (tests in msg/tests.rs)
       mux.rs              TCP multiplexing (yamux)
-      protocol.rs         V1/V2 frame read/write
+      protocol.rs         V1/V2 frame read/write (tests in protocol/tests.rs)
       transport/          transport.rs → directory: tcp.rs, tls.rs, kcp.rs, quic.rs,
                           websocket.rs (manual RFC 6455), yamux.rs, cipher.rs, aead.rs,
                           ssh_channel.rs, pre_read.rs, buffered_read.rs — IoStream

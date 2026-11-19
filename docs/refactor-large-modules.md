@@ -212,12 +212,25 @@ Before any production code moves, do this in every file that has a large inline
 `#[cfg(test)] mod tests`:
 
 ```bash
-git mv frp-server/src/control/proxy_ops.rs frp-server/src/control/proxy_ops/mod.rs
-# declare the test modules, then move each body into a sibling file
+scripts/split_inline_tests.py --check frp-server/src/control/proxy_ops.rs   # report
+scripts/split_inline_tests.py frp-server/src/control/proxy_ops.rs           # split
+# for a file that already lives at <name>/mod.rs:
+#   git mv frp-server/src/control/proxy_ops.rs frp-server/src/control/proxy_ops/mod.rs
+#   then the same two commands, which emit
 #   #[cfg(test)] pub(crate) mod unregister_generation_tests;
 #   #[cfg(test)] mod subdomain_conflict_tests;
 #   #[cfg(test)] mod tcp_auto_bind_retry_tests;
 ```
+
+`scripts/split_inline_tests.py` (added with PR #634) does the mechanical half:
+it finds the trailing `#[cfg(test)] mod …` block, writes the body to a sibling
+file, and leaves `#[cfg(test)] mod …;` behind. It de-indents **only code
+lines** — a multi-line string literal keeps its columns (the help-text pins
+lost four columns per line to a blind dedent) — and it deliberately takes the
+block to the end of the file rather than brace-matching: a lexer that lost one
+brace to a literal once moved a boundary into the middle of a module. The
+proof is unchanged either way: the `--list` set of test names must be
+identical before and after.
 
 This is **zero-risk and unusually high-yield**, because a file module and an
 inline module have the *same module path* and the same `use super::*` semantics
