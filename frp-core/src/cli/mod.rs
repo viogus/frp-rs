@@ -608,7 +608,7 @@ pub struct FrpsArgs {
 /// `frps` has a subcommand now, and Go has had one all along: `verify`
 /// (`cmd/frps/verify.go:29`). Before this, `parse_frps_args` returned
 /// [`FrpsArgs`] directly, which is the same shape as saying "`frps` has no
-/// commands" — the premise the old `frp-core/src/cli.rs` comment recorded and
+/// commands" — the premise the old comment in this doc recorded and
 /// which was false.
 ///
 /// The size gap between the two variants is accepted rather than boxed: one
@@ -1178,12 +1178,12 @@ fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
 /// in, because the set is not one list and the directions are easy to invert:
 ///
 /// * `-c` is a value-taking short on every parser of both binaries
-///   (`frp-core/src/cli.rs`, `config_arg`);
+///   (`frp-core/src/cli/mod.rs`, `config_arg`);
 /// * `-p` and `-t` are `frps`'s own on its **root** — `bind_port`
 ///   (`pkg/config/flags.go:231`) and `token` (`:247`) — and `-t` is also
 ///   `frpc`'s `token` on its proxy and visitor subcommands (`:171`);
 /// * `-L` is **frpc's run path only** — frp-rs's alias for `--log-level`
-///   (`frp-core/src/cli.rs`, the `run_mode` parser). It is *not* a Go shorthand
+///   (`frp-core/src/cli/mod.rs`, the `run_mode` parser). It is *not* a Go shorthand
 ///   at all: Go registers `log_level` with an empty shorthand
 ///   (`pkg/config/flags.go:161`), so Go answers `unknown shorthand flag: 'L' in
 ///   -L`. It is therefore in the **root** set (the run path is the root's) and
@@ -1199,7 +1199,7 @@ fn expand_bool_short_value_form(argv: Vec<OsString>) -> Vec<OsString> {
 /// pflag **bool**, so it never needs an argument.
 ///
 /// `frpc`'s root, which is the run path: `-c` (frp-rs's `config_arg`) and `-L`
-/// (frp-rs's own alias for `--log-level`, `frp-core/src/cli.rs` `run_mode`) are
+/// (frp-rs's own alias for `--log-level`, `frp-core/src/cli/mod.rs` `run_mode`) are
 /// registered there; **`-p` and `-t` are not** — frp-rs's `frpc` root has no
 /// `bind_port`/`token`, and neither does Go's (`log_level` itself is registered
 /// with an empty shorthand, `pkg/config/flags.go:161`, so Go's `-L` refusal is

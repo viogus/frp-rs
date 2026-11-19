@@ -1412,7 +1412,7 @@ jobs:
           log=/tmp/frp-todo-cite-fixtures.$$.log
           status=0
           guard_file=scripts/tests/todo-cite-guard-fixtures.sh
-          guard_pin=0575080e20463c176c584dc0f26ebd7685901e86246d96add0b6450420843be4
+          guard_pin=a2848ac0262ca30107105c09e978b7ede9afbac78bb84ccdc3424ce588f2bb77
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -2576,7 +2576,7 @@ jobs:
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
       - name: Run frp-core's help-document pins in the two mixed feature shapes (count guard)
-        # `frp-core/src/cli.rs`'s help-document pins are feature-sensitive:
+        # `frp-core/src/cli/help_doc_tests.rs`'s help-document pins are feature-sensitive:
         # `feature_adjusted_pin` keeps `--kcp-bind-port` only when `kcp` is on
         # and `--quic-bind-port` only when `quic` is on, so the pins have four
         # shapes. Two were executed — default features (both on, the step

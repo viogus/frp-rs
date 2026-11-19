@@ -111,7 +111,7 @@ Default features: frps = websocket, kcp, quic, oidc, tls, http-proxy, compressio
 Feature-surface maintenance policy — which surfaces keep Go parity, which are opt-in best-effort, which are frozen, and what would unfreeze them: [**docs/developing.md § Maintenance policy: feature surface**](docs/developing.md#maintenance-policy-feature-surface).
 
 - No `cargo check` variation needed — `cargo build` covers the workspace; `ci.yml` gates the tiny/micro tiers under `RUSTFLAGS="-D warnings"`.
-- Unit tests live inline (`#[cfg(test)] mod tests`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
+- Unit tests live inline (`#[cfg(test)] mod tests`) or in sibling `#[cfg(test)] mod x;` files (e.g. `frp-core/src/cli/tests.rs`); integration tests live in per-crate `tests/` dirs (`frp-server/tests/`, `frp-client/tests/`, `frp-core/tests/`).
 
 ## Versioning (mandatory)
 

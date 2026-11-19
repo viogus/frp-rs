@@ -805,7 +805,7 @@ fn the_hoisted_argv_parses_as_the_subcommand() {
 }
 
 /// `FrpcCmd`'s twelve command variants, one per `frpc_parser` subcommand —
-/// the same set `FrpcCmd` in this file declares, and the same set
+/// the same set `FrpcCmd` in `mod.rs` declares, and the same set
 /// [`FRPC_SUBCOMMANDS`] names. Adding a thirteenth subcommand to the parser
 /// without extending this list fails the match below.
 fn command_variant_name(cmd: &FrpcCmd) -> Option<&'static str> {
