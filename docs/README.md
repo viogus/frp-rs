@@ -17,6 +17,8 @@ read the [main README](../README.md) first, then pick from the tables below.
 
 | Document | What it covers |
 |---|---|
+| [Onboarding](onboarding.md) | **Read this first** if you are inheriting the code: the reading order, the five commands that mean green, and the traps that cost the last maintainers time |
+| [Naming map](naming.md) | One concept, three spellings — the Go config name, the frp-rs config name, the Rust field — plus the ten places a single setting has to be registered |
 | [Architecture](architecture.md) | **Canonical.** Wire protocol and message types, server accept loop and control plane, work-connection lifecycle, auth, encryption, transports, config normalization, XTCP hole punching, project/crate layout |
 | [Developer Guide](developing.md) | **Contributor path for a new proxy type or client plugin** (config, registration, listeners, tests, Go compat, review), building and feature flags, debugging, testing, release process |
 | [Refactoring the large modules](refactor-large-modules.md) | Where the code that is actually big is, and the seam to cut — **proposal, no code changed** |
