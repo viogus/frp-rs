@@ -84,7 +84,7 @@ impl Service {
             //    drops the replaced `Stage::Running(future)`) or by
             //    `drop_future_or_output` on cancellation (harness.rs:503 ->
             //    core.rs:399), and the COMPLETE bit `is_finished` reads
-            //    (join.rs:258 -> state.rs:599) is set afterwards by
+            //    (join.rs:258 -> frp-server/src/frp-server/src/state.rs:599) is set afterwards by
             //    `transition_to_complete` (harness.rs:334). The listener socket
             //    is therefore already closed when `is_finished()` turns true.
             //    `service::tests::shutdown_visitor_tasks_releases_listeners`
@@ -601,6 +601,11 @@ impl Service {
         let wc_udp_packet_size = cfg_local.udp_packet_size.max(0) as usize;
         let wc_disable_custom_tls_first_byte = cfg_local.disable_custom_tls_first_byte;
         let wc_keepalive_secs = cfg_local.dial_server_keepalive.max(0) as u64;
+        let wc_kcp_dead_link = cfg_local
+            .kcp_options
+            .as_ref()
+            .map(|opts| opts.dead_link)
+            .unwrap_or(frp_core::KCP_DEAD_LINK_DEFAULT);
         let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
         let wc_proxy_url = cfg_local.proxy_url.clone();
         let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
@@ -630,6 +635,7 @@ impl Service {
             cfg_local.v2,
             cfg_local.tcp_send_buffer_size,
             cfg_local.tcp_recv_buffer_size,
+            wc_kcp_dead_link,
             self.oidc_client.clone(),
             cfg_local.metas.clone(),
             cfg_local.proxy_url.clone(),
@@ -782,6 +788,7 @@ impl Service {
             wc_udp_packet_codec: udp_codec,
             wc_disable_custom_tls_first_byte,
             wc_keepalive_secs,
+            wc_kcp_dead_link,
             wc_bind_addr,
             wc_proxy_url,
             wc_dial_timeout_secs,

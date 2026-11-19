@@ -824,7 +824,7 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   `ConfigFormat`, and the file path hands it `Ini` —
   `frp-core/src/config/file.rs:127` passes it to `load_config_from_file`, which
   detects the extension at `frp-core/src/config/normalize.rs:630` and applies it
-  at `:664`; the TOML-from-string path passes `ConfigFormat::Toml`,
+  at `frp-core/src/config/normalize.rs:664`; the TOML-from-string path passes `ConfigFormat::Toml`,
   `frp-core/src/config/loader.rs:186`) — is fed through the
   same check, but with Go's accept-and-ignore semantics rather than the v1
   surface's rejection: the legacy collector folds the prefix mechanisms Go reads
@@ -1212,6 +1212,48 @@ four workers and **+48 %** when both ends use four
 § Driver thread). A single-worker runtime is left alone, so a default `frpc`
 creates no extra thread. `FRP_KCP_DRIVER_RUNTIME=0` turns it off (bisecting a
 KCP throughput regression), `=1` forces it on.
+
+**KCP dead-link bound (`[transport.kcp] deadLink`):**
+
+```toml
+# frps.toml and frpc.toml
+[transport.kcp]
+dead_link = 5   # default 20, kcp-go's value; values below 3 are refused at load
+```
+
+A KCP session is torn down once a segment has been transmitted this many times.
+The first transmission counts toward the bound, so `deadLink = 5` tolerates four
+retransmissions, and the loader refuses 1 and 2 outright — 1 dies on the first
+write and 2 on the first retransmission, which an ordinary reorder triggers.
+Timers and reordering share the counter, so a lossy path wants a bound well
+above the retransmission count you expect to be wasted.
+It is a timer, not a wire field: each side applies its own value, and a Go peer
+keeps 20 whatever you write here. Lowering it fails over faster after a silent
+peer and gives up sooner on a genuinely lossy link. Two measurements on a
+4-vCPU Linux VM (`tcpMux = false`, `heartbeatInterval = 1`, `frps` frozen with
+`SIGSTOP` mid-transfer) show what it does and does not buy:
+
+| `deadLink` | declared dead after |
+|---|---|
+| 5 | 0.7 s |
+| 20 (default) | 3.8 s |
+
+The bound only shortens the tail. A session has to *try* to write before it can
+be declared dead, so the transport's keepalive cadence dominates: the same freeze
+at the defaults was noticed at ~28 s at `deadLink = 5` and ~31 s at 20. What
+supplies that traffic depends on `tcpMux`: with it on (the default) the client
+heartbeat is disabled (`heartbeat_interval` is normalised to `-1`) and yamux's
+own PING — a fixed 10 s in the vendored yamux, not a setting — is the only
+traffic; with `tcp_mux = false` the client heartbeat (30 s by default) is. That
+is why the measured tail sits near 30 s rather than near the PING: the freeze has
+to fall inside a heartbeat window. Lowering `heartbeat_interval` therefore only
+helps with `tcp_mux = false`; with yamux there is no knob, and `deadLink` is the
+second-order lever either way. Two paths do not read this table and keep the kcp-go default
+of 20: visitor dials (`[visitors]`, including the XTCP visitor) and the XTCP
+proxy's own P2P data plane, which `[[proxies]] type = "xtcp"` sets up outside the
+control connection. On the client the value is read when a session is
+dialled, so a `frpc reload` does not re-arm connections that are already up —
+the new bound applies on the next reconnect.
 
 **Heartbeat intervals:**
 

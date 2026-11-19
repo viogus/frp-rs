@@ -101,6 +101,9 @@ pub struct ControlConnection {
     tcp_send_buffer_size: u32,
     /// SO_RCVBUF (0 = OS default). frp-rs extension.
     tcp_recv_buffer_size: u32,
+    /// KCP retransmission bound before the session is declared dead
+    /// (`[transport.kcp] deadLink`, frp-rs extension).
+    kcp_dead_link: u32,
     oidc_client: Option<Arc<OidcClient>>,
     /// Server's additional auth scopes from LoginResp. Combined with client
     /// config to decide whether Ping/NewWorkConn need auth.
@@ -145,6 +148,7 @@ impl ControlConnection {
         v2: bool,
         tcp_send_buffer_size: u32,
         tcp_recv_buffer_size: u32,
+        kcp_dead_link: u32,
         oidc_client: Option<Arc<OidcClient>>,
         metas: std::collections::HashMap<String, String>,
         proxy_url: String,
@@ -179,6 +183,7 @@ impl ControlConnection {
             v2,
             tcp_send_buffer_size,
             tcp_recv_buffer_size,
+            kcp_dead_link,
             oidc_client,
             server_auth_scopes: Vec::new(),
             metas,
@@ -217,6 +222,7 @@ impl ControlConnection {
             bind_addr: self.bind_addr.clone(),
             tcp_send_buffer_size: self.tcp_send_buffer_size,
             tcp_recv_buffer_size: self.tcp_recv_buffer_size,
+            kcp_dead_link: self.kcp_dead_link,
             proxy_url: opt_if_empty!(self.proxy_url),
             v2: self.v2,
             dial_timeout_secs: self.dial_server_timeout as u64,

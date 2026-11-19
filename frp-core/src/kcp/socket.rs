@@ -1925,6 +1925,7 @@ mod tests {
                 resend: 2,
                 nc: true,
             },
+            dead_link: super::super::config::KCP_DEAD_LINK_DEFAULT,
         };
         let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(16);
         let mut sender = KcpSession::new(1, "127.0.0.1:9001".parse().unwrap(), cfg.clone(), tx1);

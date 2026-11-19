@@ -167,13 +167,13 @@ import sys
 HDR = "| Field | Type | Default | Go frp Equivalent | Description |"
 GO_ARTIFACT = sys.argv[2]
 EXPECTED_TABLES = 18
-EXPECTED_ROWS = 210
-EXPECTED_DIVERGENT = 32
+EXPECTED_ROWS = 212
+EXPECTED_DIVERGENT = 34
 EXPECTED_ALIAS_ROWS = 0
 EXPECTED_GO_KEYS = 276
 EXPECTED_GO_DOTTED = 121
 EXPECTED_GO_BARE = 155
-EXPECTED_ROW_PATHS = 210
+EXPECTED_ROW_PATHS = 212
 EXPECTED_RESOLUTIONS = 41
 
 # --- curated Go frp v0.72.0 spellings: dotted json paths + bare json field names ---
@@ -594,6 +594,7 @@ ROW_GO_PATHS = {
     (4, 'pprof_enable'): 'go:webServer.pprofEnable',
     # table 5
     (5, 'worker_threads'): 'divergent',
+    (5, 'kcp_options` / `[transport.kcp]'): 'divergent',
     (5, 'tcp_mux'): 'go:transport.tcpMux',
     (5, 'tcp_mux_keepalive_interval'): 'go:transport.tcpMuxKeepaliveInterval',
     (5, 'tcp_mux_keepalive_timeout'): 'divergent',
@@ -614,6 +615,7 @@ ROW_GO_PATHS = {
     (7, 'enable_control'): 'extension:enableControl',
     # table 8
     (8, 'worker_threads'): 'divergent',
+    (8, 'kcp_options` / `[transport.kcp]'): 'divergent',
     (8, 'server_addr'): 'go:serverAddr',
     (8, 'tls_use_system_ca'): 'go:transport.tls.useSystemCa',
 

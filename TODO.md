@@ -13063,3 +13063,20 @@ remains the documented choice for one fat tunnel on a busy client, and
 `docs/deployment.md` now states both sides of the trade-off with these numbers.
 Entry point:
 `docs/archive/notes/2026-11-16-worker-thread-default.md`.
+
+## P2 — measured: a silent KCP peer is noticed only when something is written
+
+A KCP session is declared dead on a retransmission bound (`[transport.kcp]
+deadLink`, default 20 — now configurable), but the bound can only fire when the
+session has a segment in flight or a queued write. With `tcpMux = false` the
+client's heartbeat is the only traffic, at 30 s by default, so a `SIGSTOP`ped
+peer was noticed at ~28-31 s whether `deadLink` was 5 or 20. Anything that
+survives on the KCP transport therefore has a ~30 s blind spot regardless of
+how the retransmission bound is tuned.
+
+Proposal: have the KCP driver probe sessions that have been quiet for a chosen
+interval, so the bound fires on schedule instead of waiting for the next
+application write. Done when: a frozen peer is declared dead within ~2 s at the
+defaults with `deadLink = 5`; a 60 s idle soak over KCP with no traffic produces
+no false positives and no measurable CPU cost; and `scripts/compat-test.sh`
+stays green against Go frp v0.72.0.

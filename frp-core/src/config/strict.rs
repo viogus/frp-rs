@@ -229,6 +229,8 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "observability",
         // Go frp v0.70.1 compat — new fields
         "quic",
+        // `[transport.kcp]` (frp-rs extension) flattens to the root key.
+        "kcp",
         "dial_server_timeout",
         "dialServerTimeout",
         "clientID",
@@ -657,10 +659,14 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
             "tcpSendBuffer",
             "tcpRecvBuffer",
             "quic",
+            "kcp",
             // Go frp wireProtocol v2 is expressed as `v2 = true`; the compat
             // suite appends it inside [transport] (audit task 9 fix round 1).
             "v2",
         ],
+        // frp-rs extension: `[transport.kcp]` (Go frp has no such table; its
+        // kcp-go dead_link is hard-coded at 20).
+        "kcp" => &["dead_link", "deadLink"],
         "quic" => &[
             "keepalive_period",
             "keepalivePeriod",

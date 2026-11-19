@@ -236,6 +236,17 @@ use thiserror::Error;
 ///   `bindPort` binds inside `service.run()` and exits 1, like Go.
 pub const EXIT_RUNTIME: i32 = 1; // any CLI config/flag failure — Go's only failure code
 pub const EXIT_CONFIG: i32 = 2; // frp-rs extension: --config-dir refusal (Go exits 0 there)
+
+/// kcp-go's default retransmission bound: a session is torn down after this
+/// many retransmissions of one segment (`[transport.kcp] deadLink` overrides
+/// it). Declared here rather than in the `kcp` module because the config layer
+/// references it in builds without the `kcp` feature.
+pub const KCP_DEAD_LINK_DEFAULT: u32 = 20;
+
+/// Smallest accepted bound. The first transmission consumes one count and the
+/// state machine tears the session down at `xmit >= dead_link`, so 1 dies on the
+/// first write and 2 on the first retransmission — values no operator means.
+pub const KCP_DEAD_LINK_MIN: u32 = 3;
 pub const EXIT_AUTH: i32 = 3; // frp-rs extension: construction failure tagged InitErrorKind::Auth
 pub const EXIT_BIND: i32 = 4; // frp-rs extension: construction failure tagged InitErrorKind::Other
 

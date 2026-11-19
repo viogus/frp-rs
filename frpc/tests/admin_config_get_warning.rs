@@ -533,7 +533,7 @@ fn rival_bind_fails(port: u16) -> bool {
 /// passed; 2 failed`) — the startup rows witness the `-c` load above
 /// (`frpc/src/main.rs:832-845`), the hand-edit rows witness the GET handler
 /// (`frp-client/src/admin.rs:771`); the reload site is
-/// `service/reload_apply.rs:98`.
+/// `frp-client/src/service/reload_apply.rs:98`.
 fn assert_clause_is_the_dashboard_one(tag: &str, out: &str) {
     assert!(
         out.contains(DASHBOARD_CLAUSE),

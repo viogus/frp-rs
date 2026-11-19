@@ -227,6 +227,10 @@ struct SessionCtx {
     wc_udp_packet_codec: String,
     wc_disable_custom_tls_first_byte: bool,
     wc_keepalive_secs: u64,
+    /// `[transport.kcp] deadLink` recorded at session start, forwarded to the
+    /// work-conn dial so a standalone KCP work connection tears down on the
+    /// same retransmission bound as the control connection.
+    wc_kcp_dead_link: u32,
     wc_bind_addr: Option<String>,
     wc_proxy_url: String,
     wc_dial_timeout_secs: u64,
@@ -989,6 +993,7 @@ impl Service {
             server_auth_scopes: ctx.server_scopes.clone(),
             disable_custom_tls_first_byte: ctx.wc_disable_custom_tls_first_byte,
             keepalive_secs: ctx.wc_keepalive_secs,
+            kcp_dead_link: ctx.wc_kcp_dead_link,
             bind_addr: ctx.wc_bind_addr.clone(),
             proxy_url: ctx.wc_proxy_url.clone(),
             dial_timeout_secs: ctx.wc_dial_timeout_secs,
@@ -1054,7 +1059,7 @@ mod tests;
 
 // The reload entry points live in a child module. `filter_active_proxies`/
 // `filter_active_visitors` are re-exported because `crate::service::filter_active_
-// {proxies,visitors}` is the spelled path at `store.rs:592` and at this file's own
+// {proxies,visitors}` is the spelled path at `frp-client/src/frp-client/src/store.rs:592` and at this file's own
 // startup/message-loop call sites; `reload_apply` is private, so without the
 // re-export those two names would be unreachable from here. `pub(crate)` matches
 // the functions' original visibility — it does not widen it. Nothing outside

@@ -175,7 +175,7 @@ pub fn check_server_unsafe_features(
 /// *condition*: this gate is fail-closed, refusing either spelling on `verify`
 /// regardless of `auth_method`, while the daemon gates `auth.tokenSource`
 /// unconditionally and `auth.oidc_token_source` only inside its
-/// `auth_method == AuthMethod::Oidc` branch (`frp-client/src/service.rs:676-679`;
+/// `auth_method == AuthMethod::Oidc` branch (`frp-client/src/service.rs:680-683`;
 /// measured: with `method = "token"` plus an exec `auth.oidc.tokenSource`,
 /// `frpc -c` starts and logs its connection attempts, while `frpc verify` and
 /// Go's `frpc -c`/`frpc verify` all exit 1 — the daemon side is the looser of
@@ -851,7 +851,7 @@ pub(super) fn go_clean(path: &str) -> String {
 /// filesystem that allows such names (e.g. Linux under a non-UTF-8 locale).
 ///
 /// The `dir` guard above is unreachable in the current tree: the only caller
-/// ([`process_includes`], `file.rs:424-430`) refuses a missing or non-directory
+/// ([`process_includes`], `frp-core/src/config/file.rs:424-430`) refuses a missing or non-directory
 /// `search_dir` with Go's `include: directory of … not exist` error first.
 /// Measured by deleting the guard and running `cargo test -p frp-core --lib`:
 /// the suite stays green (1071 passed), including

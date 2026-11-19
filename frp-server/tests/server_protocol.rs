@@ -354,7 +354,7 @@ async fn test_new_proxy_duplicate_name_fails() {
             // Explicit allocated port: remote_port=0 would make the server
             // scan the whole 1..65535 range with probe-binds, racing
             // parallel test servers for the same low port (EADDRINUSE flake
-            // observed in this test at server_protocol.rs:393).
+            // observed in this test at frp-server/tests/server_protocol.rs:393).
             remote_port: Some(allocate_port() as i32),
             use_encryption: None,
             use_compression: None,

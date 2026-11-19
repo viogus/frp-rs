@@ -330,22 +330,27 @@ impl Service {
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
             let kcp_addr2 = kcp_addr.clone();
             let (kcp_bind_tx, kcp_bind_rx) = tokio::sync::oneshot::channel::<()>();
+            // `[transport.kcp]` (frp-rs extension): the retransmission bound
+            // before a session is declared dead. Absent = the kcp-go default.
+            let kcp_config = frp_core::kcp::kcp_config_from_dead_link(
+                self.cfg
+                    .transport
+                    .kcp_options
+                    .as_ref()
+                    .map(|options| options.dead_link),
+            );
             spawn_boxed(Box::pin(async move {
-                let mut listener = match frp_core::kcp::KcpListener::bind(
-                    &kcp_addr2,
-                    frp_core::kcp::default_kcp_config(),
-                )
-                .await
-                {
-                    Ok(l) => {
-                        let _ = kcp_bind_tx.send(());
-                        l
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "KCP listener bind failed: {}", e);
-                        return;
-                    }
-                };
+                let mut listener =
+                    match frp_core::kcp::KcpListener::bind(&kcp_addr2, kcp_config).await {
+                        Ok(l) => {
+                            let _ = kcp_bind_tx.send(());
+                            l
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "KCP listener bind failed: {}", e);
+                            return;
+                        }
+                    };
                 tracing::info!(addr = %kcp_addr2, "KCP listener started on {}", kcp_addr2);
                 'kcp_accept: loop {
                     tokio::select! {

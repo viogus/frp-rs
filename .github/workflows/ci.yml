@@ -1096,9 +1096,9 @@ jobs:
           log=/tmp/frp-docs-go-column.$$.log
           status=0
           guard_file=scripts/tests/docs-go-column.sh
-          guard_pin=2c6b2cc0d625cd8839df4c5a0ef08bf02c1aeadcb1f3f04ee8e3b7af6ea52374
-          guard_exact=275
-          guard_floor=275
+          guard_pin=76c880fb7bb88b4f7080981ba3f746d710bdab9bc8195b8d37f1a01687b4fae1
+          guard_exact=277
+          guard_floor=277
           guard_canary='M1 (websocket_port reworded'
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
@@ -1171,8 +1171,8 @@ jobs:
             printf '%s' "$guard_fail_text"
           fi
           if [ "$status" != "0" ]; then
-            echo "::error::the docs-go-column fixture did not report 275 checks with no failure line"
-            echo "::error::scripts/tests/docs-go-column.sh must print 275 '  ok' lines, include the M1 witness, and end with 'RESULT: 275 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
+            echo "::error::the docs-go-column fixture did not report 277 checks with no failure line"
+            echo "::error::scripts/tests/docs-go-column.sh must print 277 '  ok' lines, include the M1 witness, and end with 'RESULT: 277 fixture check(s) hold' (floor=$guard_floor, exact=$guard_exact), and must not print a 'FAIL' line; a smaller total, a missing witness, a failure line or no output at all (an \`exec\`) means checks were skipped or swallowed — restore them rather than lowering this literal"
             exit 1
           fi
           echo "docs-go-column fixture checks ok: 275 checks hold (floor $guard_floor), M1 witness present, no failure line"
@@ -1772,15 +1772,15 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=a74562bbd7bf496442654bcf66ac0b4b7ab4680b6668c6402434ef3588d9484f
+          guard_data_pin=71c745c0739a739910416db97fa832e93523c94e9097fa9efa0bc2fa64486e6d
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
           # uses: a *falling* count has to move both literals.
-          guard_cites=610
-          guard_cites_floor=610
+          guard_cites=604
+          guard_cites_floor=604
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -2130,7 +2130,7 @@ jobs:
       # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
       # tests with the admin feature". The `admin` flag changes the linked
       # client: the child binds its `[webServer]` and announces it
-      # (`frp-client/src/service/session.rs:1406`), which is what made the pre-fix
+      # (`frp-client/src/service/session.rs:1413`), which is what made the pre-fix
       # assertion in `a_config_file_named_after_a_subcommand_stays_a_config_file`
       # a false positive. Re-derived on this tree with
       # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
@@ -2820,7 +2820,7 @@ jobs:
         # (`assert_eq!(stdout.trim_end(), GO_NO_PORT_MSG)`), while the
         # load-error tests check a stdout substring
         # (`stdout_of(&out).contains("unknown field \"notAKnownFrpKey\"")`, e.g.
-        # `frpc/tests/admin_cli.rs:278`; also `:310`, `:521`, `:663`) plus a
+        # `frpc/tests/admin_cli.rs:278`; also `frpc/tests/admin_cli.rs:310`, `frpc/tests/admin_cli.rs:521`, `frpc/tests/admin_cli.rs:663`) plus a
         # stderr check that no `connect` was attempted. Pre-fix those fail with
         # empty stdout and stderr
         # `reload failed: connect 127.0.0.1:7400: Connection refused (os error
@@ -3419,7 +3419,7 @@ jobs:
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
-        # `:719` survived every lane in CI. Same three-check guard shape as its
+        # `frpc/src/main.rs:719` survived every lane in CI. Same three-check guard shape as its
         # siblings, with the admin build already warm from the step above.
         shell: bash
         run: |
@@ -3456,7 +3456,7 @@ jobs:
         # `a_config_file_named_after_a_subcommand_stays_a_config_file` was
         # invisible in this configuration. That hid a red: it read run mode's own
         # admin bind line (`frpc admin server starting on 127.0.0.1:<port>`,
-        # `frp-client/src/service/session.rs:1406`) as a dial of the config's
+        # `frp-client/src/service/session.rs:1413`) as a dial of the config's
         # `[webServer]` port.
         #
         # Scoped to the one target that needs the flag rather than the whole
@@ -4277,7 +4277,7 @@ jobs:
         # The third answer of `WebServerTlsEnableReader::from_features`. `admin`
         # compiles the client's admin server; `tls` gates the acceptor that
         # server builds (`frp-client/src/admin.rs:1149`, with the
-        # `not(feature = "tls")` discard arm at `:1164`). The step above
+        # `not(feature = "tls")` discard arm at `frp-client/src/admin.rs:1164`). The step above
         # (`--features admin`, frp-client's defaults) always has `tls`, and the
         # `--no-default-features --all-targets` lanes have neither feature — so
         # until this step no lane EXECUTED `reload_warning_delivery` in the third

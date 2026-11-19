@@ -57,7 +57,7 @@
 //! `frps/tests/warn_delivery.rs` (real `frps`, `-c` and `--config-dir`, stdout and
 //! stderr captured separately, plus a real SIGUSR1 reload adding a record). The
 //! client side is deliberately **not** covered because it must stay silent:
-//! `ClientConfig::tls_enable` is live (`frp-client/src/control.rs:389-395` reads
+//! `ClientConfig::tls_enable` is live (`frp-client/src/control.rs:395-401` reads
 //! it), so no `frpc`/`frp-client` site calls `warn_inert_server_tls_enable`, and
 //! that absence is pinned by the existing `frpc` warning-delivery tests plus the
 //! grep recorded in the item. YAML and `.ini` spellings are out of scope (only

@@ -159,7 +159,7 @@ async fn test_password_failures_throttle_per_ip() {
     // A FRESH connection from the same IP within the window is denied
     // without a USERAUTH_FAILURE round-trip (same state table, shared
     // below). Round-12 pin (audit A1): the deny is now a FAIL-CLOSED
-    // pre-auth gate (login.rs:680 `is_login_throttled` parity) that
+    // pre-auth gate (frp-server/src/control/login.rs:680 `is_login_throttled` parity) that
     // runs BEFORE the constant-time compare — an armed IP's guess is
     // never evaluated, and even a CORRECT password from an armed IP is
     // denied for the window. Round-11's deny ran only on the mismatch

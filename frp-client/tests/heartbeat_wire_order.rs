@@ -122,7 +122,7 @@ async fn no_ping_before_login_resp_pings_begin_after_registration() {
         // (service.rs: register_proxies Phase 4 -> run_message_loop
         // Phase 6 — pings physically cannot leave before this point, the
         // writer task is not spawned until Phase 5). The heartbeat interval
-        // is armed at login success (session.rs:713-716, tokio `interval()`:
+        // is armed at login success (frp-client/src/service/session.rs:719-722, tokio `interval()`:
         // tick 1's deadline is the arm instant) and polled for the first
         // time at loop start, so tick 1 fires immediately: Ping#1 must
         // reach the wire ~ms after this write.
@@ -380,7 +380,7 @@ async fn ping_reuses_startup_token_snapshot_when_source_becomes_unreadable() {
             .expect("write LoginResp");
 
         // Oracle-1 immediacy anchor: the client arms its heartbeat interval
-        // when it processes this LoginResp (session.rs:713-716, tokio
+        // when it processes this LoginResp (frp-client/src/service/session.rs:719-722, tokio
         // `interval()`: tick 1's deadline is the arm instant). This session
         // has no proxies or visitors, so the registration phase
         // (service.rs register_proxies — nothing pending) and the loop
@@ -652,7 +652,7 @@ fn assert_oidc_ping_key(frame: &FrpMessage, token: &str) {
 ///            CONSECUTIVE failure, re-armed at
 ///            `next_ping_backoff(Some(PING_FIRST_BACKOFF), 10s)` = 4s;
 ///   T4       T3+4s, the re-armed tick: invocation #5 succeeds → Ping#2, and
-///            `ctx.ping_retry_backoff` is reset to `None` (message_loop.rs:1074);
+///            `ctx.ping_retry_backoff` is reset to `None` (frp-client/src/service/message_loop.rs:1074);
 ///   T5       T4+10s, back on the interval period: invocation #6 exits 1 again,
 ///            but the streak is now CLEARED, so it must re-arm at
 ///            `next_ping_backoff(None, 10s)` = 2s again;
@@ -744,7 +744,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         server_additional_auth_scopes: None,
     });
     // The OIDC config carries no `auth.token`, so `AuthConfig.token` is empty
-    // and the control-stream key is derive_key("") (service.rs:665 + session.rs:680).
+    // and the control-stream key is derive_key("") (frp-client/src/service.rs:669 + frp-client/src/service/session.rs:686).
     let enc_key = frp_core::encryption::derive_key("");
     let pong = FrpMessage::Pong(msg::Pong { error: None });
 
@@ -840,7 +840,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
 
         // Invocation #4 ALSO exited 1 (the fixture fails #3 and #4), so this is
         // the SECOND CONSECUTIVE failed attempt: the streak was never cleared
-        // (only a non-skipped attempt clears it, message_loop.rs:1074) and the next
+        // (only a non-skipped attempt clears it, frp-client/src/service/message_loop.rs:1074) and the next
         // re-arm must consult the PROGRESSION, not the first-failure constant.
 
         // Oracle 4 (decisive for the progression, not just the constant):
@@ -877,7 +877,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
 
         // Invocation #5 (the re-armed tick after the two consecutive failures)
         // SUCCEEDED, which cleared the streak (`ctx.ping_retry_backoff = None`,
-        // message_loop.rs:1074). Oracle 5: the cadence is back on the 10s interval
+        // frp-client/src/service/message_loop.rs:1074). Oracle 5: the cadence is back on the 10s interval
         // period, so the next exec invocation — #6, which exits 1 again — lands
         // ~10s after Ping#2.
         let tick5_at = wait_for_exec_invocations(&mock_log, 6, Duration::from_secs(25)).await;
@@ -893,7 +893,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
         // Oracle 6: that tick's invocation #6 exited 1, but the successful
         // retry had already reset the streak, so the re-arm must be back at
         // `next_ping_backoff(None, 10s)` = PING_FIRST_BACKOFF. A call site that
-        // never clears (message_loop.rs:1074 deleted) still sees the second
+        // never clears (frp-client/src/service/message_loop.rs:1074 deleted) still sees the second
         // failure's 4s and re-arms here at 8s.
         let f3 = tokio::time::timeout(Duration::from_secs(15), enc.read_v1_frame())
             .await
@@ -908,7 +908,7 @@ async fn skipped_ping_rearms_interval_on_two_second_backoff() {
             rearm3 >= rearm3_min && rearm3 <= rearm3_max,
             "Ping#3 arrived {}ms after the post-success failed tick (expected \
              ~{}ms = PING_FIRST_BACKOFF: the successful retry reset \
-             ctx.ping_retry_backoff to None at message_loop.rs:1074, so the next \
+             ctx.ping_retry_backoff to None at frp-client/src/service/message_loop.rs:1074, so the next \
              failure re-arms at the FIRST-failure value again; the accepted \
              window [{}, {}]ms is derived from that constant). A call site that \
              never clears the streak keeps the second failure's 4s and re-arms \
