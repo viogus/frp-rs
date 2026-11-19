@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use super::server::{
     default_authentication_timeout, default_heartbeat_timeout, default_token_auth_timeout,
-    default_true, FeatureConfig, LogConfig, ObservabilityConfig, PluginConfig, QuicOptions,
+    default_true, FeatureConfig, KcpOptions, LogConfig, ObservabilityConfig, PluginConfig,
+    QuicOptions,
     StoreConfig, ValueSource, WebServerConfig,
 };
 
@@ -366,6 +367,10 @@ pub struct ClientConfig {
     /// QUIC protocol options.
     #[serde(default, rename = "quic")]
     pub quic_options: Option<QuicOptions>,
+    /// KCP transport tuning (frp-rs extension; must match the server's value
+    /// for symmetric behaviour — each side applies its own bound).
+    #[serde(default, rename = "kcp")]
+    pub kcp_options: Option<KcpOptions>,
     #[serde(default)]
     pub proxies: Vec<ProxyConfig>,
     #[serde(default)]
@@ -442,6 +447,7 @@ impl Default for ClientConfig {
             tcp_recv_buffer_size: 0,
             v2: false,
             quic_options: None,
+            kcp_options: None,
             proxies: vec![],
             visitors: vec![],
             web_server: WebServerConfig::default(),

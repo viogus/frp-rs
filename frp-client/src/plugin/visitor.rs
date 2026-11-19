@@ -280,6 +280,9 @@ async fn handle_visitor_conn(
         tcp_recv_buffer_size: 0,
         proxy_url: proxy_url.clone(),
         dial_timeout_secs,
+        // Visitor dials take the kcp-go default: the visitor transport section
+        // does not expose `[transport.kcp]` (see docs/deployment.md).
+        kcp_dead_link: frp_core::kcp::KCP_DEAD_LINK_DEFAULT,
         v2,
     };
     let raw_stream = transport::dial_server(&opts)

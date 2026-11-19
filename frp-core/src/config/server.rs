@@ -1174,6 +1174,36 @@ pub struct QuicOptions {
     pub stream_receive_window: i64,
 }
 
+/// `[transport.kcp]` — KCP transport tuning.
+///
+/// frp-rs extension: Go frp hard-codes these in `pkg/util/net/kcp.go`, so a
+/// config that sets them is refused by Go frp (`unknown field`), not silently
+/// ignored. Values are wire-neutral — they change timers only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KcpOptions {
+    /// Retransmissions of one segment before the session is declared dead.
+    /// Default: 20 (kcp-go). Lower fails over faster on a black-holed peer;
+    /// higher tolerates a lossier path. `0` is refused at load.
+    #[serde(
+        default = "default_kcp_dead_link",
+        alias = "deadLink",
+        deserialize_with = "crate::config::deserialize_kcp_dead_link"
+    )]
+    pub dead_link: u32,
+}
+
+impl Default for KcpOptions {
+    fn default() -> Self {
+        Self {
+            dead_link: default_kcp_dead_link(),
+        }
+    }
+}
+
+fn default_kcp_dead_link() -> u32 {
+    crate::kcp::KCP_DEAD_LINK_DEFAULT
+}
+
 impl Default for QuicOptions {
     fn default() -> Self {
         Self {
@@ -1249,6 +1279,9 @@ pub struct ServerTransportConfig {
     /// QUIC protocol options.
     #[serde(default, rename = "quic")]
     pub quic_options: Option<QuicOptions>,
+    /// KCP transport tuning (frp-rs extension).
+    #[serde(default, rename = "kcp")]
+    pub kcp_options: Option<KcpOptions>,
 }
 
 impl Default for ServerTransportConfig {
@@ -1264,6 +1297,7 @@ impl Default for ServerTransportConfig {
             tcp_recv_buffer_size: 0,
             worker_threads: None,
             quic_options: None,
+            kcp_options: None,
         }
     }
 }

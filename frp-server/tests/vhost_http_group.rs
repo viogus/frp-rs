@@ -423,7 +423,7 @@ async fn test_http_group_route_cleaned_when_last_member_leaves() {
 /// DIFFERENT run_id must stay raw across the cross-run_id hop. The group LB
 /// (`frp-server/src/control/pool.rs` forward-to-backend) carries
 /// `request_is_connect` in the `ProxyUserConn` it sends to the member's
-/// control (pool.rs:784) — if that flag were dropped on the hop, the
+/// control (frp-server/src/control/pool.rs:784) — if that flag were dropped on the hop, the
 /// receiving bridge would treat the tunnel as a plain GET and run the full
 /// injection path (requestHeaders, host_header_rewrite, X-Forwarded-*,
 /// response_headers) on a raw CONNECT. Go's connectHandler writes the

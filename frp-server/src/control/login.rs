@@ -3174,7 +3174,7 @@ mod login_order_tests {
     /// the same state and peer and pushes the returned string through the
     /// real `send_login_error` wire path.
     ///
-    /// Mutant: reword the literal at `throttle.rs:58` — this test reds while
+    /// Mutant: reword the literal at `frp-server/src/control/login/throttle.rs:58` — this test reds while
     /// the gate-path integration assertions stay green.
     #[tokio::test]
     async fn throttled_login_error_message_reaches_the_login_resp() {
@@ -3244,7 +3244,7 @@ mod login_order_tests {
 
     /// PR #454 invariant 5: the replay-table guard is released (`drop(used)`,
     /// `frp-server/src/control/login/auth.rs:414`) BEFORE the
-    /// replay-rejection `send_login_error` (`auth.rs:415-428`).
+    /// replay-rejection `send_login_error` (`frp-server/src/control/login/auth.rs:415-428`).
     /// `used_timestamps` is one tokio Mutex shared by every login, so holding
     /// it across the reject write stalls unrelated logins for up to the 5s
     /// reject-path deadline.

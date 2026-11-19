@@ -330,10 +330,16 @@ impl Service {
             let kcp_addr = format_socket_addr(&self.cfg.bind_addr, self.cfg.kcp_bind_port);
             let kcp_addr2 = kcp_addr.clone();
             let (kcp_bind_tx, kcp_bind_rx) = tokio::sync::oneshot::channel::<()>();
+            // `[transport.kcp]` (frp-rs extension): the retransmission bound
+            // before a session is declared dead. Absent = the kcp-go default.
+            let mut kcp_config = frp_core::kcp::default_kcp_config();
+            if let Some(opts) = self.cfg.transport.kcp_options.as_ref() {
+                kcp_config.dead_link = opts.dead_link;
+            }
             spawn_boxed(Box::pin(async move {
                 let mut listener = match frp_core::kcp::KcpListener::bind(
                     &kcp_addr2,
-                    frp_core::kcp::default_kcp_config(),
+                    kcp_config,
                 )
                 .await
                 {

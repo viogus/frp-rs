@@ -1725,7 +1725,7 @@ def normalize(span):
         return None
     s = re.sub(r'::[A-Za-z_][A-Za-z0-9_:]*$', '', s)           # file.rs::symbol
     s = re.sub(r'#[A-Za-z0-9_.-]+$', '', s)                    # file.md#anchor
-    s = re.sub(r':~?\d+([-\u2013]\d+)?([/,]\d+)*\+?$', '', s)  # file.rs:20-28,30
+    s = re.sub(r':~?\d+([-\u2013]\d+)?([/,]\d+)*\+?$', '', s)  # frp-core/src/config/file.rs:20-28,30
     return s or None
 
 def nearest_manifest_dir(base):

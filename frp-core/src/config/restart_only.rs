@@ -478,7 +478,7 @@ fn web_server_restart_changes(
 /// which is why it is reported as restart-only rather than reloadable. None is
 /// re-keyed by the reload.
 ///
-/// **What keeps it complete.** Both patterns name all ten fields with no `..`
+/// **What keeps it complete.** Both patterns name all eleven fields with no `..`
 /// (the `#[cfg]` on `quic_options` is this crate's own gate, so it matches the
 /// struct exactly).
 ///
@@ -509,6 +509,7 @@ fn transport_restart_changes(
         tcp_recv_buffer_size: old_tcp_recv_buffer_size,
         worker_threads: old_worker_threads,
         quic_options: old_quic_options,
+        kcp_options: old_kcp_options,
     } = old;
     let ServerTransportConfig {
         tcp_mux: new_tcp_mux,
@@ -521,6 +522,7 @@ fn transport_restart_changes(
         tcp_recv_buffer_size: new_tcp_recv_buffer_size,
         worker_threads: new_worker_threads,
         quic_options: new_quic_options,
+        kcp_options: new_kcp_options,
     } = new;
 
     let any = ServerReader::Any;
@@ -599,6 +601,18 @@ fn transport_restart_changes(
     // entry above is stripped along with it.
     #[cfg(not(feature = "quic"))]
     let _ = (old_quic_options, new_quic_options);
+
+    // The KCP listener is built once in `Service::run`, so a changed
+    // `[transport.kcp]` (frp-rs extension) needs a restart like the QUIC
+    // options do. Compared as the effective value: absent means the kcp-go
+    // default, so `unset -> deadLink = 20` is not a change.
+    push(
+        out,
+        &old_kcp_options.clone().unwrap_or_default().dead_link,
+        &new_kcp_options.clone().unwrap_or_default().dead_link,
+        "transport.kcp.deadLink",
+        any,
+    );
 }
 
 /// Every restart-only `[ssh_tunnel_gateway]` difference.

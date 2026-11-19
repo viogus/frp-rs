@@ -6,11 +6,11 @@
 //! format!("failed to load config: {e}"))?` — the load failure propagates
 //! BEFORE any mutation, so `self.cfg`/`self.proxies` are untouched,
 //! `reload::do_reload` never runs, and the previously running proxies keep
-//! serving. (reload.rs:485-497 is a DIFFERENT arm: the no-changes shortcut
+//! serving. (frp-client/src/reload.rs:485-497 is a DIFFERENT arm: the no-changes shortcut
 //! for a config that *loaded fine*.)
 //!
 //! Observability note: `Service::request_reload()` (the SIGUSR1 path) drops
-//! the reply oneshot (`reload_apply.rs:29-32`), so the Err *string* is only
+//! the reply oneshot (`frp-client/src/service/reload_apply.rs:29-32`), so the Err *string* is only
 //! observable on the admin-API path, where the requester waits on the reply
 //! (`admin.rs reload_and_wait` → HTTP 400 with the Err text). Both sides of
 //! the gap are covered here:
@@ -130,7 +130,7 @@ fn write_malformed_toml(path: &std::path::Path) {
 }
 
 /// Parseable TOML, semantically invalid: `type = "bogus-proxy-type"` is
-/// rejected by `validate_proxy_configs` (loader.rs:1344-1350) inside
+/// rejected by `validate_proxy_configs` (frp-core/src/config/loader.rs:1344-1350) inside
 /// `load_client_config` — this is the failure `validate_client_config`
 /// reports, independent of the `strict` flag. Carries `remote_port` so a
 /// buggy partial-apply would be observable (the proxy would move ports).

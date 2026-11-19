@@ -824,7 +824,7 @@ What the walk does **not** reach, each cell measured on Go frp v0.71.0
   `ConfigFormat`, and the file path hands it `Ini` —
   `frp-core/src/config/file.rs:127` passes it to `load_config_from_file`, which
   detects the extension at `frp-core/src/config/normalize.rs:630` and applies it
-  at `:664`; the TOML-from-string path passes `ConfigFormat::Toml`,
+  at `frp-core/src/config/normalize.rs:664`; the TOML-from-string path passes `ConfigFormat::Toml`,
   `frp-core/src/config/loader.rs:186`) — is fed through the
   same check, but with Go's accept-and-ignore semantics rather than the v1
   surface's rejection: the legacy collector folds the prefix mechanisms Go reads
@@ -1212,6 +1212,34 @@ four workers and **+48 %** when both ends use four
 § Driver thread). A single-worker runtime is left alone, so a default `frpc`
 creates no extra thread. `FRP_KCP_DRIVER_RUNTIME=0` turns it off (bisecting a
 KCP throughput regression), `=1` forces it on.
+
+**KCP dead-link bound (`[transport.kcp] deadLink`):**
+
+```toml
+# frps.toml and frpc.toml
+[transport.kcp]
+dead_link = 5   # default 20, kcp-go's value; 0 is refused at load
+```
+
+A KCP session is torn down after this many retransmissions of one segment.
+It is a timer, not a wire field: each side applies its own value, and a Go peer
+keeps 20 whatever you write here. Lowering it fails over faster after a silent
+peer and gives up sooner on a genuinely lossy link. Two measurements on a
+4-vCPU Linux VM (`tcpMux = false`, `heartbeatInterval = 1`, `frps` frozen with
+`SIGSTOP` mid-transfer) show what it does and does not buy:
+
+| `deadLink` | declared dead after |
+|---|---|
+| 5 | 0.7 s |
+| 20 (default) | 3.8 s |
+
+The bound only shortens the tail. A session has to *try* to write before it can
+be declared dead, so with the default pings the cadence dominates: the same
+freeze at the defaults was noticed at ~28 s at `deadLink = 5` and ~31 s at 20,
+because the client's heartbeat is 10 s under `tcpMux` and 30 s without it. If you
+need fast failover, lower `heartbeat_interval` first and treat `deadLink` as the
+second-order knob. Visitor dials (`[visitors]`) do not read this table; they use
+the kcp-go default of 20.
 
 **Heartbeat intervals:**
 

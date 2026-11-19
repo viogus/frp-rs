@@ -13,6 +13,22 @@ User-facing release notes for frp-rs.
 
 ### Notes
 
+- **KCP's retransmission bound is configurable (`[transport.kcp] deadLink`).**
+  A KCP session used to die after 20 retransmissions of one segment — kcp-go's
+  constant, unreachable from config even though the state machine had a setter
+  no caller used. Both binaries accept `[transport.kcp] deadLink` (snake
+  `dead_link` too; `0` is refused at load) and apply it to every KCP session
+  they open, control and work connections alike. It is a timer, not a wire
+  field: each side applies its own value and a Go peer keeps 20. On a 4-vCPU
+  VM with `frps` frozen mid-transfer, `deadLink = 5` had the client declaring
+  the session dead **0.7 s** after the freeze against **3.8 s** at the default
+  20 (with `heartbeatInterval = 1` to keep writing). Only the tail shortens: a
+  session must *try* to write before it can be declared dead, so with default
+  pings the cadence dominates (10 s with `tcpMux`, 30 s without — frozen runs at
+  the defaults noticed nothing for ~28-31 s at 5 and 20 alike). Lower
+  `heartbeatInterval` first if you need fast failover; see
+  [`docs/deployment.md`](docs/deployment.md).
+
 - **The zero-copy `splice(2)` relay now works on the server side of plain `tcp` proxies.** The server sniffs each V1 work connection for the V2 magic before handing it to the proxy bridge, so the bridge always received a byte-replay wrapper (`PreRead`/`BufferedRead`) whose default `try_tcp()` returned `None` — and `relay_plain_fast_inner` needs *both* sides to be raw TCP before it splices. Every byte of such a tunnel was copied twice in userspace on the server side. Drained wrappers now delegate the fast path (an undrained one still refuses). With `tcp_mux = false` and `transport.tls.enable = false`, a 2048 MiB stream on a 4-vCPU Linux VM goes 1320 → 2248-2570 MiB/s (the raw loopback ceiling is 2489), and eight independent sessions go 1227 → 2266 MiB/s at one worker (2867 at four); server CPU drops from 0.99 to 0.81 cores on one flow. V2 work connections were never affected (they arrive unwrapped), and the defaults (`tcpMux` and TLS on) are unchanged: a yamux stream and a TLS record layer cannot be spliced. Measurements and the remaining default-path costs (yamux ~600 MiB/s, TLS ~2x CPU per byte) are in [`docs/archive/notes/2026-11-13-splice-wrapper-peel.md`](docs/archive/notes/2026-11-13-splice-wrapper-peel.md).
 
 - **Bridge buffer now defaults to 64 KiB — +13.5% on `tcpMux` + TLS.** The buffer is also the tcpMux frame payload, so a bridge chunk travels as one yamux frame instead of two: on a 4-vCPU Linux VM, five interleaved pairs of the same binary with only `FRP_BRIDGE_BUF_KB` changing measured 526 → 597 MiB/s (**+13.5%**, every pair positive), +12.8% at one stream, +13.9% on WebSocket without mux, and no change on the plain rows. `FRP_BRIDGE_BUF_KB` still overrides it (4–1024). The same size ships on macOS: its WebSocket streaming rows gain more than the Linux ones (mean-to-mean +55% at one flow, +33% at four flows), and the ping-pong row that once argued for 32 KiB there measures frame latency, not throughput. Three structural alternatives — one `writev` per yamux frame, a one-copy vectored write into the frame body, and inline writes from the bridge task — were built and measured at zero gain; see [`docs/archive/notes/2026-11-10-mux-frame-cost.md`](docs/archive/notes/2026-11-10-mux-frame-cost.md) and [`docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md`](docs/archive/notes/2026-11-10-bridge-buffer-64k-default.md).

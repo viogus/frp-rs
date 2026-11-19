@@ -43,6 +43,11 @@ pub(crate) const KCP_WIRE_OVERHEAD: usize = crate::kcp::session::FEC_HEADER_SIZE
 /// on the listen path, and via `KcpConfig::clamped` on the dial path.
 pub const MAX_KCP_MTU: usize = crate::kcp::socket::DRIVER_RECV_BUF_SIZE - KCP_WIRE_OVERHEAD;
 
+/// Default retransmission bound before a KCP session is declared dead.
+/// kcp-go hard-codes 20 (`pkg/util/net/kcp.go`); frp-rs keeps that default and
+/// lets the config override it through `[transport.kcp] deadLink`.
+pub const KCP_DEAD_LINK_DEFAULT: u32 = 20;
+
 /// KCP transport configuration.
 #[derive(Debug, Clone)]
 pub struct KcpConfig {
@@ -64,6 +69,17 @@ pub struct KcpConfig {
     pub parity_shards: usize,
     /// Stream mode: each KCP output produces a single contiguous datagram.
     pub stream: bool,
+    /// Maximum retransmissions of one segment before the session is declared
+    /// dead (kcp-go's `dead_link`). Default 20, the kcp-go value.
+    ///
+    /// The timer that matters: a segment is retransmitted on its RTO, and the
+    /// RTO grows linearly under nodelay (`rto += rx_rto / 2`), so 20
+    /// retransmissions is several seconds of silence before the driver tears
+    /// the session down and the client reconnects. Lower values fail over
+    /// faster on a black-holed peer and give up sooner on a genuinely lossy
+    /// link; `[transport.kcp] deadLink` exposes it (frp-rs extension — Go frp
+    /// hard-codes 20 in `pkg/util/net/kcp.go`).
+    pub dead_link: u32,
 }
 
 impl Default for KcpConfig {
@@ -76,6 +92,7 @@ impl Default for KcpConfig {
             data_shards: 0,
             parity_shards: 0,
             stream: true,
+            dead_link: KCP_DEAD_LINK_DEFAULT,
         }
     }
 }

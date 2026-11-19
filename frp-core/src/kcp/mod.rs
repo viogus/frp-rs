@@ -12,7 +12,7 @@ pub mod session;
 mod socket;
 mod stream;
 
-pub use config::{KcpConfig, KcpNoDelayConfig};
+pub use config::{KcpConfig, KcpNoDelayConfig, KCP_DEAD_LINK_DEFAULT};
 pub use listener::{dial_kcp, dial_kcp_with_driver, KcpListener};
 pub use session::KcpSession;
 pub use stream::KcpStream;
@@ -49,6 +49,7 @@ pub fn default_kcp_config() -> KcpConfig {
         data_shards: 10,
         parity_shards: 3,
         stream: true,
+        dead_link: KCP_DEAD_LINK_DEFAULT,
     }
 }
 
@@ -72,6 +73,7 @@ pub fn default_kcp_client_config() -> KcpConfig {
         data_shards: 10,
         parity_shards: 3,
         stream: true,
+        dead_link: KCP_DEAD_LINK_DEFAULT,
     }
 }
 

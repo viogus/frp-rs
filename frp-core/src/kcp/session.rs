@@ -263,6 +263,10 @@ impl KcpSession {
             config.nodelay.resend,
             config.nodelay.nc,
         );
+        // Retransmission bound before the driver declares the session dead
+        // (kcp-go's `dead_link`). Floored at 1: zero would let a single lost
+        // segment kill the session on the first RTO.
+        kcp.set_maximum_resend_times(config.dead_link.max(1));
 
         // Go frp (kcp-go) calls SetACKNoDelay(false) on its KCP sessions.
         // Our in-tree KCP implementation does not expose a set_ack_no_delay
@@ -873,7 +877,7 @@ impl KcpSession {
                     // `recv_buf[..n].to_vec()` copy is gone. The channel
                     // message owns the allocation. `size` is bounded by the
                     // reassembly window (`(KCP_WND_RCV-1) * mss`, see
-                    // protocol.rs:59), so a hostile peer cannot inflate it.
+                    // frp-core/src/kcp/frp-core/src/kcp/protocol.rs:59), so a hostile peer cannot inflate it.
                     //
                     // Read-side pool (M4): the buffer is drawn from the
                     // shared chunk pool (the same pool KcpWriter draws
@@ -1063,7 +1067,7 @@ impl KcpSession {
 
 #[cfg(test)]
 mod tests {
-    use super::super::config::{KcpConfig, KcpNoDelayConfig};
+    use super::super::config::{KcpConfig, KcpNoDelayConfig, KCP_DEAD_LINK_DEFAULT};
     use super::*;
 
     fn test_config() -> KcpConfig {
@@ -1079,7 +1083,29 @@ mod tests {
                 resend: 2,
                 nc: true,
             },
+            dead_link: KCP_DEAD_LINK_DEFAULT,
         }
+    }
+
+    #[test]
+    fn the_configured_dead_link_reaches_the_state_machine() {
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel(16);
+        let mut config = test_config();
+        config.dead_link = 3;
+        let session = KcpSession::new(9, "127.0.0.1:9000".parse().unwrap(), config, read_tx);
+        assert_eq!(session.kcp.maximum_resend_times(), 3);
+    }
+
+    #[test]
+    fn a_zero_dead_link_is_clamped_to_one_retransmission() {
+        // Zero would kill the session on its first RTO, which cannot be what
+        // an operator meant; the config layer refuses it and the session
+        // constructor clamps it as a second line of defence.
+        let (read_tx, _read_rx) = tokio::sync::mpsc::channel(16);
+        let mut config = test_config();
+        config.dead_link = 0;
+        let session = KcpSession::new(9, "127.0.0.1:9000".parse().unwrap(), config, read_tx);
+        assert_eq!(session.kcp.maximum_resend_times(), 1);
     }
 
     #[test]
@@ -1315,6 +1341,7 @@ mod tests {
                 resend: 2,
                 nc: true,
             },
+            dead_link: KCP_DEAD_LINK_DEFAULT,
         }
     }
 
