@@ -28,9 +28,10 @@ User-facing release notes for frp-rs.
   unchanged (116.0/115.6 vs 107.2/119.1 MiB/s), a live idle connection still
   carries data after 60 s, and `scripts/compat-test.sh` against Go frp v0.72.0
   stays at 86/0. Sessions with data still rely on the retransmission bound.
-  `[transport.kcp] probe = false` turns it off — do that on a side whose
-  inbound path is closed while idle (a client behind NAT), where a probe that
-  cannot arrive says nothing about the peer; see
+  `[transport.kcp] probe = false` turns it off — do that on the side whose
+  probes cannot reach the peer (normally the public side, when the peer is
+  behind a NAT whose mapping expired); leave it on for the NATed side, where
+  the probe traffic is what keeps the mapping alive. See
   [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](docs/archive/notes/2026-11-19-kcp-liveness-probe.md).
 
 ### Notes

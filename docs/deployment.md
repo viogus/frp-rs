@@ -1292,18 +1292,23 @@ the bound cannot be the cause):
 Two datagrams per second per idle session per end is invisible in CPU and in
 throughput, and the compat suite against Go frp v0.72.0 stays green.
 
-**When to turn it off.** The probe cannot be told apart from a dead peer when
-the *inbound* path is closed while the tunnel is idle — an `frps` behind NAT, or
-a client whose UDP mapping expired. In that state the side that sends probes
-sees silence and reaps a session whose peer is perfectly healthy; the peer only
-notices on its next keepalive and reconnects, which costs one reconnect per NAT
-mapping lifetime. Blocking `frps`→client UDP for 5 s on the test VM reproduced
-it: with probing on the server reaped three sessions within ~2 s, with it off
-none. Set `probe = false` on the side behind NAT (typically the client) and
-leave it on for the public side; if you need fast failover on both sides and
-cannot place the NAT, lower `heartbeat_interval` instead. Visitor dials and the
-XTCP proxy P2P plane use their built-in KCP configs, which do not expose this
-table. See
+**When to turn it off.** The probe is inbound traffic, so it cannot be told
+apart from a dead peer when that direction is closed while the tunnel is idle —
+the usual case being a client whose UDP mapping expired. The side that then
+reaps is the one *sending* the probes: normally the public `frps`, whose probes
+the NATed peer's mapping no longer accepts, while the NATed client's own probes
+still reach the server and are answered. Blocking `frps`→client UDP for 5 s on
+the test VM reproduced it: with probing on the server reaped three sessions
+within ~2 s, with it off none.
+
+So turn it off on the side whose probes cannot get through — normally the
+**public** side — and leave it on for the NATed side, where those two datagrams
+per second are also what keeps the mapping alive. Turning the NATed side's probe
+off is the wrong lever twice over: it does not stop the public side from
+reaping, and it removes the traffic that refreshes the mapping. If a side cannot
+be reached at all, no probe can help it; lower `heartbeat_interval` for a faster
+reconnect instead. Visitor dials and the XTCP proxy P2P plane use their built-in
+KCP configs, which do not expose this table. See
 [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](archive/notes/2026-11-19-kcp-liveness-probe.md).
 
 **Heartbeat intervals:**

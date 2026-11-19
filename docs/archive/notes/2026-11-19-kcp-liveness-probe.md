@@ -86,11 +86,13 @@ no traffic still echoed data afterwards, and the session was not reaped.
 
 ## The trade-off this cannot avoid
 
-The probe is unsolicited inbound traffic. Where that path is legitimately
-closed — an `frps` behind NAT, or a client whose UDP mapping expired — a
-perfectly healthy peer looks silent, and the sending side reaps the session.
-The peer only notices at its next keepalive, so the cost is one reconnect per
-NAT mapping lifetime instead of nothing.
+The probe is unsolicited inbound traffic. Where that direction is legitimately
+closed — the usual case being a client whose UDP mapping expired — a perfectly
+healthy peer looks silent **to the side that is sending the probes**, which
+then reaps the session. The peer only notices at its next keepalive, so the
+cost is one reconnect per NAT mapping lifetime instead of nothing. Note the
+asymmetry: the NATed side's own probes still leave, so it is normally the
+*public* side that reaps, not the NATed one.
 
 Reproduced on the VM by blocking `frps`→client UDP (`iptables -I OUTPUT -p udp
 --sport 19102 -j DROP`) for 5 s on an established idle tunnel:
@@ -103,10 +105,11 @@ Reproduced on the VM by blocking `frps`→client UDP (`iptables -I OUTPUT -p udp
 The end-to-end recovery is similar because the client's own retransmission bound
 also fires once its data stops being ACKed; the observable difference is that
 with probing on the server throws away healthy sessions. Hence the knob:
-`[transport.kcp] probe = false` on the side behind NAT, `true` on the public
-side. KCP has no NAT traversal of its own, so there is no probe that both
-traverses a closed mapping and reaches the peer — this is a choice, not a bug
-that can be fixed downstream.
+`probe = false` on the side whose probes cannot get through — normally the
+public side — and `true` on the NATed side, whose probes both reach the peer and
+keep the mapping refreshed. KCP has no NAT traversal of its own, so there is no
+probe that both traverses a closed mapping and reaches the peer — this is a
+choice, not a bug that can be fixed downstream.
 
 ## Tests
 

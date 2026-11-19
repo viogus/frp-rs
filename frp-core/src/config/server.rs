@@ -1195,9 +1195,11 @@ pub struct KcpOptions {
     /// Default: true. frp-rs extension — Go frp has no equivalent, and a Go
     /// peer answers the probe without any configuration of its own.
     ///
-    /// Turn it off on a side whose inbound path is closed while idle (an
-    /// frps behind NAT, a client whose NAT mapping expires): those probes are
-    /// unreachable for reasons that say nothing about the peer's health.
+    /// Turn it off on the side whose probes cannot get through — normally the
+    /// public side, when the peer sits behind a NAT whose mapping expired:
+    /// those probes are dropped for reasons that say nothing about the peer's
+    /// health. Leave it on for the NATed side, where they keep the mapping
+    /// refreshed.
     #[serde(default = "default_kcp_probe")]
     pub probe: bool,
 }

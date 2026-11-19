@@ -167,9 +167,9 @@ pub(crate) const PROBE_IDLE_MS: u32 = 500;
 /// dropped probe or a slow answer costs nothing. Two consecutive losses do
 /// not kill a live session either — the peer must miss all three.
 ///
-/// Set `[transport.kcp] probe = false` where the inbound path is closed
-/// while idle (a NATed frps, an expiring client mapping): those probes are
-/// dropped for reasons that say nothing about the peer.
+/// Set `[transport.kcp] probe = false` on the side whose probes cannot reach
+/// the peer (normally the public side, when the peer's NAT mapping expired):
+/// those probes are dropped for reasons that say nothing about the peer.
 pub(crate) const PROBE_MAX_UNANSWERED: u32 = 3;
 
 /// Window (segments) to advertise when `active` sessions are moving data.

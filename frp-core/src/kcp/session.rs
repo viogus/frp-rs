@@ -391,10 +391,10 @@ impl KcpSession {
     /// answers slowly is not killed for being slow — only for silence.
     ///
     /// The last probe must also have had its own interval to be answered:
-    /// without that, the count reaches the bound on the same tick that sends
-    /// the final `WASK` and the answer can never arrive, which makes the
-    /// documented tolerance a lie and costs a premature reconnect whenever
-    /// one answer is slow.
+    /// without that, the count reaches the bound on the tick *after* the one
+    /// that sends the final `WASK`, so the answer can never arrive — which
+    /// makes the documented tolerance a lie and costs a premature reconnect
+    /// whenever one answer is slow.
     pub fn probe_expired(&self, driver_clock_ms: u32) -> bool {
         self.probes_unanswered >= crate::kcp::socket::PROBE_MAX_UNANSWERED
             && driver_clock_ms.wrapping_sub(self.probe_sent_ms) >= crate::kcp::socket::PROBE_IDLE_MS
@@ -1667,6 +1667,27 @@ mod tests {
         assert!(
             !session.should_probe(10_000),
             "in-flight data is the retransmission bound's job"
+        );
+    }
+
+    /// `[transport.kcp] probe = false` must reach the session, not merely the
+    /// parsed option: the driver asks `should_probe`, so this is the pin that
+    /// keeps the operator's escape hatch wired end to end.
+    #[test]
+    fn a_session_with_probing_off_never_probes() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut config = test_config();
+        config.liveness_probe = false;
+        let session = KcpSession::with_chunk_pool(
+            4248,
+            "127.0.0.1:9007".parse().unwrap(),
+            config,
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        assert!(
+            !session.should_probe(60_000),
+            "probe = false must leave a quiet session alone"
         );
     }
 

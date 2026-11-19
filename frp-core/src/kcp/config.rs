@@ -88,12 +88,13 @@ pub struct KcpConfig {
     /// KCP window request (`IKCP_CMD_WASK`) answered by `IKCP_CMD_WINS`, so
     /// liveness needs no new message on the wire and no new config.
     ///
-    /// Turn it off (`[transport.kcp] probe = false`) where the inbound path
-    /// is legitimately closed while idle — an frps behind NAT, or a client
-    /// whose NAT mapping expires: probes the peer never receives would
-    /// count toward the bound and cost a reconnect per mapping lifetime.
-    /// That trade-off is real and cannot be told apart from a dead peer
-    /// locally, so the operator decides per side.
+    /// Turn it off (`[transport.kcp] probe = false`) on the side whose probes
+    /// cannot reach the peer — normally the public side, when the peer is
+    /// behind a NAT whose mapping expired: probes the peer never receives
+    /// still count toward the bound and cost a reconnect per mapping lifetime.
+    /// The NATed side should keep probing, since its probes both get through
+    /// and refresh the mapping. That trade-off cannot be told apart from a
+    /// dead peer locally, so the operator decides per side.
     pub liveness_probe: bool,
 }
 
