@@ -1404,7 +1404,7 @@ jobs:
         # suite must *say* it drove the gate red on an injected bad cite —
         # otherwise a gate that silently stopped scanning (an empty file list,
         # an emptied ledger, a regex that stopped matching) would look exactly
-        # like a clean tree. 40 is the number of scenario checks in
+        # like a clean tree. 60 is the number of scenario checks in
         # `scripts/tests/todo-cite-guard-fixtures.sh`.
         shell: bash
         run: |
@@ -1412,7 +1412,7 @@ jobs:
           log=/tmp/frp-todo-cite-fixtures.$$.log
           status=0
           guard_file=scripts/tests/todo-cite-guard-fixtures.sh
-          guard_pin=0575080e20463c176c584dc0f26ebd7685901e86246d96add0b6450420843be4
+          guard_pin=a2848ac0262ca30107105c09e978b7ede9afbac78bb84ccdc3424ce588f2bb77
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=10eac6642b4bdd1ece1a397b8f5e502341b776fd34dbd3108bbc8c67f1809d33
+          guard_data_pin=cbf54d3b29ebf84b26ef0bca6d944283654f02a976da35a141e4b2a77ce7d52c
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2576,7 +2576,7 @@ jobs:
         # cost — Linux, cold cache — was not measured.
         run: cargo test -p frp-core --no-default-features --all-targets
       - name: Run frp-core's help-document pins in the two mixed feature shapes (count guard)
-        # `frp-core/src/cli.rs`'s help-document pins are feature-sensitive:
+        # `frp-core/src/cli/help_doc_tests.rs`'s help-document pins are feature-sensitive:
         # `feature_adjusted_pin` keeps `--kcp-bind-port` only when `kcp` is on
         # and `--quic-bind-port` only when `quic` is on, so the pins have four
         # shapes. Two were executed — default features (both on, the step

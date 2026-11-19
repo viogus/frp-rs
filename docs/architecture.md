@@ -84,7 +84,8 @@ frp-rs/
     Cargo.toml
     src/
       lib.rs              Error types, Result, VERSION
-      cli.rs              CLI argument parsing (shared by frps + frpc)
+      cli/                CLI argument parsing — mod.rs + tests.rs,
+                          hoist_tests.rs, help_doc_tests.rs
       admin_auth.rs       HTTP Basic Auth middleware (admin API / dashboard)
       auth.rs             MD5 token authentication + OIDC verification
       bridge.rs           Encrypted/compressed data bridge (streaming CFB)
