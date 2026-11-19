@@ -1,6 +1,7 @@
 # Onboarding — first week
 
-You know Rust and you are inheriting a 210k-line proxy. This file is the
+You know Rust and you are inheriting a proxy of roughly 210k production lines.
+This file is the
 reading order, the five commands that define "green", and the traps that cost
 the last maintainers real time. It assumes you have `ssh` access to nothing and
 a laptop with Rust installed.
@@ -24,7 +25,7 @@ read, in this order:
    the transport stack, the bridge, and the KCP/NAT sections.
 2. [`naming.md`](naming.md) — 10 minutes. Three spellings of every config name
    and the ten places a setting touches; this is the highest-yield page here.
-3. `docs/CLAUDE.md`-style rules live in [`../CLAUDE.md`](../CLAUDE.md) — read the
+3. The rules live in [`../CLAUDE.md`](../CLAUDE.md) — read the
    "Development Workflow" section. It is binding, not advice.
 
 Do not start with [`config.md`](config.md) (1,100 lines of field reference, one
@@ -46,10 +47,13 @@ lookups, not reading.
 
 Two reading aids that save a day each:
 
-- `module_report` / `read_symbol` on any file give you the outline without
-  reading 3,000 lines. Test code is in sibling files
-  (`<name>/tests.rs`), so a source file is production code plus a one-line
-  module declaration.
+- Most source files open with a module-level doc comment that says what the
+  file owns; read that first, then jump by symbol (your editor's outline or
+  `grep -n "^pub \(async \)\?fn \|^pub struct "`). Some modules keep their tests
+  in a sibling `<name>/tests.rs` (for example
+  [`../frp-core/src/config/tests.rs`](../frp-core/src/config/tests.rs)) and the
+  parent ends with a one-line `mod tests;`; others keep an inline
+  `#[cfg(test)] mod tests` at the bottom. Check before you scroll.
 - [`../TODO.md`](../TODO.md) is the open-work ledger with a done-when per item.
   Headings marked `resolved` are history kept for the evidence.
 
@@ -59,7 +63,7 @@ Two reading aids that save a day each:
 cargo test --workspace --all-features          # needs an all-features frps binary
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
-bash scripts/repo-health.sh                     # invariants: paths, versions, pins
+bash scripts/repo-health.sh                     # invariants: paths, versions, toolchain pin
 bash scripts/tests/pathline-cite-guard.sh       # line-exact citations
 ```
 
@@ -87,15 +91,18 @@ claim; see [`developing.md`](developing.md).
    still says what was recorded. Re-point by *content*, then `--write`, then
    re-pin `guard_data_pin`. New files must be `git add`ed first — the guard
    scans tracked files only and will silently drop their rows.
-3. **Feature stubs drift.** Under `--no-default-features` the KCP/QUIC types
-   are stubs in [`../frp-core/src/lib.rs`](../frp-core/src/lib.rs). A method
+3. **Feature stubs drift.** Under `--no-default-features` the KCP, STUN and
+   XTCP types are stubs in [`../frp-core/src/lib.rs`](../frp-core/src/lib.rs)
+   (QUIC has no stub — it is gated at each call site instead). A method
    added to the real type and called from shared code compiles with the feature
    on and fails with it off — CI has a lane for each extreme; run
    `cargo check -p frp-core --no-default-features --all-targets` before pushing.
-4. **UTF-8 in byte strings.** `&[u8]` literals cannot take `"…"` with non-ASCII
-   when the destination is `Vec<u8>`-typed; and a `\`-continued literal's
-   continuation lines are re-indented by refactors without changing its value.
-5. **`.worktrees/*/target` eats the disk.** A worktree builds its own 10-20 GB
+4. **Byte strings are ASCII-only.** Write `"…".as_bytes()` when the text has
+   non-ASCII; `b"…"` cannot carry it. And a backslash-continued literal's
+   continuation lines are re-indented by refactors without changing its value,
+   so a formatter pass is not a semantic change.
+5. **`.worktrees/*/target` eats the disk.** A worktree builds its own target tree
+   (tens of gigabytes with debug info)
    target tree. Use `CARGO_TARGET_DIR=<main checkout>/target` and set
    `FRPS_BIN`/`FRPC_BIN` so integration tests find the binaries.
 6. **`docs/archive/`, `docs/history/`, `CHANGELOG.md` and `TODO.md` are
