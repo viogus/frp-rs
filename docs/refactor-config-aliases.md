@@ -1,6 +1,6 @@
 # One name, seven places: the configuration alias layer
 
-Status: **design note plus three verified defects — no behaviour has changed.**
+Status: **design note plus four verified defects — no behaviour has changed.**
 This replaces an earlier draft whose central premise was wrong; the review that
 falsified it is recorded in the PR. The correction is kept visible here because
 the wrong version is the intuitive one: the strict check does **not** run on the
@@ -15,10 +15,14 @@ validates: `run_strict_check_top_level` for `.ini` (the deprecation path) and
 call either function; it threads the `known_server_keys` / `known_client_keys`
 function pointers into `load_config_from_file`.
 
-`normalize` itself, in order: hoists a fixed list of root keys into
-`[transport]` (snake_case only), renames a table of Go camelCase spellings,
-flattens `[transport.tls]` onto the legacy top-level TLS fields, and — on the
-client — flattens `[transport.x]` to root `x` generically.
+`normalize` itself, on the server, in this order: hoists a fixed list of
+snake_case root keys into `[transport]`, flattens `[transport.tls]` onto the
+legacy top-level TLS fields, hoists a **second**, camelCase-keyed list of root
+keys (`heartbeatTimeout`, `maxPoolCount`, `tcpKeepalive`, …), and applies the
+Go camelCase rename table **last** — and only inside `[transport]`, so a
+camelCase key written at the root is never reached by it. On the client the
+order is the same until the end, where `[transport.x]` is flattened to root `x`
+generically.
 
 Then `serde` runs, and its `#[serde(alias = "…")]` attributes accept one extra
 spelling per field.
@@ -29,17 +33,20 @@ only if the normalizer or serde knows it, and acceptable only if the strict list
 knows the spelling *as it arrives at the check* — which is after the rename pass,
 for the names the rename pass covers.
 
-Inventory, measured on the working tree: 115 + 92 `#[serde(alias)]`, 5 + 5
-`rename`, 109 + 86 distinct spellings, 9 `flatten_to_table` call sites, 24 rename
-pairs, two root strict lists plus one arm per section, and 166 + 131 `pub` fields
-across the whole of `frp-core/src/config/server.rs` / `client.rs` (the top-level
-`ServerConfig` itself has 44 — the larger figure is the file, not the struct).
+Inventory, measured on the working tree: 115 + 92 `#[serde(alias)]` and 5 + 5
+`rename` attributes on the server/client config sources; 7 `flatten_to_table`
+call sites; 27 root-level rename pairs (plus per-table arms further down); two
+root strict lists of 110 and 100 entries (97 distinct on the client, which
+repeats three spellings) plus one arm per section and nine `*KNOWN_KEYS` arrays;
+and 168 + 132 `pub` field declarations across the whole of
+`frp-core/src/config/server.rs` / `client.rs` (the top-level `ServerConfig` itself
+has 44 — the larger figure is the file, not the struct).
 
-## Three defects this layer already has
+## Four defects this layer already has
 
-All three were reproduced with `frps verify -c`, i.e. through the strict path,
-not through the strict-free `load_*_config_from_str` helpers that every
-`test_parse_*` test uses:
+All four were reproduced by running `verify` on a config that uses them — three
+on `frps`, one on `frpc` — i.e. through the strict path, not through the
+strict-free `load_*_config_from_str` helpers that every `test_parse_*` test uses:
 
 1. **Accepted, then dropped.** `tcpMux = true` (and `tcpMuxKeepaliveInterval`,
    `tcpMuxKeepaliveTimeout`) at the root of `frps.toml` prints
@@ -48,11 +55,15 @@ not through the strict-free `load_*_config_from_str` helpers that every
    value is discarded. Same shape for `tls_skip_verify` / `tlsSkipVerify` at the
    root of `frps.toml`: they are in the **server** strict list but are a
    **client** field, so a server config that sets them is silently ignored.
-2. **Reachable, unlisted.** A field with a serde alias whose spelling is missing
-   from the list is rejected by default and accepted only in lenient mode. This
-   class has already shipped once (recorded in `docs/history/development-log.md`)
-   and is the reason the onboarding checklist tells contributors to register a
-   key in three places.
+2. **Reachable, unlisted — live on the client today.** `[transport.tls]
+   useSystemCa = true` in `frpc.toml` is a documented setting, and the default
+   strict mode refuses it with
+   `Config file /tmp/c1.toml is invalid: unknown field "tls_use_system_ca"`.
+   The client normalizer flattens the table to the root key `tls_use_system_ca`
+   and `known_client_keys()` never learned that name, so a setting the docs
+   advertise cannot be used in the configuration the docs recommend. This is the
+   same shape as defect 3, on the other binary, and it is the reason the
+   onboarding checklist tells contributors to register a key in three places.
 3. **The error names an internal key.** `[transport.tls] useSystemCa = true` in
    `frps.toml` is hoisted to the root key `tls_use_system_ca` *before* the check,
    which is not in `known_server_keys()`, so the user gets
@@ -61,8 +72,8 @@ not through the strict-free `load_*_config_from_str` helpers that every
    wrong here — the list is simply missing the key the hoist produces.
 
 Defect 1 and 3 are the same shape seen from opposite ends: the hoist and the
-strict list disagree about the name. Defect 2 is the serde aliases and the list
-disagreeing. No test catches either, because `test_parse_*` never runs the strict
+strict list disagree about the name. Defects 2 and 3 are one bug on two
+binaries — the hoist produces a root key the list never learned. No test catches either, because `test_parse_*` never runs the strict
 check, and the array-element parity test
 (`strict_array_element_keys_match_struct_fields`) covers only the nine
 `*KNOWN_KEYS` arrays — the two root lists are explicitly out of its scope.
@@ -73,9 +84,22 @@ check, and the array-element parity test
 new table.** A table that generates the lists is worth it only when the lists
 have stopped lying; otherwise it generates the same lies faster.
 
-The parity test is the load-bearing piece, and it has to run where the bug
-lives: drive a real `frps --verify` / `frpc --verify` over a generated config
-per section, with one spelling per entry of the strict list, and assert
+The parity test is the load-bearing piece. Two layers, cheapest first:
+
+- **A source-derived unit test.** `frp-core/src/config/tests.rs` already reads the
+  config sources with `include_str!`, so a test can assert that every `pub` field
+  and every `#[serde(alias)]`/`rename` spelling in `frp-core/src/config/server.rs`
+  and `client.rs` appears in the list the corresponding section validates
+  against, and that every strict-list key resolves to a field or an alias. About
+  fifty lines, no new machinery, and it *enumerates* the defect-2 population
+  instead of guessing at it. The strict path is also unit-testable directly —
+  `load_client_config(path, true)` runs the full check, unlike the lenient
+  `load_*_config_from_str` helpers every `test_parse_*` test uses.
+- **A CLI layer** for what a unit test cannot see: `frps`/`frpc verify` exit
+  codes, the `.ini` top-level-only strictness, and the `--strict-config=false`
+  escape hatch.
+
+Both assert
 
 - every spelling in a list is *accepted* by that binary in that section
   (kills defect 1 and the "one list is in the wrong mode" variant), and
@@ -108,11 +132,11 @@ new file, and a migration that has to touch the admin surface deliberately.
 
 ## Honest accounting of the per-knob cost
 
-The onboarding checklist has ten steps, and a table only removes two of them
-(the list entry and the alias). The rest — restart-only bookkeeping, a config
-test, the `docs/config.md` row, the Go-column suite row, the `CHANGELOG.md`
-bullet, and the citation-table regeneration that any `docs/config.md` edit
-triggers — remain. So the realistic post-table cost is **seven touch points, not
+The onboarding checklist has ten steps, and a table removes three of them (the
+serde alias, the strict-list entry, the hoist or flatten entry — design A drives
+all three). The rest — restart-only bookkeeping, a config test, the
+`docs/config.md` row, the Go-column suite row, the `CHANGELOG.md` bullet, and the
+citation-table regeneration that any `docs/config.md` edit triggers — remain. So the realistic post-table cost is **seven touch points, not
 two**, and the citation table is still regenerated per knob. Saying otherwise
 would repeat the mistake this note was written to correct.
 
@@ -127,7 +151,13 @@ would repeat the mistake this note was written to correct.
 
 ## Recommended order
 
-1. Three defect fixes plus the CLI-driven parity test, as one PR.
-2. Re-measure the per-knob cost with the parity test in place.
-3. Design A, if the parity test shows the lists can be trusted long enough to
+1. The source-derived parity test, first and alone — it prints the true size of
+   defect 2 instead of the three instances found by hand.
+2. Fix what it prints, in one PR: the three named defects, the client
+   `useSystemCa` instance, and the `docs/naming.md` line that currently documents
+   a root `tcpMux` being "accepted and then ignored" as intended behaviour.
+3. The CLI layer of the test, for exit codes, `.ini` strictness and the
+   `--strict-config=false` path.
+4. Re-measure the per-knob cost with the tests in place.
+5. Design A, if the parity test shows the lists can be trusted long enough to
    migrate them.
