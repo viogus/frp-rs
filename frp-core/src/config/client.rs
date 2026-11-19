@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 use super::server::{
     default_authentication_timeout, default_heartbeat_timeout, default_token_auth_timeout,
     default_true, FeatureConfig, KcpOptions, LogConfig, ObservabilityConfig, PluginConfig,
-    QuicOptions,
-    StoreConfig, ValueSource, WebServerConfig,
+    QuicOptions, StoreConfig, ValueSource, WebServerConfig,
 };
 
 fn default_udp_packet_size_i64() -> i64 {

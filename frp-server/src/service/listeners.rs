@@ -337,21 +337,17 @@ impl Service {
                 kcp_config.dead_link = opts.dead_link;
             }
             spawn_boxed(Box::pin(async move {
-                let mut listener = match frp_core::kcp::KcpListener::bind(
-                    &kcp_addr2,
-                    kcp_config,
-                )
-                .await
-                {
-                    Ok(l) => {
-                        let _ = kcp_bind_tx.send(());
-                        l
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "KCP listener bind failed: {}", e);
-                        return;
-                    }
-                };
+                let mut listener =
+                    match frp_core::kcp::KcpListener::bind(&kcp_addr2, kcp_config).await {
+                        Ok(l) => {
+                            let _ = kcp_bind_tx.send(());
+                            l
+                        }
+                        Err(e) => {
+                            tracing::error!(error = %e, "KCP listener bind failed: {}", e);
+                            return;
+                        }
+                    };
                 tracing::info!(addr = %kcp_addr2, "KCP listener started on {}", kcp_addr2);
                 'kcp_accept: loop {
                     tokio::select! {

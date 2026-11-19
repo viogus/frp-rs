@@ -173,10 +173,9 @@ fn test_parse_server_kcp_dead_link() {
 fn test_parse_client_kcp_dead_link() {
     let cfg: ClientConfig = load_client_config_from_str("server_addr = '127.0.0.1'").unwrap();
     assert!(cfg.kcp_options.is_none());
-    let cfg: ClientConfig = load_client_config_from_str(
-        "server_addr = '127.0.0.1'\n[transport.kcp]\ndeadLink = 8",
-    )
-    .unwrap();
+    let cfg: ClientConfig =
+        load_client_config_from_str("server_addr = '127.0.0.1'\n[transport.kcp]\ndeadLink = 8")
+            .unwrap();
     assert_eq!(cfg.kcp_options.as_ref().map(|o| o.dead_link), Some(8));
 }
 
@@ -204,7 +203,11 @@ fn strict_client_mode_accepts_the_kcp_table() {
     // A typo inside the table is still refused in strict mode.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("frpc.toml");
-    std::fs::write(&path, "server_addr = '127.0.0.1'\n[transport.kcp]\ndeadLinks = 6\n").unwrap();
+    std::fs::write(
+        &path,
+        "server_addr = '127.0.0.1'\n[transport.kcp]\ndeadLinks = 6\n",
+    )
+    .unwrap();
     let error = load_client_config(path.to_str().unwrap(), true)
         .expect_err("a misspelt key inside [transport.kcp] must be refused");
     assert!(
