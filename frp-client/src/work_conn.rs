@@ -1422,7 +1422,7 @@ mod tests {
             server_auth_scopes: Vec::new(),
             disable_custom_tls_first_byte: true,
             keepalive_secs: 0,
-            kcp_dead_link: frp_core::kcp::KCP_DEAD_LINK_DEFAULT,
+            kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
             bind_addr: None,
             proxy_url: String::new(),
             dial_timeout_secs: 1,

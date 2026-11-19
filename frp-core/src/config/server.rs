@@ -1201,7 +1201,7 @@ impl Default for KcpOptions {
 }
 
 fn default_kcp_dead_link() -> u32 {
-    crate::kcp::KCP_DEAD_LINK_DEFAULT
+    crate::KCP_DEAD_LINK_DEFAULT
 }
 
 impl Default for QuicOptions {

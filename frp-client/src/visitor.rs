@@ -209,7 +209,7 @@ fn plan_visitor_dial(
         dial_timeout_secs: transport.dial_timeout_secs,
         // Visitor dials take the kcp-go default: the visitor transport section
         // does not expose `[transport.kcp]` (see docs/deployment.md).
-        kcp_dead_link: frp_core::kcp::KCP_DEAD_LINK_DEFAULT,
+        kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
         v2: transport.v2,
     };
     let yamux_keepalive_secs = if transport.tcp_mux {

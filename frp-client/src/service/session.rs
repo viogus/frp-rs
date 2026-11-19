@@ -605,7 +605,7 @@ impl Service {
             .kcp_options
             .as_ref()
             .map(|opts| opts.dead_link)
-            .unwrap_or(frp_core::kcp::KCP_DEAD_LINK_DEFAULT);
+            .unwrap_or(frp_core::KCP_DEAD_LINK_DEFAULT);
         let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
         let wc_proxy_url = cfg_local.proxy_url.clone();
         let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
@@ -639,7 +639,7 @@ impl Service {
                 .kcp_options
                 .as_ref()
                 .map(|o| o.dead_link)
-                .unwrap_or(frp_core::kcp::KCP_DEAD_LINK_DEFAULT),
+                .unwrap_or(frp_core::KCP_DEAD_LINK_DEFAULT),
             self.oidc_client.clone(),
             cfg_local.metas.clone(),
             cfg_local.proxy_url.clone(),

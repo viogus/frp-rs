@@ -692,7 +692,7 @@ impl Default for DialOptions {
             bind_addr: None,
             tcp_send_buffer_size: 0,
             tcp_recv_buffer_size: 0,
-            kcp_dead_link: crate::kcp::KCP_DEAD_LINK_DEFAULT,
+            kcp_dead_link: crate::KCP_DEAD_LINK_DEFAULT,
             proxy_url: None,
             v2: false,
         }

@@ -46,7 +46,7 @@ pub const MAX_KCP_MTU: usize = crate::kcp::socket::DRIVER_RECV_BUF_SIZE - KCP_WI
 /// Default retransmission bound before a KCP session is declared dead.
 /// kcp-go hard-codes 20 (`pkg/util/net/kcp.go`); frp-rs keeps that default and
 /// lets the config override it through `[transport.kcp] deadLink`.
-pub const KCP_DEAD_LINK_DEFAULT: u32 = 20;
+pub use crate::KCP_DEAD_LINK_DEFAULT;
 
 /// KCP transport configuration.
 #[derive(Debug, Clone)]

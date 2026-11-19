@@ -480,7 +480,7 @@ fn normalize_server_config_with_legacy_include_cleanup(
 /// entries and removed them; this drops what it did **not** consume — a
 /// `[includes] foo = 1` section, which Go v0.71.0 loads and ignores (rc 0 in both
 /// loader modes) but which would otherwise fail the `includes: Vec<String>` decode
-/// at `frp-core/src/config/client.rs:257`.
+/// at `frp-core/src/config/client.rs:256`.
 fn normalize_client_config_with_legacy_include_cleanup(
     value: &mut toml::Value,
     format: ConfigFormat,

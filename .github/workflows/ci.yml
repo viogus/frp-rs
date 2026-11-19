@@ -1328,7 +1328,7 @@ jobs:
           # and reds; lowering the declared total has to move both literals, and
           # `bash scripts/tests/todo-cite-guard.sh` prints the number to paste.
           guard_cites=101
-          guard_cites_floor=101
+          guard_cites_floor=604
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=fa7256d10fdd9ee792a306761c0c079aa758045467f4bc03515e33e1d4cd9443
+          guard_data_pin=a6e0ca48419fd2ab8d1987c222cf2557b1f374f781ef6d7d436152e0f5d22ed5
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
