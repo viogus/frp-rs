@@ -53,6 +53,11 @@
 #   27 a `path : N` spelling that names one of the tree's files is a violation,
 #      while a spaced form naming nothing (`Go : 817`) is not a cite at all;
 #   28 a `/N` after a shorthand or after a `, N` continuation is checked too.
+#   29 `--relocate` moves a cite a one-line insert shifted, rewrites the token,
+#      and leaves the tree green;
+#   30 `--relocate` refuses an ambiguous fingerprint instead of guessing;
+#   31 `--relocate` rewrites *every* cite on a citing line that carries two (a
+#      comma/shorthand list), and a second run moves nothing;
 #
 # Self-contained: no network, no cargo, no compat run. Synthetic trees live
 # under `mktemp -d` and are removed on every exit path.
@@ -91,7 +96,7 @@ FLOOR_EXEMPT=""
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fails"` alone is happy with no assertions at all.
-MIN_CHECKS=93
+MIN_CHECKS=97
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup_all() {
@@ -872,6 +877,38 @@ esac
 case $(cat "$TREE/notes.md") in
   *"$(cite fx/anchor.rs 3)"*) ok 'relocate: the ambiguous cite was left untouched' ;;
   *) bad "relocate: an ambiguous cite was rewritten: $(cat "$TREE/notes.md")" ;;
+esac
+
+hdr 'scenario 31 — `--relocate` rewrites every cite on one citing line'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s and %s -->' "$(cite fx/anchor.rs 2)" "$(shorthand '4')")"
+write_table
+printf 'inserted line\n' | cat - "$TREE/fx/anchor.rs" > "$TREE/fx/anchor.rs.new"
+mv "$TREE/fx/anchor.rs.new" "$TREE/fx/anchor.rs"
+RELOC_OUT=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --relocate "$TREE" "$TABLE" 2>&1)
+RELOC_RC=$?
+if [ "$RELOC_RC" -eq 0 ]; then
+  ok 'relocate: two cites on one line both move'
+else
+  bad "relocate: multi-cite line exited $RELOC_RC: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')"
+fi
+NOTE=$(cat "$TREE/notes.md")
+case $NOTE in
+  *"$(cite fx/anchor.rs 3)"*"$(shorthand '5')"*)
+    ok 'relocate: both tokens on the line were rewritten, not one' ;;
+  *) bad "relocate: a token kept its old number: $NOTE" ;;
+esac
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'relocate: the gate is green after a multi-cite move'
+else
+  bad "relocate: the gate still reds: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+RELOC_OUT=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --relocate "$TREE" "$TABLE" 2>&1)
+case $RELOC_OUT in
+  *'0 cite(s) moved by content, 0 left for a human'*)
+    ok 'relocate: a second run has nothing left to move' ;;
+  *) bad "relocate: not idempotent: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')" ;;
 esac
 
 hdr 'summary'

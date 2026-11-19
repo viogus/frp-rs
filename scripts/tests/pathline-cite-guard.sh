@@ -143,6 +143,12 @@
 # is the content-preserving half of a renumbering: `--write` alone would record
 # whatever text now sits at the stale number.
 #
+# It is **content-addressed, not history-aware**: if a cited line was *rewritten*
+# and its old text survives once elsewhere in the same file, `--relocate` moves
+# the cite to that survivor and the move is indistinguishable from a shift in its
+# output. Confirm each `relocate` line with `--derive` (which reads `git blame`)
+# before trusting a number that moved further than the insert you made.
+#
 # Regeneration: `bash scripts/tests/pathline-cite-guard.sh --write` re-bakes the
 # expectation file from the current tree. That is a **review surface, not
 # tamper-proofing**: `--write` records whatever the tree says, so repairing a
@@ -761,12 +767,12 @@ if mode == "derive":
     sys.exit(0)
 
 def build_rows(result):
+    """One row per cite; order is decided once, by `emit_table`'s `sorted(rows)`."""
     return ["\t".join([
         c["target"], str(c["line"]),
         "-" if c["end"] is None else str(c["end"]),
         c["fp"] or "-", c["fp_end"] or "-", c["kind"], c["cite"], c["raw"],
-        str(c["cite_line"])]) for c in
-        sorted(result["cites"], key=lambda c: (c["cite"], c["raw"], c["target"], c["line"]))]
+        str(c["cite_line"])]) for c in result["cites"]]
 
 
 def emit_table(result):
@@ -833,11 +839,12 @@ def emit_table(result):
 
 if mode == "relocate":
     def read_lines(rel):
+        """The file's lines, or None when it cannot be read as UTF-8 text."""
         try:
             with open(os.path.join(root, rel), encoding="utf-8") as fh:
                 return fh.read().split("\n")
         except (UnicodeDecodeError, OSError):
-            return []
+            return None
 
     def render_token(raw, target, line, end, old_target):
         pos = ":%d" % line if end is None else ":%d-%d" % (line, end)
@@ -873,12 +880,21 @@ if mode == "relocate":
             unresolved.append((row["cite"], row["cite_line"], row["raw"],
                                "the citing line or its token changed; this cite needs a human"))
             continue
+        if row["end"] is not None and row["end"] < row["line"]:
+            unresolved.append((row["cite"], row["cite_line"], row["raw"],
+                               "the recorded range ends before it starts (%d-%d); fix the "
+                               "table by hand" % (row["line"], row["end"])))
+            continue
         tlines = read_lines(row["target"])
+        if tlines is None:
+            unresolved.append((row["cite"], row["cite_line"], row["raw"],
+                               "cannot read the target file %s as text" % row["target"]))
+            continue
         hits = []
         for i, text in enumerate(tlines):
             if not text.strip() or fingerprint(text) != row["fp"]:
                 continue
-            if row["end"] is not None:
+            if row["end"] is not None and row["end"] != row["line"]:
                 off = row["end"] - row["line"]
                 if i + off >= len(tlines) or fingerprint(tlines[i + off]) != row["fp_end"]:
                     continue
@@ -896,6 +912,10 @@ if mode == "relocate":
         if new_raw == row["raw"]:
             continue
         clines = read_lines(row["cite"])
+        if clines is None:
+            unresolved.append((row["cite"], row["cite_line"], row["raw"],
+                               "cannot read the citing file as text"))
+            continue
         if row["cite_line"] - 1 >= len(clines):
             unresolved.append((row["cite"], row["cite_line"], row["raw"],
                                "the citing line is past the end of the file"))
@@ -906,19 +926,35 @@ if mode == "relocate":
                                "the token appears %d times on its citing line"
                                % text.count(row["raw"])))
             continue
-        edits.setdefault(row["cite"], {})[row["cite_line"]] = (row["raw"], new_raw)
+        edits.setdefault(row["cite"], {}).setdefault(row["cite_line"], []).append(
+            (row["raw"], new_raw))
         relocated += 1
 
+    # One citing line can carry several cites into the same target (an absolute
+    # token followed by a comma list of bare numbers); every one of them must be
+    # rewritten, or the table is re-baked around tokens whose halves disagree.
     for rel, changes in sorted(edits.items()):
         lines = read_lines(rel)
-        for ln, (was, now) in changes.items():
-            lines[ln - 1] = lines[ln - 1].replace(was, now)
+        if lines is None:
+            print("FAIL  cannot rewrite %s: it is no longer readable as text" % rel)
+            sys.exit(1)
+        for ln in sorted(changes):
+            if ln - 1 >= len(lines):
+                print("FAIL  cannot rewrite %s:%d: the file no longer has that line"
+                      % (rel, ln))
+                sys.exit(1)
+            for was, now in changes[ln]:
+                lines[ln - 1] = lines[ln - 1].replace(was, now)
         with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
-        for ln, (was, now) in sorted(changes.items()):
-            print("relocate  %s:%d  %s -> %s" % (rel, ln, was, now))
+        for ln in sorted(changes):
+            for was, now in changes[ln]:
+                print("relocate  %s:%d  %s -> %s" % (rel, ln, was, now))
     print("relocate: %d cite(s) moved by content, %d left for a human"
           % (relocated, len(unresolved)))
+    if relocated:
+        print("relocate: content-addressed — check each line above with --derive "
+              "before trusting a number that moved further than your edit")
     for rel, ln, raw, why in unresolved[:20]:
         print("  HUMAN  %s:%s %s  (%s)" % (rel, ln, raw, why))
     if unresolved:
