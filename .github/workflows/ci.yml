@@ -1404,7 +1404,7 @@ jobs:
         # suite must *say* it drove the gate red on an injected bad cite —
         # otherwise a gate that silently stopped scanning (an empty file list,
         # an emptied ledger, a regex that stopped matching) would look exactly
-        # like a clean tree. 40 is the number of scenario checks in
+        # like a clean tree. 60 is the number of scenario checks in
         # `scripts/tests/todo-cite-guard-fixtures.sh`.
         shell: bash
         run: |
