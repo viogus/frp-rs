@@ -1218,10 +1218,15 @@ KCP throughput regression), `=1` forces it on.
 ```toml
 # frps.toml and frpc.toml
 [transport.kcp]
-dead_link = 5   # default 20, kcp-go's value; 0 is refused at load
+dead_link = 5   # default 20, kcp-go's value; values below 3 are refused at load
 ```
 
-A KCP session is torn down after this many retransmissions of one segment.
+A KCP session is torn down once a segment has been transmitted this many times.
+The first transmission counts toward the bound, so `deadLink = 5` tolerates four
+retransmissions, and the loader refuses 1 and 2 outright — 1 dies on the first
+write and 2 on the first retransmission, which an ordinary reorder triggers.
+Timers and reordering share the counter, so a lossy path wants a bound well
+above the retransmission count you expect to be wasted.
 It is a timer, not a wire field: each side applies its own value, and a Go peer
 keeps 20 whatever you write here. Lowering it fails over faster after a silent
 peer and gives up sooner on a genuinely lossy link. Two measurements on a
@@ -1238,8 +1243,10 @@ be declared dead, so with the default pings the cadence dominates: the same
 freeze at the defaults was noticed at ~28 s at `deadLink = 5` and ~31 s at 20,
 because the client's heartbeat is 10 s under `tcpMux` and 30 s without it. If you
 need fast failover, lower `heartbeat_interval` first and treat `deadLink` as the
-second-order knob. Visitor dials (`[visitors]`) do not read this table; they use
-the kcp-go default of 20. On the client the value is read when a session is
+second-order knob. Two paths do not read this table and keep the kcp-go default
+of 20: visitor dials (`[visitors]`, including the XTCP visitor) and the XTCP
+proxy's own P2P data plane, which `[[proxies]] type = "xtcp"` sets up outside the
+control connection. On the client the value is read when a session is
 dialled, so a `frpc reload` does not re-arm connections that are already up —
 the new bound applies on the next reconnect.
 

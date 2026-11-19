@@ -96,7 +96,7 @@ pub(crate) struct VisitorListenerConfig {
 // bridge helpers with **no** visibility change on any of them; `stcp` itself
 // is private. `run_visitor_listener` is re-exported because
 // `crate::visitor::run_visitor_listener` is the spelled path at its only
-// caller (`frp-client/src/service/session.rs:1090`) and a path previously reachable from
+// caller (`frp-client/src/service/session.rs:1091`) and a path previously reachable from
 // outside this module must stay reachable. Its `pub(crate)` is the function's
 // original token — the re-export preserves it, it does not widen it.
 mod stcp;

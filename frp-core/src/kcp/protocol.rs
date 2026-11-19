@@ -1088,9 +1088,8 @@ impl<Output> Kcp<Output> {
 
     /// The retransmission bound currently in force (`[transport.kcp]
     /// deadLink`, kcp-go's `dead_link`).
-    #[cfg(test)]
     #[inline]
-    pub(crate) fn maximum_resend_times(&self) -> u32 {
+    pub fn maximum_resend_times(&self) -> u32 {
         self.dead_link
     }
 

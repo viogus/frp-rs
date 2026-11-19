@@ -1587,8 +1587,7 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             // address dialled is the one the KCP+TLS stream reports as its
             // `peer_addr`.
             let addr = udp_peer.to_string();
-            let mut kcp_cfg = crate::kcp::default_kcp_client_config();
-            kcp_cfg.dead_link = opts.kcp_dead_link.max(1);
+            let kcp_cfg = crate::kcp::kcp_client_config(opts.kcp_dead_link);
             let stream = crate::kcp::dial_kcp(&addr, kcp_cfg)
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
@@ -3362,7 +3361,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2338).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2337).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

@@ -611,7 +611,7 @@ fn transport_restart_changes(
         &old_kcp_options.clone().unwrap_or_default().dead_link,
         &new_kcp_options.clone().unwrap_or_default().dead_link,
         "transport.kcp.deadLink",
-        any,
+        ServerReader::Kcp,
     );
 }
 

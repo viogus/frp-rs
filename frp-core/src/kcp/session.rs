@@ -264,9 +264,10 @@ impl KcpSession {
             config.nodelay.nc,
         );
         // Retransmission bound before the driver declares the session dead
-        // (kcp-go's `dead_link`). Floored at 1: zero would let a single lost
-        // segment kill the session on the first RTO.
-        kcp.set_maximum_resend_times(config.dead_link.max(1));
+        // (kcp-go's `dead_link`). The config layer refuses anything below
+        // `KCP_DEAD_LINK_MIN`, because the first transmission already consumes
+        // one count; the clamp here is the second line of defence.
+        kcp.set_maximum_resend_times(config.dead_link.max(crate::KCP_DEAD_LINK_MIN));
 
         // Go frp (kcp-go) calls SetACKNoDelay(false) on its KCP sessions.
         // Our in-tree KCP implementation does not expose a set_ack_no_delay
@@ -1097,15 +1098,15 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_dead_link_is_clamped_to_one_retransmission() {
-        // Zero would kill the session on its first RTO, which cannot be what
-        // an operator meant; the config layer refuses it and the session
-        // constructor clamps it as a second line of defence.
+    fn a_dead_link_below_the_minimum_is_clamped() {
+        // 1 dies on the first write and 2 on the first retransmission, which
+        // cannot be what an operator meant; the config layer refuses them and
+        // the session constructor clamps as a second line of defence.
         let (read_tx, _read_rx) = tokio::sync::mpsc::channel(16);
         let mut config = test_config();
         config.dead_link = 0;
         let session = KcpSession::new(9, "127.0.0.1:9000".parse().unwrap(), config, read_tx);
-        assert_eq!(session.kcp.maximum_resend_times(), 1);
+        assert_eq!(session.kcp.maximum_resend_times(), crate::KCP_DEAD_LINK_MIN);
     }
 
     #[test]

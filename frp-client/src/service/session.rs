@@ -635,11 +635,7 @@ impl Service {
             cfg_local.v2,
             cfg_local.tcp_send_buffer_size,
             cfg_local.tcp_recv_buffer_size,
-            cfg_local
-                .kcp_options
-                .as_ref()
-                .map(|o| o.dead_link)
-                .unwrap_or(frp_core::KCP_DEAD_LINK_DEFAULT),
+            wc_kcp_dead_link,
             self.oidc_client.clone(),
             cfg_local.metas.clone(),
             cfg_local.proxy_url.clone(),

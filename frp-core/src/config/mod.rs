@@ -27,19 +27,23 @@ mod strict;
 #[cfg(test)]
 mod tests;
 
-/// Deserializer for `[transport.kcp] deadLink`: reject zero at load time.
+/// Deserializer for `[transport.kcp] deadLink`: reject the degenerate range at
+/// load time.
 ///
-/// A zero retransmission bound would declare a session dead on its first RTO,
-/// which reads as "the transport mysteriously never connects". Fail with a
-/// message that names the key instead; unset stays 20 (kcp-go's value).
+/// The state machine tears a session down once a segment has been transmitted
+/// `dead_link` times, so the first transmission already consumes one count: a
+/// bound of 1 kills the session on its first write and 2 on the first
+/// retransmission (which an ordinary reorder triggers). Both read as "the
+/// transport mysteriously never connects", so they are refused with a message
+/// that names the key; unset stays 20 (kcp-go's value).
 pub(crate) fn deserialize_kcp_dead_link<'de, D>(deserializer: D) -> Result<u32, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::Deserialize as _;
     match u32::deserialize(deserializer)? {
-        0 => Err(serde::de::Error::custom(
-            "transport.kcp.deadLink must be at least 1 (unset = 20)",
+        n if n < crate::KCP_DEAD_LINK_MIN => Err(serde::de::Error::custom(
+            "transport.kcp.deadLink must be at least 3 (unset = 20); the first transmission counts toward the bound",
         )),
         other => Ok(other),
     }

@@ -17,8 +17,11 @@ User-facing release notes for frp-rs.
   A KCP session used to die after 20 retransmissions of one segment — kcp-go's
   constant, unreachable from config even though the state machine had a setter
   no caller used. Both binaries accept `[transport.kcp] deadLink` (snake
-  `dead_link` too; `0` is refused at load) and apply it to every KCP session
-  they open, control and work connections alike. It is a timer, not a wire
+  `dead_link` too; anything below 3 is refused at load) and apply it to the KCP
+  sessions the control and work connections open. Visitor dials and the XTCP
+  proxy's P2P data plane still use the kcp-go default of 20. The first
+  transmission counts toward the bound, so `deadLink = 5` tolerates four
+  retransmissions. It is a timer, not a wire
   field: each side applies its own value and a Go peer keeps 20. On a 4-vCPU
   VM with `frps` frozen mid-transfer, `deadLink = 5` had the client declaring
   the session dead **0.7 s** after the freeze against **3.8 s** at the default

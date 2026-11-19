@@ -19,7 +19,7 @@
 //! tests exercise the two halves of `scope_requires_auth`'s OR
 //! (`frp-client/src/work_conn.rs:261`) — the scope can arrive from the client
 //! config (`additional_auth_scopes`) or from the server's LoginResp
-//! (`server_additional_auth_scopes`, read at `frp-client/src/service/session.rs:683`
+//! (`server_additional_auth_scopes`, read at `frp-client/src/service/session.rs:679`
 //! and threaded through `SessionCtx.server_scopes`) — so emptying EITHER
 //! threading in `handle_req_work_conn` reds exactly one of them.
 //!
@@ -149,7 +149,7 @@ async fn drive_one_req_work_conn(
         server_additional_auth_scopes: server_scopes,
     });
     // The OIDC config carries no `auth.token`, so the control-stream key is
-    // derive_key("") (frp-client/src/service/session.rs:690).
+    // derive_key("") (frp-client/src/service/session.rs:686).
     let enc_key = frp_core::encryption::derive_key("");
 
     let mock = tokio::spawn(async move {
