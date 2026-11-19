@@ -26,11 +26,12 @@ User-facing release notes for frp-rs.
   VM with `frps` frozen mid-transfer, `deadLink = 5` had the client declaring
   the session dead **0.7 s** after the freeze against **3.8 s** at the default
   20 (with `heartbeatInterval = 1` to keep writing). Only the tail shortens: a
-  session must *try* to write before it can be declared dead, so with default
-  pings the cadence dominates (10 s with `tcpMux`, 30 s without — frozen runs at
-  the defaults noticed nothing for ~28-31 s at 5 and 20 alike). Lower
-  `heartbeatInterval` first if you need fast failover; see
-  [`docs/deployment.md`](docs/deployment.md).
+  session must *try* to write before it can be declared dead, so the keepalive
+  cadence dominates: yamux's fixed 10 s PING under `tcpMux`, the 30 s client
+  heartbeat without it — frozen runs at the defaults noticed nothing for
+  ~28-31 s at 5 and 20 alike. Lowering `heartbeatInterval` only helps with
+  `tcpMux = false`; see [`docs/deployment.md`](docs/deployment.md) and
+  [`docs/archive/notes/2026-11-19-kcp-dead-link.md`](docs/archive/notes/2026-11-19-kcp-dead-link.md).
 
 - **The zero-copy `splice(2)` relay now works on the server side of plain `tcp` proxies.** The server sniffs each V1 work connection for the V2 magic before handing it to the proxy bridge, so the bridge always received a byte-replay wrapper (`PreRead`/`BufferedRead`) whose default `try_tcp()` returned `None` — and `relay_plain_fast_inner` needs *both* sides to be raw TCP before it splices. Every byte of such a tunnel was copied twice in userspace on the server side. Drained wrappers now delegate the fast path (an undrained one still refuses). With `tcp_mux = false` and `transport.tls.enable = false`, a 2048 MiB stream on a 4-vCPU Linux VM goes 1320 → 2248-2570 MiB/s (the raw loopback ceiling is 2489), and eight independent sessions go 1227 → 2266 MiB/s at one worker (2867 at four); server CPU drops from 0.99 to 0.81 cores on one flow. V2 work connections were never affected (they arrive unwrapped), and the defaults (`tcpMux` and TLS on) are unchanged: a yamux stream and a TLS record layer cannot be spliced. Measurements and the remaining default-path costs (yamux ~600 MiB/s, TLS ~2x CPU per byte) are in [`docs/archive/notes/2026-11-13-splice-wrapper-peel.md`](docs/archive/notes/2026-11-13-splice-wrapper-peel.md).
 

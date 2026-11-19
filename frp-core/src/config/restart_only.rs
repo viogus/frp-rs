@@ -610,7 +610,7 @@ fn transport_restart_changes(
         out,
         &old_kcp_options.clone().unwrap_or_default().dead_link,
         &new_kcp_options.clone().unwrap_or_default().dead_link,
-        "transport.kcp.deadLink",
+        "transport.kcp.dead_link",
         ServerReader::Kcp,
     );
 }
@@ -1575,6 +1575,10 @@ mod tests {
         let old = base();
         let mut new = base();
         set_gated_ports(&mut new);
+        #[cfg(feature = "kcp")]
+        {
+            new.transport.kcp_options = Some(crate::config::server::KcpOptions { dead_link: 7 });
+        }
         let changes = old.restart_only_changes(&new);
         for c in &changes {
             assert!(
@@ -1595,6 +1599,16 @@ mod tests {
         assert!(changes
             .iter()
             .any(|c| c.name == "websocket_port" && c.reader == ServerReader::Websocket));
+
+        // The KCP dead-link bound is read only by a build with the `kcp`
+        // feature, so its report must say so rather than `Any`.
+        #[cfg(feature = "kcp")]
+        assert!(
+            changes
+                .iter()
+                .any(|c| { c.name == "transport.kcp.dead_link" && c.reader == ServerReader::Kcp }),
+            "the dead-link bound must be classified as read by the kcp listener: {changes:?}"
+        );
 
         // In the micro tier none of the three fields exists, so every arm above
         // is compiled out and the loop is empty. Anchor the test there rather

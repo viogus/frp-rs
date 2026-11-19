@@ -1239,11 +1239,16 @@ peer and gives up sooner on a genuinely lossy link. Two measurements on a
 | 20 (default) | 3.8 s |
 
 The bound only shortens the tail. A session has to *try* to write before it can
-be declared dead, so with the default pings the cadence dominates: the same
-freeze at the defaults was noticed at ~28 s at `deadLink = 5` and ~31 s at 20,
-because the client's heartbeat is 10 s under `tcpMux` and 30 s without it. If you
-need fast failover, lower `heartbeat_interval` first and treat `deadLink` as the
-second-order knob. Two paths do not read this table and keep the kcp-go default
+be declared dead, so the transport's keepalive cadence dominates: the same freeze
+at the defaults was noticed at ~28 s at `deadLink = 5` and ~31 s at 20. What
+supplies that traffic depends on `tcpMux`: with it on (the default) the client
+heartbeat is disabled (`heartbeat_interval` is normalised to `-1`) and yamux's
+own PING — a fixed 10 s in the vendored yamux, not a setting — is the only
+traffic; with `tcp_mux = false` the client heartbeat (30 s by default) is. That
+is why the measured tail sits near 30 s rather than near the PING: the freeze has
+to fall inside a heartbeat window. Lowering `heartbeat_interval` therefore only
+helps with `tcp_mux = false`; with yamux there is no knob, and `deadLink` is the
+second-order lever either way. Two paths do not read this table and keep the kcp-go default
 of 20: visitor dials (`[visitors]`, including the XTCP visitor) and the XTCP
 proxy's own P2P data plane, which `[[proxies]] type = "xtcp"` sets up outside the
 control connection. On the client the value is read when a session is

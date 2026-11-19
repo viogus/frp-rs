@@ -171,9 +171,15 @@ fn test_parse_server_kcp_dead_link() {
             "unexpected error for {degenerate}: {error}"
         );
     }
-    // The hop from the parsed table to the listener config is what the
-    // listener actually consumes; pin it here so deleting the assignment in
-    // `start_kcp_listener` cannot stay green.
+}
+
+/// The hop from the parsed table to the listener config. The function is
+/// inside the `kcp` feature, so this test has to be as well; it pins the
+/// argument being taken (not that `start_kcp_listener` calls it — that call is
+/// reviewed by reading).
+#[cfg(feature = "kcp")]
+#[test]
+fn the_listener_config_carries_the_parsed_bound() {
     let cfg: ServerConfig =
         load_server_config_from_str("bindPort = 7000\n[transport.kcp]\ndeadLink = 7").unwrap();
     assert_eq!(
@@ -9248,7 +9254,7 @@ fn legacy_ini_typed_array_root_visitor_is_collected() {
 /// reserved-root bypass keys on the **port** keys and never on `type`, because
 /// keying it on `type` would collect every typed settings root and contradict
 /// `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:11614`) and the `[web_server] type`-only v1
+/// (`frp-core/src/config/tests.rs:11620`) and the `[web_server] type`-only v1
 /// boundary. This test pins the strict verdict so the delta is measured rather
 /// than silent.
 #[test]
@@ -15492,7 +15498,7 @@ fn legacy_ini_start_comes_from_the_common_section_only() {
 /// `frp-core/src/config/format.rs:1499` is therefore gated on `legacy_ini`
 /// (`frp-core/src/config/format.rs:1333`); the legacy `[common]` case keeps the
 /// section (`legacy_ini_scalar_and_section_collision_keeps_the_section_like_go`,
-/// `frp-core/src/config/tests.rs:14079`).
+/// `frp-core/src/config/tests.rs:14085`).
 #[test]
 fn v1_ini_scalar_section_collision_is_still_a_type_error() {
     for (body, expected) in [
@@ -15908,7 +15914,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// and that `[p2]` is rc 0 with proxy `p1`. Non-strict frp-rs matches; the strict
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
-/// `frp-core/src/config/tests.rs:14058`. Without the `ini_section_started`
+/// `frp-core/src/config/tests.rs:14064`. Without the `ini_section_started`
 /// guard the role scan at `frp-core/src/config/normalize.rs:2193` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
@@ -15993,7 +15999,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// non-strict refusal is the loose-only divergence the item calls a follow-up.
 /// Recorded deliberate: making the two detectors agree would mean dropping
 /// `common` from the dotted-section roots, which the `[common.webServer.tls]`
-/// spelling pinned at `frp-core/src/config/tests.rs:8339` still needs. A mutant
+/// spelling pinned at `frp-core/src/config/tests.rs:8345` still needs. A mutant
 /// that forces `legacy_ini` false in the collector loads this file non-strict.
 #[test]
 fn dotted_common_only_section_is_legacy_for_the_collector_both_modes() {
@@ -16058,7 +16064,7 @@ fn default_section_header_is_an_ordinary_section_both_modes() {
 /// and loads zero proxies. The strict rc agrees; only the message and the
 /// non-strict verdict diverge, and matching Go's non-strict message would mean
 /// addressing the array element as `proxies[0]`, which the `.ini` reader does not
-/// do (pinned as out of scope at `frp-core/src/config/tests.rs:13869`). Both
+/// do (pinned as out of scope at `frp-core/src/config/tests.rs:13875`). Both
 /// modes pinned.
 #[test]
 fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
@@ -16094,7 +16100,7 @@ fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
 /// (`frp-core/src/config/normalize.rs:2337`) and loads `p2`, rc 0. Recorded
 /// deliberate: making a missing port fatal is a separate design question, and the
 /// sibling skip paths are pinned as intentional at
-/// `frp-core/src/config/tests.rs:11521` / `frp-core/src/config/tests.rs:11546`. Both modes pinned.
+/// `frp-core/src/config/tests.rs:11527` / `frp-core/src/config/tests.rs:11552`. Both modes pinned.
 #[test]
 fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
     let dir = tempfile::tempdir().unwrap();
@@ -16128,14 +16134,14 @@ fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
 /// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
 /// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
 /// and would contradict `test_legacy_ini_known_section_with_type_not_collected`
-/// (`frp-core/src/config/tests.rs:11571`). The item calls this a design question
+/// (`frp-core/src/config/tests.rs:11577`). The item calls this a design question
 /// about whether frp-rs keeps supporting v1 settings roots in `.ini` at all, so
 /// the divergence is recorded deliberate rather than forced. The sibling
 /// typeless/port-less shape (`c2.ini`, `[p] custom_domains = ["a.com"]`) is
 /// pinned the same way both modes: Go collects `p` (rc 0), frp-rs keeps it a v1
 /// section (`unknown field "p"` strict, rc 0 non-strict), matching
 /// `typeless_ini_section_without_ports_stays_a_v1_section`
-/// (`frp-core/src/config/tests.rs:8592`).
+/// (`frp-core/src/config/tests.rs:8598`).
 #[test]
 fn legacy_ini_reserved_root_type_only_section_is_not_collected_both_modes() {
     let dir = tempfile::tempdir().unwrap();

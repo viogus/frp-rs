@@ -1183,7 +1183,8 @@ pub struct QuicOptions {
 pub struct KcpOptions {
     /// Retransmissions of one segment before the session is declared dead.
     /// Default: 20 (kcp-go). Lower fails over faster on a black-holed peer;
-    /// higher tolerates a lossier path. `0` is refused at load.
+    /// higher tolerates a lossier path. Values below 3 are refused at load
+    /// (the first transmission counts toward the bound).
     #[serde(
         default = "default_kcp_dead_link",
         alias = "deadLink",

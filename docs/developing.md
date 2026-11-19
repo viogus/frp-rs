@@ -199,7 +199,7 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   ignored* by Go frp — the config is accepted and the setting is dropped. This is
   the single most expensive compatibility bug class in this repository.
 - The client plugin config struct is separate: `PluginConfig` at
-  `frp-core/src/config/server.rs:1476`.
+  `frp-core/src/config/server.rs:1477`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
 `fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1339`) checks
@@ -4121,7 +4121,7 @@ work; a bug fix on a frozen surface never needs an unfreeze.
   repo's CI does not exercise vnet on Windows.
 - **Non-default XTCP data plane (KCP+yamux)** — selected by `protocol = "kcp"`;
   the default is QUIC (`frp-core/src/config/client.rs:1052`,
-  `docs/config.md:673`). Unfreeze if a case is reported that the QUIC plane
+  `docs/config.md:675`). Unfreeze if a case is reported that the QUIC plane
   cannot serve (for example a hole punch where the QUIC handshake never
   completes but KCP does).
 
