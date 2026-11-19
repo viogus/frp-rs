@@ -1239,7 +1239,9 @@ freeze at the defaults was noticed at ~28 s at `deadLink = 5` and ~31 s at 20,
 because the client's heartbeat is 10 s under `tcpMux` and 30 s without it. If you
 need fast failover, lower `heartbeat_interval` first and treat `deadLink` as the
 second-order knob. Visitor dials (`[visitors]`) do not read this table; they use
-the kcp-go default of 20.
+the kcp-go default of 20. On the client the value is read when a session is
+dialled, so a `frpc reload` does not re-arm connections that are already up —
+the new bound applies on the next reconnect.
 
 **Heartbeat intervals:**
 
