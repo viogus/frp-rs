@@ -943,8 +943,28 @@ if mode == "relocate":
                 print("FAIL  cannot rewrite %s:%d: the file no longer has that line"
                       % (rel, ln))
                 sys.exit(1)
+            # Rewrite by *position*, right to left, never by repeated
+            # `str.replace`: a shift can map one token's new number onto
+            # another token's old one (112 -> 114 beside a 114), and a
+            # sequential replace would then rewrite both.
+            text = lines[ln - 1]
+            spans = []
             for was, now in changes[ln]:
-                lines[ln - 1] = lines[ln - 1].replace(was, now)
+                at = text.find(was)
+                if at < 0:
+                    print("FAIL  cannot rewrite %s:%d: %r is no longer on the line"
+                          % (rel, ln, was))
+                    sys.exit(1)
+                spans.append((at, at + len(was), now))
+            spans.sort(reverse=True)
+            for k in range(len(spans) - 1):
+                if spans[k][0] < spans[k + 1][1]:
+                    print("FAIL  cannot rewrite %s:%d: two cites overlap (%r, %r)"
+                          % (rel, ln, spans[k + 1][2], spans[k][2]))
+                    sys.exit(1)
+            for at, end_at, now in spans:
+                text = text[:at] + now + text[end_at:]
+            lines[ln - 1] = text
         with open(os.path.join(root, rel), "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
         for ln in sorted(changes):

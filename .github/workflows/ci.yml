@@ -1768,13 +1768,13 @@ jobs:
           sabotage_table=/tmp/frp-pathline-cite-sabotage.$$.txt
           status=0
           guard_file=scripts/tests/pathline-cite-fixtures.sh
-          guard_pin=73e841b8897d80f7b7dace53da417c760ddca5bfbb4a5c9c805c16de7f31d847
+          guard_pin=123ffc9d79e21e3dbb4b7f3d1b9db37421b900ed3e04cf22a624b4f4cd1d95dc
           guard_subject=scripts/tests/pathline-cite-guard.sh
-          guard_subject_pin=788c0a3dad0f336589f4ff4f609ec8b4cab432f985e5cfa9dcc8a519f44a35cb
+          guard_subject_pin=0685074b0ff444fb7058d096ed4bec4d219c741bd7f1166adf6e3149b323c0f6
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
           guard_data_pin=658f7b277e3bdbc3cd3c8b18ca5be091b1abeb856b99858ad9f8ae3fd08f118f
-          guard_exact=97
-          guard_floor=97
+          guard_exact=101
+          guard_floor=101
           guard_canary='witness M1: one-line insert reddened notes.md:1'
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step

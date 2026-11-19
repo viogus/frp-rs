@@ -90,7 +90,10 @@ claim; see [`developing.md`](developing.md).
    stale) line now says, so a run without a content check silently turns a
    broken pointer into a "passing" one. For the common case — an insert above a
    cited line — `--relocate` moves the cite to the one line that still carries
-   the recorded text and refuses when that text is gone or ambiguous; otherwise
+   the recorded text and refuses when that text is gone or ambiguous — it is
+   content-addressed, not history-aware, so a *rewritten* line whose old text
+   survives elsewhere is moved too and looks like a shift: confirm each
+   `relocate` line with `--derive`; otherwise
    re-point by *content* by hand. Either way finish with `--write` and re-pin
    `guard_data_pin`. New files must be `git add`ed first — the guard
    scans tracked files only and will silently drop their rows.

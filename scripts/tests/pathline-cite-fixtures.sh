@@ -58,6 +58,8 @@
 #   30 `--relocate` refuses an ambiguous fingerprint instead of guessing;
 #   31 `--relocate` rewrites *every* cite on a citing line that carries two (a
 #      comma/shorthand list), and a second run moves nothing;
+#   32 `--relocate` does not sweep a neighbour whose old number equals another
+#      cite's new one;
 #
 # Self-contained: no network, no cargo, no compat run. Synthetic trees live
 # under `mktemp -d` and are removed on every exit path.
@@ -96,7 +98,7 @@ FLOOR_EXEMPT=""
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fails"` alone is happy with no assertions at all.
-MIN_CHECKS=97
+MIN_CHECKS=101
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup_all() {
@@ -863,8 +865,14 @@ write_table
 # Two lines now carry the recorded text and the recorded line no longer does:
 # the only honest answer is "a human decides".
 printf 'three\nthree\nother\nother\n' > "$TREE/fx/anchor.rs"
+cp "$TABLE" "$TREE/table.before"
 RELOC_OUT=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --relocate "$TREE" "$TABLE" 2>&1)
 RELOC_RC=$?
+if cmp -s "$TABLE" "$TREE/table.before"; then
+  ok 'relocate: a refusal leaves the table untouched'
+else
+  bad 'relocate: a refusal rewrote the table anyway'
+fi
 if [ "$RELOC_RC" -ne 0 ]; then
   ok "relocate: an ambiguous fingerprint exits $RELOC_RC instead of guessing"
 else
@@ -910,6 +918,34 @@ case $RELOC_OUT in
     ok 'relocate: a second run has nothing left to move' ;;
   *) bad "relocate: not idempotent: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')" ;;
 esac
+
+hdr 'scenario 32 — `--relocate` does not clobber a neighbour whose number it reuses'
+build_tree "$TREE"
+# 2 -> 3 after a one-line insert, and 3 -> 4: the first edit's *new* number is
+# the second cite's *old* one, which a sequential `replace` would rewrite twice.
+set_notes "$(printf '<!-- see %s and %s -->' "$(cite fx/anchor.rs 2)" "$(shorthand '3')")"
+write_table
+printf 'inserted line\n' | cat - "$TREE/fx/anchor.rs" > "$TREE/fx/anchor.rs.new"
+mv "$TREE/fx/anchor.rs.new" "$TREE/fx/anchor.rs"
+RELOC_OUT=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --relocate "$TREE" "$TABLE" 2>&1)
+RELOC_RC=$?
+NOTE=$(cat "$TREE/notes.md")
+if [ "$RELOC_RC" -eq 0 ]; then
+  ok 'relocate: a colliding pair exits 0'
+else
+  bad "relocate: a colliding pair exited $RELOC_RC: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')"
+fi
+case $NOTE in
+  *"$(cite fx/anchor.rs 3) and :4"*)
+    ok 'relocate: each token kept its own number when the shift reused a neighbour’s old one' ;;
+  *) bad "relocate: a token took its neighbour's number: $NOTE" ;;
+esac
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'relocate: the gate is green after a colliding move'
+else
+  bad "relocate: the gate reds after a colliding move: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
 
 hdr 'summary'
 if [ "$fails" -eq 0 ]; then
