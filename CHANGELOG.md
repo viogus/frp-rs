@@ -11,6 +11,29 @@ User-facing release notes for frp-rs.
 
 ## Unreleased
 
+### Fixes
+
+- **KCP: a peer that vanishes while the tunnel is idle is noticed in about two
+  seconds.** A KCP session was only declared dead when it had a segment in
+  flight, so a frozen peer survived until the application next wrote — 20-30 s
+  at the defaults, and unaffected by `[transport.kcp] deadLink` because nothing
+  was being sent to trip the bound. The driver now asks a quiet session for the
+  peer's window (`IKCP_CMD_WASK`, answered by `IKCP_CMD_WINS` — both already
+  part of the KCP wire format, so a Go peer answers without configuration), so
+  silence becomes observable: three probes 500 ms apart plus one interval for
+  the third answer. On a 4-vCPU VM a `SIGSTOP`ped `frps` was detected after
+  **1.05-1.15 s** at both `deadLink = 5` and 20, against "nothing within 15 s"
+  before. Idle cost is invisible (41/36 CPU ticks per 60 s against 40/39, and
+  44/40 against 43/39 with 200 idle proxies), single-flow KCP throughput is
+  unchanged (116.0/115.6 vs 107.2/119.1 MiB/s), a live idle connection still
+  carries data after 60 s, and `scripts/compat-test.sh` against Go frp v0.72.0
+  stays at 86/0. Sessions with data still rely on the retransmission bound.
+  `[transport.kcp] probe = false` turns it off — do that on the side whose
+  probes cannot reach the peer (normally the public side, when the peer is
+  behind a NAT whose mapping expired); leave it on for the NATed side, where
+  the probe traffic is what keeps the mapping alive. See
+  [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](docs/archive/notes/2026-11-19-kcp-liveness-probe.md).
+
 ### Notes
 
 - **KCP's retransmission bound is configurable (`[transport.kcp] deadLink`).**

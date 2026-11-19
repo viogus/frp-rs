@@ -156,6 +156,11 @@ pub struct KcpSession {
     data_window_start_ms: u32,
     /// Payload bytes received since `data_window_start_ms`.
     data_window_bytes: u32,
+    /// Driver-clock ms of the last window probe this session sent (0: none).
+    probe_sent_ms: u32,
+    /// Consecutive window probes the peer has not answered. Reset by any
+    /// inbound packet, so a single `IKCP_CMD_WINS` verdict clears it.
+    probes_unanswered: u32,
     shutdown: bool,
     /// Frame that couldn't be delivered to the read channel on the previous
     /// tick because the channel was full. Must be flushed before consuming
@@ -290,6 +295,8 @@ impl KcpSession {
             read_tx,
             pool: chunk_pool,
             last_rx_ms: 0,
+            probe_sent_ms: 0,
+            probes_unanswered: 0,
             data_window_start_ms: 0,
             data_window_bytes: 0,
             shutdown: false,
@@ -346,6 +353,51 @@ impl KcpSession {
     /// window's worth of segments).
     pub fn wait_snd(&self) -> usize {
         self.kcp.wait_snd()
+    }
+
+    /// Whether the driver should probe this session for liveness now.
+    ///
+    /// A session with nothing in flight cannot reach the retransmission
+    /// bound, so a peer that vanished while the tunnel was idle is noticed
+    /// only when the application next writes. The probe is a KCP window
+    /// request (`IKCP_CMD_WASK`), answered by `IKCP_CMD_WINS`; the answer
+    /// arrives through the normal receive path, so liveness needs no new
+    /// message on the wire.
+    ///
+    /// The gate is "nothing in flight", not "nothing waiting to be sent":
+    /// data parked in `snd_queue` behind a zero peer window never reaches
+    /// the wire, so `wait_snd() > 0` there and the retransmission bound can
+    /// never fire. Probing on an empty `snd_buf` covers that state too,
+    /// which is why this checks in-flight segments rather than `wait_snd`.
+    pub fn should_probe(&self, driver_clock_ms: u32) -> bool {
+        self.config.liveness_probe
+            && self.kcp.in_flight() == 0
+            && driver_clock_ms.wrapping_sub(self.last_rx_ms) >= crate::kcp::socket::PROBE_IDLE_MS
+            && driver_clock_ms.wrapping_sub(self.probe_sent_ms) >= crate::kcp::socket::PROBE_IDLE_MS
+    }
+
+    /// Queue one window request and count it as unanswered until a datagram
+    /// arrives. Called right before `update()`, whose flush emits the probe.
+    pub fn request_probe(&mut self, driver_clock_ms: u32) {
+        self.kcp.request_window_probe();
+        self.probe_sent_ms = driver_clock_ms;
+        self.probes_unanswered = self.probes_unanswered.saturating_add(1);
+    }
+
+    /// Whether the peer has missed enough probes to be declared dead.
+    ///
+    /// The bound is counted in probes rather than milliseconds so the
+    /// interval stays the driver's (`PROBE_IDLE_MS`) and a session that
+    /// answers slowly is not killed for being slow — only for silence.
+    ///
+    /// The last probe must also have had its own interval to be answered:
+    /// without that, the count reaches the bound on the tick *after* the one
+    /// that sends the final `WASK`, so the answer can never arrive — which
+    /// makes the documented tolerance a lie and costs a premature reconnect
+    /// whenever one answer is slow.
+    pub fn probe_expired(&self, driver_clock_ms: u32) -> bool {
+        self.probes_unanswered >= crate::kcp::socket::PROBE_MAX_UNANSWERED
+            && driver_clock_ms.wrapping_sub(self.probe_sent_ms) >= crate::kcp::socket::PROBE_IDLE_MS
     }
 
     /// Window the driver currently has this session at, in segments.
@@ -972,6 +1024,9 @@ impl KcpSession {
     /// on every input() success, including the first packet at creation.
     pub fn note_inbound(&mut self, driver_clock_ms: u32, bytes: usize) {
         self.last_rx_ms = driver_clock_ms;
+        // Any inbound datagram — including the `IKCP_CMD_WINS` answer to a
+        // probe — proves the peer is alive.
+        self.probes_unanswered = 0;
         if driver_clock_ms.wrapping_sub(self.data_window_start_ms)
             > crate::kcp::socket::ACTIVE_WINDOW_MS
         {
@@ -1085,6 +1140,7 @@ mod tests {
                 nc: true,
             },
             dead_link: KCP_DEAD_LINK_DEFAULT,
+            liveness_probe: true,
         }
     }
 
@@ -1343,6 +1399,7 @@ mod tests {
                 nc: true,
             },
             dead_link: KCP_DEAD_LINK_DEFAULT,
+            liveness_probe: true,
         }
     }
 
@@ -1523,6 +1580,165 @@ mod tests {
             shards[1].as_deref(),
             Some(&expected_row1[..]),
             "recovered row 1 (zero-padded to the group max)"
+        );
+    }
+
+    /// A session with nothing queued and no inbound traffic must start
+    /// probing after `PROBE_IDLE_MS`, and keep quiet inside the interval.
+    #[test]
+    fn a_quiet_session_probes_for_the_peer_window() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session = KcpSession::with_chunk_pool(
+            4242,
+            "127.0.0.1:9001".parse().unwrap(),
+            test_config(),
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        session.note_inbound(1_000, 40);
+        assert!(
+            !session.should_probe(1_000 + super::super::socket::PROBE_IDLE_MS - 1),
+            "a fresh session must not probe inside the idle interval"
+        );
+        assert!(session.should_probe(1_000 + super::super::socket::PROBE_IDLE_MS));
+        session.request_probe(1_500);
+        assert_eq!(
+            session.probes_unanswered, 1,
+            "requesting a probe must count it until the peer answers"
+        );
+        assert!(
+            !session.should_probe(1_500),
+            "the driver must not stack probes inside one interval"
+        );
+    }
+
+    /// One inbound datagram — the `IKCP_CMD_WINS` answer to a `WASK` — clears
+    /// the unanswered count, so a live peer is never declared dead.
+    #[test]
+    fn an_inbound_datagram_clears_unanswered_probes() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session = KcpSession::with_chunk_pool(
+            4243,
+            "127.0.0.1:9002".parse().unwrap(),
+            test_config(),
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        let interval = super::super::socket::PROBE_IDLE_MS;
+        let mut now = 1_000;
+        for _ in 0..super::super::socket::PROBE_MAX_UNANSWERED {
+            session.request_probe(now);
+            now += interval;
+        }
+        assert!(
+            !session.probe_expired(now - interval),
+            "the last probe must get its own interval to be answered"
+        );
+        assert!(
+            session.probe_expired(now),
+            "three unanswered probes plus their interval is a dead peer"
+        );
+        session.note_inbound(now, 24);
+        assert_eq!(session.probes_unanswered, 0, "an answer proves liveness");
+        assert!(!session.probe_expired(now));
+    }
+
+    /// A session carrying data must not be probed: the retransmission bound
+    /// already covers it, and a probe would compete with the payload for the
+    /// driver's flush.
+    #[test]
+    fn a_session_with_data_in_flight_is_not_probed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session = KcpSession::with_chunk_pool(
+            4244,
+            "127.0.0.1:9003".parse().unwrap(),
+            test_config(),
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        session.send(b"payload").unwrap();
+        // `send` parks the payload in `snd_queue`; the flush is what puts
+        // segments on the wire, and only those can reach the bound.
+        session.update(0).unwrap();
+        assert!(
+            session.wait_snd() > 0 && session.kcp.in_flight() > 0,
+            "the flush must leave a segment in flight"
+        );
+        assert!(
+            !session.should_probe(10_000),
+            "in-flight data is the retransmission bound's job"
+        );
+    }
+
+    /// `[transport.kcp] probe = false` must reach the session, not merely the
+    /// parsed option: the driver asks `should_probe`, so this is the pin that
+    /// keeps the operator's escape hatch wired end to end.
+    #[test]
+    fn a_session_with_probing_off_never_probes() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut config = test_config();
+        config.liveness_probe = false;
+        let session = KcpSession::with_chunk_pool(
+            4248,
+            "127.0.0.1:9007".parse().unwrap(),
+            config,
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        assert!(
+            !session.should_probe(60_000),
+            "probe = false must leave a quiet session alone"
+        );
+    }
+
+    /// The complement: data waiting behind a zero peer window never reaches
+    /// the wire, so the bound cannot fire and the probe has to cover it.
+    #[test]
+    fn a_flow_controlled_session_is_probed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session = KcpSession::with_chunk_pool(
+            4246,
+            "127.0.0.1:9005".parse().unwrap(),
+            test_config(),
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        // Peer advertised a zero window: `send` can only park the payload.
+        session.kcp.set_remote_window(0);
+        session.send(b"parked behind a closed window").unwrap();
+        session.update(0).unwrap();
+        assert_eq!(
+            session.kcp.in_flight(),
+            0,
+            "a closed peer window must keep the segment out of `snd_buf`"
+        );
+        assert!(session.wait_snd() > 0, "the payload is still queued");
+        assert!(
+            session.should_probe(10_000),
+            "queued-but-unsent data is exactly the case the bound cannot see"
+        );
+    }
+
+    /// The probe has to reach the wire as `IKCP_CMD_WASK`, or the peer has
+    /// nothing to answer and the count only measures our own silence.
+    #[test]
+    fn a_probe_request_emits_a_wask_segment() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session = KcpSession::with_chunk_pool(
+            4245,
+            "127.0.0.1:9004".parse().unwrap(),
+            test_config(),
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        session.request_probe(1_000);
+        let packets = session.update(1_000).unwrap();
+        assert!(
+            packets
+                .iter()
+                .any(|packet| packet.len() > 4 && packet[4] == super::super::protocol::KCP_CMD_WASK),
+            "a probe must flush as a WASK segment, got {:?}",
+            packets.iter().map(|p| p.get(4).copied()).collect::<Vec<_>>()
         );
     }
 

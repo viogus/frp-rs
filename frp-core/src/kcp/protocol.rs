@@ -44,7 +44,7 @@ const KCP_CMD_PUSH: u8 = 81;
 /// Cmd: acknowledge.
 const KCP_CMD_ACK: u8 = 82;
 /// Cmd: window probe (ask).
-const KCP_CMD_WASK: u8 = 83;
+pub(crate) const KCP_CMD_WASK: u8 = 83;
 /// Cmd: window size (tell).
 const KCP_CMD_WINS: u8 = 84;
 
@@ -927,6 +927,17 @@ impl<Output> Kcp<Output> {
         }
     }
 
+    /// Ask the peer for its window on the next `flush()`.
+    ///
+    /// The driver uses this as a liveness probe for a session that has
+    /// nothing in flight: `IKCP_CMD_WASK` is answered with `IKCP_CMD_WINS`,
+    /// so a quiet session produces a datagram each way without inventing
+    /// application bytes. Both commands are part of the KCP wire format that
+    /// kcp-go implements, so this adds no incompatibility.
+    pub fn request_window_probe(&mut self) {
+        self.probe |= KCP_ASK_SEND;
+    }
+
     /// Exponential-backoff window probing while the remote window is zero.
     fn probe_wnd_size(&mut self) {
         if self.rmt_wnd == 0 {
@@ -1044,10 +1055,29 @@ impl<Output> Kcp<Output> {
         self.snd_buf.len() + self.snd_queue.len()
     }
 
+    /// Segments already handed to the wire but not yet ACKed.
+    ///
+    /// Distinct from `wait_snd`: data can wait in `snd_queue` behind a zero
+    /// peer window without ever reaching the wire, and only in-flight
+    /// segments can reach the retransmission bound (see
+    /// `KcpSession::should_probe`).
+    pub fn in_flight(&self) -> usize {
+        self.snd_buf.len()
+    }
+
     /// Get the remote window size.
     #[inline]
     pub fn rmt_wnd(&self) -> u16 {
         self.rmt_wnd
+    }
+
+    /// Force the remote window, for tests that need a flow-controlled sender
+    /// without a live peer. Only the probe tests use it: with `0` a send can
+    /// only park in `snd_queue`, which is the state the retransmission bound
+    /// cannot see (see `KcpSession::should_probe`).
+    #[cfg(test)]
+    pub(crate) fn set_remote_window(&mut self, wnd: u16) {
+        self.rmt_wnd = wnd;
     }
 
     /// Set `rx_minrto`.

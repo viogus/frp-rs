@@ -104,6 +104,9 @@ pub struct ControlConnection {
     /// KCP retransmission bound before the session is declared dead
     /// (`[transport.kcp] deadLink`, frp-rs extension).
     kcp_dead_link: u32,
+    /// Whether the driver probes a quiet KCP session for liveness
+    /// (`[transport.kcp] probe`, frp-rs extension).
+    kcp_liveness_probe: bool,
     oidc_client: Option<Arc<OidcClient>>,
     /// Server's additional auth scopes from LoginResp. Combined with client
     /// config to decide whether Ping/NewWorkConn need auth.
@@ -149,6 +152,7 @@ impl ControlConnection {
         tcp_send_buffer_size: u32,
         tcp_recv_buffer_size: u32,
         kcp_dead_link: u32,
+        kcp_liveness_probe: bool,
         oidc_client: Option<Arc<OidcClient>>,
         metas: std::collections::HashMap<String, String>,
         proxy_url: String,
@@ -184,6 +188,7 @@ impl ControlConnection {
             tcp_send_buffer_size,
             tcp_recv_buffer_size,
             kcp_dead_link,
+            kcp_liveness_probe,
             oidc_client,
             server_auth_scopes: Vec::new(),
             metas,
@@ -223,6 +228,7 @@ impl ControlConnection {
             tcp_send_buffer_size: self.tcp_send_buffer_size,
             tcp_recv_buffer_size: self.tcp_recv_buffer_size,
             kcp_dead_link: self.kcp_dead_link,
+            kcp_liveness_probe: self.kcp_liveness_probe,
             proxy_url: opt_if_empty!(self.proxy_url),
             v2: self.v2,
             dial_timeout_secs: self.dial_server_timeout as u64,

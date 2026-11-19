@@ -1745,6 +1745,7 @@ mod tests {
             wc_disable_custom_tls_first_byte: false,
             wc_keepalive_secs: 7200,
             wc_kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
+            wc_kcp_liveness_probe: true,
             wc_bind_addr: None,
             wc_proxy_url: String::new(),
             wc_dial_timeout_secs: 10,

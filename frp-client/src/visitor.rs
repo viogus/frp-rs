@@ -96,7 +96,7 @@ pub(crate) struct VisitorListenerConfig {
 // bridge helpers with **no** visibility change on any of them; `stcp` itself
 // is private. `run_visitor_listener` is re-exported because
 // `crate::visitor::run_visitor_listener` is the spelled path at its only
-// caller (`frp-client/src/service/session.rs:1091`) and a path previously reachable from
+// caller (`frp-client/src/service/session.rs:1098`) and a path previously reachable from
 // outside this module must stay reachable. Its `pub(crate)` is the function's
 // original token — the re-export preserves it, it does not widen it.
 mod stcp;
@@ -210,6 +210,9 @@ fn plan_visitor_dial(
         // Visitor dials take the kcp-go default: the visitor transport section
         // does not expose `[transport.kcp]` (see docs/deployment.md).
         kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
+        // The visitor transport section does not expose
+        // `[transport.kcp] probe`, so the probe stays on.
+        kcp_liveness_probe: true,
         v2: transport.v2,
     };
     let yamux_keepalive_secs = if transport.tcp_mux {

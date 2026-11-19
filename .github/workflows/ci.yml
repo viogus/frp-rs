@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=dfd3d7399f48bce9189b8c40b51a856d035e54e2a529a44010798b542ce04220
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=71c745c0739a739910416db97fa832e93523c94e9097fa9efa0bc2fa64486e6d
+          guard_data_pin=10eac6642b4bdd1ece1a397b8f5e502341b776fd34dbd3108bbc8c67f1809d33
           guard_exact=86
           guard_floor=86
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2130,7 +2130,7 @@ jobs:
       # frpc/tests/cli_inputs.rs under `--features admin` — "Run frpc's CLI-input
       # tests with the admin feature". The `admin` flag changes the linked
       # client: the child binds its `[webServer]` and announces it
-      # (`frp-client/src/service/session.rs:1413`), which is what made the pre-fix
+      # (`frp-client/src/service/session.rs:1420`), which is what made the pre-fix
       # assertion in `a_config_file_named_after_a_subcommand_stays_a_config_file`
       # a false positive. Re-derived on this tree with
       # `cargo test -p frpc --features admin --test cli_inputs -- --list`.
@@ -3456,7 +3456,7 @@ jobs:
         # `a_config_file_named_after_a_subcommand_stays_a_config_file` was
         # invisible in this configuration. That hid a red: it read run mode's own
         # admin bind line (`frpc admin server starting on 127.0.0.1:<port>`,
-        # `frp-client/src/service/session.rs:1413`) as a dial of the config's
+        # `frp-client/src/service/session.rs:1420`) as a dial of the config's
         # `[webServer]` port.
         #
         # Scoped to the one target that needs the flag rather than the whole

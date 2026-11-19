@@ -613,6 +613,15 @@ fn transport_restart_changes(
         "transport.kcp.dead_link",
         ServerReader::Kcp,
     );
+    // `probe` is read at the same moment — the listener hands one `KcpConfig`
+    // to every session it accepts, so a reload cannot change it either.
+    push(
+        out,
+        &old_kcp_options.clone().unwrap_or_default().probe,
+        &new_kcp_options.clone().unwrap_or_default().probe,
+        "transport.kcp.probe",
+        ServerReader::Kcp,
+    );
 }
 
 /// Every restart-only `[ssh_tunnel_gateway]` difference.
@@ -1577,7 +1586,12 @@ mod tests {
         set_gated_ports(&mut new);
         #[cfg(feature = "kcp")]
         {
-            new.transport.kcp_options = Some(crate::config::server::KcpOptions { dead_link: 7 });
+            // Both knobs move, so both report: `probe` defaults to `true`,
+            // so flipping it to `false` is what makes the second entry appear.
+            new.transport.kcp_options = Some(crate::config::server::KcpOptions {
+                dead_link: 7,
+                probe: false,
+            });
         }
         let changes = old.restart_only_changes(&new);
         for c in &changes {
@@ -1608,6 +1622,16 @@ mod tests {
                 .iter()
                 .any(|c| { c.name == "transport.kcp.dead_link" && c.reader == ServerReader::Kcp }),
             "the dead-link bound must be classified as read by the kcp listener: {changes:?}"
+        );
+        // Same reader, same reason: the probe flag is baked into the listener's
+        // `KcpConfig` at startup, so a reload must report it rather than
+        // silently keep probing.
+        #[cfg(feature = "kcp")]
+        assert!(
+            changes
+                .iter()
+                .any(|c| { c.name == "transport.kcp.probe" && c.reader == ServerReader::Kcp }),
+            "the liveness probe flag must be classified as read by the kcp listener: {changes:?}"
         );
 
         // In the micro tier none of the three fields exists, so every arm above

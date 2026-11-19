@@ -1191,14 +1191,30 @@ pub struct KcpOptions {
         deserialize_with = "crate::config::deserialize_kcp_dead_link"
     )]
     pub dead_link: u32,
+    /// Probe a quiet session to tell a frozen peer from an idle one.
+    /// Default: true. frp-rs extension — Go frp has no equivalent, and a Go
+    /// peer answers the probe without any configuration of its own.
+    ///
+    /// Turn it off on the side whose probes cannot get through — normally the
+    /// public side, when the peer sits behind a NAT whose mapping expired:
+    /// those probes are dropped for reasons that say nothing about the peer's
+    /// health. Leave it on for the NATed side, where they keep the mapping
+    /// refreshed.
+    #[serde(default = "default_kcp_probe")]
+    pub probe: bool,
 }
 
 impl Default for KcpOptions {
     fn default() -> Self {
         Self {
             dead_link: default_kcp_dead_link(),
+            probe: default_kcp_probe(),
         }
     }
+}
+
+fn default_kcp_probe() -> bool {
+    true
 }
 
 fn default_kcp_dead_link() -> u32 {
