@@ -88,8 +88,11 @@ claim; see [`developing.md`](developing.md).
 2. **The citation table is line-exact.** Any edit above an existing citation
    shifts it. `--write` re-reads the tree and records whatever the (possibly
    stale) line now says, so a run without a content check silently turns a
-   broken pointer into a "passing" one. Re-point by *content* first, then
-   `--write`, then re-pin `guard_data_pin`. New files must be `git add`ed first — the guard
+   broken pointer into a "passing" one. For the common case — an insert above a
+   cited line — `--relocate` moves the cite to the one line that still carries
+   the recorded text and refuses when that text is gone or ambiguous; otherwise
+   re-point by *content* by hand. Either way finish with `--write` and re-pin
+   `guard_data_pin`. New files must be `git add`ed first — the guard
    scans tracked files only and will silently drop their rows.
 3. **Feature stubs drift.** Under `--no-default-features` the KCP, STUN and
    XTCP types are stubs in [`../frp-core/src/lib.rs`](../frp-core/src/lib.rs)

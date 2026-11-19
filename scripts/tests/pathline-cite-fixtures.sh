@@ -91,7 +91,7 @@ FLOOR_EXEMPT=""
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fails"` alone is happy with no assertions at all.
-MIN_CHECKS=86
+MIN_CHECKS=93
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup_all() {
@@ -821,6 +821,57 @@ run_gate
 case $LAST_OUT in
   *'notes.md:1 cites 3'*) ok 'slash after comma: the trailing number reds when it moves' ;;
   *) bad "slash after comma: the trailing number was not checked: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 29 — `--relocate` moves a cite a shift broke, by content'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs 3)")"
+write_table
+printf 'inserted line\n' | cat - "$TREE/fx/anchor.rs" > "$TREE/fx/anchor.rs.new"
+mv "$TREE/fx/anchor.rs.new" "$TREE/fx/anchor.rs"
+RELOC_OUT=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --relocate "$TREE" "$TABLE" 2>&1)
+RELOC_RC=$?
+if [ "$RELOC_RC" -eq 0 ]; then
+  ok 'relocate: exits 0 when the recorded text has exactly one new home'
+else
+  bad "relocate: exited $RELOC_RC: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')"
+fi
+case $RELOC_OUT in
+  *'1 cite(s) moved by content, 0 left for a human'*) ok 'relocate: reports one moved cite and no stragglers' ;;
+  *) bad "relocate: unexpected summary: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')" ;;
+esac
+case $(cat "$TREE/notes.md") in
+  *"$(cite fx/anchor.rs 4)"*) ok 'relocate: the citing token now names the line that carries the text' ;;
+  *) bad "relocate: the citing token was not rewritten: $(cat "$TREE/notes.md")" ;;
+esac
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'relocate: the gate is green afterwards'
+else
+  bad "relocate: the gate still reds: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+
+hdr 'scenario 30 — `--relocate` refuses an ambiguous fingerprint'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs 3)")"
+write_table
+# Two lines now carry the recorded text and the recorded line no longer does:
+# the only honest answer is "a human decides".
+printf 'three\nthree\nother\nother\n' > "$TREE/fx/anchor.rs"
+RELOC_OUT=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --relocate "$TREE" "$TABLE" 2>&1)
+RELOC_RC=$?
+if [ "$RELOC_RC" -ne 0 ]; then
+  ok "relocate: an ambiguous fingerprint exits $RELOC_RC instead of guessing"
+else
+  bad 'relocate: an ambiguous fingerprint was moved without a witness'
+fi
+case $RELOC_OUT in
+  *'refusing to guess'*) ok 'relocate: says it refuses to guess' ;;
+  *) bad "relocate: unexpected refusal text: $(printf '%s' "$RELOC_OUT" | tr '\n' ' ')" ;;
+esac
+case $(cat "$TREE/notes.md") in
+  *"$(cite fx/anchor.rs 3)"*) ok 'relocate: the ambiguous cite was left untouched' ;;
+  *) bad "relocate: an ambiguous cite was rewritten: $(cat "$TREE/notes.md")" ;;
 esac
 
 hdr 'summary'
