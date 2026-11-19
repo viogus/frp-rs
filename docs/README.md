@@ -22,6 +22,7 @@ read the [main README](../README.md) first, then pick from the tables below.
 | [Architecture](architecture.md) | **Canonical.** Wire protocol and message types, server accept loop and control plane, work-connection lifecycle, auth, encryption, transports, config normalization, XTCP hole punching, project/crate layout |
 | [Developer Guide](developing.md) | **Contributor path for a new proxy type or client plugin** (config, registration, listeners, tests, Go compat, review), building and feature flags, debugging, testing, release process |
 | [Refactoring the large modules](refactor-large-modules.md) | Where the code that is actually big is, and the seam to cut — **proposal, no code changed** |
+| [The configuration alias layer](refactor-config-aliases.md) | Why one setting lives in seven places, the three ways they disagree silently, and the table that would collapse them — **design only, no code changed** |
 | [`../CLAUDE.md`](../CLAUDE.md) | Agent/contributor **rules**: build matrix, versioning, workflow, dependency policy, invariants |
 | [Technical Details](technical-details.md) | *Moved* — redirect stub to [Architecture](architecture.md), kept so old links keep working |
 
