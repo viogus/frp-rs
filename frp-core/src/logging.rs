@@ -101,7 +101,7 @@ use tracing_subscriber::filter::{LevelFilter, Targets};
 /// pins that. R1 does not name the flag, so it is left for a separate item.
 ///
 /// Pinned by
-/// `frp-core/src/cli.rs::log_flag_zero_values_do_not_override_the_config_file`,
+/// `frp-core/src/cli/tests.rs::log_flag_zero_values_do_not_override_the_config_file`,
 /// `frps/tests/cli_completion.rs::cli_empty_log_level_keeps_the_config_files_level`
 /// and
 /// `frps/tests/log_completion.rs::cli_nonempty_log_level_flag_does_not_override_the_config_file`.
@@ -151,7 +151,7 @@ pub fn resolve_log_level(
 ///
 /// **The empty CLI value is filtered twice, and the second filter is what
 /// makes the file's destination survive.** `FrpsArgs::override_server_config`
-/// (`frp-core/src/cli.rs`) skips an empty `--log-file ""`, so the loaded file's
+/// (`frp-core/src/cli/mod.rs`) skips an empty `--log-file ""`, so the loaded file's
 /// `to` reaches this function; without that skip, `LogConfig::complete` would
 /// fill the clobbered `""` with the concrete `"console"`
 /// (`EmptyOr(c.To, "console")`, `pkg/config/v1/common.go:120`) and this filter

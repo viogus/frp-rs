@@ -7403,7 +7403,7 @@ additionalAuthScopes = ["HeartBeats"]
 #[test]
 fn test_strict_flag_false_disables_unknown_key_check() {
     // --strict-config=false must parse and disable strict mode (audit task 9
-    // finding 3). The CLI flag itself is exercised in frp-core/src/cli.rs
+    // finding 3). The CLI flag itself is exercised in frp-core/src/cli/mod.rs
     // tests; here the loader honors the bool.
     let mut client_file = tempfile::NamedTempFile::new().unwrap();
     client_file

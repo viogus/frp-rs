@@ -1315,7 +1315,7 @@ fn oidc_construction_failure_exits_3_whatever_the_issuer_path() {
 /// ```
 ///
 /// Two separate pre-fix defects are pinned here, both fixed by routing the flag
-/// through the shared bool-value parser (`frp-core/src/cli.rs`) **and** moving
+/// through the shared bool-value parser (`frp-core/src/cli/mod.rs`) **and** moving
 /// the `--version` check out of `frpc_parser()`'s `.map()` into
 /// `parse_frpc_args`:
 ///
