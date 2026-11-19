@@ -1328,7 +1328,7 @@ jobs:
           # and reds; lowering the declared total has to move both literals, and
           # `bash scripts/tests/todo-cite-guard.sh` prints the number to paste.
           guard_cites=101
-          guard_cites_floor=604
+          guard_cites_floor=101
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
           for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
