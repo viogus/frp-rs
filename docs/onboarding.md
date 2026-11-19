@@ -42,7 +42,7 @@ lookups, not reading.
 | a proxy type | [`../frp-server/src/control/`](../frp-server/src/control) on the server, [`../frp-client/src/proxy.rs`](../frp-client/src/proxy.rs) on the client |
 | a plugin | [`../frp-client/src/plugin/`](../frp-client/src/plugin) |
 | KCP behaviour | [`../frp-core/src/kcp/`](../frp-core/src/kcp) — the driver lives in `socket.rs`, the state machine in `protocol.rs` |
-| the CLI | [`../frp-core/src/cli/mod.rs`](../frp-core/src/cli/mod.rs) — the *surface* (name, default, help text, Go parity) is a data table (`FRPS_GO_FLAGS`, `FRPC_PROXY_GO_FLAGS`, …); parsing itself is hand-written |
+| the CLI | [`../frp-core/src/cli/mod.rs`](../frp-core/src/cli/mod.rs) — the *surface* (name, default, help text, Go parity) is a data table (`FRPS_GO_FLAGS`, `FRPC_PROXY_GO_FLAGS`, …) parsed by `bpaf`, with a hand-written argv pre-pass for `-c=value` forms |
 | the dashboard / status API | [`../frp-server/src/`](../frp-server/src) behind the `dashboard` feature |
 
 Two reading aids that save a day each:
@@ -86,10 +86,10 @@ claim; see [`developing.md`](developing.md).
    literal moves (`env.FRPC_CLI_TESTS`, the frps bin `n_floor`, `guard_cites`).
    Bump the count in the same commit, or you lose ten minutes per round trip.
 2. **The citation table is line-exact.** Any edit above an existing citation
-   shifts it; `--write` regenerates the fingerprints and will happily "fix" a
-   citation by baking the wrong line, because it only checks that the cited line
-   still says what was recorded. Re-point by *content*, then `--write`, then
-   re-pin `guard_data_pin`. New files must be `git add`ed first — the guard
+   shifts it. `--write` re-reads the tree and records whatever the (possibly
+   stale) line now says, so a run without a content check silently turns a
+   broken pointer into a "passing" one. Re-point by *content* first, then
+   `--write`, then re-pin `guard_data_pin`. New files must be `git add`ed first — the guard
    scans tracked files only and will silently drop their rows.
 3. **Feature stubs drift.** Under `--no-default-features` the KCP, STUN and
    XTCP types are stubs in [`../frp-core/src/lib.rs`](../frp-core/src/lib.rs)
@@ -101,13 +101,21 @@ claim; see [`developing.md`](developing.md).
    non-ASCII; `b"…"` cannot carry it. And a backslash-continued literal's
    continuation lines are re-indented by refactors without changing its value,
    so a formatter pass is not a semantic change.
-5. **`.worktrees/*/target` eats the disk.** A worktree builds its own target tree
-   (tens of gigabytes with debug info)
-   target tree. Use `CARGO_TARGET_DIR=<main checkout>/target` and set
-   `FRPS_BIN`/`FRPC_BIN` so integration tests find the binaries.
-6. **`docs/archive/`, `docs/history/`, `CHANGELOG.md` and `TODO.md` are
+5. **`.worktrees/*/target` eats the disk.** A worktree builds its own target
+   tree, which is tens of gigabytes with debug info. Use
+   `CARGO_TARGET_DIR=<main checkout>/target` and set `FRPS_BIN`/`FRPC_BIN` so
+   integration tests find the binaries.
+6. **`docs/archive/`, `docs/history/`, `docs/audit/`, `CHANGELOG.md`,
+   `TODO.md`, `performance-audit.md` and `docs/refactor-large-modules.md` are
    point-in-time.** Never edit their numbers to match new behaviour; add a dated
    section that says what changed. The citation guard deliberately skips them.
+7. **A narrowed build clobbers the dashboard test binary.** `cargo test -p frps`
+   or a clippy run that links `frps` replaces `target/debug/frps` with the
+   no-dashboard artifact — the same path the dashboard tests resolve through
+   `FRPS_BIN` — and the resulting failure says `port N not ready after 15s`, not
+   "wrong binary". Build with `cargo build -p frps --features dashboard` and run
+   `cargo test -p frp-server --features dashboard -j 1`; the wider
+   `cargo test --workspace --all-features` is unaffected.
 
 ## Working protocol (non-negotiable)
 

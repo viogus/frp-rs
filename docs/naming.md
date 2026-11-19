@@ -13,7 +13,7 @@ This file is the map. For the underlying compatibility rules see
 | Layer | Spelling | Example | Where it lives |
 |---|---|---|---|
 | Go config file (compat target) | `camelCase` | `tcpMux = false` | what users write, and what Go frp accepts |
-| frp-rs config file | either | `tcpMux` **or** `tcp_mux`, `workerThreads` **or** `worker_threads` | normalised in [`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs) |
+| frp-rs config file | per section | inside `[transport]`: `tcpMux` **or** `tcp_mux`; at the root: only `tcp_mux` (a root `tcpMux` passes strict mode and is then ignored) | normalised in [`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs) |
 | Rust field | `snake_case` | `tcp_mux: bool` | config structs in [`../frp-core/src/config/server.rs`](../frp-core/src/config/server.rs) and [`../frp-core/src/config/client.rs`](../frp-core/src/config/client.rs) |
 | JSON on the control channel | `snake_case` | `http_user`, `host_header_rewrite` | wire messages in [`../frp-core/src/msg.rs`](../frp-core/src/msg.rs) — **must** stay Go-compatible |
 
@@ -34,24 +34,40 @@ has its own failure mode. Read the one that applies before editing.
    `#[serde(alias = "theGoSpelling")]`. Nothing else needed.
 2. **Nested table that Go writes flat** — the client's `[transport.x]`
    sub-tables are *flattened* into root keys by `normalize_client_config`
-   ([`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs)),
-   so a table key must be listed in the flatten map or it is dropped.
+   ([`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs)).
+   A key the flatten map does not rename is moved to the root **under its own
+   name**, not dropped — where it is then either refused by the root strict list
+   or accepted and silently ignored, which is the failure mode to watch for.
 3. **Flat key that belongs in a table** — on the server, a few Go-era keys are
    *hoisted* into their table (`[transport]`, `[webServer]`) by
    `normalize_server_config` ([`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs)),
    with an explicit `("camelCase", "snake_case")` rename list inside the table.
 
-Order matters: the hoist and the flatten run **before** the in-table renames, so
-a spelling that only appears in the rename list will not be found by the hoist.
-Both spellings have to be listed in *both* places, or one of them becomes a
-silent no-op — that is the shape of bug this ordering produces.
+Order matters, and it differs by side. On the **server** the hoist runs before
+the in-table `RENAMES` pass, so a spelling that appears only in `RENAMES` is
+never found by the hoist; both spellings must be in the hoist list *and* in
+`RENAMES`. On the **client** there is no separate rename pass — the renames are
+inline in the flatten map — so the two places are the flatten map and the root
+strict list. A spelling missing from either place becomes a silent no-op, and
+that is the shape of bug this ordering produces.
 
-Strict mode reads a **fourth** list: `section_known_keys` in
-[`../frp-core/src/config/strict.rs`](../frp-core/src/config/strict.rs) decides
-whether a key is an error. A field that exists in the struct but is missing
-there is refused as `unknown field "…" in config file`, and a key that is in the
-list but not in the struct is accepted and ignored. The two must be updated
-together, in the same commit, with a test that loads the documented spelling.
+Strict mode — on by default — consults **three** different lists, and the one
+you must edit depends on where the key lands *after* normalisation:
+
+| Key lands | List | Where |
+|---|---|---|
+| at the root | `known_server_keys()` / `known_client_keys()` | [`../frp-core/src/config/strict.rs`](../frp-core/src/config/strict.rs) |
+| inside a nested section (`[transport]`, `[auth.oidc]`, …) | that section's arm of `section_known_keys` | same file |
+| inside an array element (`[[proxies]]`, …) | the corresponding `*KNOWN_KEYS` array | same file |
+
+A field present in the struct but missing from the list it needs is refused as
+`unknown field "…" in config file`; a key in the list but not in the struct is
+accepted and ignored. Neither mistake is caught by a test unless you write one:
+the normalising load path never calls the section check for a root key, and the
+drift guard in [`../frp-core/src/config/tests.rs`](../frp-core/src/config/tests.rs)
+covers neither the root lists (function-local) nor the section arms (inline
+literals). The two sides must be updated together, in the same commit, with a
+test that loads the documented spelling.
 
 ## Vocabulary
 
@@ -63,7 +79,7 @@ together, in the same commit, with a test that loads the documented spelling.
 | **visitor** | the client-side dialer for `stcp`/`xtcp`/`sudp` — it asks the server to connect it to a named proxy | a proxy; also not a plugin |
 | **bridge** | the data-plane copy between two streams, in [`../frp-core/src/bridge.rs`](../frp-core/src/bridge.rs) | **splice**, the Linux zero-copy fast path in [`../frp-core/src/splice.rs`](../frp-core/src/splice.rs); also not the *relay* naming variant below |
 | **relay** | `relay_plain_pooled` and friends — the pooled-buffer bridge entry points, also in [`../frp-core/src/bridge.rs`](../frp-core/src/bridge.rs) | bridge: same concept, different name. **Known wart**, kept to avoid a rename across its nine production call sites |
-| **transport** | the `Transport` trait and its implementors (tcp, tls, kcp, quic, websocket, yamux, ssh, aead, cipher) | **protocol**, which in config means the *carrier* choice (`transport.protocol = "kcp"`) — see the next row |
+| **transport** | the `Transport` trait and its implementors (tcp, tls, kcp, quic, websocket, yamux, ssh, aead, pre_read, buffered_read) | **protocol**, which in config means the *carrier* choice (`transport.protocol = "kcp"`) — see the next row |
 | **`transport.protocol`** | the config key that selects tcp/kcp/quic/websocket | the `Transport` trait; the name collides with the module, and `[transport] transport = …` is not an accepted key |
 | **`tcpMux` / yamux** | one TCP connection carrying many logical streams | `transport.tcpMux` is the switch; yamux is the implementation, vendored under [`../vendor/yamux`](../vendor/yamux) |
 | **`IoStream`** | `Box<dyn Transport>` newtype used everywhere a concrete stream type is inconvenient | a transport implementor — it *wraps* one |
@@ -80,7 +96,7 @@ change except the tests named below.
 
 1. Config struct field, `snake_case`, with `#[serde(default = "…")]`.
 2. `camelCase` alias, or a rename entry if the value lives in a table.
-3. `section_known_keys` entry in [`../frp-core/src/config/strict.rs`](../frp-core/src/config/strict.rs) — **both** spellings if the table is flattened.
+3. The strict-mode list for where the key lands after normalisation: `known_server_keys()` / `known_client_keys()` for a root key, that section's arm of `section_known_keys` for one inside `[transport]`-style tables, the `*KNOWN_KEYS` array for an array element — both spellings wherever both are accepted.
 4. Hoist/flatten entry in [`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs).
 5. Restart-only bookkeeping in [`../frp-core/src/config/restart_only.rs`](../frp-core/src/config/restart_only.rs) if the value is baked at startup (with the right `ServerReader`).
 6. A config test that loads the documented spelling and a strict-mode refusal test (`#[cfg(test)] mod tests` in [`../frp-core/src/config/tests.rs`](../frp-core/src/config/tests.rs)).
@@ -103,7 +119,8 @@ refactors badly), and replacing it with symbol anchors is scheduled in
 - **"timeout"** alone: say *dead link*, *idle timeout*, *dial timeout*,
   *write deadline*, *heartbeat interval*. They fire at different layers.
 - **"session"** alone: say *control session* (a login), *KCP session* (a conv),
-  *QUIC connection*, *visitor session* (an stcp tunnel).
+  *QUIC connection*, *yamux session* (one muxed TCP connection), *visitor
+  session* (an stcp tunnel).
 
 ## Where to look next
 
