@@ -44,7 +44,7 @@ const KCP_CMD_PUSH: u8 = 81;
 /// Cmd: acknowledge.
 const KCP_CMD_ACK: u8 = 82;
 /// Cmd: window probe (ask).
-const KCP_CMD_WASK: u8 = 83;
+pub(crate) const KCP_CMD_WASK: u8 = 83;
 /// Cmd: window size (tell).
 const KCP_CMD_WINS: u8 = 84;
 
@@ -925,6 +925,17 @@ impl<Output> Kcp<Output> {
         } else {
             0
         }
+    }
+
+    /// Ask the peer for its window on the next `flush()`.
+    ///
+    /// The driver uses this as a liveness probe for a session that has
+    /// nothing in flight: `IKCP_CMD_WASK` is answered with `IKCP_CMD_WINS`,
+    /// so a quiet session produces a datagram each way without inventing
+    /// application bytes. Both commands are part of the KCP wire format that
+    /// kcp-go implements, so this adds no incompatibility.
+    pub fn request_window_probe(&mut self) {
+        self.probe |= KCP_ASK_SEND;
     }
 
     /// Exponential-backoff window probing while the remote window is zero.

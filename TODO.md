@@ -13064,7 +13064,7 @@ remains the documented choice for one fat tunnel on a busy client, and
 Entry point:
 `docs/archive/notes/2026-11-16-worker-thread-default.md`.
 
-## P2 — measured: a silent KCP peer is noticed only when something is written
+## P2 — resolved: a silent KCP peer is noticed only when something is written
 
 A KCP session is declared dead on a retransmission bound (`[transport.kcp]
 deadLink`, default 20 — now configurable), but the bound can only fire when the
@@ -13074,9 +13074,11 @@ peer was noticed at ~28-31 s whether `deadLink` was 5 or 20. Anything that
 survives on the KCP transport therefore has a ~30 s blind spot regardless of
 how the retransmission bound is tuned.
 
-Proposal: have the KCP driver probe sessions that have been quiet for a chosen
-interval, so the bound fires on schedule instead of waiting for the next
-application write. Done when: a frozen peer is declared dead within ~2 s at the
-defaults with `deadLink = 5`; a 60 s idle soak over KCP with no traffic produces
-no false positives and no measurable CPU cost; and `scripts/compat-test.sh`
-stays green against Go frp v0.72.0.
+Resolved 2026-11-19: the driver probes a quiet session with `IKCP_CMD_WASK`
+(answered `IKCP_CMD_WINS`), so silence becomes observable. Done-when met and
+measured on a 4-vCPU VM: a frozen peer was declared dead after **1.05 s**
+(`deadLink = 5`) and **1.15 s** (`deadLink = 20`), where the pre-probe build saw
+nothing within 15 s; a 60 s idle soak produced no dead-link line and identical
+CPU (40/39 ticks before, 41/36 after); and `scripts/compat-test.sh` against Go
+frp v0.72.0 stayed at 86 passed / 0 failed. Evidence:
+[`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](docs/archive/notes/2026-11-19-kcp-liveness-probe.md).

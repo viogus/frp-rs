@@ -150,6 +150,20 @@ const AUTO_WINDOW_FLOOR: u16 = 1024;
 /// A session counts as busy if it moved payload within this many milliseconds.
 pub(crate) const ACTIVE_WINDOW_MS: u32 = 250;
 
+/// How long a session with nothing in flight stays quiet before the driver
+/// asks the peer for its window. That request is the session's liveness
+/// probe: KCP answers `IKCP_CMD_WASK` with `IKCP_CMD_WINS`, so silence
+/// becomes observable instead of waiting for the application's next write
+/// (which is how a frozen peer used to survive for the 20-30 s heartbeat
+/// period regardless of `[transport.kcp] deadLink`).
+pub(crate) const PROBE_IDLE_MS: u32 = 500;
+
+/// Consecutive unanswered probes before the session is declared dead. Three
+/// intervals is ~1.5 s after the first probe is due, which keeps a single
+/// dropped datagram from killing a live session while still detecting a
+/// frozen peer in about two seconds.
+pub(crate) const PROBE_MAX_UNANSWERED: u32 = 3;
+
 /// Window (segments) to advertise when `active` sessions are moving data.
 ///
 /// KCP paces one connection at roughly `window × segment / interval`, so a
@@ -758,6 +772,25 @@ impl KcpSocket {
                     self.drain_pending_udp();
                     self.to_remove.clear();
                     for (key, session) in &mut self.sessions {
+                        // A session with nothing in flight cannot reach the
+                        // retransmission bound, so a peer that vanished while
+                        // the tunnel was idle would be noticed only on the
+                        // next application write. Ask for the peer's window
+                        // instead (`should_probe`) and count the unanswered
+                        // requests; the answer arrives through the normal
+                        // receive path and clears the count.
+                        if session.probe_expired() {
+                            tracing::warn!(
+                                conv = key.0,
+                                peer = %key.1,
+                                "KCP session dead link (unanswered window probes)"
+                            );
+                            self.to_remove.push(*key);
+                            continue;
+                        }
+                        if session.should_probe(now_ms) {
+                            session.request_probe(now_ms);
+                        }
                         // A paused stream must not strand its last bytes: any
                         // held-back tail goes out on the tick.
                         if let Err(e) = session.flush_carry() {

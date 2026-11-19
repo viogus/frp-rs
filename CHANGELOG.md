@@ -11,6 +11,23 @@ User-facing release notes for frp-rs.
 
 ## Unreleased
 
+### Fixes
+
+- **KCP: a peer that vanishes while the tunnel is idle is now noticed in about
+  a second.** A KCP session was only declared dead when it had a segment in
+  flight, so a frozen peer survived until the application next wrote — 20-30 s
+  at the defaults, and unaffected by `[transport.kcp] deadLink` because nothing
+  was being sent to trip the bound. The driver now asks a quiet session for the
+  peer's window (`IKCP_CMD_WASK`, answered by `IKCP_CMD_WINS` — both already
+  part of the KCP wire format), so silence is observable: a `SIGSTOP`ped `frps`
+  was detected after **1.05-1.15 s** at both `deadLink = 5` and 20, against
+  "nothing within 15 s" before. Idle CPU is unchanged (40/39 ticks per 60 s
+  before, 41/36 after), single-flow KCP throughput is unchanged (116.0/115.6
+  vs 107.2/119.1 MiB/s), a live idle connection still carries data after 60 s,
+  and `scripts/compat-test.sh` against Go frp v0.72.0 stays at 86/0. Sessions
+  with data still rely on the retransmission bound; see
+  [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](docs/archive/notes/2026-11-19-kcp-liveness-probe.md).
+
 ### Notes
 
 - **KCP's retransmission bound is configurable (`[transport.kcp] deadLink`).**

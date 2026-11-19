@@ -1255,6 +1255,17 @@ control connection. On the client the value is read when a session is
 dialled, so a `frpc reload` does not re-arm connections that are already up —
 the new bound applies on the next reconnect.
 
+**Liveness probing (no knob):** the driver itself asks a quiet session for the
+peer's window — a KCP `IKCP_CMD_WASK` that the peer answers with
+`IKCP_CMD_WINS` — so a peer that vanished while the tunnel was idle is noticed
+in about a second instead of waiting for the application's next write. It runs
+only for sessions with nothing in flight (a session carrying data is still the
+retransmission bound's job), costs no measurable CPU when idle, and needs no
+setting: a `SIGSTOP`ped `frps` was detected after 1.05-1.15 s with `deadLink`
+at both 5 and 20, where the pre-probe build detected nothing within 15 s. A Go
+peer answers the same probe; see
+[`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](archive/notes/2026-11-19-kcp-liveness-probe.md).
+
 **Heartbeat intervals:**
 
 ```toml
