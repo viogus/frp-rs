@@ -158,10 +158,18 @@ pub(crate) const ACTIVE_WINDOW_MS: u32 = 250;
 /// period regardless of `[transport.kcp] deadLink`).
 pub(crate) const PROBE_IDLE_MS: u32 = 500;
 
-/// Consecutive unanswered probes before the session is declared dead. Three
-/// intervals is ~1.5 s after the first probe is due, which keeps a single
-/// dropped datagram from killing a live session while still detecting a
-/// frozen peer in about two seconds.
+/// Consecutive unanswered probes before the session is declared dead.
+///
+/// Three probes leave at the first three 500 ms intervals (t = 0.5 s,
+/// 1.0 s, 1.5 s after the session goes quiet) and the tear-down waits one
+/// more interval so the third `IKCP_CMD_WINS` still has time to arrive:
+/// a frozen peer is removed ~2.0 s after its last datagram, while a single
+/// dropped probe or a slow answer costs nothing. Two consecutive losses do
+/// not kill a live session either — the peer must miss all three.
+///
+/// Set `[transport.kcp] probe = false` where the inbound path is closed
+/// while idle (a NATed frps, an expiring client mapping): those probes are
+/// dropped for reasons that say nothing about the peer.
 pub(crate) const PROBE_MAX_UNANSWERED: u32 = 3;
 
 /// Window (segments) to advertise when `active` sessions are moving data.
@@ -779,7 +787,7 @@ impl KcpSocket {
                         // instead (`should_probe`) and count the unanswered
                         // requests; the answer arrives through the normal
                         // receive path and clears the count.
-                        if session.probe_expired() {
+                        if session.probe_expired(now_ms) {
                             tracing::warn!(
                                 conv = key.0,
                                 peer = %key.1,
@@ -1959,6 +1967,7 @@ mod tests {
                 nc: true,
             },
             dead_link: super::super::config::KCP_DEAD_LINK_DEFAULT,
+            liveness_probe: true,
         };
         let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(16);
         let mut sender = KcpSession::new(1, "127.0.0.1:9001".parse().unwrap(), cfg.clone(), tx1);
@@ -2040,5 +2049,99 @@ mod tests {
                 "message {i}: fully-consumed channel buffer was not recycled to the chunk pool"
             );
         }
+    }
+
+    /// A quiet session whose peer answers the window probe must survive; one
+    /// whose peer never answers must be removed by the driver tick.
+    ///
+    /// This is the only test that exercises the tick wiring itself: deleting
+    /// the probe block from `run` leaves every session-level test green, so
+    /// without this the feature could be disconnected in a refactor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_driver_reaps_a_silent_peer_and_keeps_an_answering_one() {
+        use super::super::session::KcpSession as Session;
+
+        // Peers are raw UDP sockets: the silent one never replies, the other
+        // answers every WASK with a bare WINS segment.
+        let silent = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent_addr = silent.local_addr().unwrap();
+        let answering = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let answering_addr = answering.local_addr().unwrap();
+        let answer_task = tokio::spawn(async move {
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok((n, from)) = answering.recv_from(&mut buf).await else {
+                    return;
+                };
+                // KCP header: conv(4) cmd(1) frg(1) wnd(2) ts(4) sn(4)
+                // una(4) len(4) = 24 bytes; only answer window requests.
+                if n >= 24 && buf[4] == super::super::protocol::KCP_CMD_WASK {
+                    let mut wins = [0u8; 24];
+                    wins[..4].copy_from_slice(&buf[..4]);
+                    wins[4] = 84; // KCP_CMD_WINS
+                    let _ = answering.send_to(&wins, from).await;
+                }
+            }
+        });
+
+        let local = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = crate::kcp::default_kcp_config();
+        // No FEC: the stub peers speak bare KCP segments.
+        config.data_shards = 0;
+        config.parity_shards = 0;
+        let (socket, handle, _accept_rx) = KcpSocket::new(Arc::new(local), config.clone());
+        let (silent_tx, mut silent_rx) = mpsc::channel::<Vec<u8>>(4);
+        let silent_session = Session::with_chunk_pool(
+            9101,
+            silent_addr,
+            config.clone(),
+            silent_tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        let (answering_tx, mut answering_rx) = mpsc::channel::<Vec<u8>>(4);
+        let answering_session = Session::with_chunk_pool(
+            9102,
+            answering_addr,
+            config.clone(),
+            answering_tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        handle
+            .register_tx
+            .send((9101, silent_addr, silent_session))
+            .await
+            .unwrap();
+        handle
+            .register_tx
+            .send((9102, answering_addr, answering_session))
+            .await
+            .unwrap();
+        let driver = tokio::spawn(async move { socket.run().await });
+
+        // The silent session's read channel closes when the driver drops it.
+        // Three probes plus their interval is ~2 s; allow slack for a slow CI
+        // box without weakening the assertion (a live session never closes).
+        let reaped =
+            tokio::time::timeout(std::time::Duration::from_secs(6), silent_rx.recv()).await;
+        assert!(
+            matches!(reaped, Ok(None)),
+            "a session whose peer never answers the window probe must be removed, got {reaped:?}"
+        );
+
+        // The answering session must still be there after the same window.
+        assert!(
+            answering_rx.try_recv().is_err(),
+            "the answering peer's session must stay open, not deliver data, and not close"
+        );
+        assert!(
+            matches!(
+                answering_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "the answering peer's read channel must still be open"
+        );
+
+        driver.abort();
+        answer_task.abort();
     }
 }

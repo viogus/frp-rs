@@ -13075,10 +13075,22 @@ survives on the KCP transport therefore has a ~30 s blind spot regardless of
 how the retransmission bound is tuned.
 
 Resolved 2026-11-19: the driver probes a quiet session with `IKCP_CMD_WASK`
-(answered `IKCP_CMD_WINS`), so silence becomes observable. Done-when met and
-measured on a 4-vCPU VM: a frozen peer was declared dead after **1.05 s**
-(`deadLink = 5`) and **1.15 s** (`deadLink = 20`), where the pre-probe build saw
-nothing within 15 s; a 60 s idle soak produced no dead-link line and identical
-CPU (40/39 ticks before, 41/36 after); and `scripts/compat-test.sh` against Go
-frp v0.72.0 stayed at 86 passed / 0 failed. Evidence:
+(answered `IKCP_CMD_WINS`), so silence becomes observable — three probes 500 ms
+apart, and the tear-down waits one more interval so the third answer can arrive
+(~2 s after the peer's last datagram). Done-when met and measured on a 4-vCPU
+VM: a frozen peer was declared dead after **1.05 s** and **1.15 s** (`deadLink`
+5 and 20, i.e. the bound is not what fires), where the pre-probe build saw
+nothing within 15 s; 60 s idle cost is unchanged (41/36 ticks against 40/39, and
+44/40 against 43/39 with 200 idle proxies); a live idle connection still carries
+data after 60 s; and `scripts/compat-test.sh` against Go frp v0.72.0 stayed at
+86 passed / 0 failed.
+
+Known trade-off, now documented rather than latent: on a side whose inbound path
+is closed while idle (a client behind NAT), probes are dropped for reasons that
+say nothing about the peer, so that side reaps healthy sessions and the peer
+reconnects on its next keepalive. Blocking `frps`→client UDP for 5 s on the VM
+made the server reap three sessions within ~2 s with the probe on and none with
+it off. `[transport.kcp] probe = false` is the escape hatch; the structural fix
+(a probe the peer can receive, i.e. no unsolicited inbound) is not available
+without NAT traversal, which KCP does not have. Evidence:
 [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](docs/archive/notes/2026-11-19-kcp-liveness-probe.md).

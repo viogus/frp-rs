@@ -80,6 +80,21 @@ pub struct KcpConfig {
     /// link; `[transport.kcp] deadLink` exposes it (frp-rs extension — Go frp
     /// hard-codes 20 in `pkg/util/net/kcp.go`).
     pub dead_link: u32,
+    /// Whether the driver probes a quiet session for liveness.
+    ///
+    /// A session with nothing in flight cannot reach the retransmission
+    /// bound, so without a probe a peer that vanished while the tunnel was
+    /// idle is noticed only on the next application write. The probe is a
+    /// KCP window request (`IKCP_CMD_WASK`) answered by `IKCP_CMD_WINS`, so
+    /// liveness needs no new message on the wire and no new config.
+    ///
+    /// Turn it off (`[transport.kcp] probe = false`) where the inbound path
+    /// is legitimately closed while idle — an frps behind NAT, or a client
+    /// whose NAT mapping expires: probes the peer never receives would
+    /// count toward the bound and cost a reconnect per mapping lifetime.
+    /// That trade-off is real and cannot be told apart from a dead peer
+    /// locally, so the operator decides per side.
+    pub liveness_probe: bool,
 }
 
 impl Default for KcpConfig {
@@ -93,6 +108,7 @@ impl Default for KcpConfig {
             parity_shards: 0,
             stream: true,
             dead_link: KCP_DEAD_LINK_DEFAULT,
+            liveness_probe: true,
         }
     }
 }

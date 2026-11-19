@@ -199,7 +199,7 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   ignored* by Go frp — the config is accepted and the setting is dropped. This is
   the single most expensive compatibility bug class in this repository.
 - The client plugin config struct is separate: `PluginConfig` at
-  `frp-core/src/config/server.rs:1477`.
+  `frp-core/src/config/server.rs:1491`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
 `fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1339`) checks
@@ -918,7 +918,7 @@ The surface is much smaller than a proxy type's, and unlike a proxy type it has
   `local_addr`, the task's `JoinHandle`, and a shutdown sender. Existing plugins
   in `frp-client/src/plugin/` are the templates; pick the closest one
   (`socks5.rs` for a protocol speaker, `static_file.rs` for a trivial one).
-- `frp-client/src/service.rs:739` starts plugins for `p.plugin`. `virtual_net`
+- `frp-client/src/service.rs:740` starts plugins for `p.plugin`. `virtual_net`
   is special-cased there because its work connections go to the shared vnet
   controller in `frp-client/src/work_conn.rs`.
 - Server-side plugins are a **different** surface: `frp-server/src/plugin/mod.rs`

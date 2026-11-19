@@ -231,6 +231,7 @@ struct SessionCtx {
     /// work-conn dial so a standalone KCP work connection tears down on the
     /// same retransmission bound as the control connection.
     wc_kcp_dead_link: u32,
+    wc_kcp_liveness_probe: bool,
     wc_bind_addr: Option<String>,
     wc_proxy_url: String,
     wc_dial_timeout_secs: u64,
@@ -994,6 +995,7 @@ impl Service {
             disable_custom_tls_first_byte: ctx.wc_disable_custom_tls_first_byte,
             keepalive_secs: ctx.wc_keepalive_secs,
             kcp_dead_link: ctx.wc_kcp_dead_link,
+            kcp_liveness_probe: ctx.wc_kcp_liveness_probe,
             bind_addr: ctx.wc_bind_addr.clone(),
             proxy_url: ctx.wc_proxy_url.clone(),
             dial_timeout_secs: ctx.wc_dial_timeout_secs,

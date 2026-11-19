@@ -1255,15 +1255,55 @@ control connection. On the client the value is read when a session is
 dialled, so a `frpc reload` does not re-arm connections that are already up —
 the new bound applies on the next reconnect.
 
-**Liveness probing (no knob):** the driver itself asks a quiet session for the
-peer's window — a KCP `IKCP_CMD_WASK` that the peer answers with
-`IKCP_CMD_WINS` — so a peer that vanished while the tunnel was idle is noticed
-in about a second instead of waiting for the application's next write. It runs
-only for sessions with nothing in flight (a session carrying data is still the
-retransmission bound's job), costs no measurable CPU when idle, and needs no
-setting: a `SIGSTOP`ped `frps` was detected after 1.05-1.15 s with `deadLink`
-at both 5 and 20, where the pre-probe build detected nothing within 15 s. A Go
-peer answers the same probe; see
+**Liveness probing (`[transport.kcp] probe`):**
+
+```toml
+# frps.toml and frpc.toml
+[transport.kcp]
+probe = false   # default true; turn it off where inbound is closed while idle
+```
+
+The retransmission bound above can only fire on a segment that is in flight, so
+a peer that vanished while the tunnel was idle used to be noticed only when the
+application next wrote (or when the keepalive happened to be due — ~30 s). The
+driver now asks a quiet session for the peer's window: a KCP `IKCP_CMD_WASK`
+the peer answers with `IKCP_CMD_WINS`. Both commands are part of the KCP wire
+format, so **a Go peer answers without any configuration**, and liveness needs
+no new message.
+
+It runs only for a session with nothing in flight (a session carrying data is
+still the retransmission bound's job — and, deliberately, a session whose peer
+window is zero too, so flow-controlled silence is covered). The cadence is
+fixed: a probe every 500 ms once the session has been quiet that long, and the
+session is declared dead after three unanswered probes plus one more interval
+for the third answer — about **2 s** after the peer's last datagram. One or two
+dropped probes cost nothing; zero answers do.
+
+Measured on a 4-vCPU Linux VM (`tcpMux = false`, `deadLink` at 5 and at 20, so
+the bound cannot be the cause):
+
+| scenario | probing on | probing off |
+|---|---|---|
+| `frps` frozen mid-transfer, 15 s | dead after 1.05 / 1.15 s | nothing within 15 s |
+| idle 60 s, control connection only | 41 / 36 CPU ticks | 40 / 39 |
+| idle 60 s, 200 proxies | 44 / 40 CPU ticks | 43 / 39 |
+| one KCP flow, 512 MiB | 116.0 / 115.6 MiB/s | 107.2 / 119.1 |
+
+Two datagrams per second per idle session per end is invisible in CPU and in
+throughput, and the compat suite against Go frp v0.72.0 stays green.
+
+**When to turn it off.** The probe cannot be told apart from a dead peer when
+the *inbound* path is closed while the tunnel is idle — an `frps` behind NAT, or
+a client whose UDP mapping expired. In that state the side that sends probes
+sees silence and reaps a session whose peer is perfectly healthy; the peer only
+notices on its next keepalive and reconnects, which costs one reconnect per NAT
+mapping lifetime. Blocking `frps`→client UDP for 5 s on the test VM reproduced
+it: with probing on the server reaped three sessions within ~2 s, with it off
+none. Set `probe = false` on the side behind NAT (typically the client) and
+leave it on for the public side; if you need fast failover on both sides and
+cannot place the NAT, lower `heartbeat_interval` instead. Visitor dials and the
+XTCP proxy P2P plane use their built-in KCP configs, which do not expose this
+table. See
 [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](archive/notes/2026-11-19-kcp-liveness-probe.md).
 
 **Heartbeat intervals:**

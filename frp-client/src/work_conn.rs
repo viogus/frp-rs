@@ -304,6 +304,9 @@ pub(crate) struct WorkConnConfig {
     /// Retransmission bound for KCP sessions this work connection dials
     /// (`[transport.kcp] deadLink`), forwarded to the dial options.
     pub kcp_dead_link: u32,
+    /// Whether KCP sessions this work connection dials probe a quiet peer
+    /// (`[transport.kcp] probe`), forwarded to the dial options.
+    pub kcp_liveness_probe: bool,
     pub bind_addr: Option<String>,
     pub proxy_url: String,
     pub dial_timeout_secs: u64,
@@ -340,6 +343,7 @@ struct WorkConnDialConfig<'a> {
     disable_custom_tls_first_byte: bool,
     keepalive_secs: u64,
     kcp_dead_link: u32,
+    kcp_liveness_probe: bool,
     bind_addr: &'a Option<String>,
     proxy_url: &'a str,
     dial_timeout_secs: u64,
@@ -377,6 +381,7 @@ async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream>
             disable_custom_tls_first_byte: cfg.disable_custom_tls_first_byte,
             keepalive_secs: cfg.keepalive_secs,
             kcp_dead_link: cfg.kcp_dead_link,
+            kcp_liveness_probe: cfg.kcp_liveness_probe,
             bind_addr: cfg.bind_addr.clone(),
             proxy_url: if cfg.proxy_url.is_empty() {
                 None
@@ -648,6 +653,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
             disable_custom_tls_first_byte,
             keepalive_secs,
             kcp_dead_link,
+            kcp_liveness_probe,
             bind_addr,
             proxy_url,
             dial_timeout_secs,
@@ -701,6 +707,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                 disable_custom_tls_first_byte,
                 keepalive_secs,
                 kcp_dead_link,
+                kcp_liveness_probe,
                 bind_addr: &bind_addr,
                 proxy_url: &proxy_url,
                 dial_timeout_secs,
@@ -727,6 +734,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
             disable_custom_tls_first_byte,
             keepalive_secs,
             kcp_dead_link,
+            kcp_liveness_probe,
             bind_addr: &bind_addr,
             proxy_url: &proxy_url,
             dial_timeout_secs,
@@ -1423,6 +1431,7 @@ mod tests {
             disable_custom_tls_first_byte: true,
             keepalive_secs: 0,
             kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
+            kcp_liveness_probe: true,
             bind_addr: None,
             proxy_url: String::new(),
             dial_timeout_secs: 1,

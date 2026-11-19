@@ -662,6 +662,10 @@ pub struct DialOptions {
     /// Retransmissions of one KCP segment before the session is declared dead.
     /// frp-rs extension (`[transport.kcp] deadLink`); 20 = kcp-go's value.
     pub kcp_dead_link: u32,
+    /// Whether the driver probes a quiet KCP session for liveness.
+    /// frp-rs extension (`[transport.kcp] probe`); see
+    /// [`crate::kcp::KcpConfig::liveness_probe`].
+    pub kcp_liveness_probe: bool,
     /// Upstream proxy URL. Supports http:// and socks5:// schemes.
     /// When set, the TCP connection goes through the proxy instead of
     /// connecting directly. Empty = direct connection.
@@ -693,6 +697,7 @@ impl Default for DialOptions {
             tcp_send_buffer_size: 0,
             tcp_recv_buffer_size: 0,
             kcp_dead_link: crate::KCP_DEAD_LINK_DEFAULT,
+            kcp_liveness_probe: true,
             proxy_url: None,
             v2: false,
         }
@@ -1587,7 +1592,8 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             // address dialled is the one the KCP+TLS stream reports as its
             // `peer_addr`.
             let addr = udp_peer.to_string();
-            let kcp_cfg = crate::kcp::kcp_client_config(opts.kcp_dead_link);
+            let kcp_cfg =
+                crate::kcp::kcp_client_config(opts.kcp_dead_link, opts.kcp_liveness_probe);
             let stream = crate::kcp::dial_kcp(&addr, kcp_cfg)
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
@@ -3361,7 +3367,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2337).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2343).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

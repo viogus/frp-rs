@@ -363,8 +363,15 @@ impl KcpSession {
     /// request (`IKCP_CMD_WASK`), answered by `IKCP_CMD_WINS`; the answer
     /// arrives through the normal receive path, so liveness needs no new
     /// message on the wire.
+    ///
+    /// The gate is "nothing in flight", not "nothing waiting to be sent":
+    /// data parked in `snd_queue` behind a zero peer window never reaches
+    /// the wire, so `wait_snd() > 0` there and the retransmission bound can
+    /// never fire. Probing on an empty `snd_buf` covers that state too,
+    /// which is why this checks in-flight segments rather than `wait_snd`.
     pub fn should_probe(&self, driver_clock_ms: u32) -> bool {
-        self.wait_snd() == 0
+        self.config.liveness_probe
+            && self.kcp.in_flight() == 0
             && driver_clock_ms.wrapping_sub(self.last_rx_ms) >= crate::kcp::socket::PROBE_IDLE_MS
             && driver_clock_ms.wrapping_sub(self.probe_sent_ms) >= crate::kcp::socket::PROBE_IDLE_MS
     }
@@ -382,8 +389,15 @@ impl KcpSession {
     /// The bound is counted in probes rather than milliseconds so the
     /// interval stays the driver's (`PROBE_IDLE_MS`) and a session that
     /// answers slowly is not killed for being slow — only for silence.
-    pub fn probe_expired(&self) -> bool {
+    ///
+    /// The last probe must also have had its own interval to be answered:
+    /// without that, the count reaches the bound on the same tick that sends
+    /// the final `WASK` and the answer can never arrive, which makes the
+    /// documented tolerance a lie and costs a premature reconnect whenever
+    /// one answer is slow.
+    pub fn probe_expired(&self, driver_clock_ms: u32) -> bool {
         self.probes_unanswered >= crate::kcp::socket::PROBE_MAX_UNANSWERED
+            && driver_clock_ms.wrapping_sub(self.probe_sent_ms) >= crate::kcp::socket::PROBE_IDLE_MS
     }
 
     /// Window the driver currently has this session at, in segments.
@@ -1126,6 +1140,7 @@ mod tests {
                 nc: true,
             },
             dead_link: KCP_DEAD_LINK_DEFAULT,
+            liveness_probe: true,
         }
     }
 
@@ -1384,6 +1399,7 @@ mod tests {
                 nc: true,
             },
             dead_link: KCP_DEAD_LINK_DEFAULT,
+            liveness_probe: true,
         }
     }
 
@@ -1567,9 +1583,6 @@ mod tests {
         );
     }
 
-    /// Real-path pin: with a pool pre-seeded by an oversized chunk, the
-    /// emitted data shard must BE that pooled chunk (its capacity survives),
-    /// proving the datagram is the pool-cycled buffer, not a fresh wire Vec.
     /// A session with nothing queued and no inbound traffic must start
     /// probing after `PROBE_IDLE_MS`, and keep quiet inside the interval.
     #[test]
@@ -1611,16 +1624,23 @@ mod tests {
             tx,
             Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
         );
-        for step in 0..super::super::socket::PROBE_MAX_UNANSWERED {
-            session.request_probe(1_000 + step * 500);
+        let interval = super::super::socket::PROBE_IDLE_MS;
+        let mut now = 1_000;
+        for _ in 0..super::super::socket::PROBE_MAX_UNANSWERED {
+            session.request_probe(now);
+            now += interval;
         }
         assert!(
-            session.probe_expired(),
-            "three quiet intervals is a dead peer"
+            !session.probe_expired(now - interval),
+            "the last probe must get its own interval to be answered"
         );
-        session.note_inbound(3_000, 24);
+        assert!(
+            session.probe_expired(now),
+            "three unanswered probes plus their interval is a dead peer"
+        );
+        session.note_inbound(now, 24);
         assert_eq!(session.probes_unanswered, 0, "an answer proves liveness");
-        assert!(!session.probe_expired());
+        assert!(!session.probe_expired(now));
     }
 
     /// A session carrying data must not be probed: the retransmission bound
@@ -1637,10 +1657,44 @@ mod tests {
             Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
         );
         session.send(b"payload").unwrap();
-        assert!(session.wait_snd() > 0, "the send must leave data in flight");
+        // `send` parks the payload in `snd_queue`; the flush is what puts
+        // segments on the wire, and only those can reach the bound.
+        session.update(0).unwrap();
+        assert!(
+            session.wait_snd() > 0 && session.kcp.in_flight() > 0,
+            "the flush must leave a segment in flight"
+        );
         assert!(
             !session.should_probe(10_000),
             "in-flight data is the retransmission bound's job"
+        );
+    }
+
+    /// The complement: data waiting behind a zero peer window never reaches
+    /// the wire, so the bound cannot fire and the probe has to cover it.
+    #[test]
+    fn a_flow_controlled_session_is_probed() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let mut session = KcpSession::with_chunk_pool(
+            4246,
+            "127.0.0.1:9005".parse().unwrap(),
+            test_config(),
+            tx,
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
+        );
+        // Peer advertised a zero window: `send` can only park the payload.
+        session.kcp.set_remote_window(0);
+        session.send(b"parked behind a closed window").unwrap();
+        session.update(0).unwrap();
+        assert_eq!(
+            session.kcp.in_flight(),
+            0,
+            "a closed peer window must keep the segment out of `snd_buf`"
+        );
+        assert!(session.wait_snd() > 0, "the payload is still queued");
+        assert!(
+            session.should_probe(10_000),
+            "queued-but-unsent data is exactly the case the bound cannot see"
         );
     }
 
@@ -1667,6 +1721,9 @@ mod tests {
         );
     }
 
+    /// Real-path pin: with a pool pre-seeded by an oversized chunk, the
+    /// emitted data shard must BE that pooled chunk (its capacity survives),
+    /// proving the datagram is the pool-cycled buffer, not a fresh wire Vec.
     #[test]
     fn test_fec_data_shard_is_pooled_chunk() {
         let config = fec_config();

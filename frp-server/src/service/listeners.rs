@@ -332,12 +332,17 @@ impl Service {
             let (kcp_bind_tx, kcp_bind_rx) = tokio::sync::oneshot::channel::<()>();
             // `[transport.kcp]` (frp-rs extension): the retransmission bound
             // before a session is declared dead. Absent = the kcp-go default.
-            let kcp_config = frp_core::kcp::kcp_config_from_dead_link(
+            let kcp_config = frp_core::kcp::kcp_config_from_options(
                 self.cfg
                     .transport
                     .kcp_options
                     .as_ref()
                     .map(|options| options.dead_link),
+                self.cfg
+                    .transport
+                    .kcp_options
+                    .as_ref()
+                    .map(|options| options.probe),
             );
             spawn_boxed(Box::pin(async move {
                 let mut listener =

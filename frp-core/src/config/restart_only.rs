@@ -1577,7 +1577,10 @@ mod tests {
         set_gated_ports(&mut new);
         #[cfg(feature = "kcp")]
         {
-            new.transport.kcp_options = Some(crate::config::server::KcpOptions { dead_link: 7 });
+            new.transport.kcp_options = Some(crate::config::server::KcpOptions {
+                dead_link: 7,
+                probe: true,
+            });
         }
         let changes = old.restart_only_changes(&new);
         for c in &changes {
