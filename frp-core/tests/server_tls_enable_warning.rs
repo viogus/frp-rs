@@ -26,7 +26,7 @@
 //! key wins), and a literal `tls_enable` inside `[transport.tls]` — the lift
 //! renames its five Go keys
 //! (`force`/`certFile`/`keyFile`/`trustedCaFile`/`serverName`, the match at
-//! `frp-core/src/config/normalize.rs:939-948`) and passes everything else through
+//! `frp-core/src/config/normalize.rs:949-956`) and passes everything else through
 //! unchanged, so that key is hoisted onto the
 //! same field. Either way the key was *written*. A nested
 //! `[common.transport.tls] tls_enable` counts **only when no top-level
@@ -43,13 +43,13 @@
 //! **Why a written key warns but a synthesized one does not.** The server
 //! normalizer *synthesizes* `tls_enable = true` from the legacy
 //! `[transport.tls]` section when it carries `force = true`, `certFile` or
-//! `keyFile` (`frp-core/src/config/normalize.rs:938-955`,
+//! `keyFile` (`frp-core/src/config/normalize.rs:948-957`,
 //! `table.entry("tls_enable").or_insert(…)`) — a Go-shaped input, not a user
 //! writing the frp-rs-only field. After normalization the two are
 //! indistinguishable, so `ConfigPresence::server_tls_enable_set_in` reads the
 //! **raw** value. The `[transport.tls] enable` spelling is a deliberately
 //! *unrecognized* neighbour: the *server* lift has no `"enable"` arm (only the
-//! client's does, at `frp-core/src/config/normalize.rs:1507-1515`), so it stays a
+//! client's does, at `frp-core/src/config/normalize.rs:1542-1553`), so it stays a
 //! top-level key literally named `enable` — ignored leniently, refused strictly —
 //! and never sets `tls_enable` at all. Every case is pinned below.
 //!
@@ -554,7 +554,7 @@ fn synthesized_tls_enable_stays_silent() {
 /// A literal `tls_enable` written *inside* `[transport.tls]` is a third written
 /// spelling: the server lift renames its five Go keys (`force`, `certFile`,
 /// `keyFile`, `trustedCaFile`, `serverName` — the match at
-/// `frp-core/src/config/normalize.rs:939-948`) and passes every other key through
+/// `frp-core/src/config/normalize.rs:949-956`) and passes every other key through
 /// unchanged, so this one is hoisted onto the very same inert field the warning
 /// is about.
 #[test]

@@ -3011,7 +3011,7 @@ tlsServerName = "frps.example.com"
 /// "Go frp Equivalent". No loader accepts them — `frp-core/src/config/server.rs:42-56`
 /// declares those fields with `#[serde(default)]` and no alias, and Go
 /// v0.71.0 carries them under the nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:929-956` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:930-957` maps onto the flat fields.
 /// This pins both directions (the four stay rejected, the two real aliases
 /// stay accepted) so the table cannot drift back.
 #[test]
@@ -3087,7 +3087,7 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
 /// `frp-core/src/config/client.rs:264-270` declares those fields with
 /// `#[serde(default)]` and no alias, and Go v0.71.0 carries them under the
 /// nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:1464-1475` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:1465-1490` maps onto the flat fields.
 /// This pins both directions (the five spellings stay rejected, the two real
 /// aliases stay accepted) so the table cannot drift back.
 #[test]
@@ -9228,8 +9228,8 @@ fn legacy_ini_typed_reserved_root_visitor_is_refused_like_go() {
 /// This pin is about the *routing* (a `visitors.foo` / `proxies.foo` header with
 /// `role = "visitor"` ends up in `cfg.visitors` under its raw name, not in
 /// `cfg.proxies`), not about which collector clause collects it: both the
-/// authoritative-`role` clause (`frp-core/src/config/normalize.rs:2105-2107`) and
-/// the array-root clause (`frp-core/src/config/normalize.rs:2121-2123`) accept
+/// authoritative-`role` clause (`frp-core/src/config/normalize.rs:2120-2122`) and
+/// the array-root clause (`frp-core/src/config/normalize.rs:2136-2138`) accept
 /// this input, so deleting either one alone leaves this test green. Each clause
 /// has its own single-path pin instead — the `role` clause via
 /// `legacy_ini_typed_reserved_root_visitor_is_refused_like_go`, the array-root
@@ -9357,7 +9357,7 @@ fn legacy_ini_non_string_type_is_not_defaulted_to_tcp() {
 /// rc 0 with `Proxies: 0 Visitors: 0` — `process_includes` removed the table
 /// whatever its shape (`frp-core/src/config/file.rs:158` on b4b60b91; the shape
 /// gate is now `frp-core/src/config/file.rs:312-313`) and it runs from
-/// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:2012`, so the section was gone before
+/// `frp-core/src/config/normalize.rs:634`, before the guard at `frp-core/src/config/normalize.rs:2027`, so the section was gone before
 /// anything could refuse it. A dotted `[includes.foo]` was never reached by that
 /// removal, but not because it is absent from the top level: `includes` is not in
 /// `INI_NESTED_SECTION_ROOTS` (`frp-core/src/config/format.rs:1369-1385`), so the
@@ -9432,7 +9432,7 @@ fn legacy_ini_includes_section_with_ports_is_a_proxy() {
 /// server (the server legacy reader only reads `[common]`, and the client's
 /// proxy-name rule finds no `type`/port to act on). The shape gate at
 /// `frp-core/src/config/file.rs:312-313` deliberately lets the table through so the
-/// typeless-visitor guard (`frp-core/src/config/normalize.rs:2012`) and the
+/// typeless-visitor guard (`frp-core/src/config/normalize.rs:2027`) and the
 /// collector can see it, so the loader drops whatever table is still there after
 /// normalization (`frp-core/src/config/file.rs:499`, run by the two `normalize`
 /// wrappers at `frp-core/src/config/file.rs:467` and
@@ -14295,11 +14295,11 @@ fn legacy_ini_scalar_and_section_collision_keeps_the_section_like_go() {
 /// `LoadAllProxyConfsFromIni` builds `startProxy` from the list and skips every
 /// named section that is not in it (`pkg/config/legacy/client.go:227-262`), and
 /// the generated `{prefix}_{i}` range sections are filtered by their *generated*
-/// names. The role refusal (`frp-core/src/config/normalize.rs:2206`) and the
-/// collector's candidate list (`frp-core/src/config/normalize.rs:2175`) both
+/// names. The role refusal (`frp-core/src/config/normalize.rs:2221`) and the
+/// collector's candidate list (`frp-core/src/config/normalize.rs:2190`) both
 /// apply it now; the `[common] start` list is read after the hoist
-/// (`frp-core/src/config/normalize.rs:1204-1205`,
-/// `ini_start_names` at `frp-core/src/config/normalize.rs:2505`, which trims each
+/// (`frp-core/src/config/normalize.rs:1205-1206`,
+/// `ini_start_names` at `frp-core/src/config/normalize.rs:2520`, which trims each
 /// element exactly like Go's `Key.Strings(",")`).
 ///
 /// One half remains pre-existing: a *non-started* section that is not a
@@ -14435,7 +14435,7 @@ fn legacy_ini_common_start_is_applied_before_role_and_collection() {
 /// switch does not exist: `[foo] role = "weird"` is rc 1 **strict** with
 /// `json: unknown field "foo"` but **rc 0 non-strict** (measured on Go v0.71.0).
 /// The role scan is therefore gated on the `[common]` presence captured before
-/// the hoist (`frp-core/src/config/normalize.rs:1204-1205`) and must not refuse
+/// the hoist (`frp-core/src/config/normalize.rs:1205-1206`) and must not refuse
 /// the file where Go loads it.
 #[test]
 fn nocommon_ini_weird_role_is_not_a_role_refusal() {
@@ -14597,7 +14597,7 @@ fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
 /// name, so `c1.ini` (`[common] server_addr + zzz_unknown_common = 1`) is rc 0 in
 /// both loader modes. frp-rs is rc 0 loose but rc 1 strict
 /// (`unknown field "zzz_unknown_common"`), because the `[common]` hoist
-/// (`frp-core/src/config/normalize.rs:1206`) moves the key to the top level before
+/// (`frp-core/src/config/normalize.rs:1207`) moves the key to the top level before
 /// the top-level strict walk and the `.ini` exemption does not reach it. The
 /// item's Done-when allows the measurement instead of a fix — exempting the keys
 /// the merge created would also blind the top-level check to a genuine v1 typo
@@ -15431,12 +15431,12 @@ fn legacy_ini_server_ignores_common_includes_both_modes() {
 /// (`UnmarshalClientConfFromIni`: `GetSection("common")` + `MapTo`,
 /// `pkg/config/legacy/client.go:173-200`) and `start` is one of those keys
 /// (`Start []string \`ini:"start"\``, `pkg/config/legacy/client.go:119`). The
-/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1206-1210`)
+/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1207-1211`)
 /// would let a DefaultSection `start` win and mask Go's refusals (round-5
 /// adversarial RF5-1), so the `[common]` value is captured before the hoist
-/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2532`) and written
+/// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2547`) and written
 /// back after it (`legacy_start_override`,
-/// `frp-core/src/config/normalize.rs:2551`). Measured on Go v0.71.0, both loader
+/// `frp-core/src/config/normalize.rs:2566`). Measured on Go v0.71.0, both loader
 /// modes: the four shapes below are rc 1 with the message asserted, a
 /// DefaultSection-only `start` is rc 0 with both proxies (Go's list is empty,
 /// i.e. `startAll`), `[common] start` beats a DefaultSection `start`, and
@@ -15594,7 +15594,7 @@ fn v1_ini_scalar_section_collision_is_still_a_type_error() {
 /// be 'server' or 'visitor'`) and `[start] type = "custom"` is rc 1 (`failed to
 /// parse proxy start, err: invalid type [custom]`). The round-6 defect removed
 /// the root `start` key before collection (`legacy_start_override`,
-/// `frp-core/src/config/normalize.rs:2551`), which deleted the section and
+/// `frp-core/src/config/normalize.rs:2566`), which deleted the section and
 /// swallowed both refusals (rc 0); this test reds on `c7495cbd`.
 #[test]
 fn legacy_ini_start_section_refusals_like_go() {
@@ -15680,7 +15680,7 @@ fn legacy_ini_start_section_is_still_a_proxy() {
             assert_eq!(names, expected, "{label}, strict={strict}");
             // Go's `start` list itself: empty means `startAll`, and a
             // DefaultSection `start` must not survive into the runtime filter
-            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2551`).
+            // (`legacy_start_override`, `frp-core/src/config/normalize.rs:2566`).
             let mut started: Vec<&str> = cfg.start.iter().map(String::as_str).collect();
             started.sort_unstable();
             assert_eq!(started, expected_start, "{label}, strict={strict}");
@@ -15836,7 +15836,7 @@ fn legacy_ini_start_array_literal_selects_nothing_like_go() {
 /// no proxy, and rc 0 with proxy `p1`. Such a list round-trips against its raw
 /// text, so `frp-core/src/config/format.rs` keeps it an array and
 /// `ini_start_names` renders each element as Go's text
-/// (`frp-core/src/config/normalize.rs:2505`). Dropping the non-string element
+/// (`frp-core/src/config/normalize.rs:2520`). Dropping the non-string element
 /// instead emptied the list and let `startAll` collect every section.
 #[test]
 fn legacy_ini_numeric_start_list_selects_nothing_like_go() {
@@ -15943,7 +15943,7 @@ fn legacy_ini_empty_start_dispatches_every_section_like_go() {
 /// checker still reports the leftover table (`unknown field "p2"`), the
 /// pre-existing residue of a non-candidate section documented at
 /// `frp-core/src/config/tests.rs:14092`. Without the `ini_section_started`
-/// guard the role scan at `frp-core/src/config/normalize.rs:2208` refuses the
+/// guard the role scan at `frp-core/src/config/normalize.rs:2223` refuses the
 /// file (rc 1, `proxy p2 role should be 'server' or 'visitor'`).
 #[test]
 fn legacy_ini_start_skips_role_scan_for_unlisted_sections() {
@@ -15972,7 +15972,7 @@ fn legacy_ini_start_skips_role_scan_for_unlisted_sections() {
 
 /// **`ini_start_names` maps a `[common] start` value to Go's names.**
 ///
-/// Unit tooth for the dispatch helper (`frp-core/src/config/normalize.rs:2505`),
+/// Unit tooth for the dispatch helper (`frp-core/src/config/normalize.rs:2520`),
 /// whose `Table` arm is masked end to end: a nested `[common.start]` header is a
 /// section of its own in Go's `gopkg.in/ini.v1`, so `[common]` has no `start` key
 /// and `startAll` is true, while frp-rs nests the table under `common` and then
@@ -16021,7 +16021,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
 /// it, so the file never reaches the legacy reader. frp-rs nests the dotted
 /// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1433`)
-/// and the collector's own detector (`frp-core/src/config/normalize.rs:1204`)
+/// and the collector's own detector (`frp-core/src/config/normalize.rs:1205`)
 /// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
 /// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the
 /// non-strict refusal is the loose-only divergence the item calls a follow-up.
@@ -16125,7 +16125,7 @@ fn r_toml_hybrid_ini_is_a_v1_shape_both_modes() {
 /// proxy range:p: local_port or remote_port is empty`
 /// (`renderRangeProxyTemplates`, `pkg/config/legacy/client.go:289`). frp-rs logs
 /// `legacy INI [range:...] section: missing or invalid remote_port; skipped`
-/// (`frp-core/src/config/normalize.rs:2352`) and loads `p2`, rc 0. Recorded
+/// (`frp-core/src/config/normalize.rs:2367`) and loads `p2`, rc 0. Recorded
 /// deliberate: making a missing port fatal is a separate design question, and the
 /// sibling skip paths are pinned as intentional at
 /// `frp-core/src/config/tests.rs:11555` / `frp-core/src/config/tests.rs:11580`. Both modes pinned.
@@ -16157,7 +16157,7 @@ fn range_section_without_remote_port_is_skipped_not_fatal_both_modes() {
 /// `LoadAllProxyConfsFromIni` skips only the default section, `common` and
 /// `range:`, so every other header is a proxy regardless of its name. frp-rs
 /// keeps its known-settings-root guard (`KNOWN_SECTIONS` in
-/// `frp-core/src/config/normalize.rs:2063`) and reports `Proxies: 0`, rc 0 in
+/// `frp-core/src/config/normalize.rs:2078`) and reports `Proxies: 0`, rc 0 in
 /// both modes. Keying the bypass on `type` instead of the ports would also
 /// collect `[log] type = "custom" disable_print_color = true` (Go rc 1
 /// `failed to parse proxy log, err: invalid type [custom]`, frp-rs rc 0 today)
@@ -16871,6 +16871,32 @@ fn client_accepts_the_system_ca_switch() {
         cfg.tls_use_system_ca,
         "`[transport.tls] useSystemCa` must reach the field, not be refused as `tls_use_system_ca`"
     );
+}
+
+#[test]
+fn client_root_camel_mux_spelling_reaches_the_transport_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(&path, "server_addr = '127.0.0.1'\ntcpMux = false\n").unwrap();
+    let cfg = load_client_config(path.to_str().unwrap(), true)
+        .expect("a strict-listed root spelling must load");
+    assert!(
+        !cfg.tcp_mux,
+        "a root tcpMux was accepted by strict mode and then dropped"
+    );
+}
+
+#[test]
+fn client_root_snake_mux_spelling_wins_over_the_camel_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("frpc.toml");
+    std::fs::write(
+        &path,
+        "server_addr = '127.0.0.1'\ntcp_mux = true\ntcpMux = false\n",
+    )
+    .unwrap();
+    let cfg = load_client_config(path.to_str().unwrap(), true).expect("both spellings must load");
+    assert!(cfg.tcp_mux, "the snake spelling must win");
 }
 
 #[test]

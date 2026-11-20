@@ -968,7 +968,7 @@ The recorded residues, each pinned in both loader modes:
   `legacy_ini_default_section_start_beside_start_section_both_modes`.
 - **An unknown key merged out of `[common]`** (`[common] zzz_unknown_common = 1`) loads on Go in both
   modes while frp-rs is rc 0 loose / rc 1 strict `unknown field "zzz_unknown_common"`, because the
-  `[common]` merge (`frp-core/src/config/normalize.rs:1206-1209`) moves the key to the top level before
+  `[common]` merge (`frp-core/src/config/normalize.rs:1218-1209`) moves the key to the top level before
   the top-level walk (`frp-core/src/config/strict.rs:558`). Exempting the keys that merge created would
   blind the top-level half to a genuine v1 typo spelled under `[common]`, so this is recorded rather than
   fixed — `legacy_ini_common_unknown_key_residual_both_modes`.

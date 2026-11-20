@@ -28,8 +28,6 @@ User-facing release notes for frp-rs.
   Pinned by five tests that drive the strict loader (not the lenient
   `load_*_config_from_str` helpers, which skip the check entirely).
 
-### Fixes
-
 - **KCP: a peer that vanishes while the tunnel is idle is noticed in about two
   seconds.** A KCP session was only declared dead when it had a segment in
   flight, so a frozen peer survived until the application next wrote — 20-30 s

@@ -903,9 +903,10 @@ pub(super) fn normalize_server_config(
             table.insert("worker_threads".to_string(), value);
         }
         // Same treatment for the three root camelCase mux spellings: they are
-        // strict-listed (Go writes them) but the hoist list below carries only
-        // the snake_case names, so without this a root `tcpMux` was accepted
-        // and then dropped. Root snake wins over root camel, as above.
+        // strict-listed — frp-rs's own `[common]`/legacy allowance, and Go's
+        // `[common]`/INI form writes them — but the hoist list below carries
+        // only the snake_case names, so without this a root `tcpMux` was
+        // accepted and then dropped. Root snake wins over root camel, as above.
         for (camel, snake) in [
             ("tcpMux", "tcp_mux"),
             ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
@@ -1470,6 +1471,20 @@ pub(super) fn normalize_client_config(
             table.remove("workerThreads");
         } else if let Some(value) = table.remove("workerThreads") {
             table.insert("worker_threads".to_string(), value);
+        }
+        // The same hole existed for the mux trio: `known_client_keys()` lists
+        // the camel spellings, but `ClientConfig::tcp_mux` has no `tcpMux`
+        // alias, so a root `tcpMux` was accepted by strict mode and dropped.
+        for (camel, snake) in [
+            ("tcpMux", "tcp_mux"),
+            ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+            ("tcpMuxKeepaliveTimeout", "tcp_mux_keepalive_timeout"),
+        ] {
+            if table.contains_key(snake) {
+                table.remove(camel);
+            } else if let Some(value) = table.remove(camel) {
+                table.insert(snake.to_string(), value);
+            }
         }
         // Flatten [transport] section → top-level (ClientConfig has tcp_mux at top level,
         // but Go frp config puts it under [transport])
