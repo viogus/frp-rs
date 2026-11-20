@@ -1,54 +1,58 @@
-#![cfg(all(feature = "quic", feature = "kcp"))]
-//! End-to-end coverage for the server's `PlainPath::PooledXttpFallback` arm
-//! (`frp-server/src/control/bridge.rs`): an XTCP visitor connection relayed to
-//! the provider by the pooled-BUFFER relay (`relay_plain_pooled`) instead of
-//! the fast relay. "Pooled" names the buffer pool, not the work-conn pool.
+//! Pins the server's `PlainPath::PooledXttpFallback` arm
+//! (`frp-server/src/control/bridge.rs`) twice over: that the arm is *selected*
+//! for an XTCP visitor fallback, and that its relay carries bytes the provider
+//! writes only after the user's half close.
 //!
-//! Why this has to be an e2e and not an in-process socket test: the arm exists
-//! because `relay_plain_fast` / `bridge_plain` half-close the provider side
-//! the moment the user reader sees EOF, which races frpc's bridge startup
-//! (`ECONNRESET` / premature FIN on VPS). `relay_plain_pooled` instead runs
-//! both directions to completion and only shuts the work side down afterwards.
-//! A raw loopback fixture cannot observe the difference — `copy_bidirectional`
-//! also delivers late provider bytes — so the only honest observable is a real
-//! frps + real frpc provider + real frpc visitor + a real user socket whose
-//! payload is written by the provider AFTER the user's half close.
+//! Why both assertions: selection is invisible to the data path. All plain
+//! relays propagate the half close — the peer's write half is FIN'd as soon as
+//! a direction EOFs, which is what lets the provider's local server see the
+//! user's EOF and reply late — so bytes arrive identically through this arm,
+//! through `FastRelay`, and through the pre-pooled `bridge_plain`. Measured
+//! 2026-11-20 on macOS: rewriting the plan's `xtcp` term to `false` still
+//! passes, because `relay_plain_fast_inner` *is* `relay_plain_pooled` off
+//! Linux (`frp-server/src/control/bridge.rs`). What the arm genuinely differs
+//! in is relayed through pooled buffers instead of a per-conn pair, and in
+//! bounding a post-half-close stall at
+//! [`frp_core::bridge::HALF_CLOSE_LINGER_TIMEOUT`] rather than waiting
+//! unbounded. None of that is observable per connection, so selection is
+//! asserted on the counter `frp_server::control::pooled_xtcp_fallback_bridges`
+//! (the same shape as `frp_core::splice::bridge_splice_calls`, which exists
+//! because the zero-copy arm sat unreachable while every test passed). frps
+//! runs in-process here, so the process-global counter is readable from the
+//! test.
 //!
 //! Fixture shape (mirrors `xtcp_visitor_failure_e2e.rs`):
 //! - the punch can never succeed (dead loopback UDP STUN port), so the visitor
 //!   falls through to the STCP-shaped relay at
-//!   `frp-client/src/visitor/stcp.rs`, which opens a `NewVisitorConn` for the
-//!   XTCP proxy's own `server_name` (`stcp_proxy_name = if fb_to.is_empty()
-//!   { sn } else { fb_to }`). With `fallback_to` empty that is the XTCP proxy
-//!   itself, and the server's bridge then sees `proxy_type == "xtcp"` — the
-//!   only production path that selects `PooledXttpFallback`.
+//!   `frp-client/src/visitor/stcp.rs`, which opens a `NewVisitorConn` for
+//!   `stcp_proxy_name = if fb_to.is_empty() { sn } else { fb_to }`. Setting
+//!   `fallback_to` to the XTCP proxy's OWN name yields that same name, so the
+//!   server still sees `proxy_type == "xtcp"` — the only production path that
+//!   selects `PooledXttpFallback` — while taking the branch whose timeout is
+//!   configurable (an empty `fallback_to` pins the budget to Go's 20 s, which
+//!   made this test 21.7 s instead of 2 s).
 //! - the provider's local server reads until EOF (the user's half close,
-//!   relayed all the way down), then writes [`LATE_BYTES`] and closes. Those
-//!   bytes can only reach the user if the server relay kept the provider side
-//!   alive across the user's half close — the property the pooled arm was
-//!   introduced for.
+//!   relayed all the way down), then writes [`LATE_BYTES`] and closes.
 //!
 //! Discrimination, measured (each mutation applied to
-//! `frp-server/src/control/bridge.rs`, test re-run alone, mutation reverted):
+//! `frp-server/src/control/bridge.rs`, test re-run alone, mutation reverted;
+//! timings from the 2 s fixture):
 //!
-//! - Plan trigger neutralized (`plain_path(false, ...)` instead of
-//!   `plain_path(proxy_info…proxy_type == "xtcp", ...)`): test still PASSES
-//!   (21.7 s). On non-Linux, `relay_plain_fast_inner` *is*
-//!   `relay_plain_pooled`, so the mutation changes which arm runs but not the
-//!   relay function. Not yet measured on Linux, where the same mutation routes
-//!   to `splice::bridge_splice` — rerun it there before treating this file as
-//!   a pin on the arm's necessity.
+//! - Plan trigger neutralized (`plain_path(false, ...)`): the late-bytes
+//!   assertion still PASSES (2.1 s) — the reason both assertions exist; the
+//!   counter assertion FAILS with "arm counter did not move:
+//!   PlainPath::PooledXttpFallback was never taken".
 //! - Arm body replaced by `bridge_plain` over `try_split_work_halves` (the
-//!   pre-pooled semantics the arm replaced): test still PASSES (21.7 s).
-//!   `bridge_plain` also runs both directions to completion, so on loopback it
-//!   delivers the post-half-close bytes too; this observable does NOT falsify
-//!   the arm-vs-`bridge_plain` choice, only the arm's own happy path.
-//! - Arm body replaced by `return;` (no relay): test FAILS on the late-bytes
-//!   assertion ("… early eof: the relay closed the user side instead of
-//!   delivering the post-half-close write", 64 s). This is the evidence that
-//!   the test really reaches `PlainPath::PooledXttpFallback` and that its relay
-//!   is what carries the bytes — no other arm is exercised with the trigger in
-//!   place.
+//!   pre-pooled semantics the arm replaced): still PASSES (2.1 s) — this test
+//!   does not falsify arm-vs-`bridge_plain`, only arm reachability.
+//! - Arm body replaced by `return;` (no relay): FAILS on the late-bytes
+//!   assertion ("the relay closed the user side instead of delivering the
+//!   post-half-close write", 5.5 s) — proves the arm's relay is what carries
+//!   the bytes.
+//!
+//! On Linux `relay_plain_fast_inner` routes to `splice::bridge_splice`, so the
+//! first mutation changes the relay function too; re-measure there before
+//! leaning on the late-bytes half alone.
 
 mod common;
 
@@ -108,9 +112,14 @@ async fn start_provider(server_port: u16, local_port: u16) -> ClientService {
         tcp_mux: false,
         tls_enable: false,
         // No pre-spawned work conns: the server asks for a fresh one when the
-        // visitor's relay starts. (The arm's "pooled" is the buffer pool; with
-        // `pool_count: 2` the pre-spawned conns time out after 8 s waiting for
-        // StartWorkConn and the server pool then hands the relay a dead one.)
+        // visitor's relay starts. (The arm's "pooled" is the buffer pool, not
+        // the pool of work conns. With `pool_count: 2` the pre-spawned conns
+        // wait for `StartWorkConn` under `start_work_conn_timeout`
+        // (`frp-client/src/work_conn.rs`), i.e. `dial_timeout_secs.max(1)` —
+        // 10 s by default — while the server-side pool keeps no idle expiry
+        // (`frp-server/src/control/pool.rs`); the relay here does not start
+        // until the punch budget expires, so every pre-spawned conn would be
+        // dead before it is used.)
         pool_count: 0,
         nat_hole_stun_server: format!("127.0.0.1:{}", dead_udp_port()),
         proxies: vec![ProxyConfig {
@@ -151,7 +160,11 @@ async fn start_visitor(server_port: u16, visitor_port: u16) -> ClientService {
             bind_addr: "127.0.0.1".into(),
             bind_port: visitor_port as i32,
             protocol: "quic".into(),
-            fallback_to: String::new(),
+            // The proxy's OWN name — see the module docs: an empty
+            // `fallback_to` also lands here but pins the punch budget to Go's
+            // fixed 20 s, making the test 21.7 s instead of 2 s.
+            fallback_to: XTCP_PROXY.into(),
+            fallback_timeout_ms: 200,
             ..Default::default()
         }],
         ..Default::default()
@@ -243,27 +256,29 @@ async fn test_xtcp_visitor_pooled_relay_delivers_late_provider_bytes() {
         .await
         .expect("visitor port became connectable within 15s");
 
-    // Empty `fallback_to` pins the visitor's `open_tunnel` budget to Go's 20 s
-    // (`frp-client/src/visitor/stcp.rs`: `if fb_to.is_empty() {
-    // Duration::from_secs(20) }`), so the relay only starts ~20 s after the
-    // user connection arrives. The read budget must therefore exceed that, not
-    // the punch itself.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(100);
-    let mut last = String::new();
-    for _attempt in 1..=2 {
-        match expect_late_bytes_after_user_half_close(visitor_addr, Duration::from_secs(45)).await {
-            Ok(()) => return,
-            Err(e) => {
-                last = e;
-                if tokio::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-        }
-    }
-    panic!(
-        "pooled XTCP relay e2e: the visitor never received the provider's post-half-close \
-         bytes through the server relay. Last failure: {last}"
+    // The visitor listener is bound in `spawn_session_tasks`, i.e. after
+    // login/registration (`frp-client/src/service/session.rs`), so a
+    // connectable port implies the visitor is logged in.
+    // `wait_for_port` opened and closed one user connection of its own, which
+    // also reaches the arm a budget later; let that increment land before the
+    // baseline so the assertion below is about THIS socket's relay.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = frp_server::control::pooled_xtcp_fallback_bridges();
+    expect_late_bytes_after_user_half_close(visitor_addr, Duration::from_secs(20))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "pooled XTCP relay e2e: the visitor never received the provider's \
+                 post-half-close bytes through the server relay. {e}"
+            )
+        });
+    // The data path cannot tell this arm from `FastRelay` (see the module
+    // docs), so selection is asserted on the counter: with the plan's `xtcp`
+    // term rewritten to `false` this line is the one that goes red.
+    assert!(
+        frp_server::control::pooled_xtcp_fallback_bridges() > before,
+        "arm counter did not move: PlainPath::PooledXttpFallback was never taken \
+         (before={before}, after={})",
+        frp_server::control::pooled_xtcp_fallback_bridges()
     );
 }

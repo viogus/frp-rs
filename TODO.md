@@ -13130,7 +13130,7 @@ needs the two-review rule and its own gate run.
       `else` is deleted because an exhaustive `match` over the plan makes
       "the fallback escaped its arm" a compile error instead of a runtime
       case. 48 tests, compat 86/0.
-- [ ] **Coverage for the pooled-relay arm, against a real provider.** No
+- [x] **Coverage for the pooled-relay arm, against a real provider.** No
       in-tree test drives `run_work_bridge` with `proxy_type == "xtcp"` (the
       STCP `fallback_to` fixture is `stcp`; the XTCP pairwise e2e omits
       fallback so P2P must succeed), and an *in-process* raw-socket test
@@ -13153,6 +13153,25 @@ needs the two-review rule and its own gate run.
       `frp-server/src/control/proxy_ops/unregister_generation_tests.rs:4,73`,
       the latter already used from `frp-server/src/control/bridge/tests.rs:547`).
       What is missing is the client-side delay, not the fixtures.
+      Done: `frp-client/tests/xtcp_pooled_relay_e2e.rs` — real frps (in
+      process) + provider + visitor, punch impossible (dead loopback STUN),
+      `fallback_to` set to the proxy's own name so the server still sees
+      `proxy_type == "xtcp"` and the punch budget is 200 ms rather than Go's
+      fixed 20 s (2.6 s, down from 21.7 s). The late-bytes assertion alone did
+      NOT close the gap: measured 2026-11-20, it passes with the plan's `xtcp`
+      term rewritten to `false` (off Linux `relay_plain_fast_inner` *is*
+      `relay_plain_pooled`) and with the arm's body swapped for the pre-pooled
+      `bridge_plain`, because every plain relay propagates the half close. So
+      selection is pinned on a counter instead —
+      `frp_server::control::pooled_xtcp_fallback_bridges()`
+      (`frp-server/src/control/bridge.rs`, the
+      `frp_core::splice::bridge_splice_calls` shape), which goes red under that
+      mutation and green unmutated. Residual, recorded rather than hidden: the
+      test does not falsify arm-vs-`bridge_plain`, only that the arm is taken
+      and that its relay carries the bytes. A server-side pin is still cheaper
+      than this fixture if one is ever wanted (`frp-server/tests/stcp_relay.rs`
+      reaches `run_work_bridge` with hand-built V1 frames in milliseconds);
+      this one lives in the client lane because it needs a real provider.
 - [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** Eleven flag families ×
       nine config formats; write the matrix first, then move one family per
       commit.
