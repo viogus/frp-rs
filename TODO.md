@@ -13281,13 +13281,19 @@ needs the two-review rule and its own gate run.
       expanders consume it: the table (`FRPS_GO_FLAGS`), the `FrpsArgs` fields
       (the hand-written struct is gone) and the six `Svr*` builder structs plus
       `impl From<FrpsBuild> for FrpsArgs`. 93 declarations became 31 in the list
-      plus 31 at the `construct!` sites. The oracle held: 207 `frp-core --lib
-      cli` tests, no `--help` pin changed (`frp-core/src/cli/help_doc_tests.rs` is
-      not in the diff; the diff's other files are the cite table and `ci.yml`'s
-      data pin), `--no-default-features` 185 tests — which is the real
-      proof the `#[cfg(feature = "kcp")]` / `("quic")` gates still sit on their
-      own rows, because `help_doc_tests.rs`'s `strip_pinned_row` panics unless
-      exactly one rendered line carries each. Two things to know before
+      plus 31 at the `construct!` sites. The oracle held: 101 `cli::` tests (98
+      under `--no-default-features`), no `--help` pin changed
+      (`frp-core/src/cli/help_doc_tests.rs` is not in the diff; the other files
+      are the cite table, `ci.yml`'s data pin, and the two re-baked cites in
+      `frps/tests/cli_exit_codes.rs` and `frps/tests/log_completion.rs`), and
+      `--help` stayed byte-identical across 15 surfaces in four feature shapes
+      (`--all-features` 17,914 B, `tiny` 17,676 B, `tiny,kcp` 17,794 B,
+      `tiny,quic` 17,796 B). That the `#[cfg(feature = "kcp")]` / `("quic")`
+      gates sit on their own rows is proven by the kcp-only and quic-only
+      lanes, not by the `--no-default-features` lane: swapping the two gates
+      passes both the default and the no-default-features lanes and reddens
+      only those two shapes, and `strip_pinned_row` validates the frozen pin
+      constant rather than a rendered document. Two things to know before
       the next family: generating per-struct fields forces the rows to be
       grouped by owning struct, so `FRPS_GO_FLAGS` is no longer in pflag byte
       order as a whole (nothing reads it positionally — the renderer sorts — and

@@ -293,7 +293,7 @@ frp-core/src/config/normalize.rs	949	956	8e671e550d95ad22	df3982fd61017359	absol
 frp-core/src/config/server.rs	1493	-	c76767988b0d75ba	-	absolute	docs/developing.md	frp-core/src/config/server.rs:1493	202
 frp-core/src/config/server.rs	165	-	9acced459a4d1711	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/server.rs:165	465
 frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/tests.rs	frp-core/src/config/server.rs:249	628
-frp-core/src/config/server.rs	259	-	40543641219f3caa	-	absolute	frp-core/src/cli/flag_tables.rs	frp-core/src/config/server.rs:259	121
+frp-core/src/config/server.rs	259	261	40543641219f3caa	d10b36aa74a59bcf	absolute	frp-core/src/cli/flag_tables.rs	frp-core/src/config/server.rs:259-261	121
 frp-core/src/config/server.rs	39	41	7f4dc7c9a19c10f0	e8ce8b12b33170f3	absolute	docs/config.md	frp-core/src/config/server.rs:39-41	22
 frp-core/src/config/server.rs	42	43	6c60b85e59ef9571	10cd5aec687621e8	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/server.rs:42-43	22
 frp-core/src/config/server.rs	42	56	6c60b85e59ef9571	f2c9c1112b74d0d9	absolute	frp-core/src/config/tests.rs	frp-core/src/config/server.rs:42-56	3011
