@@ -13323,6 +13323,35 @@ needs the two-review rule and its own gate run.
       is not accessible due to macro hygiene`); the generated struct makes the
       hand-written site a compile check, so adding a row reddens it with
       `error[E0063]: missing field … in initializer of FrpcRunArgs`.
+      The three admin commands' argument structs took the same shape next
+      (`frpc_admin_flag_specs`, 5 rows: the four `admin-*` extension flags plus
+      Go's single `--api-timeout`, each row carrying the doc comment that used
+      to sit on the field). Two expanders consume it — `frpc_admin_flag_tables`
+      for `FRPC_ADMIN_GO_FLAGS` (1 row) and `FRPC_ADMIN_EXTENSION_FLAGS` (5
+      rows), and `frpc_admin_args_structs` for `ReloadArgs`, `StatusArgs` and
+      `StopArgs`. Two parts stay hand-written. Each struct's non-admin tail
+      (`config`, `strict_config`, and `json` on `status`) is written *before*
+      the generated block: a `macro_rules!` body emits a whole struct and
+      cannot splice a field group after literal fields, and field order is what
+      the struct diff is read for (it is also what `Debug` prints), so the
+      generated block is the part that moves. `--json` is likewise not a row —
+      every row becomes a field of all three structs and only `StatusArgs` has
+      it — so its table row is the named `FRPC_ADMIN_STATUS_ONLY_ROW`, appended
+      by the table arm, and the three `construct!`s are untouched for the
+      hygiene reason the root family recorded, which makes each of them a
+      compile check: a row added here reddens all three with `error[E0063]`.
+      Oracle: the three structs' field lists diff clean against the file's
+      previous revision on `main` (7/8/7 fields — names, types, order and doc
+      text), the two tables are value-identical row for row (1 + 5, compared
+      order-insensitively), 101 `cli::` tests (98 under
+      `--no-default-features`), 164 `frpc --all-features` tests, and no `--help`
+      pin moved. Residual: reading one list for both shapes means one order, so
+      `FRPC_ADMIN_EXTENSION_FLAGS` now lists `admin-user` before `admin-pwd`
+      where it had them the other way round — nothing reads either table
+      positionally (the renderer sorts by long, and `surface_consults` keys a
+      table on its first row, still `admin-addr`); the cite table was re-baked
+      for the three citing-line shifts in `frpc.rs` (targets unmoved) and
+      `ci.yml`'s `guard_data_pin` moved with it.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from
