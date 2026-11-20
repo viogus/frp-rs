@@ -13306,6 +13306,15 @@ needs the two-review rule and its own gate run.
       It is compile-checked — a literal must name every field, so it cannot drift
       silently — but "the names now live in one place" is true of `frp-core`
       only.
+      The `frpc` root/run family then took the same two steps
+      (`frpc_root_flag_specs`, 10 rows = 5 Go + 5 extension): both tables and
+      `FrpcRunArgs` are generated, but the `construct!` in `run_mode` cannot
+      be — a name written in a macro body carries that expansion's syntax
+      context and cannot name a call-site local (measured: `help: an
+      identifier with the same name exists, but is not accessible due to macro
+      hygiene`) — so it stays hand-written and is checked instead: adding a row
+      reddens it with `error[E0063]: missing field … in initializer of
+      FrpcRunArgs`.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from

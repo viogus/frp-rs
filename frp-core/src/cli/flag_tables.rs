@@ -175,12 +175,13 @@ frps_flag_specs!(frps_go_flag_table);
 /// Each row names the `FrpcRunArgs` field the flag fills, its type, and the
 /// pflag-shaped cells of that flag's table row — `go ( … )` for a row Go
 /// registers, `ext ( … )` for one it does not. That is what the callback form
-/// buys, one list two shapes: `frpc_root_flag_tables` below emits **both**
-/// [`FRPC_ROOT_GO_FLAGS`] (from the `go ( … )` cells) and
-/// [`FRPC_ROOT_EXTENSION_FLAGS`] (from the `ext ( … )` cells), and
-/// `frpc_root_args_struct` / `frpc_root_run_construct` in `frpc.rs` emit
-/// `FrpcRunArgs` and the `construct!` that fills it, so a flag that is in one
-/// shape is in all of them.
+/// buys: one list feeds every shape but the hand-written `construct!` —
+/// `frpc_root_flag_tables` below emits **both** [`FRPC_ROOT_GO_FLAGS`] (from the
+/// `go ( … )` cells) and [`FRPC_ROOT_EXTENSION_FLAGS`] (from the `ext ( … )`
+/// cells), and `frpc_root_args_struct` in `frpc.rs` emits `FrpcRunArgs`, whose
+/// fields the `construct!` in `run_mode` still fills by hand — a macro body
+/// cannot name a call-site local — so a row added here reddens that struct
+/// literal until the site names it too.
 ///
 /// The `ext ( … )` cells carry frp-rs's own text, not Go's: measured on Go
 /// v0.71.0, `frpc --log-file x --help`, `--log-level`, `--log-max-days`,
@@ -253,9 +254,8 @@ pub(crate) use frpc_root_flag_specs;
 /// table row at all, which is how a flag with no pflag entry of either kind
 /// would be spelled.
 ///
-/// Its pattern mirrors `frpc_root_args_struct` and `frpc_root_run_construct` in
-/// `frpc.rs`: all three open the same list, so a change to the row shape has to
-/// change all three.
+/// Its pattern mirrors `frpc_root_args_struct` in `frpc.rs`: both open the same
+/// list, so a change to the row shape has to change both.
 macro_rules! frpc_root_flag_tables {
     (
         $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? ) ),* $(,)?
