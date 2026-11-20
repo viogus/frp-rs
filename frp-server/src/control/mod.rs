@@ -1,4 +1,7 @@
 pub(crate) mod bridge;
+
+#[doc(hidden)]
+pub use bridge::pooled_xtcp_fallback_bridges;
 mod dispatch;
 // pub(crate) so the stale-control reaper (service.rs) can clear the OIDC
 // subject mapping for a swept run_id (round-7 audit LOW — the generation-

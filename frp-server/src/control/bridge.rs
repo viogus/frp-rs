@@ -346,6 +346,28 @@ impl<R: AsyncRead + Unpin, W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWri
     }
 }
 
+/// Connections served by the `PlainPath::PooledXttpFallback` arm.
+///
+/// Test support only. Off Linux the arm is behaviourally indistinguishable
+/// from its neighbour — `relay_plain_fast_inner` *is* `relay_plain_pooled`
+/// there, so a `tcp`/XTCP pair bridges identically whichever arm runs, and a
+/// byte-level e2e passes even with the plan's `xtcp` term rewritten to
+/// `false` (measured). This counter is the only portable way to pin that the
+/// arm is SELECTED: `frp-client/tests/xtcp_pooled_relay_e2e.rs` asserts it
+/// moved, and that assertion goes red under the same mutation. Same shape and
+/// rationale as [`frp_core::splice::bridge_splice_calls`].
+static POOLED_XTCP_FALLBACK_BRIDGES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Connections this process has served through [`PlainPath::PooledXttpFallback`].
+///
+/// Test support only — see the static's docs for why the arm needs a counter
+/// to be pinned at all.
+#[doc(hidden)]
+pub fn pooled_xtcp_fallback_bridges() -> u64 {
+    POOLED_XTCP_FALLBACK_BRIDGES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Bridge a user connection to a work connection for one proxy.
 ///
 /// Runs inside the spawned bridge task. Extracted from `assign_work_to_proxy`
@@ -645,6 +667,7 @@ async fn run_work_bridge(
 
         match path {
             PlainPath::PooledXttpFallback => {
+                POOLED_XTCP_FALLBACK_BRIDGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some((u_r, u_w)) =
                     try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
                 else {
