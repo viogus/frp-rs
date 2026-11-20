@@ -15,7 +15,7 @@ splice fast path:
 | `bridge_plain_decompressed_read` | none | `use_compression` | no | no | caller |
 | `bridge_plain_rate_limited` | none | `use_compression` | `use_compression` | yes | caller |
 | `bridge_plain_rate_limited_decompressed_read` | none | `use_compression` | no | yes | caller |
-| `bridge_encrypted` | AES-128-CFB | `use_compression` | `use_compression` unless `read_is_decrypted` | yes | caller |
+| `bridge_encrypted` | AES-128-CFB | `use_compression` | `use_compression` (independent of `read_is_decrypted`) | yes | caller |
 | `bridge_encrypted_decompressed_read` | AES-128-CFB | `use_compression` | no | yes | caller |
 | `bridge_encrypted_io` | AES-128-CFB | `use_compression` | `use_compression` | yes | this function splits |
 | `relay_plain_pooled` / `bridge_splice` | none | no | no | no | pooled buffers / `splice(2)` |
@@ -30,21 +30,27 @@ every entry point, both dispatchers, and every caller that has to choose.
 ## What slice 1 changes
 
 - `BridgePlan` holds the axes: `crypto` (`Plain` | `Encrypted { key }`),
-  `compress`, `read_side` (`Decompress` | `AlreadyPlain`), `pre_read`,
-  `limiter`, `metrics`. Builders are `BridgePlan::plain(compress)` and
-  `BridgePlan::encrypted(key, compress)`, plus chainable `read_side`,
-  `pre_read`, `limiter`, `metrics`.
-- `BridgePlan::run(user_r, user_w, work_r, work_w)` derives the three booleans
-  the cores take in one place (`fn core_flags`) and calls the matching core.
-  Entry points are now three lines each; their signatures and behaviour are
-  unchanged.
+  `compress`, `decompress_read`, `read_is_plaintext`, `pre_read`, `limiter`,
+  `metrics`. Builders are `BridgePlan::plain(compress)` and
+  `BridgePlan::encrypted(key, compress)`, plus chainable `read_is_plaintext`,
+  `without_read_decompression`, `pre_read`, `limiter`, `metrics`.
+- Decompression and decryption stay **separate** axes. The first draft collapsed
+  them into one `ReadSide` enum; the adversarial review caught that
+  `bridge_encrypted(read_is_decrypted = true, compression on)` used to pass
+  `decompress_read = use_compression` (base `frp-core/src/bridge.rs:729-741`) and
+  the collapse silently stopped decompressing a stream that is decrypted but
+  still snappy-compressed. `core_flags` therefore reads three independent
+  booleans, and the entry points fix their pairs explicitly.
+- `BridgePlan::run_plain` / `run_encrypted` call the matching core. Keeping two
+  methods is what lets the plain entry points keep their original
+  `impl AsyncReadExt + Unpin` bound: the `Send` requirement belongs to the
+  encrypted core's boxed reader, not to the plan.
 - `bridge_plain_rate_limited_core` was deleted: it was `bridge_plain_core` with
   a different debug line, and nothing else. One core per crypto mode now.
 
-The one visible API change: the plain entry points' `work_r` parameter gained
-`+ Send`, because `BridgePlan::run` is shared with the encrypted path, which
-moves the reader into a task. Every caller passes a tokio stream or
-`tokio::io::split` half, which is `Send`, so no call site changed.
+No public signature changed: the plan is split into `run_plain` and
+`run_encrypted` precisely so the plain entry points do not inherit the encrypted
+core's `Send` bound.
 
 ## What slice 1 does not do
 
@@ -60,9 +66,13 @@ moves the reader into a task. Every caller passes a tokio stream or
 
 ## Evidence
 
-`bridge_plan_keeps_the_entry_point_semantics` pins the eight historical
-combinations against `core_flags`; `bridge_plan_defaults_leave_the_optional_axes_off`
-pins the defaults. The 40 tests in `frp-core/src/bridge.rs`'s `mod tests`
-(the byte-moving ones) were untouched and still pass, which is what says the
-rewiring did not change behaviour: they exercise each entry point through real
-pipes.
+`bridge_plan_keeps_the_entry_point_semantics` pins ten combinations — the eight
+entry points plus the two `read_is_decrypted` values for `bridge_encrypted`, one
+of which is the case the first draft got wrong —
+`bridge_plan_defaults_leave_the_optional_axes_off` pins the defaults, and
+`without_read_decompression_keeps_the_write_side_compressing` pins the axis that
+is easy to collapse again. The existing byte-moving tests in `frp-core/src/bridge.rs`'s
+`mod tests` were untouched and still pass; they cover most but **not all** entry
+points (the two `_rate_limited` variants have no unit test — their only callers
+are `frp-server/src/control/bridge.rs` and `frp-client/src/proxy.rs`), so the
+flag table above is the evidence for those two, not the pipe tests.
