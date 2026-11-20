@@ -2094,3 +2094,51 @@ async fn injector_mid_body_snappy_decode_failure_after_head_is_clean_eof() {
         "corrupt frame bytes must never reach the wire: {out:?}"
     );
 }
+
+#[test]
+fn plain_path_picks_the_fast_relay_only_when_every_term_holds() {
+    assert_eq!(
+        plain_path(false, false, false, true, false, false, false),
+        PlainPath::FastRelay
+    );
+    for (name, a) in [
+        (
+            "compression on",
+            (false, false, true, true, false, false, false),
+        ),
+        (
+            "pre-read bytes",
+            (false, false, false, false, false, false, false),
+        ),
+        (
+            "header injector",
+            (false, false, false, true, true, false, false),
+        ),
+        (
+            "visitor encrypted",
+            (false, false, false, true, false, true, false),
+        ),
+        (
+            "visitor compressed",
+            (false, false, false, true, false, false, true),
+        ),
+    ] {
+        assert_eq!(
+            plain_path(a.0, a.1, a.2, a.3, a.4, a.5, a.6),
+            PlainPath::Slow,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn plain_path_priorities_put_the_fallback_and_the_limit_first() {
+    assert_eq!(
+        plain_path(true, true, false, true, false, false, false),
+        PlainPath::PooledXttpFallback
+    );
+    assert_eq!(
+        plain_path(false, true, false, true, false, false, false),
+        PlainPath::RateLimited
+    );
+}

@@ -62,6 +62,48 @@ impl Drop for ActiveGuard {
 /// swallowed by Tokio (audit round 5, MEDIUM). The RAII `ConnGuard` still
 /// releases the connection slot during unwind, but the panic cause was lost
 /// — `catch_unwind` at the spawn sites preserves the diagnostic.
+/// Which shape a plain (unencrypted work connection) request takes, in priority
+/// order. Spelled inline, the third arm is a six-term condition whose terms each
+/// exist because of an incident; naming it makes the list reviewable and
+/// testable, and forces a comment per term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlainPath {
+    /// XTCP/STCP fallback: needs the pooled relay, not `splice`.
+    PooledXttpFallback,
+    /// A bandwidth limit is configured.
+    RateLimited,
+    /// Compression off, no VHost pre-read, no header injector, no visitor-segment
+    /// wrapping: the only shape where `splice(2)` applies.
+    FastRelay,
+    /// Everything else: split both sides, let the plain core (de)compress.
+    Slow,
+}
+
+fn plain_path(
+    xctp_visitor_fallback: bool,
+    bw_limited: bool,
+    comp_key: bool,
+    pre_read_is_empty: bool,
+    has_header_injector: bool,
+    visitor_encrypted: bool,
+    visitor_comp: bool,
+) -> PlainPath {
+    if xctp_visitor_fallback {
+        PlainPath::PooledXttpFallback
+    } else if bw_limited {
+        PlainPath::RateLimited
+    } else if !comp_key
+        && pre_read_is_empty
+        && !has_header_injector
+        && !visitor_encrypted
+        && !visitor_comp
+    {
+        PlainPath::FastRelay
+    } else {
+        PlainPath::Slow
+    }
+}
+
 fn log_bridge_panic(proxy_name: &str, what: &str, p: Box<dyn std::any::Any + Send>) {
     let msg = p
         .downcast_ref::<&str>()
@@ -649,11 +691,15 @@ async fn run_work_bridge(
                 )
                 .await;
             }
-        } else if !comp_key
-            && bridge_pre_read.is_empty()
-            && injector_headers.is_none()
-            && !visitor_encrypted
-            && !visitor_comp
+        } else if plain_path(
+            false,
+            false,
+            comp_key,
+            bridge_pre_read.is_empty(),
+            injector_headers.is_some(),
+            visitor_encrypted,
+            visitor_comp,
+        ) == PlainPath::FastRelay
         {
             // Fast path: pure plain relay with no compression, no VHost
             // pre-read, no header injection, and no visitor-segment

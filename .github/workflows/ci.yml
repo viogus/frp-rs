@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=0685074b0ff444fb7058d096ed4bec4d219c741bd7f1166adf6e3149b323c0f6
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=f1d4cd662350ae486a3f2d227876bb2c134ab925c408a38ed947085f11147142
+          guard_data_pin=65e3208eaa33d7b2969702128ed9a15a50dc8e44673a3c8399201eba76ce37cd
           guard_exact=101
           guard_floor=101
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2528,7 +2528,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=370
+          n_expected=372
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1
