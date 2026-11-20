@@ -20,7 +20,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=605 weak=136 ambiguous=2 excluded=101 foreign_reported=1163 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=611f43121f84b344
+#   pins: checked=605 weak=135 ambiguous=2 excluded=101 foreign_reported=1163 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=611f43121f84b344
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2384	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2384	1524
@@ -292,8 +292,8 @@ frp-core/src/config/normalize.rs	949	956	8e671e550d95ad22	df3982fd61017359	absol
 frp-core/src/config/normalize.rs	949	956	8e671e550d95ad22	df3982fd61017359	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/normalize.rs:949-956	557
 frp-core/src/config/server.rs	1493	-	c76767988b0d75ba	-	absolute	docs/developing.md	frp-core/src/config/server.rs:1493	202
 frp-core/src/config/server.rs	165	-	9acced459a4d1711	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/server.rs:165	465
-frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/flag_tables.rs	frp-core/src/config/server.rs:249	121
 frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/tests.rs	frp-core/src/config/server.rs:249	628
+frp-core/src/config/server.rs	259	-	40543641219f3caa	-	absolute	frp-core/src/cli/flag_tables.rs	frp-core/src/config/server.rs:259	121
 frp-core/src/config/server.rs	39	41	7f4dc7c9a19c10f0	e8ce8b12b33170f3	absolute	docs/config.md	frp-core/src/config/server.rs:39-41	22
 frp-core/src/config/server.rs	42	43	6c60b85e59ef9571	10cd5aec687621e8	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/server.rs:42-43	22
 frp-core/src/config/server.rs	42	56	6c60b85e59ef9571	f2c9c1112b74d0d9	absolute	frp-core/src/config/tests.rs	frp-core/src/config/server.rs:42-56	3011

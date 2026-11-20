@@ -118,7 +118,7 @@ macro_rules! frps_flag_specs {
                     /// `pkg/config/flags.go:237`), so `frps verify` inherits it too. `None`
                     /// means the flag was absent and the config value stands;
                     /// `ServerConfig::default()` already carries Go's 60
-                    /// (`frp-core/src/config/server.rs:249`), so the absent case is Go's default.
+                    /// (`frp-core/src/config/server.rs:259`), so the absent case is Go's default.
                     /// The value is `i64`, matching `Int64VarP` and Go's `int64` config field:
                     /// Go accepts `--vhost-http-timeout -1` (its floor then applies) and refuses
                     /// only what does not fit an `int64` (measured on Go v0.71.0:
