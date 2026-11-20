@@ -13113,19 +13113,46 @@ needs the two-review rule and its own gate run.
       Done: the plan is evaluated once above the chain and rows 4-6 read that
       one value (`path == PlainPath::RateLimited` / `FastRelay`); the rate
       limited arm's executable lines are unchanged (its leading comment was
-      rewritten), and the fallback stays the head `if` with its term now bound
-      to the plan instead of a literal. 48 tests, compat 86/0.
-- [ ] **Collapse the XTCP/STCP fallback arm the same way.** It is the only
+      rewritten), and the fallback stayed the head `if` in this PR — folded
+      into the `match` by the slice below — with its term bound to the plan
+      instead of a literal. 48 tests, compat 86/0.
+- [x] **Collapse the XTCP/STCP fallback arm the same way.** It is the only
       caller of `relay_plain_pooled`'s `UserSide` pair; keep the pooled relay's
       own error handling (it drops both writers instead of joining forever).
       Done when: `plain_path` returns `PooledXttpFallback`, the STCP/XTCP
       visitor integration tests pass, and the fallback still logs its
       `debug!` line.
-      Carry-in: no in-tree test drives `run_work_bridge` with an `xtcp` proxy
-      (the STCP `fallback_to` fixture is `proxy_type == "stcp"`), so slice 1's
-      fail-closed last arm is currently the only net; this slice should bring
-      an in-process `Service` test that pushes bytes through an xtcp-proxy
-      plain bridge.
+      Done: rows 3-6 are now one `match path`, the fallback is its first arm
+      (body unchanged apart from indentation — `git diff -w` shows the arm
+      headers, the inlined-comment rewrite, and the deleted fail-closed
+      `else`), `PooledXttpFallback` comes straight from
+      `proxy_type == "xtcp"` in the plan call, and slice 1's fail-closed
+      `else` is deleted because an exhaustive `match` over the plan makes
+      "the fallback escaped its arm" a compile error instead of a runtime
+      case. 48 tests, compat 86/0.
+- [ ] **Coverage for the pooled-relay arm, against a real provider.** No
+      in-tree test drives `run_work_bridge` with `proxy_type == "xtcp"` (the
+      STCP `fallback_to` fixture is `stcp`; the XTCP pairwise e2e omits
+      fallback so P2P must succeed), and an *in-process* raw-socket test
+      cannot close the gap: measured 2026-11-20, a `#[tokio::test]` that calls
+      `run_work_bridge` over two `tcp_pair()`s with
+      `proxy_type: "xtcp"` passes, and it still passes with the plan's first
+      term neutralized (`… && false`), because `relay_plain_fast`'s
+      `copy_bidirectional` also delivers the provider's late bytes after the
+      user half-close. The premature-FIN loss needs the server's FIN to reach
+      a *real* frpc provider whose bridge is still starting (that is what
+      turns into ECONNRESET), so the fixture has to be a client-side half
+      close with the provider's bridge delayed — not two raw sockets.
+      Done when: an e2e (in the style of
+      `frp-client/tests/xtcp_visitor_failure_e2e.rs`, with an `xtcp` proxy
+      that has `fallback_to` configured) asserts the visitor still receives
+      bytes written by the provider after the visitor half-closes.
+      Cost note: cheaper than it looks — `AppState` and a `ProxyInfo` builder
+      already exist (`crate::control::proxy_ops::unregister_generation_tests::test_state()`
+      and `::proxy_info(name, proxy_type, run_id, remote_port, control_id)` at
+      `frp-server/src/control/proxy_ops/unregister_generation_tests.rs:4,73`,
+      the latter already used from `frp-server/src/control/bridge/tests.rs:547`).
+      What is missing is the client-side delay, not the fixtures.
 - [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** Eleven flag families ×
       nine config formats; write the matrix first, then move one family per
       commit.

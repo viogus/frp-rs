@@ -2137,6 +2137,14 @@ fn plain_path_priorities_put_the_fallback_and_the_limit_first() {
         plain_path(true, true, false, true, false, false, false),
         PlainPath::PooledXttpFallback
     );
+    // An `xtcp` proxy reaches the pooled arm with every other flag off — the
+    // destination the fast-relay arm would otherwise take (a mangled first
+    // term sends the fallback there silently, since the fast relay is the
+    // "nothing special" case).
+    assert_eq!(
+        plain_path(true, false, false, true, false, false, false),
+        PlainPath::PooledXttpFallback
+    );
     assert_eq!(
         plain_path(false, true, false, true, false, false, false),
         PlainPath::RateLimited

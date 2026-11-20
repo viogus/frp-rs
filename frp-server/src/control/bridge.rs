@@ -622,17 +622,19 @@ async fn run_work_bridge(
         //
         // Rows 3-6 of the decision table
         // (docs/archive/notes/2026-11-20-server-bridge-branches.md) are one
-        // predicate, evaluated once and compared per arm. Row 3 (the
-        // XTCP/STCP fallback) is still the head of the chain; folding its body
-        // into the plan's match is the next slice. Its term is bound rather
-        // than passed as `false` so the guard above and the plan below cannot
-        // drift: if a later slice deletes that `if` and relies on the plan, a
-        // fallback request surfaces as PooledXttpFallback at the last arm,
-        // which drops the pair and logs instead of quietly taking the wrong
-        // relay.
-        let xctp_fallback = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp");
+        // predicate, evaluated once here, and the arms below are a single
+        // `match` over that value — the fallback (row 3) is an ordinary arm
+        // rather than a guard in front of the chain. What the compiler now
+        // guarantees is that no view of the plan lacks a body: deleting the
+        // arm or widening the enum fails to compile, where the old chain
+        // silently fell through to the release-live `else`. It does not
+        // guarantee that the plan routes an `xtcp` proxy here — that is the
+        // first term's job, and
+        // `plain_path_priorities_put_the_fallback_and_the_limit_first`
+        // (`frp-server/src/control/bridge/tests.rs`) pins both destinations it
+        // could move to.
         let path = plain_path(
-            xctp_fallback,
+            proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp"),
             bw_limiter.is_some(),
             comp_key,
             bridge_pre_read.is_empty(),
@@ -641,150 +643,139 @@ async fn run_work_bridge(
             visitor_comp,
         );
 
-        if xctp_fallback {
-            let Some((u_r, u_w)) =
-                try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
-            else {
-                return;
-            };
-            // Pooled-buffer relay (audit round-8 P1): relay_plain_pooled
-            // keeps the copy_bidirectional semantics this arm's comment above
-            // requires — both directions run to completion and the work side
-            // is only shut down after the full bidirectional copy
-            // (FIN-propagation, no premature-FIN race), without the
-            // per-conn buffer pair. Buffer size stays FRP_BRIDGE_BUF_KB
-            // (the pool's BUFFER_SIZE governs the XTCP STCP fallback path).
-            //
-            // Difference from copy_bidirectional: once one direction has hit
-            // EOF, the other is bounded by HALF_CLOSE_LINGER_TIMEOUT (30 s of
-            // idleness) so a silent peer cannot pin both sockets forever.
-            let user_side = UserSide { r: u_r, w: u_w };
-            match frp_core::bridge::relay_plain_pooled(user_side, work_conn).await {
-                Ok((a, b)) => {
-                    metrics.record_traffic(a, b);
-                }
-                Err(e) => {
-                    debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
-                }
-            }
-        } else if path == PlainPath::RateLimited {
-            // Bandwidth limiting active: use rate-limited plain bridge. The
-            // body is copied verbatim from the arm this condition replaced
-            // (`bw_limiter.is_some()`), including the injector's decompressor
-            // ordering — `ResponseHeaderInjector` above `SnappyStreamReader`.
-            let Some((u_r, u_w)) =
-                try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
-            else {
-                return;
-            };
-            let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
-                return;
-            };
-            if let Some(headers) = injector_headers {
-                // A1: decompress the work stream before the injector when the
-                // proxy uses compression (see the encrypted arm above).
-                let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
-                    Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
-                } else {
-                    w_r
+        match path {
+            PlainPath::PooledXttpFallback => {
+                let Some((u_r, u_w)) =
+                    try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+                else {
+                    return;
                 };
-                let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
-                // No one-shot header_timeout to the bridge: the injector
-                // owns the absolute response-head deadline (see the
-                // encrypted arm above).
-                frp_core::bridge::bridge_plain_rate_limited_decompressed_read(
-                    u_r,
-                    u_w,
-                    injector,
-                    w_w,
-                    comp_key,
-                    bridge_pre_read,
-                    bw_limiter.as_ref(),
-                    Some(metrics.clone()),
-                )
-                .await;
-            } else {
-                frp_core::bridge::bridge_plain_rate_limited(
-                    u_r,
-                    u_w,
-                    w_r,
-                    w_w,
-                    comp_key,
-                    bridge_pre_read,
-                    bw_limiter.as_ref(),
-                    Some(metrics.clone()),
-                )
-                .await;
+                // Pooled-buffer relay (audit round-8 P1): relay_plain_pooled
+                // keeps the copy_bidirectional semantics this arm's comment above
+                // requires — both directions run to completion and the work side
+                // is only shut down after the full bidirectional copy
+                // (FIN-propagation, no premature-FIN race), without the
+                // per-conn buffer pair. Buffer size stays FRP_BRIDGE_BUF_KB
+                // (the pool's BUFFER_SIZE governs the XTCP STCP fallback path).
+                //
+                // Difference from copy_bidirectional: once one direction has hit
+                // EOF, the other is bounded by HALF_CLOSE_LINGER_TIMEOUT (30 s of
+                // idleness) so a silent peer cannot pin both sockets forever.
+                let user_side = UserSide { r: u_r, w: u_w };
+                match frp_core::bridge::relay_plain_pooled(user_side, work_conn).await {
+                    Ok((a, b)) => {
+                        metrics.record_traffic(a, b);
+                    }
+                    Err(e) => {
+                        debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
+                    }
+                }
             }
-        } else if path == PlainPath::FastRelay {
-            // Fast path: pure plain relay with no compression, no VHost
-            // pre-read, no header injection, and no visitor-segment
-            // encryption/compression (splice needs the raw IoStream; visitor
-            // wrapping already split it into wrapped halves). On Linux, try
-            // zero-copy splice for Tcp-to-Tcp; otherwise use
-            // copy_bidirectional.
-            relay_plain_fast(req.user_conn, work_conn, &metrics).await;
-        } else if path == PlainPath::Slow {
-            // Slow path: compression, VHost pre-read, header injection, or
-            // visitor-segment encryption.
-            let Some((u_r, u_w)) =
-                try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
-            else {
-                return;
-            };
-            let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
-                return;
-            };
-            if let Some(headers) = injector_headers {
-                // A1: decompress the work stream before the injector when the
-                // proxy uses compression (see the encrypted arm above).
-                let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
-                    Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
-                } else {
-                    w_r
+            PlainPath::RateLimited => {
+                // Bandwidth limiting active: use rate-limited plain bridge. The
+                // body is copied verbatim from the arm this condition replaced
+                // (`bw_limiter.is_some()`), including the injector's decompressor
+                // ordering — `ResponseHeaderInjector` above `SnappyStreamReader`.
+                let Some((u_r, u_w)) =
+                    try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+                else {
+                    return;
                 };
-                let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
-                // No one-shot header_timeout to the bridge: the injector
-                // owns the absolute response-head deadline (see the
-                // encrypted arm above).
-                frp_core::bridge::bridge_plain_decompressed_read(
-                    u_r,
-                    u_w,
-                    injector,
-                    w_w,
-                    comp_key,
-                    bridge_pre_read,
-                    Some(metrics.clone()),
-                )
-                .await;
-            } else {
-                frp_core::bridge::bridge_plain(
-                    u_r,
-                    u_w,
-                    w_r,
-                    w_w,
-                    comp_key,
-                    bridge_pre_read,
-                    Some(metrics.clone()),
-                )
-                .await;
+                let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+                    return;
+                };
+                if let Some(headers) = injector_headers {
+                    // A1: decompress the work stream before the injector when the
+                    // proxy uses compression (see the encrypted arm above).
+                    let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                        Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
+                    } else {
+                        w_r
+                    };
+                    let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                    // No one-shot header_timeout to the bridge: the injector
+                    // owns the absolute response-head deadline (see the
+                    // encrypted arm above).
+                    frp_core::bridge::bridge_plain_rate_limited_decompressed_read(
+                        u_r,
+                        u_w,
+                        injector,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        bw_limiter.as_ref(),
+                        Some(metrics.clone()),
+                    )
+                    .await;
+                } else {
+                    frp_core::bridge::bridge_plain_rate_limited(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        bw_limiter.as_ref(),
+                        Some(metrics.clone()),
+                    )
+                    .await;
+                }
             }
-        } else {
-            // `path == PooledXttpFallback` escaped the head arm above, so a
-            // future slice deleted that guard without teaching the plan. Fail
-            // closed: dropping the pair is loud and recoverable, while falling
-            // through to the slow relay would silently give up the pooled
-            // relay's no-premature-FIN semantics (audit round-8 P1) and the
-            // fast relay would lose the visitor wrapping entirely.
-            //
-            // No in-tree test drives this function with an `xtcp` proxy (the
-            // STCP `fallback_to` fixtures use `proxy_type == "stcp"`), so this
-            // arm — not an assertion — is the net; TODO slice 2 records the
-            // missing in-process test.
-            tracing::error!(
-                proxy_name = %req.proxy_name,
-                "bridge plan returned an unhandled XTCP/STCP fallback; dropping both connections"
-            );
+            PlainPath::FastRelay => {
+                // Fast path: pure plain relay with no compression, no VHost
+                // pre-read, no header injection, and no visitor-segment
+                // encryption/compression (splice needs the raw IoStream; visitor
+                // wrapping already split it into wrapped halves). On Linux, try
+                // zero-copy splice for Tcp-to-Tcp; otherwise use
+                // copy_bidirectional.
+                relay_plain_fast(req.user_conn, work_conn, &metrics).await;
+            }
+            PlainPath::Slow => {
+                // Slow path: compression, VHost pre-read, header injection, or
+                // visitor-segment encryption.
+                let Some((u_r, u_w)) =
+                    try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
+                else {
+                    return;
+                };
+                let Some((w_r, w_w)) = try_split_work_halves(work_conn) else {
+                    return;
+                };
+                if let Some(headers) = injector_headers {
+                    // A1: decompress the work stream before the injector when the
+                    // proxy uses compression (see the encrypted arm above).
+                    let injector_r: Box<dyn AsyncRead + Unpin + Send> = if comp_key {
+                        Box::new(frp_core::snappy_stream::SnappyStreamReader::new(w_r))
+                    } else {
+                        w_r
+                    };
+                    let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                    // No one-shot header_timeout to the bridge: the injector
+                    // owns the absolute response-head deadline (see the
+                    // encrypted arm above).
+                    frp_core::bridge::bridge_plain_decompressed_read(
+                        u_r,
+                        u_w,
+                        injector,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        Some(metrics.clone()),
+                    )
+                    .await;
+                } else {
+                    frp_core::bridge::bridge_plain(
+                        u_r,
+                        u_w,
+                        w_r,
+                        w_w,
+                        comp_key,
+                        bridge_pre_read,
+                        Some(metrics.clone()),
+                    )
+                    .await;
+                }
+            }
         }
     }
     debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);
