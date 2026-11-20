@@ -777,7 +777,14 @@ impl<'a> BridgePlan<'a> {
     pub fn choice(&self) -> BridgeChoice {
         match self.crypto {
             Crypto::Encrypted { .. } => BridgeChoice::EncryptedWhole,
-            Crypto::Plain if self.compress || self.limiter.is_some() => BridgeChoice::PlainSplit,
+            // Pre-read bytes only exist on the split path: the fast relay has
+            // nowhere to put them, so a plain plan carrying them must not be
+            // answered with `PlainFastRelay`.
+            Crypto::Plain
+                if self.compress || self.limiter.is_some() || !self.pre_read.is_empty() =>
+            {
+                BridgeChoice::PlainSplit
+            }
             Crypto::Plain => BridgeChoice::PlainFastRelay,
         }
     }
@@ -3418,7 +3425,8 @@ mod tests {
     /// The dispatcher's three answers, pinned so a dispatcher cannot drift from
     /// `core_flags`: every encrypted plan runs whole, a plain plan with
     /// compression or a limiter splits, and only a bare plain plan takes the
-    /// fast relay.
+    /// fast relay. A plain plan that carries pre-read bytes also splits, because
+    /// the fast relay has no way to inject them.
     #[test]
     fn bridge_plan_choice_matches_the_core_it_selects() {
         let key = [7u8; 16];
@@ -3442,6 +3450,11 @@ mod tests {
             (
                 "plain, both",
                 BridgePlan::plain(true).limiter(Some(&limiter)),
+                BridgeChoice::PlainSplit,
+            ),
+            (
+                "plain, pre-read only",
+                BridgePlan::plain(false).pre_read(vec![1, 2, 3]),
                 BridgeChoice::PlainSplit,
             ),
             (

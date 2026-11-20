@@ -361,6 +361,9 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
     match plan.choice() {
         bridge::BridgeChoice::EncryptedWhole => {
             let Some(key) = enc_key else {
+                // Unreachable: a plan is only `EncryptedWhole` when a key was
+                // present. Log rather than return silently if that changes.
+                warn!(name = %name, "Proxy {}: encrypted shape without a key", name);
                 return;
             };
             let local_io = IoStream::Tcp(local);
