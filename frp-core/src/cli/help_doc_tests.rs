@@ -1276,13 +1276,21 @@ fn the_admin_tables_name_exactly_the_flags_each_side_registers() {
         ["api-timeout"],
         "Go registers exactly one flag on the admin commands (cmd/frpc/sub/admin.go)"
     );
-    let ext: std::collections::BTreeSet<&str> =
-        FRPC_ADMIN_EXTENSION_FLAGS.iter().map(|row| row.long).collect();
+    let ext: std::collections::BTreeSet<&str> = FRPC_ADMIN_EXTENSION_FLAGS
+        .iter()
+        .map(|row| row.long)
+        .collect();
     assert_eq!(
         ext,
-        ["admin-addr", "admin-port", "admin-pwd", "admin-user", "json"]
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            "admin-addr",
+            "admin-port",
+            "admin-pwd",
+            "admin-user",
+            "json"
+        ]
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>(),
         "the five flags frp-rs adds on top of Go's"
     );
     assert!(
