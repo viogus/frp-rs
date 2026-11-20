@@ -43,19 +43,43 @@ pub enum FrpcCmd {
     Stop(StopArgs),
 }
 
-#[derive(Debug, Clone)]
-pub struct FrpcRunArgs {
-    pub config: String,
-    pub config_dir: Option<String>,
-    pub strict_config: bool,
-    pub allow_unsafe: Vec<String>,
-    pub show_version: bool,
-    pub log_file: Option<String>,
-    pub log_level: Option<String>,
-    pub log_max_days: Option<i32>,
-    pub log_format: Option<String>,
-    pub disable_log_color: bool,
+/// `frpc_root_flag_specs`' struct arm: the rows become [`FrpcRunArgs`].
+///
+/// The arm emits the struct, not the `construct!` that fills it. Writing that
+/// call *inside* this macro cannot work: it fills each field from a local of
+/// the same name in `run_mode`, and an identifier written in a macro body — or
+/// handed through one, as the rows are — carries that expansion's syntax
+/// context, so it fails with `error[E0425]: cannot find value` plus the hint
+/// "an identifier with the same name exists, but is not accessible due to
+/// macro hygiene".
+///
+/// It can be generated *indirectly*: a macro-emitted binder
+/// `fn frpc_root_run_parser($($field: impl Parser<$ty>),*) -> impl
+/// Parser<FrpcRunArgs>` whose body is `construct!(FrpcRunArgs { $($field),* })`
+/// compiles and was measured to produce identical `--help` output. It is not
+/// used, because passing the parsers positionally drops the field-name↔parser
+/// correspondence: swapping two same-typed arguments (`log_file` and
+/// `log_level`, say) then compiles and passes every test, while the name-based
+/// call below rejects that swap by construction.
+///
+/// So the call site stays written out — and is checked rather than free: every
+/// field this arm emits is a field that literal must fill, so a row added to
+/// the list breaks the build with `error[E0063]` until the site names it too.
+///
+/// Its pattern mirrors `frpc_root_flag_tables` in `flag_tables.rs`: both open
+/// the same list, so a change to the row shape has to change both.
+macro_rules! frpc_root_args_struct {
+    (
+        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? $(,)? ) ),* $(,)?
+    ) => {
+        #[derive(Debug, Clone)]
+        pub struct FrpcRunArgs {
+            $( $(#[$doc])* pub $field: $ty, )*
+        }
+    };
 }
+
+frpc_root_flag_specs!(frpc_root_args_struct);
 
 #[derive(Debug, Clone)]
 pub struct TcpArgs {
@@ -904,7 +928,7 @@ pub(crate) fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
     // Go's `--mux string` names the multiplexer — it is **not** the port. The
     // same spelling means the same thing in frp-server's SSH gateway
     // (`frp-server/src/ssh_gateway/args.rs:692`), and `ProxyConfig::multiplexer`
-    // (frp-core/src/config/client.rs:741) is where it lands. A literal
+    // (frp-core/src/config/client.rs:1142) is where it lands. A literal
     // `--mux-port`→`--mux` rename would have rendered `--mux int` and rejected
     // Go's string value; this is the flag Go actually has.
     let mux = long("mux").argument::<String>("MUX").optional();

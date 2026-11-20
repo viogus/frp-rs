@@ -13306,6 +13306,23 @@ needs the two-review rule and its own gate run.
       It is compile-checked — a literal must name every field, so it cannot drift
       silently — but "the names now live in one place" is true of `frp-core`
       only.
+      The `frpc` root/run family then took the same two steps
+      (`frpc_root_flag_specs`, 10 rows = 5 Go + 5 extension): both tables and
+      `FrpcRunArgs` are generated. The `construct!` in `run_mode` stays
+      hand-written, but **not** because it cannot be generated — a macro-emitted
+      binder (`fn frpc_root_run_parser($($field: impl Parser<$ty>),*) -> impl
+      Parser<FrpcRunArgs>` around `construct!(FrpcRunArgs { $($field),* })`)
+      compiles and was measured to render identical help. It is not used
+      because passing the parsers positionally loses the field-name↔parser
+      mapping: swapping two same-typed arguments (`log_file`/`log_level`) then
+      compiles and passes every test, while the name-based call rejects that
+      swap by construction. What does fail is writing `construct!` *inside* the
+      macro — an identifier there carries that expansion's syntax context and
+      cannot name a local of the same name in `run_mode` (measured:
+      `error[E0425]` plus `help: an identifier with the same name exists, but
+      is not accessible due to macro hygiene`); the generated struct makes the
+      hand-written site a compile check, so adding a row reddens it with
+      `error[E0063]: missing field … in initializer of FrpcRunArgs`.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from
