@@ -13,6 +13,24 @@ User-facing release notes for frp-rs.
 
 ### Fixes
 
+- **Four configuration spellings that strict mode accepted and then ignored now
+  do what they say.** A root `tcpMux` / `tcpMuxKeepaliveInterval` /
+  `tcpMuxKeepaliveTimeout` in `frps.toml` passed validation and was dropped (the
+  hoist list carried only the snake_case names); it is now hoisted like
+  `tcp_mux`, with the snake spelling winning when a file sets both.
+  `[transport.tls] useSystemCa` in `frpc.toml` — a documented setting — was
+  refused as `unknown field "tls_use_system_ca"` because the key the flatten
+  produces was missing from the strict list; it loads now, and the same key on
+  `frps` produces Go's own `transport.tls.useSystemCa is only supported in frpc
+  transport.tls` instead of an unknown-field error. Finally, `tls_skip_verify` /
+  `tlsSkipVerify` were listed for `frps` although the field is client-only, so a
+  server config that set them was silently ignored; that is now a load error.
+  The same hole existed in `frpc.toml`, where `ClientConfig::tcp_mux` has no
+  camelCase alias either, so a root `tcpMux` was accepted and dropped; both
+  binaries now canonicalise the trio. Pinned by seven tests that drive the
+  strict loader (not the lenient `load_*_config_from_str` helpers, which skip
+  the check entirely).
+
 - **KCP: a peer that vanishes while the tunnel is idle is noticed in about two
   seconds.** A KCP session was only declared dead when it had a segment in
   flight, so a frozen peer survived until the application next wrote — 20-30 s

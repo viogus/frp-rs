@@ -1,6 +1,8 @@
 # One name, seven places: the configuration alias layer
 
-Status: **design note plus four verified defects — no behaviour has changed.**
+Status: **design note plus four verified defects; three of them are fixed in
+this change and the fourth (the inventory drift the parity test would catch) is
+still open.**
 This replaces an earlier draft whose central premise was wrong; the review that
 falsified it is recorded in the PR. The correction is kept visible here because
 the wrong version is the intuitive one: the strict check does **not** run on the
@@ -42,7 +44,7 @@ and 168 + 132 `pub` field declarations across the whole of
 `frp-core/src/config/server.rs` / `client.rs` (the top-level `ServerConfig` itself
 has 44 — the larger figure is the file, not the struct).
 
-## Four defects this layer already has
+## Four defects this layer already has (1–3 fixed here, 4 open)
 
 All four were reproduced by running `verify` on a config that uses them — three
 on `frps`, one on `frpc` — i.e. through the strict path, not through the
@@ -55,7 +57,7 @@ strict-free `load_*_config_from_str` helpers that every `test_parse_*` test uses
    value is discarded. Same shape for `tls_skip_verify` / `tlsSkipVerify` at the
    root of `frps.toml`: they are in the **server** strict list but are a
    **client** field, so a server config that sets them is silently ignored.
-2. **Reachable, unlisted — live on the client today.** `[transport.tls]
+2. **Reachable, unlisted — refused on the client before this change.** `[transport.tls]
    useSystemCa = true` in `frpc.toml` is a documented setting, and the default
    strict mode refuses it with
    `Config file /tmp/c1.toml is invalid: unknown field "tls_use_system_ca"`.

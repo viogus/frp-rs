@@ -784,9 +784,9 @@ length: 144116287587483648 (max: 10240), raw header: 000200010000000000`. A plai
 mismatch — server `tcp_mux = false`, client snake_case `tcp_mux = true` — fails
 identically. Do not generalise the drop to every camelCase key: `transport.tcpMux`
 under a `[transport]` table is **not** dropped — `normalize_client_config`
-(`frp-core/src/config/normalize.rs:1179`, called from
+(`frp-core/src/config/normalize.rs:1203`, called from
 `frp-core/src/config/loader.rs:186`) flattens `[transport]` and maps
-`"tcpMux" => "tcp_mux"` (`frp-core/src/config/normalize.rs:1453`), so that
+`"tcpMux" => "tcp_mux"` (`frp-core/src/config/normalize.rs:1501`), so that
 spelling logs in and registers fine.
 
 Helper line numbers for orientation: `start_echo_server`
@@ -2435,12 +2435,12 @@ That row has since **changed** with the strict-mode array recursion
 `proxies[0].RemotePort`), because `check_strict` walks the
 `[[proxies]]`/`[[visitors]]`/`[[httpPlugins]]` elements with one exact-match key
 set per **struct** (`PROXY_KNOWN_KEYS` and friends in
-`frp-core/src/config/strict.rs:280`). Non-strict mode still drops the keys
+`frp-core/src/config/strict.rs:287`). Non-strict mode still drops the keys
 (rc 0, `remote_port: 0`, `local_port: 80`).
 
 - **Strict mode does not refuse everywhere: it walks only the tables it has a
   key list for.** `section_known_keys`
-  (`frp-core/src/config/strict.rs:551`) has nine arms, plus the top level
+  (`frp-core/src/config/strict.rs:558`) has nine arms, plus the top level
   `check_strict` is entered with and, since the array recursion, the proxy /
   visitor / client-plugin / visitor-plugin / http-plugin element sets. Each
   walked position is listed here with a capitalised key measured as refused at
