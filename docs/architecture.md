@@ -421,6 +421,13 @@ plain path — pool-buffered, sized by `BUFFER_SIZE` and overridable via
 streaming — a single random 16-byte IV followed by continuous ciphertext, no
 per-frame length prefix). The client-side plain relay uses the same helpers.
 
+Those entry points are combinations of five axes (crypto, user→work
+compression, whether work→user still needs decompressing, pre-read bytes, the
+shared limiter) plus the split-vs-whole shape; `frp_core::bridge::BridgePlan`
+holds the axes and `BridgePlan::run` derives the flags the cores take, so the
+eight public functions are three-line wrappers. Design and remaining slices:
+[the bridge note](archive/notes/2026-11-20-bridge-plan.md).
+
 ---
 
 ## Server Control Plane: The InternalMsg Channel

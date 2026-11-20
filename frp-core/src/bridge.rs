@@ -661,6 +661,149 @@ async fn bridge_work_to_user(
     }
 }
 
+/// Which direction of a bridge decompresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadSide {
+    /// Both directions carry compressed bytes, so the work→user reader is
+    /// wrapped in a decompressor.
+    Decompress,
+    /// The caller already handed over plaintext (a `SnappyStreamReader` over the
+    /// decrypted stream, or an injector above it); only user→work compresses.
+    AlreadyPlain,
+}
+
+/// The transform applied to the work connection's bytes.
+#[derive(Clone, Copy, Debug)]
+pub enum Crypto<'a> {
+    /// No encryption on the work connection.
+    Plain,
+    /// AES-128-CFB streaming encryption with this key.
+    Encrypted { key: &'a [u8; 16] },
+}
+
+/// Everything that distinguishes the bridge entry points, as data.
+///
+/// The eight public entry points below are combinations of five independent
+/// axes — crypto, whether user→work compresses, whether work→user still needs
+/// decompressing, the bytes read before the handshake finished, and the
+/// shared bandwidth limiter — plus one shape axis (whole `IoStream`s versus
+/// already-split halves). Naming the axes once keeps the combinations from
+/// drifting apart, and makes the two dispatchers (`frp-server/src/control/`
+/// `bridge.rs` and `frp-client/src/proxy.rs`) able to build a value instead of
+/// re-deriving the case analysis.
+pub struct BridgePlan<'a> {
+    /// Wire transform on the work connection.
+    pub crypto: Crypto<'a>,
+    /// Compress user→work. `false` means the connection is plain both ways.
+    pub compress: bool,
+    /// Whether work→user still carries compressed bytes.
+    pub read_side: ReadSide,
+    /// Bytes already read from the work connection (VHost HTTP body).
+    pub pre_read: Vec<u8>,
+    /// The proxy's shared limiter: one bucket covers both directions.
+    pub limiter: Option<&'a SharedBandwidthLimiter>,
+    /// Per-proxy counters for the duration of the bridge.
+    pub metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
+}
+
+impl<'a> BridgePlan<'a> {
+    /// Unencrypted work connection; `compress` turns on bidirectional snappy.
+    pub fn plain(compress: bool) -> Self {
+        Self {
+            crypto: Crypto::Plain,
+            compress,
+            read_side: ReadSide::Decompress,
+            pre_read: Vec::new(),
+            limiter: None,
+            metrics: None,
+        }
+    }
+
+    /// Encrypted work connection (AES-128-CFB); `compress` as above.
+    pub fn encrypted(key: &'a [u8; 16], compress: bool) -> Self {
+        Self {
+            crypto: Crypto::Encrypted { key },
+            ..Self::plain(compress)
+        }
+    }
+
+    pub fn read_side(mut self, read_side: ReadSide) -> Self {
+        self.read_side = read_side;
+        self
+    }
+
+    pub fn pre_read(mut self, pre_read: Vec<u8>) -> Self {
+        self.pre_read = pre_read;
+        self
+    }
+
+    pub fn limiter(mut self, limiter: Option<&'a SharedBandwidthLimiter>) -> Self {
+        self.limiter = limiter;
+        self
+    }
+
+    pub fn metrics(mut self, metrics: Option<Arc<crate::metrics::ProxyMetrics>>) -> Self {
+        self.metrics = metrics;
+        self
+    }
+
+    /// The three booleans the cores take, derived in one place.
+    ///
+    /// `decompress_read` is only set when the connection actually carries
+    /// compressed bytes in both directions; `read_is_decrypted` only applies to
+    /// the encrypted core, where an `AlreadyPlain` read side means the caller has
+    /// already wrapped it (the round-14 A1 injector path).
+    fn core_flags(&self) -> (bool, bool, bool) {
+        let decompress_read = self.compress && self.read_side == ReadSide::Decompress;
+        let read_is_decrypted = self.read_side == ReadSide::AlreadyPlain;
+        (self.compress, decompress_read, read_is_decrypted)
+    }
+
+    /// Bridge already-split halves. `work_r` must be `Send` because the
+    /// encrypted core moves the cipher reader into its own task.
+    pub async fn run<UR, UW, WR, WW>(self, user_r: UR, user_w: UW, work_r: WR, work_w: WW)
+    where
+        UR: AsyncReadExt + Unpin,
+        UW: AsyncWriteExt + Unpin,
+        WR: tokio::io::AsyncRead + Unpin + Send,
+        WW: AsyncWriteExt + Unpin,
+    {
+        let (compress, decompress_read, read_is_decrypted) = self.core_flags();
+        match self.crypto {
+            Crypto::Plain => {
+                bridge_plain_core(
+                    user_r,
+                    user_w,
+                    work_r,
+                    work_w,
+                    compress,
+                    self.pre_read,
+                    self.limiter,
+                    self.metrics,
+                    decompress_read,
+                )
+                .await
+            }
+            Crypto::Encrypted { key } => {
+                bridge_encrypted_core(
+                    user_r,
+                    user_w,
+                    work_r,
+                    work_w,
+                    key,
+                    compress,
+                    self.pre_read,
+                    self.limiter,
+                    self.metrics,
+                    read_is_decrypted,
+                    decompress_read,
+                )
+                .await
+            }
+        }
+    }
+}
+
 /// Bridge encrypted data between two IoStreams, splitting them internally.
 #[allow(clippy::too_many_arguments)]
 pub async fn bridge_encrypted_io(
@@ -675,19 +818,12 @@ pub async fn bridge_encrypted_io(
     tracing::debug!(use_compression, "bridge_encrypted_io: starting");
     let (u_r, u_w) = user.into_split()?;
     let (w_r, w_w) = work.into_split()?;
-    bridge_encrypted(
-        u_r,
-        u_w,
-        w_r,
-        w_w,
-        key,
-        use_compression,
-        pre_read,
-        limiter,
-        metrics,
-        false,
-    )
-    .await;
+    BridgePlan::encrypted(key, use_compression)
+        .pre_read(pre_read)
+        .limiter(limiter)
+        .metrics(metrics)
+        .run(u_r, u_w, w_r, w_w)
+        .await;
     Ok(())
 }
 
@@ -726,20 +862,18 @@ pub async fn bridge_encrypted(
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
     read_is_decrypted: bool,
 ) {
-    bridge_encrypted_core(
-        user_r,
-        user_w,
-        work_r,
-        work_w,
-        key,
-        use_compression,
-        pre_read,
-        limiter,
-        metrics,
-        read_is_decrypted,
-        use_compression,
-    )
-    .await;
+    let read_side = if read_is_decrypted {
+        ReadSide::AlreadyPlain
+    } else {
+        ReadSide::Decompress
+    };
+    BridgePlan::encrypted(key, use_compression)
+        .read_side(read_side)
+        .pre_read(pre_read)
+        .limiter(limiter)
+        .metrics(metrics)
+        .run(user_r, user_w, work_r, work_w)
+        .await;
 }
 
 /// Like [`bridge_encrypted`], but the work→user read stream is assumed to be
@@ -767,20 +901,13 @@ pub async fn bridge_encrypted_decompressed_read(
     limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    bridge_encrypted_core(
-        user_r,
-        user_w,
-        work_r,
-        work_w,
-        key,
-        use_compression,
-        pre_read,
-        limiter,
-        metrics,
-        true,
-        false,
-    )
-    .await;
+    BridgePlan::encrypted(key, use_compression)
+        .read_side(ReadSide::AlreadyPlain)
+        .pre_read(pre_read)
+        .limiter(limiter)
+        .metrics(metrics)
+        .run(user_r, user_w, work_r, work_w)
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -847,24 +974,17 @@ async fn bridge_encrypted_core(
 pub async fn bridge_plain(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin + Send,
     work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    bridge_plain_core(
-        user_r,
-        user_w,
-        work_r,
-        work_w,
-        use_compression,
-        pre_read,
-        None,
-        metrics,
-        use_compression,
-    )
-    .await;
+    BridgePlan::plain(use_compression)
+        .pre_read(pre_read)
+        .metrics(metrics)
+        .run(user_r, user_w, work_r, work_w)
+        .await;
 }
 
 /// Like [`bridge_plain`], but the work→user read stream is assumed to be
@@ -878,31 +998,25 @@ pub async fn bridge_plain(
 pub async fn bridge_plain_decompressed_read(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin + Send,
     work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    bridge_plain_core(
-        user_r,
-        user_w,
-        work_r,
-        work_w,
-        use_compression,
-        pre_read,
-        None,
-        metrics,
-        false,
-    )
-    .await;
+    BridgePlan::plain(use_compression)
+        .read_side(ReadSide::AlreadyPlain)
+        .pre_read(pre_read)
+        .metrics(metrics)
+        .run(user_r, user_w, work_r, work_w)
+        .await;
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn bridge_plain_core(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin + Send,
     work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
@@ -1126,25 +1240,19 @@ where
 pub async fn bridge_plain_rate_limited(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin + Send,
     work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
     limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    bridge_plain_rate_limited_core(
-        user_r,
-        user_w,
-        work_r,
-        work_w,
-        use_compression,
-        pre_read,
-        limiter,
-        metrics,
-        use_compression,
-    )
-    .await;
+    BridgePlan::plain(use_compression)
+        .pre_read(pre_read)
+        .limiter(limiter)
+        .metrics(metrics)
+        .run(user_r, user_w, work_r, work_w)
+        .await;
 }
 
 /// Like [`bridge_plain_rate_limited`], but the work→user read stream is
@@ -1158,50 +1266,20 @@ pub async fn bridge_plain_rate_limited(
 pub async fn bridge_plain_rate_limited_decompressed_read(
     user_r: impl AsyncReadExt + Unpin,
     user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
+    work_r: impl AsyncReadExt + Unpin + Send,
     work_w: impl AsyncWriteExt + Unpin,
     use_compression: bool,
     pre_read: Vec<u8>,
     limiter: Option<&SharedBandwidthLimiter>,
     metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 ) {
-    bridge_plain_rate_limited_core(
-        user_r,
-        user_w,
-        work_r,
-        work_w,
-        use_compression,
-        pre_read,
-        limiter,
-        metrics,
-        false,
-    )
-    .await;
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn bridge_plain_rate_limited_core(
-    user_r: impl AsyncReadExt + Unpin,
-    user_w: impl AsyncWriteExt + Unpin,
-    work_r: impl AsyncReadExt + Unpin,
-    work_w: impl AsyncWriteExt + Unpin,
-    use_compression: bool,
-    pre_read: Vec<u8>,
-    limiter: Option<&SharedBandwidthLimiter>,
-    metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
-    decompress_read: bool,
-) {
-    let user_to_work = bridge_user_to_work(
-        user_r,
-        WorkWriter::Plain(work_w),
-        use_compression,
-        pre_read,
-        limiter,
-        metrics.clone(),
-    );
-    let work_to_user = bridge_work_to_user(work_r, user_w, decompress_read, limiter, metrics);
-
-    let _ = tokio::join!(user_to_work, work_to_user);
+    BridgePlan::plain(use_compression)
+        .read_side(ReadSide::AlreadyPlain)
+        .pre_read(pre_read)
+        .limiter(limiter)
+        .metrics(metrics)
+        .run(user_r, user_w, work_r, work_w)
+        .await;
 }
 
 #[cfg(test)]
@@ -3207,5 +3285,71 @@ mod tests {
             "response-head deadline must render Go's bare 504, got: {:?}",
             String::from_utf8_lossy(&received)
         );
+    }
+
+    /// The eight public entry points are combinations of three booleans. Pin the
+    /// derivation so a future edit to `core_flags` cannot silently change one
+    /// entry point's meaning (e.g. start decrypting an already-decrypted read
+    /// side, or stop decompressing a compressed connection).
+    #[test]
+    fn bridge_plan_keeps_the_entry_point_semantics() {
+        let key = [0u8; 16];
+        let cases: Vec<(&str, BridgePlan<'_>, (bool, bool, bool))> = vec![
+            (
+                "bridge_plain(compress)",
+                BridgePlan::plain(true),
+                (true, true, false),
+            ),
+            (
+                "bridge_plain(no compress)",
+                BridgePlan::plain(false),
+                (false, false, false),
+            ),
+            (
+                "bridge_plain_decompressed_read",
+                BridgePlan::plain(true).read_side(ReadSide::AlreadyPlain),
+                (true, false, true),
+            ),
+            (
+                "bridge_plain_rate_limited",
+                BridgePlan::plain(true),
+                (true, true, false),
+            ),
+            (
+                "bridge_plain_rate_limited_decompressed_read",
+                BridgePlan::plain(true).read_side(ReadSide::AlreadyPlain),
+                (true, false, true),
+            ),
+            (
+                "bridge_encrypted(read_is_decrypted = false)",
+                BridgePlan::encrypted(&key, true),
+                (true, true, false),
+            ),
+            (
+                "bridge_encrypted(read_is_decrypted = true)",
+                BridgePlan::encrypted(&key, true).read_side(ReadSide::AlreadyPlain),
+                (true, false, true),
+            ),
+            (
+                "bridge_encrypted_decompressed_read",
+                BridgePlan::encrypted(&key, true).read_side(ReadSide::AlreadyPlain),
+                (true, false, true),
+            ),
+        ];
+        for (name, plan, expected) in cases {
+            assert_eq!(plan.core_flags(), expected, "{name}");
+        }
+    }
+
+    /// The opt-in pieces default to off, so a plan built with `plain(true)` is
+    /// exactly the old `bridge_plain` call.
+    #[test]
+    fn bridge_plan_defaults_leave_the_optional_axes_off() {
+        let plan = BridgePlan::plain(false);
+        assert!(plan.pre_read.is_empty());
+        assert!(plan.limiter.is_none());
+        assert!(plan.metrics.is_none());
+        assert_eq!(plan.read_side, ReadSide::Decompress);
+        assert!(matches!(plan.crypto, Crypto::Plain));
     }
 }
