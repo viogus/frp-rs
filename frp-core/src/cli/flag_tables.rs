@@ -168,9 +168,10 @@ macro_rules! frps_go_flag_table {
 frps_flag_specs!(frps_go_flag_table);
 
 /// The `frpc` root flag surface as one list: the five rows Go frp **v0.71.0**
-/// prints persistently (`frpc --help`, 1370 B; `frpc verify --help` repeats
-/// exactly those under `Global Flags`), plus the five frp-rs extension flags
-/// that fill the same struct.
+/// prints persistently (`frpc --help`; the count differs from Go's — 1517 B here
+/// against 1370 B there — because the document is bpaf's rendering, not cobra's;
+/// `frpc verify --help` repeats exactly those under `Global Flags`), plus the five
+/// frp-rs extension flags that fill the same struct.
 ///
 /// Each row names the `FrpcRunArgs` field the flag fills, its type, and the
 /// pflag-shaped cells of that flag's table row — `go ( … )` for a row Go
@@ -254,11 +255,16 @@ pub(crate) use frpc_root_flag_specs;
 /// table row at all, which is how a flag with no pflag entry of either kind
 /// would be spelled.
 ///
+/// A row with *both* cells is a duplicate: it registers one spelling twice, and
+/// `leaf_global_flags_are_the_root_persistent_flags` in `help_doc_tests.rs`
+/// reports the two sets as disagreeing (the row shape cannot tell the two kinds
+/// apart, so this is caught by test rather than by the pattern).
+///
 /// Its pattern mirrors `frpc_root_args_struct` in `frpc.rs`: both open the same
 /// list, so a change to the row shape has to change both.
 macro_rules! frpc_root_flag_tables {
     (
-        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? ) ),* $(,)?
+        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? $(,)? ) ),* $(,)?
     ) => {
         pub(crate) const FRPC_ROOT_GO_FLAGS: &[GoFlagRow] = &[
             $( $( GoFlagRow { long: $glong, short: $gshort, varname: $gvarname, usage: $gusage }, )? )*
