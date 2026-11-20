@@ -13094,3 +13094,38 @@ it off. `[transport.kcp] probe = false` is the escape hatch; the structural fix
 (a probe the peer can receive, i.e. no unsolicited inbound) is not available
 without NAT traversal, which KCP does not have. Evidence:
 [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](docs/archive/notes/2026-11-19-kcp-liveness-probe.md).
+
+## P2 — simplification spine: one slice per PR (follow-up to #633–#645)
+
+The month-scope simplification round shipped 12 PRs (#633–#645). These are the
+slices deliberately left, in the order they should land. Each is one PR; each
+needs the two-review rule and its own gate run.
+
+- [ ] **Collapse the server's bandwidth-limited arm onto `PlainPath`.**
+      `frp-server/src/control/bridge.rs` still spells the rate-limited branch
+      inline after `plain_path()` was introduced (PR #644). Move the arm into
+      `match plain_path(..)` with the body copied verbatim — the injector's
+      decompressor ordering (`ResponseHeaderInjector` above
+      `SnappyStreamReader`) must survive the move unchanged.
+      Done when: `plain_path` returns `RateLimited` on that path, the 48
+      `frp-server --lib control::bridge` tests still pass, and
+      `scripts/compat-test.sh` is 86/0.
+- [ ] **Collapse the XTCP/STCP fallback arm the same way.** It is the only
+      caller of `relay_plain_pooled`'s `UserSide` pair; keep the pooled relay's
+      own error handling (it drops both writers instead of joining forever).
+      Done when: `plain_path` returns `PooledXttpFallback`, the STCP/XTCP
+      visitor integration tests pass, and the fallback still logs its
+      `debug!` line.
+- [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** Eleven flag families ×
+      nine config formats; write the matrix first, then move one family per
+      commit.
+      Done when: every family is declared as data, `--help` output is
+      byte-identical to the current pinned text (the Go-parity pins in
+      `frp-core/src/cli/help_doc_tests.rs` are the oracle), and
+      `frp-core/src/cli/mod.rs` is under 1,000 lines.
+- [ ] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
+      comment added to `.github/workflows/ci.yml` moves that file's own cited
+      lines. Restore `scripts/tests/pathline-cite-expectations.txt` from
+      `origin/main`, retarget exactly the one row whose fingerprint moved, and
+      change `ci.yml` only for count literals — then `guard_data_pin`.
+      Done when: the guard reports 604 cites / 0 violations before every push.
