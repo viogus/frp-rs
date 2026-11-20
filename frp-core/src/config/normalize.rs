@@ -902,6 +902,21 @@ pub(super) fn normalize_server_config(
         } else if let Some(value) = table.remove("workerThreads") {
             table.insert("worker_threads".to_string(), value);
         }
+        // Same treatment for the three root camelCase mux spellings: they are
+        // strict-listed (Go writes them) but the hoist list below carries only
+        // the snake_case names, so without this a root `tcpMux` was accepted
+        // and then dropped. Root snake wins over root camel, as above.
+        for (camel, snake) in [
+            ("tcpMux", "tcp_mux"),
+            ("tcpMuxKeepaliveInterval", "tcp_mux_keepalive_interval"),
+            ("tcpMuxKeepaliveTimeout", "tcp_mux_keepalive_timeout"),
+        ] {
+            if table.contains_key(snake) {
+                table.remove(camel);
+            } else if let Some(value) = table.remove(camel) {
+                table.insert(snake.to_string(), value);
+            }
+        }
         flatten_to_table(
             table,
             &[

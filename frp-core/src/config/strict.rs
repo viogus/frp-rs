@@ -46,8 +46,6 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         "tls_key_file",
         "tls_ca_file",
         "tls_server_name",
-        "tls_skip_verify",
-        "tlsSkipVerify",
         "tlsServerName",
         "tls_only",
         "auth",
@@ -151,6 +149,11 @@ pub(super) fn known_server_keys() -> std::collections::HashSet<&'static str> {
         // tls_ca_file — strict mode must not reject the documented config).
         "subdomain_host",
         "tls_trusted_ca_file",
+        // Produced at the root by the `[transport.tls]` flatten. Without this
+        // entry the strict check rejects the documented spelling with
+        // `unknown field "tls_use_system_ca"`, and validation never gets to
+        // emit Go's "only supported in frpc transport.tls" message.
+        "tls_use_system_ca",
     ])
 }
 
@@ -178,6 +181,10 @@ pub(super) fn known_client_keys() -> std::collections::HashSet<&'static str> {
         "tls_key_file",
         "tls_ca_file",
         "tls_server_name",
+        // The `[transport.tls]` flatten produces this root key and the field
+        // is `tls_use_system_ca`; without the entry the documented
+        // `[transport.tls] useSystemCa` is refused in strict mode.
+        "tls_use_system_ca",
         "tls_skip_verify",
         "tlsSkipVerify",
         "tcp_mux_keepalive_interval",
