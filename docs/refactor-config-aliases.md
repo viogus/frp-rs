@@ -153,8 +153,19 @@ would repeat the mistake this note was written to correct.
 
 ## Recommended order
 
-1. The source-derived parity test, first and alone — it prints the true size of
-   defect 2 instead of the three instances found by hand.
+1. **Shipped 2026-11-20 (root lists only).** The source-derived parity test
+   now covers `known_server_keys()` and `known_client_keys()`: every camelCase
+   entry must be either a spelling `serde_keys_of_struct` derives from the
+   struct or a key `normalize_*_config` rewrites away, and the failure message
+   names the offenders. Section and array-element lists already had this
+   guarantee through `strict_array_element_keys_match_struct_fields`. The tests
+   are in `frp-core/src/config/tests.rs`
+   (`strict_server_root_list_only_names_spellings_the_struct_can_consume`,
+   `strict_client_root_list_only_names_spellings_the_struct_can_consume`); the
+   reverse direction (a serde spelling strict mode refuses) is still open,
+   because `useSystemCa` is a legal root alias here while Go documents it only
+   under `[transport.tls]`, so refusing the root form is intended. Defect 2 is
+   therefore closed at the root lists and unmeasured below them.
 2. Fix what it prints, in one PR: the three named defects, the client
    `useSystemCa` instance, and the `docs/naming.md` line that currently documents
    a root `tcpMux` being "accepted and then ignored" as intended behaviour.

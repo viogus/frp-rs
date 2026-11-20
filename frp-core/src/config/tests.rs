@@ -16918,3 +16918,76 @@ fn server_refuses_the_client_only_skip_verify_keys() {
         );
     }
 }
+
+// --- Source-derived parity for the ROOT key lists (the test
+// `docs/refactor-config-aliases.md` asks for).
+//
+// Section and array-element keys already have this guarantee through
+// `strict_array_element_keys_match_struct_fields` (which compares every
+// `*_KNOWN_KEYS` list against its struct with `serde_keys_of_struct`). The two
+// root lists, `known_server_keys()` and `known_client_keys()`, are inline
+// literals and were the only hand-maintained copy left; that is exactly the
+// defect class #638 fixed — a spelling strict mode accepts, serde never sees,
+// and the value is silently ignored.
+//
+// The rule pinned here: a camelCase entry in a root list must be consumable by
+// the struct that will deserialise it, either directly (the field or one of its
+// `alias`/`rename` spellings) or through `normalize_*_config`, which runs before
+// strict mode and rewrites the Go spellings into their snake names.
+//
+// Deliberately not attempted: the reverse direction (a serde spelling strict
+// mode refuses) cannot be decided from the struct — `useSystemCa` is a legal
+// root alias here while Go only documents it under `[transport.tls]`, and
+// refusing the root form is intended.
+#[test]
+fn strict_server_root_list_only_names_spellings_the_struct_can_consume() {
+    let accepted = serde_keys_of_struct(include_str!("server.rs"), "ServerConfig");
+    let mut unexplained: Vec<&str> = super::strict::known_server_keys()
+        .into_iter()
+        .filter(|key| key.chars().any(|c| c.is_ascii_uppercase()))
+        .filter(|key| {
+            !accepted.contains(*key)
+                && !normalization_consumes(super::normalize::normalize_server_config, key)
+        })
+        .collect();
+    unexplained.sort_unstable();
+    assert!(
+        unexplained.is_empty(),
+        "strict mode lists root spellings that `ServerConfig` cannot consume and \
+         normalisation does not rewrite, so a config that writes them loads and then \
+         does nothing: {unexplained:?}"
+    );
+}
+
+#[test]
+fn strict_client_root_list_only_names_spellings_the_struct_can_consume() {
+    let accepted = serde_keys_of_struct(include_str!("client.rs"), "ClientConfig");
+    let mut unexplained: Vec<&str> = super::strict::known_client_keys()
+        .into_iter()
+        .filter(|key| key.chars().any(|c| c.is_ascii_uppercase()))
+        .filter(|key| {
+            !accepted.contains(*key)
+                && !normalization_consumes(super::normalize::normalize_client_config, key)
+        })
+        .collect();
+    unexplained.sort_unstable();
+    assert!(
+        unexplained.is_empty(),
+        "strict mode lists client root spellings that `ClientConfig` cannot consume and \
+         normalisation does not rewrite: {unexplained:?}"
+    );
+}
+
+/// Did normalisation rename or hoist this root key away, so serde never sees it?
+fn normalization_consumes(
+    normalize: fn(&mut toml::Value, crate::config::format::ConfigFormat) -> Result<(), String>,
+    key: &str,
+) -> bool {
+    let mut value = toml::Value::Table(toml::map::Map::new());
+    value
+        .as_table_mut()
+        .unwrap()
+        .insert(key.to_string(), toml::Value::String("x".into()));
+    let _ = normalize(&mut value, crate::config::format::ConfigFormat::Toml);
+    !value.as_table().unwrap().contains_key(key)
+}
