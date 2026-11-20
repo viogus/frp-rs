@@ -13185,6 +13185,49 @@ needs the two-review rule and its own gate run.
       'cli::' frps/ frpc/ frp-server/ frp-client/`), keep exactly those items
       `pub`, and only then split — the matrix in the original item's first line
       is the same work seen from the flag side.
+      **Landed 2026-11-20 (the split half only; the flag data model is still
+      open).** The split was done from the item map, not from line ranges: a
+      script parsed `frp-core/src/cli/mod.rs` into its 155 top-level units
+      (doc block plus body, bracket-depth boundaries) and assigned each to one
+      of ten new modules, so no line number was hand-carried between cuts — the
+      first attempt did carry them and silently mis-filed bodies, which only an
+      item-presence plus token diff caught. Result: `mod.rs` 50 lines
+      (`argv.rs` 819, `csv.rs` 379, `durations.rs` 202, `flag_tables.rs` 701,
+      `frpc.rs` 1390, `frps.rs` 830, `help_render.rs` 316, `macros.rs` 152,
+      `root.rs` 525, `values.rs` 174), 207 `frp-core --lib cli` tests and both
+      `--help` byte-pin files green, and the per-unit token diff shows 155/155
+      units present with only rustfmt reflows (signatures pushed past 100
+      columns by the `pub(crate) ` prefix).
+      Visibility, the thing that killed the first attempt: the external
+      surface is exactly eight names (`frps/src/main.rs:4` and
+      `frpc/src/main.rs:10` plus `STRICT_CONFIG_SPACE_FORM_WARNING`, which the
+      cross-binary tests read) and they are re-exported by name; every other
+      module is globbed `pub(crate)`, and the `frps` glob is `#[cfg(test)]`
+      because non-test code reaches that module only through those three
+      `pub use` names. `pub use X::*;` over an all-`pub(crate)` module is a
+      hard error (`glob import doesn't reexport anything with visibility
+      pub`), and a child's `use super::*;` does not inherit the parent's `use`
+      lines, so each module (and each test module) now spells its own imports.
+      The split also moved every cite into the old file: six line cites
+      (`docs/developing.md:266`, `frps/tests/cli_exit_codes.rs:1884,2459,2460`,
+      `frps/tests/log_completion.rs:705`, and
+      `frp-core/src/config/server.rs:411`'s cite of the
+      `config_file_precedence_go_parity` test) were retargeted to the module
+      that owns the line, twenty-eight file-level references in
+      `docs/developing.md`, `docs/deployment.md`, `docs/onboarding.md` and
+      `frp-core/src/cli/argv.rs`'s own doc comments were retargeted to their
+      owner, and `scripts/tests/pathline-cite-expectations.txt` was re-baked.
+      Two things that went wrong here are worth keeping: the first re-bake
+      recorded the `config/server.rs:411` cite at its old `tests.rs:794-796`
+      number (a bare `}` after the file gained a four-line header) instead of
+      moving it to `:798-800`, which a reviewer caught as a guard row now
+      certifying generic text — repaired by content first, then re-baked, with
+      the nineteen-row table diff audited to confirm every other row was only a
+      citing-line shift; and the module splitter silently dropped 50 free-standing
+      `//` banner lines (the `--help` document's twenty-line rationale among
+      them), which `ci.yml`'s pinned `TODO.md` cite count caught as 100-vs-101
+      before any reviewer did — section banners sit *between* items, so they
+      fall outside a doc-block-anchored unit span.
 - [ ] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from

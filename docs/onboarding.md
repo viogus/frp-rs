@@ -42,7 +42,7 @@ lookups, not reading.
 | a proxy type | [`../frp-server/src/control/`](../frp-server/src/control) on the server, [`../frp-client/src/proxy.rs`](../frp-client/src/proxy.rs) on the client |
 | a plugin | [`../frp-client/src/plugin/`](../frp-client/src/plugin) |
 | KCP behaviour | [`../frp-core/src/kcp/`](../frp-core/src/kcp) — the driver lives in `socket.rs`, the state machine in `protocol.rs` |
-| the CLI | [`../frp-core/src/cli/mod.rs`](../frp-core/src/cli/mod.rs) — the *surface* (name, default, help text, Go parity) is a data table (`FRPS_GO_FLAGS`, `FRPC_PROXY_GO_FLAGS`, …) parsed by `bpaf`, with a hand-written argv pre-pass for `-c=value` forms |
+| the CLI | [`../frp-core/src/cli/flag_tables.rs`](../frp-core/src/cli/flag_tables.rs) — the *surface* (name, default, help text, Go parity) is a data table (`FRPS_GO_FLAGS`, `FRPC_PROXY_GO_FLAGS`, …) parsed by `bpaf`, with a hand-written argv pre-pass for `-c=value` forms |
 | the dashboard / status API | [`../frp-server/src/`](../frp-server/src) behind the `dashboard` feature |
 
 Two reading aids that save a day each:

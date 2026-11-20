@@ -4,7 +4,7 @@
 //! on `frps` and *the file's level* on `frpc`, so the two binaries disagree
 //! whenever the config sets a non-default `level`. Only `frps` overlays its CLI
 //! flags onto the loaded config (`FrpsArgs::override_server_config`,
-//! `frp-core/src/cli/mod.rs`), so the empty flag reached `[log] level` there and
+//! `frp-core/src/cli/frps.rs`), so the empty flag reached `[log] level` there and
 //! `LogConfig::complete` filled it to `"info"`. The fix is on the `frps` side —
 //! the overlay now skips an empty `--log-level` — and `frps`'s arms live in
 //! `frps/tests/log_completion.rs::cli_empty_log_level_does_not_raise_the_files_warn`.

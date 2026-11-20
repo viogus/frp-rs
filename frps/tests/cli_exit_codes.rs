@@ -1881,7 +1881,7 @@ fn version_short_shorthand_clusters_and_equals_spelling_match_go() {
 ///
 /// **What this does not prove.** Only that the argv was *accepted* and a server
 /// came up: with `-c` the config file is authoritative for the transport
-/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli/mod.rs:5095`), so
+/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli/frps.rs:672`), so
 /// the parsed `tls_only = false` never reaches the service — a mutant that
 /// consumed `=false` but stored `true` would still pass this test. The value
 /// actually being applied is pinned in
@@ -1910,9 +1910,9 @@ fn tls_only_false_value_starts_and_listens() {
 /// As with `--tls-only=false` above, "started" is proved by the bind port
 /// accepting a connection, not by an exit code. **What this does not prove:**
 /// with `-c` the file is authoritative (`cli_overrides_enabled()` is false,
-/// `frp-core/src/cli/mod.rs`), so the parsed value never reaches the service here.
+/// `frp-core/src/cli/frps.rs`), so the parsed value never reaches the service here.
 /// That the value is applied on the lane where it *is* read (no `-c`) is pinned
-/// by `frp-core/src/cli/mod.rs::vhost_http_timeout_flag_applied_to_server_config`.
+/// by `frp-core/src/cli/tests.rs::vhost_http_timeout_flag_applied_to_server_config`.
 #[test]
 fn vhost_http_timeout_flag_starts_and_listens() {
     for spelling in ["--vhost-http-timeout", "--vhost_http_timeout"] {
@@ -2456,8 +2456,8 @@ fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
 /// `cmd.PersistentFlags().StringVarP(&c.Log.Level, "log_level", "", …)`), so
 /// `frps -c cfg -l ""` is rc **1** there too — but pflag's wording is
 /// `unknown shorthand flag: 'l' in -l`. frp-rs registers no `-l` short at all:
-/// `svr_log` has only the long spellings (`frp-core/src/cli/mod.rs:930`), and
-/// `VALUE_TAKING_SHORTS_FRPS_ROOT` (`frp-core/src/cli/mod.rs:1223`) is not the reason
+/// `svr_log` has only the long spellings (`frp-core/src/cli/frps.rs:401`), and
+/// `VALUE_TAKING_SHORTS_FRPS_ROOT` (`frp-core/src/cli/argv.rs:100`) is not the reason
 /// — it only governs a **two-character** `-xy` token. Measured over a *valid*
 /// config and over a missing one alike: rc **1**, **0 B stdout**, 44 B stderr
 /// ``Error: `-l` is not expected in this context``.

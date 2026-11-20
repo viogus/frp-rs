@@ -1412,7 +1412,7 @@ jobs:
           log=/tmp/frp-todo-cite-fixtures.$$.log
           status=0
           guard_file=scripts/tests/todo-cite-guard-fixtures.sh
-          guard_pin=a2848ac0262ca30107105c09e978b7ede9afbac78bb84ccdc3424ce588f2bb77
+          guard_pin=1a28e1aab1ad7f9b044dfca2d17c576e69df643a8a7f926b4f805103ef08f97b
           # The declared check total and the absolute floor under it, the
           # same pair the three steps below use: the `ok`-line count is
           # compared for equality with `guard_exact`, so a fixture case
@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=0685074b0ff444fb7058d096ed4bec4d219c741bd7f1166adf6e3149b323c0f6
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=65e3208eaa33d7b2969702128ed9a15a50dc8e44673a3c8399201eba76ce37cd
+          guard_data_pin=8962fc73c2f9b046252e1374e0bc33ec3a64d2096e169b3c1e2f8e9f29943853
           guard_exact=101
           guard_floor=101
           guard_canary='witness M1: one-line insert reddened notes.md:1'

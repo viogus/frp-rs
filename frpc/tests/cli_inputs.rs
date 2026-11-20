@@ -972,7 +972,7 @@ fn case_insensitive_key_in_a_walked_section_is_refused_in_strict_mode() {
 // here — the difference is *which config load happened*, not only an exit code.
 //
 // Every row also pins the **warning** (`frp_core::cli::STRICT_CONFIG_SPACE_FORM_WARNING`,
-// whose exact text is pinned by a unit test in `frp-core/src/cli/mod.rs`): the
+// whose exact text is pinned by a unit test in `frp-core/src/cli/tests.rs`): the
 // frp-rs space-separated extension prints exactly one stderr line and nothing
 // else does, so the divergence cannot bite silently.
 //
@@ -1228,7 +1228,7 @@ fn space_form_warning_fires_on_each_frpc_parser() {
 // picks the run-mode branch before dispatch, so that argv used to fall through
 // to run mode and answer ``Error: no such command or positional: `status`,
 // did you mean `https`?`` (rc 1). `hoist_leading_subcommand` in
-// `frp-core/src/cli/mod.rs` now moves that token in front of bpaf.
+// `frp-core/src/cli/root.rs` now moves that token in front of bpaf.
 //
 // Every Go cell below was measured on the official `frp_0.71.0_darwin_arm64`
 // binary and the frp-rs `frpc` at this branch's base (`5b9a084`, the "before"

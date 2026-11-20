@@ -151,7 +151,7 @@ pub fn resolve_log_level(
 ///
 /// **The empty CLI value is filtered twice, and the second filter is what
 /// makes the file's destination survive.** `FrpsArgs::override_server_config`
-/// (`frp-core/src/cli/mod.rs`) skips an empty `--log-file ""`, so the loaded file's
+/// (`frp-core/src/cli/frps.rs`) skips an empty `--log-file ""`, so the loaded file's
 /// `to` reaches this function; without that skip, `LogConfig::complete` would
 /// fill the clobbered `""` with the concrete `"console"`
 /// (`EmptyOr(c.To, "console")`, `pkg/config/v1/common.go:120`) and this filter

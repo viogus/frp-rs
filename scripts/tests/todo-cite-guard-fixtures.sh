@@ -298,7 +298,7 @@ fi
 
 hdr 'scenario 8 — a `file:line` that is not a continuation is not a ledger cite'
 build_tree "$tmp/t8" '- [ ] **First item.**' '  body'
-printf '//! see `src/live.rs:7` and `frp-core/src/cli/mod.rs:590` for the anchor\n' > "$tmp/t8/src/other.rs"
+printf '//! see `src/live.rs:7` and `frp-core/src/cli/mod.rs:35` for the anchor\n' > "$tmp/t8/src/other.rs"
 run_gate "$tmp/t8"
 if [ "$LAST_RC" -eq 0 ]; then
   ok 'non-continuation `file:line`: not read as a ledger cite'

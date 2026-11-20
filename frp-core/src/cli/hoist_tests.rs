@@ -1,3 +1,7 @@
+use bpaf::Parser;
+use std::ffi::OsStr;
+use std::ffi::OsString;
+
 use super::*;
 
 fn hoist(args: &[&str]) -> Vec<String> {
