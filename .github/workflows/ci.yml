@@ -2512,6 +2512,8 @@ jobs:
         # test took it to 368, all five gated only by this crate's own features;
         # the vhost CONNECT body gate's `test_connect_head_has_body` (#548) is
         # the 369th; the v0.72.0 `metricsServer` route test is the 370th (it
+        # counts whether or not TLS is compiled in), and the two
+        # `plain_path` tests are 371 and 372.
         # does not need TLS, so it runs in this lane too).
         # (still a count, not a floor: a floor would let this shape quietly lose one).
         shell: bash
@@ -2528,7 +2530,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=370
+          n_expected=372
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1
