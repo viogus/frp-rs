@@ -20,7 +20,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=604 weak=136 ambiguous=2 excluded=101 foreign_reported=1161 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=dfd3adb1d257ebdf ambiguous_set=fbd8449054b4b1a2 excluded_set=5c563b39137fa714
+#   pins: checked=604 weak=136 ambiguous=2 excluded=101 foreign_reported=1161 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=5c563b39137fa714
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2384	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2384	1524
@@ -233,19 +233,19 @@ frp-core/src/config/loader.rs	186	-	3f577e11e77d75cb	-	absolute	docs/deployment.
 frp-core/src/config/loader.rs	186	-	3f577e11e77d75cb	-	absolute	docs/developing.md	frp-core/src/config/loader.rs:186	788
 frp-core/src/config/loader.rs	524	541	37985c74289b1d4c	648bffd597b50d2b	absolute	frps/tests/log_completion.rs	frp-core/src/config/loader.rs:524-541	518
 frp-core/src/config/loader.rs	958	-	161afdc304b9b409	-	absolute	frpc/tests/admin_config_get_warning.rs	frp-core/src/config/loader.rs:958	731
-frp-core/src/config/normalize.rs	1194	-	d10b36aa74a59bcf	-	absolute	docs/developing.md	frp-core/src/config/normalize.rs:1194	787
-frp-core/src/config/normalize.rs	1205	-	8e13a6a540498194	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1205	16024
-frp-core/src/config/normalize.rs	1205	1206	8e13a6a540498194	5598ecee6e554875	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1205-1206	14301
-frp-core/src/config/normalize.rs	1205	1206	8e13a6a540498194	5598ecee6e554875	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1205-1206	14438
-frp-core/src/config/normalize.rs	1207	-	5d6e9a04debbfac0	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1207	14600
-frp-core/src/config/normalize.rs	1207	1211	5d6e9a04debbfac0	be5efef1270ed4df	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1207-1211	15434
+frp-core/src/config/normalize.rs	1203	-	d110735fd184a92b	-	absolute	docs/developing.md	frp-core/src/config/normalize.rs:1203	787
+frp-core/src/config/normalize.rs	1214	-	eb19bc2efe5c6559	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1214	16024
+frp-core/src/config/normalize.rs	1216	1220	6fbe4437b3db2989	d10b36aa74a59bcf	absolute	docs/config.md	frp-core/src/config/normalize.rs:1216-1220	971
 frp-core/src/config/normalize.rs	1216	1220	6fbe4437b3db2989	d10b36aa74a59bcf	absolute	frp-core/src/config/file.rs	frp-core/src/config/normalize.rs:1216-1220	290
+frp-core/src/config/normalize.rs	1216	1220	6fbe4437b3db2989	d10b36aa74a59bcf	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1216-1220	14301
+frp-core/src/config/normalize.rs	1216	1220	6fbe4437b3db2989	d10b36aa74a59bcf	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1216-1220	14438
+frp-core/src/config/normalize.rs	1216	1220	6fbe4437b3db2989	d10b36aa74a59bcf	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1216-1220	14600
 frp-core/src/config/normalize.rs	1218	-	aa698d57ead7284d	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/normalize.rs:1218	321
-frp-core/src/config/normalize.rs	1218	1209	aa698d57ead7284d	e59777d8aca31f45	absolute	docs/config.md	frp-core/src/config/normalize.rs:1218-1209	971
-frp-core/src/config/normalize.rs	1450	1482	47ae485944c66cb2	348ca23e725724e3	absolute	docs/config.md	frp-core/src/config/normalize.rs:1450-1482	381
-frp-core/src/config/normalize.rs	1457	1477	d10b36aa74a59bcf	f0e02fb02a12f9da	absolute	docs/config.md	frp-core/src/config/normalize.rs:1457-1477	381
-frp-core/src/config/normalize.rs	1465	1490	69ae46eea49feb1d	70deb2e744ad150d	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1465-1490	3090
-frp-core/src/config/normalize.rs	1468	-	b546eafb9c42b137	-	absolute	docs/developing.md	frp-core/src/config/normalize.rs:1468	789
+frp-core/src/config/normalize.rs	1218	-	aa698d57ead7284d	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1218	15434
+frp-core/src/config/normalize.rs	1501	-	98b16c86e3ef679f	-	absolute	docs/developing.md	frp-core/src/config/normalize.rs:1501	789
+frp-core/src/config/normalize.rs	1540	1554	6f3efb9c6cfea3ab	d10b36aa74a59bcf	absolute	docs/config.md	frp-core/src/config/normalize.rs:1540-1554	381
+frp-core/src/config/normalize.rs	1540	1554	6f3efb9c6cfea3ab	d10b36aa74a59bcf	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:1540-1554	3090
+frp-core/src/config/normalize.rs	1542	1553	537d57d38973036b	d10b36aa74a59bcf	absolute	docs/config.md	frp-core/src/config/normalize.rs:1542-1553	381
 frp-core/src/config/normalize.rs	1542	1553	537d57d38973036b	d10b36aa74a59bcf	absolute	frp-core/src/config/loader.rs	frp-core/src/config/normalize.rs:1542-1553	1041
 frp-core/src/config/normalize.rs	1542	1553	537d57d38973036b	d10b36aa74a59bcf	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/normalize.rs:1542-1553	52
 frp-core/src/config/normalize.rs	2027	-	ff11b87c55e16e20	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/normalize.rs:2027	9360

@@ -3087,7 +3087,7 @@ fn test_flat_camelcase_tls_spellings_are_not_loader_spellings() {
 /// `frp-core/src/config/client.rs:264-270` declares those fields with
 /// `#[serde(default)]` and no alias, and Go v0.71.0 carries them under the
 /// nested `[transport.tls]` section, which
-/// `frp-core/src/config/normalize.rs:1465-1490` maps onto the flat fields.
+/// `frp-core/src/config/normalize.rs:1540-1554` maps onto the flat fields.
 /// This pins both directions (the five spellings stay rejected, the two real
 /// aliases stay accepted) so the table cannot drift back.
 #[test]
@@ -14298,7 +14298,7 @@ fn legacy_ini_scalar_and_section_collision_keeps_the_section_like_go() {
 /// names. The role refusal (`frp-core/src/config/normalize.rs:2221`) and the
 /// collector's candidate list (`frp-core/src/config/normalize.rs:2190`) both
 /// apply it now; the `[common] start` list is read after the hoist
-/// (`frp-core/src/config/normalize.rs:1205-1206`,
+/// (`frp-core/src/config/normalize.rs:1216-1220`,
 /// `ini_start_names` at `frp-core/src/config/normalize.rs:2520`, which trims each
 /// element exactly like Go's `Key.Strings(",")`).
 ///
@@ -14435,7 +14435,7 @@ fn legacy_ini_common_start_is_applied_before_role_and_collection() {
 /// switch does not exist: `[foo] role = "weird"` is rc 1 **strict** with
 /// `json: unknown field "foo"` but **rc 0 non-strict** (measured on Go v0.71.0).
 /// The role scan is therefore gated on the `[common]` presence captured before
-/// the hoist (`frp-core/src/config/normalize.rs:1205-1206`) and must not refuse
+/// the hoist (`frp-core/src/config/normalize.rs:1216-1220`) and must not refuse
 /// the file where Go loads it.
 #[test]
 fn nocommon_ini_weird_role_is_not_a_role_refusal() {
@@ -14597,7 +14597,7 @@ fn legacy_ini_without_common_start_scalar_is_a_v1_shape() {
 /// name, so `c1.ini` (`[common] server_addr + zzz_unknown_common = 1`) is rc 0 in
 /// both loader modes. frp-rs is rc 0 loose but rc 1 strict
 /// (`unknown field "zzz_unknown_common"`), because the `[common]` hoist
-/// (`frp-core/src/config/normalize.rs:1207`) moves the key to the top level before
+/// (`frp-core/src/config/normalize.rs:1216-1220`) moves the key to the top level before
 /// the top-level strict walk and the `.ini` exemption does not reach it. The
 /// item's Done-when allows the measurement instead of a fix — exempting the keys
 /// the merge created would also blind the top-level check to a genuine v1 typo
@@ -15431,7 +15431,7 @@ fn legacy_ini_server_ignores_common_includes_both_modes() {
 /// (`UnmarshalClientConfFromIni`: `GetSection("common")` + `MapTo`,
 /// `pkg/config/legacy/client.go:173-200`) and `start` is one of those keys
 /// (`Start []string \`ini:"start"\``, `pkg/config/legacy/client.go:119`). The
-/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1207-1211`)
+/// hoist's `entry(k).or_insert(v)` (`frp-core/src/config/normalize.rs:1218`)
 /// would let a DefaultSection `start` win and mask Go's refusals (round-5
 /// adversarial RF5-1), so the `[common]` value is captured before the hoist
 /// (`legacy_common_start`, `frp-core/src/config/normalize.rs:2547`) and written
@@ -16021,7 +16021,7 @@ fn legacy_ini_start_names_maps_go_text_and_nested_tables() {
 /// (`pkg/config/load.go:65`), and a literal `common.foo` header does not satisfy
 /// it, so the file never reaches the legacy reader. frp-rs nests the dotted
 /// header under `common` (`ini_section_path`, `frp-core/src/config/format.rs:1433`)
-/// and the collector's own detector (`frp-core/src/config/normalize.rs:1205`)
+/// and the collector's own detector (`frp-core/src/config/normalize.rs:1214`)
 /// therefore sees a `common` table, hoists its `foo` subtable and refuses it as a
 /// proxy: rc 1 in **both** modes. The strict verdict agrees with Go, the
 /// non-strict refusal is the loose-only divergence the item calls a follow-up.
@@ -16801,10 +16801,11 @@ trustedCaFile = "/m-ca.pem"
 }
 
 // --- Reachability of strict-listed root spellings (see
-// `docs/refactor-config-aliases.md`). Every body below failed before the fix:
-// a spelling that strict mode accepts but nothing consumes is worse than one
-// it refuses, because the user sees a successful load and a setting that never
-// applied.
+// `docs/refactor-config-aliases.md`). The reachability bodies failed before the
+// fix; the two snake-wins bodies pin the precedence the fix adds and passed
+// before it too. A spelling that strict mode accepts but nothing consumes is
+// worse than one it refuses, because the user sees a successful load and a
+// setting that never applied.
 #[test]
 fn root_camel_mux_spellings_reach_the_transport_section() {
     let dir = tempfile::tempdir().unwrap();

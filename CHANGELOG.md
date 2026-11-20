@@ -25,8 +25,11 @@ User-facing release notes for frp-rs.
   transport.tls` instead of an unknown-field error. Finally, `tls_skip_verify` /
   `tlsSkipVerify` were listed for `frps` although the field is client-only, so a
   server config that set them was silently ignored; that is now a load error.
-  Pinned by five tests that drive the strict loader (not the lenient
-  `load_*_config_from_str` helpers, which skip the check entirely).
+  The same hole existed in `frpc.toml`, where `ClientConfig::tcp_mux` has no
+  camelCase alias either, so a root `tcpMux` was accepted and dropped; both
+  binaries now canonicalise the trio. Pinned by seven tests that drive the
+  strict loader (not the lenient `load_*_config_from_str` helpers, which skip
+  the check entirely).
 
 - **KCP: a peer that vanishes while the tunnel is idle is noticed in about two
   seconds.** A KCP session was only declared dead when it had a segment in

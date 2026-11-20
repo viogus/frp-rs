@@ -13,7 +13,7 @@ This file is the map. For the underlying compatibility rules see
 | Layer | Spelling | Example | Where it lives |
 |---|---|---|---|
 | Go config file (compat target) | `camelCase` | `tcpMux = false` | what users write, and what Go frp accepts |
-| frp-rs config file | per section | inside `[transport]`: `tcpMux` **or** `tcp_mux`; at the root: only `tcp_mux` (a root `tcpMux` passes strict mode and is then ignored) | normalised in [`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs) |
+| frp-rs config file | per section | inside `[transport]`: `tcpMux` **or** `tcp_mux`; at the root: `tcpMux` or `tcp_mux` (the camel spelling is hoisted to `tcp_mux`; the snake spelling wins when both are set) | normalised in [`../frp-core/src/config/normalize.rs`](../frp-core/src/config/normalize.rs) |
 | Rust field | `snake_case` | `tcp_mux: bool` | config structs in [`../frp-core/src/config/server.rs`](../frp-core/src/config/server.rs) and [`../frp-core/src/config/client.rs`](../frp-core/src/config/client.rs) |
 | JSON on the control channel | `snake_case` | `http_user`, `host_header_rewrite` | wire messages in [`../frp-core/src/msg.rs`](../frp-core/src/msg.rs) — **must** stay Go-compatible |
 

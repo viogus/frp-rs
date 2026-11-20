@@ -378,7 +378,7 @@ The client config loader normalizes Go frp format to frp-rs format:
 - `[transport]` section is flattened to top level (client keeps `tcp_mux` top-level).
 - `transport.wireProtocol = "v2"` is converted to top-level `v2 = true`.
 - Flat `log_file`, `log_level`, `log_max_days` are nested into `[log]`.
-- Exception: `tls_enable`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` have no camelCase aliases — use the snake_case names; those four fields' Go-shaped spellings are carried by the nested `[transport.tls]` section instead (`enable` / `certFile` / `keyFile` / `trustedCaFile`, the match at `frp-core/src/config/normalize.rs:1450-1482`), which the `[transport]` flatten above first lifts to a top-level `tls` table (`frp-core/src/config/normalize.rs:1457-1477`). That same lift maps **two more** nested Go spellings onto flat fields — `serverName` → `tls_server_name` and `disableCustomTLSFirstByte` → `disable_custom_tls_first_byte` — so those two rows carry the nested spellings as well as the flat aliases `tlsServerName` and `disableCustomTLSFirstByte` (`frp-core/src/config/client.rs:282-288`); both loading paths are pinned by `test_flat_camelcase_client_tls_spellings_are_not_loader_spellings` in `frp-core/src/config/tests.rs`.
+- Exception: `tls_enable`, `tls_cert_file`, `tls_key_file` and `tls_ca_file` have no camelCase aliases — use the snake_case names; those four fields' Go-shaped spellings are carried by the nested `[transport.tls]` section instead (`enable` / `certFile` / `keyFile` / `trustedCaFile`, the match at `frp-core/src/config/normalize.rs:1540-1554`), which the `[transport]` flatten above first lifts to a top-level `tls` table (`frp-core/src/config/normalize.rs:1542-1553`). That same lift maps **two more** nested Go spellings onto flat fields — `serverName` → `tls_server_name` and `disableCustomTLSFirstByte` → `disable_custom_tls_first_byte` — so those two rows carry the nested spellings as well as the flat aliases `tlsServerName` and `disableCustomTLSFirstByte` (`frp-core/src/config/client.rs:282-288`); both loading paths are pinned by `test_flat_camelcase_client_tls_spellings_are_not_loader_spellings` in `frp-core/src/config/tests.rs`.
 
 ### Client TOML Example
 
@@ -968,7 +968,7 @@ The recorded residues, each pinned in both loader modes:
   `legacy_ini_default_section_start_beside_start_section_both_modes`.
 - **An unknown key merged out of `[common]`** (`[common] zzz_unknown_common = 1`) loads on Go in both
   modes while frp-rs is rc 0 loose / rc 1 strict `unknown field "zzz_unknown_common"`, because the
-  `[common]` merge (`frp-core/src/config/normalize.rs:1218-1209`) moves the key to the top level before
+  `[common]` merge (`frp-core/src/config/normalize.rs:1216-1220`) moves the key to the top level before
   the top-level walk (`frp-core/src/config/strict.rs:558`). Exempting the keys that merge created would
   blind the top-level half to a genuine v1 typo spelled under `[common]`, so this is recorded rather than
   fixed — `legacy_ini_common_unknown_key_residual_both_modes`.
