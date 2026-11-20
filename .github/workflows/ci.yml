@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=fab581a500a64cf2dfe4f65272da18ecbacd0eee76b778528b47f1eb44fdad45
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=0516c2009341ea2a0583039fbc4869abff1ad54e9a897a525c11e9d0ee8c98c0
+          guard_data_pin=fdabc21535865bc0cff3b8f45e569d5fe38868192beaa36a2d2e9ccb5fa32f76
           guard_exact=118
           guard_floor=118
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2618,7 +2618,7 @@ jobs:
               --lib --color never -- --list help_doc_tests 2>&1 \
               | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
             n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-            n_floor=21
+            n_floor=22
             # The run's *own* summary is the other half of the count: a literal
             # taken only from `-- --list` cannot see a listed test that reported
             # nothing.
@@ -2626,15 +2626,15 @@ jobs:
             status=0
             [ -n "$n_run" ] || status=1
             [ "$n_run" = "$n" ] || status=1
-            [ "$n" = "21" ] || status=1
+            [ "$n" = "22" ] || status=1
             [ "$n" -ge "$n_floor" ] || status=1
             if [ "$status" != "0" ]; then
               echo "::error::frp-core help_doc_tests guard failed for --features $features (list=$n, run=$n_run, log=$log)"
-              if [ -n "$n" ] && [ "$n" != "21" ]; then
-                if [ "$n" -lt "21" ]; then
-                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 21 — tests were deleted, renamed, or cfg'd out; restore them rather than lowering this literal. If the *filter name* is what changed, re-point the filter (and this literal) instead."
+              if [ -n "$n" ] && [ "$n" != "22" ]; then
+                if [ "$n" -lt "22" ]; then
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 22 — tests were deleted, renamed, or cfg'd out; restore them rather than lowering this literal. If the *filter name* is what changed, re-point the filter (and this literal) instead."
                 else
-                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 21: move the literal in this shell step from 21 to $n"
+                  echo "::error::the help_doc_tests filter lists $n tests under --features $features, this step expects 22: move the literal in this shell step from 22 to $n"
                 fi
               fi
               if [ -n "$n_run" ] && [ "$n_run" != "$n" ]; then
