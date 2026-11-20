@@ -13160,6 +13160,31 @@ needs the two-review rule and its own gate run.
       byte-identical to the current pinned text (the Go-parity pins in
       `frp-core/src/cli/help_doc_tests.rs` are the oracle), and
       `frp-core/src/cli/mod.rs` is under 1,000 lines.
+      Measured 2026-11-20 (attempted and reverted — nothing landed): a pure
+      line-range extraction does fit. `frp-core/src/cli/mod.rs` is 5,453 lines
+      and partitions cleanly into eight regions — values (`:41-630`), the frps
+      combinator tree (`:632-1928`), the help-text data tables
+      (`:1930-2588`, already `GoFlagRow` literals), help rendering
+      (`:2589-2942`), the root command and hoist (`:2944-3409`),
+      `parse_frps_args` (`:3410-3745`), the CSV/`allow-unsafe` reader
+      (`:3814-4129`) and the frpc tree plus arg structs (`:4130-5064`,
+      `:5068-5447`) — and the resulting `mod.rs` is 23 lines with all 106
+      `cargo test -p frp-core --lib cli` tests and the `--help` byte pins green.
+      The blocker is not the split, it is **visibility**. Everything is
+      `fn`/`struct`/`const` private inside one module today, so a move needs a
+      visibility choice per item, and a blanket one is wrong in both
+      directions: `pub(super)`/`pub(crate)` makes items the frps/frpc binaries
+      reach through `frp_core::cli::…` unreachable, and it left six items in
+      the extracted values module reported as `never used` even though live code
+      calls them through the re-export (each file's `use super::*;` plus
+      `mod.rs`'s `use values::*;` form a glob cycle the lint does not follow) —
+      with `-D warnings` that is a hard failure, and the cycle also trips
+      `glob import doesn't reexport anything with visibility pub(crate)` when
+      the re-export is widened to match. So the next attempt should start the
+      other way round: enumerate `cli`'s **external** surface first (`grep -rn
+      'cli::' frps/ frpc/ frp-server/ frp-client/`), keep exactly those items
+      `pub`, and only then split — the matrix in the original item's first line
+      is the same work seen from the flag side.
 - [ ] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from
