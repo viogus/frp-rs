@@ -703,6 +703,20 @@ pub struct BridgePlan<'a> {
     pub metrics: Option<Arc<crate::metrics::ProxyMetrics>>,
 }
 
+/// What a dispatcher should do with a plan — see [`BridgePlan::choice`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BridgeChoice {
+    /// AES-128-CFB work connection: run the encrypted core, which splits the
+    /// pair itself.
+    EncryptedWhole,
+    /// Plain connection with compression or a bandwidth limit: split both sides
+    /// and run the plain core.
+    PlainSplit,
+    /// Plain connection with neither: the fast relay (`splice(2)` where the
+    /// platform allows it, pooled copy otherwise).
+    PlainFastRelay,
+}
+
 impl<'a> BridgePlan<'a> {
     /// Unencrypted work connection; `compress` turns on bidirectional snappy.
     pub fn plain(compress: bool) -> Self {
@@ -750,6 +764,22 @@ impl<'a> BridgePlan<'a> {
     pub fn metrics(mut self, metrics: Option<Arc<crate::metrics::ProxyMetrics>>) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    /// Which shape this configuration calls for, so a dispatcher does not have
+    /// to re-derive the case analysis itself.
+    ///
+    /// The three answers are the three things a caller can actually do with a
+    /// plan: run the encrypted core whole (it splits internally), split the
+    /// plain connection and hand it to the compress/limit core, or hand a plain
+    /// pair to the fast relay (`splice(2)` / pooled copy) which owns its own
+    /// buffer strategy.
+    pub fn choice(&self) -> BridgeChoice {
+        match self.crypto {
+            Crypto::Encrypted { .. } => BridgeChoice::EncryptedWhole,
+            Crypto::Plain if self.compress || self.limiter.is_some() => BridgeChoice::PlainSplit,
+            Crypto::Plain => BridgeChoice::PlainFastRelay,
+        }
     }
 
     /// The three booleans the cores take, read off the axes. No axis is derived
@@ -3383,6 +3413,51 @@ mod tests {
         assert!(!plan.read_is_plaintext);
         assert!(!plan.decompress_read);
         assert!(matches!(plan.crypto, Crypto::Plain));
+    }
+
+    /// The dispatcher's three answers, pinned so a dispatcher cannot drift from
+    /// `core_flags`: every encrypted plan runs whole, a plain plan with
+    /// compression or a limiter splits, and only a bare plain plan takes the
+    /// fast relay.
+    #[test]
+    fn bridge_plan_choice_matches_the_core_it_selects() {
+        let key = [7u8; 16];
+        let limiter = crate::bandwidth::BandwidthLimiter::shared(1024 * 1024).expect("rate > 0");
+        let cases: Vec<(&str, BridgePlan<'_>, BridgeChoice)> = vec![
+            (
+                "plain, no limit",
+                BridgePlan::plain(false),
+                BridgeChoice::PlainFastRelay,
+            ),
+            (
+                "plain, compressed",
+                BridgePlan::plain(true),
+                BridgeChoice::PlainSplit,
+            ),
+            (
+                "plain, limited",
+                BridgePlan::plain(false).limiter(Some(&limiter)),
+                BridgeChoice::PlainSplit,
+            ),
+            (
+                "plain, both",
+                BridgePlan::plain(true).limiter(Some(&limiter)),
+                BridgeChoice::PlainSplit,
+            ),
+            (
+                "encrypted, no limit",
+                BridgePlan::encrypted(&key, false),
+                BridgeChoice::EncryptedWhole,
+            ),
+            (
+                "encrypted, limited",
+                BridgePlan::encrypted(&key, true).limiter(Some(&limiter)),
+                BridgeChoice::EncryptedWhole,
+            ),
+        ];
+        for (name, plan, expected) in cases {
+            assert_eq!(plan.choice(), expected, "{name}");
+        }
     }
 
     /// `without_read_decompression` must not touch the write direction: the
