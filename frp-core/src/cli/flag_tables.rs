@@ -368,7 +368,7 @@ macro_rules! frpc_admin_flag_specs {
 /// the tcp/udp row, and
 /// `every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`
 /// pins that absence. bpaf's `NamedArg::short` takes a `char`, never an
-/// `Option<char>`, so the cell is spent by `named_with_short`.
+/// `Option<char>`, so the cell is spent by [`named_with_aliases`].
 ///
 /// Rows are per **command**, never per Go flag name, because two flags are
 /// typed twice: `sk` is `String` on stcp/xtcp and `Option<String>` on sudp, and

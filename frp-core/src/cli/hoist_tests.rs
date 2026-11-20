@@ -830,18 +830,24 @@ fn command_variant_name(cmd: &FrpcCmd) -> Option<&'static str> {
     }
 }
 
-/// A command that needs a flag of its own when invoked bare: the parse
-/// fails, and the failure must name that flag (run mode has none of them,
-/// so this is the evidence that the branch was reached rather than fallen
-/// through to). `verify` needs `-c` (`verify`'s config is not optional in
-/// frp-rs); the other three admin commands complete with no flags.
-fn single_proxy_own_flag(name: &str) -> Option<&'static str> {
+/// A command that needs a flag of its own when invoked bare: the parse fails,
+/// and the failure must name that flag (run mode has none of them, so this is
+/// the evidence that the branch was reached rather than fallen through to).
+/// `verify` needs `-c` (`verify`'s config is not optional in frp-rs); the other
+/// three admin commands complete with no flags.
+///
+/// Returns the flag, plus the arguments to supply in order to reach it. The
+/// second half exists because bpaf names the *first* missing required flag in
+/// `construct!` order, and the single-proxy parsers are generated common-first:
+/// a bare `frpc stcp` therefore reports `--local-port`, which every one of the
+/// eight commands requires and which says nothing about *which* branch ran.
+/// Supplying it moves the error onto the surface's own required flag, and that
+/// is the part that identifies the branch.
+fn single_proxy_own_flag(name: &str) -> Option<(&'static str, &'static [&'static str])> {
     match name {
-        "tcp" | "udp" | "sudp" => Some("--local-port"),
-        "http" | "https" => Some("--local-port"),
-        "stcp" | "xtcp" => Some("--sk"),
-        "tcpmux" => Some("--local-port"),
-        "verify" => Some("--config"),
+        "tcp" | "udp" | "sudp" | "http" | "https" | "tcpmux" => Some(("--local-port", &[])),
+        "stcp" | "xtcp" => Some(("--sk", &["--local-port", "1"])),
+        "verify" => Some(("--config", &[])),
         _ => None,
     }
 }
@@ -863,8 +869,27 @@ fn every_known_subcommand_name_selects_its_own_branch() {
                 "{name} selected a different branch"
             ),
             Err(failure) => {
-                let own_flag = own_flag
+                let (own_flag, extra) = own_flag
                     .unwrap_or_else(|| panic!("{name} must parse with no flags, got {failure:?}"));
+                // Bare, the name must land on a single-proxy branch: the error
+                // has to be about a flag of one. `--local-port` is the shared
+                // one, so this half proves the branch is a proxy command, not
+                // which — the half below proves which.
+                let message = failure.unwrap_stderr();
+                assert!(
+                    [own_flag, "--local-port"]
+                        .iter()
+                        .any(|flag| message.contains(flag)),
+                    "{name} was not resolved: neither the surface's own {own_flag} nor the \
+                     shared --local-port is the error, got {message:?}"
+                );
+                let mut argv = vec![OsString::from(name)];
+                argv.extend(extra.iter().map(OsString::from));
+                let prepared = prepared_cli_argv(&argv, RootCommand::Frpc);
+                let failure = frpc_parser()
+                    .to_options()
+                    .run_inner(&prepared[..])
+                    .unwrap_err();
                 let message = failure.unwrap_stderr();
                 assert!(
                     message.contains(own_flag),
