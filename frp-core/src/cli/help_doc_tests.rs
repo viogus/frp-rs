@@ -1260,6 +1260,37 @@ fn surface_consults(root: RootCommand, command: Option<&str>, key: &str) -> bool
 /// green. The Go tables are the opposite case — they carry rows for flags
 /// frp-rs has no flag for at all, which are deliberately never rendered; those
 /// live rows are pinned by `the_go_only_proxy_rows_are_exactly_the_recorded_set`.
+/// The admin tables' membership, pinned by name.
+///
+/// The admin surface is the one family where the two tables are *not* covered by
+/// a rendered-document pin: an `ext` row moved into the Go table (or one row
+/// carrying both cells) compiles, renders identically — the renderer does not
+/// care which table answered — and leaves every `--help` pin green. What it
+/// does change is the parity claim the table makes, so it is asserted here
+/// rather than left to a diff read.
+#[test]
+fn the_admin_tables_name_exactly_the_flags_each_side_registers() {
+    let go: Vec<&str> = FRPC_ADMIN_GO_FLAGS.iter().map(|row| row.long).collect();
+    assert_eq!(
+        go,
+        ["api-timeout"],
+        "Go registers exactly one flag on the admin commands (cmd/frpc/sub/admin.go)"
+    );
+    let ext: std::collections::BTreeSet<&str> =
+        FRPC_ADMIN_EXTENSION_FLAGS.iter().map(|row| row.long).collect();
+    assert_eq!(
+        ext,
+        ["admin-addr", "admin-port", "admin-pwd", "admin-user", "json"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "the five flags frp-rs adds on top of Go's"
+    );
+    assert!(
+        go.iter().all(|long| !ext.contains(long)),
+        "no flag may be claimed by both tables"
+    );
+}
+
 #[test]
 fn every_extension_table_row_is_rendered_by_a_surface_that_consults_it() {
     let rendered: Vec<(&str, std::collections::BTreeSet<String>)> = SURFACES

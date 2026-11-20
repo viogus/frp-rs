@@ -13325,21 +13325,31 @@ needs the two-review rule and its own gate run.
       `error[E0063]: missing field … in initializer of FrpcRunArgs`.
       The three admin commands' argument structs took the same shape next
       (`frpc_admin_flag_specs`, 5 rows: the four `admin-*` extension flags plus
-      Go's single `--api-timeout`, each row carrying the doc comment that used
-      to sit on the field). Two expanders consume it — `frpc_admin_flag_tables`
-      for `FRPC_ADMIN_GO_FLAGS` (1 row) and `FRPC_ADMIN_EXTENSION_FLAGS` (5
-      rows), and `frpc_admin_args_structs` for `ReloadArgs`, `StatusArgs` and
+      Go's single `--api-timeout`, the one row that had a field doc carrying it
+      over verbatim). Two expanders consume it — `frpc_admin_flag_tables` for
+      `FRPC_ADMIN_GO_FLAGS` (1 row) and `FRPC_ADMIN_EXTENSION_FLAGS` (5 rows),
+      and `frpc_admin_args_structs` for `ReloadArgs`, `StatusArgs` and
       `StopArgs`. Two parts stay hand-written. Each struct's non-admin tail
       (`config`, `strict_config`, and `json` on `status`) is written *before*
-      the generated block: a `macro_rules!` body emits a whole struct and
-      cannot splice a field group after literal fields, and field order is what
-      the struct diff is read for (it is also what `Debug` prints), so the
-      generated block is the part that moves. `--json` is likewise not a row —
-      every row becomes a field of all three structs and only `StatusArgs` has
-      it — so its table row is the named `FRPC_ADMIN_STATUS_ONLY_ROW`, appended
-      by the table arm, and the three `construct!`s are untouched for the
-      hygiene reason the root family recorded, which makes each of them a
-      compile check: a row added here reddens all three with `error[E0063]`.
+      the generated block: it could stay at the call site and be declared last
+      (a `macro_rules!` body can splice a `tt` after literal fields), but then
+      it would have to be threaded through both expanders as a second parameter
+      only one struct uses. Field order is review-only — nothing tests it — but
+      it is observable, since it is what `Debug` prints and what the struct diff
+      is read for. `--json` is likewise not a row — every row becomes a field of
+      all three structs and only `StatusArgs` has it, which is the limit this
+      family imposes: a flag Go registers on just one of the three commands can
+      no longer be expressed without splitting the list — so its table row is
+      the named `FRPC_ADMIN_STATUS_ONLY_ROW`, appended by the table arm, and the
+      three `construct!`s are untouched for the hygiene reason the root family
+      recorded, which makes each of them a compile check: a row added here
+      reddens all three with `error[E0063]`. Because the rendered document is
+      blind to which table answered, membership is pinned separately
+      (`the_admin_tables_name_exactly_the_flags_each_side_registers`): an `ext`
+      row moved into the Go table would otherwise falsify the parity claim with
+      every byte pin still green. The cite re-bake this time moved three citing
+      lines by a uniform +12 — one contiguous block insertion, not three
+      independent repairs.
       Oracle: the three structs' field lists diff clean against the file's
       previous revision on `main` (7/8/7 fields — names, types, order and doc
       text), the two tables are value-identical row for row (1 + 5, compared

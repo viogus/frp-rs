@@ -305,10 +305,10 @@ frpc_root_flag_specs!(frpc_root_flag_tables);
 /// The rows run in struct-field order, which is **not** the extension table's
 /// previous hand-written order: `admin-user` now precedes `admin-pwd`, where
 /// the table had them the other way round. Reading the list for the structs is
-/// what forces that — one list has one order — and nothing reads either table
-/// positionally: the renderer sorts by long (`frp-core/src/cli/help_render.rs`),
-/// so no rendered document or `--help` pin moves, and `surface_consults` keys a
-/// table on its **first** row, which is still `admin-addr`.
+/// what forces that — one list has one order — and the renderer sorts by long
+/// (`frp-core/src/cli/help_render.rs`), so no rendered document or `--help` pin
+/// moves. The one positional reader is `surface_consults`, which keys a table
+/// on its **first** row; that row is still `admin-addr`.
 macro_rules! frpc_admin_flag_specs {
     ($expand:ident) => {
         $expand! {

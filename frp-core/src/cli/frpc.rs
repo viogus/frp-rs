@@ -253,12 +253,13 @@ pub struct VerifyArgs {
 /// What stays hand-written is each struct's non-admin tail (`config`,
 /// `strict_config`, and `--json` on `StatusArgs`), written **before** the
 /// generated block so the field order is exactly the one the hand-written
-/// structs had. A `macro_rules!` body can emit a whole struct, never a field
-/// group spliced after literal fields, so the tail cannot be both hand-written
-/// at the call site and declared last: the generated block is the part that has
-/// to move, and declaration order is observable (it is what `Debug` prints, and
-/// what the `git diff` of the three structs against the pre-refactor file is
-/// read for).
+/// structs had. The tail could in principle stay at the call site and be
+/// declared last — `macro_rules! m { ($($tail:tt)*) => { struct S { pub a: u8, $($tail)* } } }`
+/// compiles — but then it would have to be threaded through both expanders as
+/// a second `tt` parameter that only `ReloadArgs` uses, so it is written inside
+/// the body instead. Declaration order is review-only (nothing tests it), but
+/// it is observable: it is what `Debug` prints, and what the `git diff` of the
+/// three structs against the pre-refactor file is read for.
 ///
 /// The `construct!`s in `reload_cmd`, `status_cmd` and `stop_cmd` are
 /// untouched, for the reason `frpc_root_args_struct` records: an identifier in a
