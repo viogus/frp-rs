@@ -16939,6 +16939,14 @@ fn server_refuses_the_client_only_skip_verify_keys() {
 // mode refuses) cannot be decided from the struct — `useSystemCa` is a legal
 // root alias here while Go only documents it under `[transport.tls]`, and
 // refusing the root form is intended.
+//
+// Known limits, so nobody reads this as more than it is: only camelCase entries
+// are inspected (a listed snake spelling whose alias is dropped stays green —
+// `subdomain_host` is accepted by a second alias in `frp-core/src/config/server.rs`);
+// a key hoisted into a section is only required to leave the root, not to land on
+// a field of the section struct; and `#[cfg]`-gated fields are read from the
+// source text, so the result is identical in every feature tier even though
+// those fields only exist in some of them.
 #[test]
 fn strict_server_root_list_only_names_spellings_the_struct_can_consume() {
     let accepted = serde_keys_of_struct(include_str!("server.rs"), "ServerConfig");
@@ -16947,7 +16955,11 @@ fn strict_server_root_list_only_names_spellings_the_struct_can_consume() {
         .filter(|key| key.chars().any(|c| c.is_ascii_uppercase()))
         .filter(|key| {
             !accepted.contains(*key)
-                && !normalization_consumes(super::normalize::normalize_server_config, key)
+                && !normalization_consumes(
+                    super::normalize::normalize_server_config,
+                    key,
+                    &accepted,
+                )
         })
         .collect();
     unexplained.sort_unstable();
@@ -16967,7 +16979,11 @@ fn strict_client_root_list_only_names_spellings_the_struct_can_consume() {
         .filter(|key| key.chars().any(|c| c.is_ascii_uppercase()))
         .filter(|key| {
             !accepted.contains(*key)
-                && !normalization_consumes(super::normalize::normalize_client_config, key)
+                && !normalization_consumes(
+                    super::normalize::normalize_client_config,
+                    key,
+                    &accepted,
+                )
         })
         .collect();
     unexplained.sort_unstable();
@@ -16978,10 +16994,17 @@ fn strict_client_root_list_only_names_spellings_the_struct_can_consume() {
     );
 }
 
-/// Did normalisation rename or hoist this root key away, so serde never sees it?
+/// Did normalisation rename or hoist this root key into somewhere serde will read
+/// it, so that the value is not merely discarded?
+///
+/// `accepted` is the root struct's key set: when the key is renamed in place, the
+/// destination has to be a spelling that struct actually has, otherwise the value
+/// moves from "accepted at the root" to "accepted nowhere" and the setting is
+/// still ignored — the failure this test exists for, one step further along.
 fn normalization_consumes(
     normalize: fn(&mut toml::Value, crate::config::format::ConfigFormat) -> Result<(), String>,
     key: &str,
+    accepted: &std::collections::BTreeSet<String>,
 ) -> bool {
     let mut value = toml::Value::Table(toml::map::Map::new());
     value
@@ -16989,5 +17012,21 @@ fn normalization_consumes(
         .unwrap()
         .insert(key.to_string(), toml::Value::String("x".into()));
     let _ = normalize(&mut value, crate::config::format::ConfigFormat::Toml);
-    !value.as_table().unwrap().contains_key(key)
+    let table = value.as_table().unwrap();
+    if table.contains_key(key) {
+        return false;
+    }
+    // A rename in place leaves the value at the root under another spelling.
+    let renamed: Vec<&String> = table
+        .iter()
+        .filter(|(k, v)| **k != key && v.is_str())
+        .map(|(k, _)| k)
+        .collect();
+    if let Some(dest) = renamed.first() {
+        return accepted.contains(*dest);
+    }
+    // Otherwise it was hoisted into a section or dropped on purpose; the section
+    // structs are covered by `strict_array_element_keys_match_struct_fields` and
+    // the deliberate no-ops are lowercase keys, which this loop never inspects.
+    true
 }

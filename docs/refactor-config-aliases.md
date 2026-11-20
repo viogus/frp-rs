@@ -158,14 +158,24 @@ would repeat the mistake this note was written to correct.
    entry must be either a spelling `serde_keys_of_struct` derives from the
    struct or a key `normalize_*_config` rewrites away, and the failure message
    names the offenders. Section and array-element lists already had this
-   guarantee through `strict_array_element_keys_match_struct_fields`. The tests
+   guarantee through `strict_array_element_keys_match_struct_fields` (for the
+   nine `*_KNOWN_KEYS` consts; the inline `section_known_keys` arms of
+   `frp-core/src/config/strict.rs` are not in that check). The tests
    are in `frp-core/src/config/tests.rs`
    (`strict_server_root_list_only_names_spellings_the_struct_can_consume`,
    `strict_client_root_list_only_names_spellings_the_struct_can_consume`); the
    reverse direction (a serde spelling strict mode refuses) is still open,
    because `useSystemCa` is a legal root alias here while Go documents it only
-   under `[transport.tls]`, so refusing the root form is intended. Defect 2 is
-   therefore closed at the root lists and unmeasured below them.
+   under `[transport.tls]`, so refusing the root form is intended. What this
+   closes is defect 1 (listed but unconsumable) for the two root lists; defect
+   2's known instances are listed and #638 fixed them, but the reverse
+   direction is open at the root as well. Three limits: the loop only inspects
+   camelCase entries, so a listed snake spelling whose alias is dropped
+   (`subdomain_host` is accepted only by the second alias in
+   `frp-core/src/config/server.rs`) is invisible; `#[cfg]`-gated fields are read
+   from the source text, so the check is tier-independent by construction; and
+   a key that is hoisted into a section is only required to leave the root, not
+   to land on a field of the section struct.
 2. Fix what it prints, in one PR: the three named defects, the client
    `useSystemCa` instance, and the `docs/naming.md` line that currently documents
    a root `tcpMux` being "accepted and then ignored" as intended behaviour.
