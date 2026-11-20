@@ -620,15 +620,19 @@ async fn run_work_bridge(
         // into wrapped halves (via `split_user_side`), re-combined via
         // `UserSide` for the same relay call.
         //
-        // Rows 4-6 of the decision table
+        // Rows 3-6 of the decision table
         // (docs/archive/notes/2026-11-20-server-bridge-branches.md) are one
-        // predicate, evaluated once below instead of once per arm. Row 3 (the
-        // XTCP/STCP fallback) is still spelled as its own `if` above the
-        // chain, which is why its term is `false` here — folding that arm in
-        // is the next slice, and until then this plan can only be
-        // RateLimited / FastRelay / Slow.
+        // predicate, evaluated once and compared per arm. Row 3 (the
+        // XTCP/STCP fallback) is still the head of the chain; folding its body
+        // into the plan's match is the next slice. Its term is bound rather
+        // than passed as `false` so the guard above and the plan below cannot
+        // drift: if a later slice deletes that `if` and relies on the plan, a
+        // fallback request surfaces as PooledXttpFallback at the last arm,
+        // which drops the pair and logs instead of quietly taking the wrong
+        // relay.
+        let xctp_fallback = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp");
         let path = plain_path(
-            false,
+            xctp_fallback,
             bw_limiter.is_some(),
             comp_key,
             bridge_pre_read.is_empty(),
@@ -637,7 +641,7 @@ async fn run_work_bridge(
             visitor_comp,
         );
 
-        if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
+        if xctp_fallback {
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
@@ -720,15 +724,9 @@ async fn run_work_bridge(
             // zero-copy splice for Tcp-to-Tcp; otherwise use
             // copy_bidirectional.
             relay_plain_fast(req.user_conn, work_conn, &metrics).await;
-        } else {
+        } else if path == PlainPath::Slow {
             // Slow path: compression, VHost pre-read, header injection, or
             // visitor-segment encryption.
-            //
-            // Debug-only net: in a test build a future slice that forgets to
-            // add an arm above must fail loudly here rather than silently
-            // skipping the rate limit or the fast relay. Compiled out in
-            // release, where this arm is the same `else` as before.
-            debug_assert_eq!(path, PlainPath::Slow);
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
@@ -771,6 +769,22 @@ async fn run_work_bridge(
                 )
                 .await;
             }
+        } else {
+            // `path == PooledXttpFallback` escaped the head arm above, so a
+            // future slice deleted that guard without teaching the plan. Fail
+            // closed: dropping the pair is loud and recoverable, while falling
+            // through to the slow relay would silently give up the pooled
+            // relay's no-premature-FIN semantics (audit round-8 P1) and the
+            // fast relay would lose the visitor wrapping entirely.
+            //
+            // No in-tree test drives this function with an `xtcp` proxy (the
+            // STCP `fallback_to` fixtures use `proxy_type == "stcp"`), so this
+            // arm — not an assertion — is the net; TODO slice 2 records the
+            // missing in-process test.
+            tracing::error!(
+                proxy_name = %req.proxy_name,
+                "bridge plan returned an unhandled XTCP/STCP fallback; dropping both connections"
+            );
         }
     }
     debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);

@@ -13111,15 +13111,21 @@ needs the two-review rule and its own gate run.
       `frp-server --lib control::bridge` tests still pass, and
       `scripts/compat-test.sh` is 86/0.
       Done: the plan is evaluated once above the chain and rows 4-6 read that
-      one value (`path == PlainPath::RateLimited` / `FastRelay`); the arm body
-      is byte-identical, and the fallback arm is still its own `if` until the
-      next slice. 48 tests, compat 86/0.
+      one value (`path == PlainPath::RateLimited` / `FastRelay`); the rate
+      limited arm's executable lines are unchanged (its leading comment was
+      rewritten), and the fallback stays the head `if` with its term now bound
+      to the plan instead of a literal. 48 tests, compat 86/0.
 - [ ] **Collapse the XTCP/STCP fallback arm the same way.** It is the only
       caller of `relay_plain_pooled`'s `UserSide` pair; keep the pooled relay's
       own error handling (it drops both writers instead of joining forever).
       Done when: `plain_path` returns `PooledXttpFallback`, the STCP/XTCP
       visitor integration tests pass, and the fallback still logs its
       `debug!` line.
+      Carry-in: no in-tree test drives `run_work_bridge` with an `xtcp` proxy
+      (the STCP `fallback_to` fixture is `proxy_type == "stcp"`), so slice 1's
+      fail-closed last arm is currently the only net; this slice should bring
+      an in-process `Service` test that pushes bytes through an xtcp-proxy
+      plain bridge.
 - [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** Eleven flag families ×
       nine config formats; write the matrix first, then move one family per
       commit.
