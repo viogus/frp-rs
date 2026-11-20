@@ -13101,7 +13101,7 @@ The month-scope simplification round shipped 12 PRs (#633–#645). These are the
 slices deliberately left, in the order they should land. Each is one PR; each
 needs the two-review rule and its own gate run.
 
-- [ ] **Collapse the server's bandwidth-limited arm onto `PlainPath`.**
+- [x] **Collapse the server's bandwidth-limited arm onto `PlainPath`.**
       `frp-server/src/control/bridge.rs` still spells the rate-limited branch
       inline after `plain_path()` was introduced (PR #644). Move the arm into
       `match plain_path(..)` with the body copied verbatim — the injector's
@@ -13110,6 +13110,10 @@ needs the two-review rule and its own gate run.
       Done when: `plain_path` returns `RateLimited` on that path, the 48
       `frp-server --lib control::bridge` tests still pass, and
       `scripts/compat-test.sh` is 86/0.
+      Done: the plan is evaluated once above the chain and rows 4-6 read that
+      one value (`path == PlainPath::RateLimited` / `FastRelay`); the arm body
+      is byte-identical, and the fallback arm is still its own `if` until the
+      next slice. 48 tests, compat 86/0.
 - [ ] **Collapse the XTCP/STCP fallback arm the same way.** It is the only
       caller of `relay_plain_pooled`'s `UserSide` pair; keep the pooled relay's
       own error handling (it drops both writers instead of joining forever).

@@ -619,6 +619,24 @@ async fn run_work_bridge(
         // Visitor-segment encryption/compression (if on) split the user conn
         // into wrapped halves (via `split_user_side`), re-combined via
         // `UserSide` for the same relay call.
+        //
+        // Rows 4-6 of the decision table
+        // (docs/archive/notes/2026-11-20-server-bridge-branches.md) are one
+        // predicate, evaluated once below instead of once per arm. Row 3 (the
+        // XTCP/STCP fallback) is still spelled as its own `if` above the
+        // chain, which is why its term is `false` here — folding that arm in
+        // is the next slice, and until then this plan can only be
+        // RateLimited / FastRelay / Slow.
+        let path = plain_path(
+            false,
+            bw_limiter.is_some(),
+            comp_key,
+            bridge_pre_read.is_empty(),
+            injector_headers.is_some(),
+            visitor_encrypted,
+            visitor_comp,
+        );
+
         if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
@@ -645,8 +663,11 @@ async fn run_work_bridge(
                     debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                 }
             }
-        } else if bw_limiter.is_some() {
-            // Bandwidth limiting active: use rate-limited plain bridge.
+        } else if path == PlainPath::RateLimited {
+            // Bandwidth limiting active: use rate-limited plain bridge. The
+            // body is copied verbatim from the arm this condition replaced
+            // (`bw_limiter.is_some()`), including the injector's decompressor
+            // ordering — `ResponseHeaderInjector` above `SnappyStreamReader`.
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
@@ -691,16 +712,7 @@ async fn run_work_bridge(
                 )
                 .await;
             }
-        } else if plain_path(
-            false,
-            false,
-            comp_key,
-            bridge_pre_read.is_empty(),
-            injector_headers.is_some(),
-            visitor_encrypted,
-            visitor_comp,
-        ) == PlainPath::FastRelay
-        {
+        } else if path == PlainPath::FastRelay {
             // Fast path: pure plain relay with no compression, no VHost
             // pre-read, no header injection, and no visitor-segment
             // encryption/compression (splice needs the raw IoStream; visitor
@@ -711,6 +723,12 @@ async fn run_work_bridge(
         } else {
             // Slow path: compression, VHost pre-read, header injection, or
             // visitor-segment encryption.
+            //
+            // Debug-only net: in a test build a future slice that forgets to
+            // add an arm above must fail loudly here rather than silently
+            // skipping the rate limit or the fast relay. Compiled out in
+            // release, where this arm is the same `else` as before.
+            debug_assert_eq!(path, PlainPath::Slow);
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
