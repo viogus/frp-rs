@@ -161,11 +161,40 @@
 # script's sha256 and the data file's sha256 — a regeneration is a two-file
 # change a reviewer sees.
 #
+# A reviewer's diff is a weak gate, so the one laundering shape that is decidable
+# from the tree is refused mechanically instead. If a row keeps its cite token
+# **and** its target line number (or, for a `:N-M` range, its end line) but its
+# fingerprint changes, and the old text still occurs exactly once in the target
+# file, then the cite was not rewritten,
+# it was *shifted*: `--write` now exits 1 naming the surviving line and tells you
+# to run `--relocate`. That is the shape a re-bake silently certifies — on
+# 2026-11-20 a row was re-recorded in place at a line that had become a bare `}`
+# while the text it was written against still lived three lines lower, and the
+# table then pinned generic punctuation as if it were the rule. Zero occurrences
+# (a genuine in-place rewrite) and more than one (a line whose text is not
+# identifiable) are both allowed through, the same rule `--relocate` uses for
+# its own guesses; `--allow-rewrites` overrides the refusal when the old text
+# legitimately survives elsewhere, and is refused itself outside `--write`, where
+# it would otherwise be a silent no-op. A refused `--write` writes nothing but
+# still prints the added/removed listing, so the other repairs in the same run
+# stay visible; a table it cannot parse, and a suspect row whose target it cannot
+# read, are both fatal rather than skipped (a table must not record what it
+# cannot check).
+#
+# The refusal is not a substitute for reading `--relocate`'s output: a failed
+# `--relocate` (exit 1, ambiguous text) leaves its edits in place and exits before
+# re-baking, so a bare `--write` afterwards is the one combination that can still
+# certify a shift — read the unresolved list, then repair by content.
+#
 # Usage:
 #   bash scripts/tests/pathline-cite-guard.sh              # gate this worktree
 #   bash scripts/tests/pathline-cite-guard.sh --derive     # report rot (git blame)
 #   bash scripts/tests/pathline-cite-guard.sh --relocate   # move cites a shift broke
 #   bash scripts/tests/pathline-cite-guard.sh --write      # re-bake expectations
+#   bash scripts/tests/pathline-cite-guard.sh --write --allow-rewrites
+#                                                          # re-bake, accepting rows
+#                                                          # whose text moved in place
+#                                                          # (only valid with --write)
 #   bash scripts/tests/pathline-cite-guard.sh [MODE] [REPO_ROOT] [DATA_FILE]
 # The two positional arguments are the test seam the fixture suite
 # (`scripts/tests/pathline-cite-fixtures.sh`) drives.
@@ -194,11 +223,13 @@ while [ -L "$self" ]; do
 done
 
 mode=check
+allow_rewrites=0
 positional=()
 for arg in "$@"; do
   case $arg in
     --check) mode=check ;;
     --write) mode=write ;;
+    --allow-rewrites) allow_rewrites=1 ;;
     --relocate) mode=relocate ;;
     --derive) mode=derive ;;
     --) ;;
@@ -245,10 +276,12 @@ if [ -z "$min_cites" ]; then
   exit 1
 fi
 
-out=$(PATHLINE_MIN_CITES="$min_cites" python3 -B - "$mode" "$ROOT" "$DATA" <<'PY'
+out=$(PATHLINE_MIN_CITES="$min_cites" PATHLINE_ALLOW_REWRITES="$allow_rewrites" \
+  python3 -B - "$mode" "$ROOT" "$DATA" <<'PY'
 import collections, hashlib, os, re, subprocess, sys
 
 mode, root, data_path = sys.argv[1], sys.argv[2], sys.argv[3]
+allow_rewrites = os.environ.get("PATHLINE_ALLOW_REWRITES", "0") == "1"
 min_cites = int(os.environ.get("PATHLINE_MIN_CITES", "400"))
 
 PIT_FILES = ("TODO.md", "CHANGELOG.md", "performance-audit.md",
@@ -622,7 +655,14 @@ def read_data(path):
                 return None, None, "record is malformed: %r" % line[:90]
             records.append(dict(target=target, line=int(line_no),
                                 end=None if end == "-" else int(end),
-                                fp=fp, fp_end=None if fp_end == "-" else fp_end,
+                                # A `-` in either fingerprint slot means the guard
+                                # could not fingerprint that line when the row was
+                                # written (the line was past EOF). Kept as None on
+                                # both sides so an unverifiable row reads as
+                                # unverifiable everywhere, instead of as the literal
+                                # text "-" that nothing can ever match.
+                                fp=None if fp == "-" else fp,
+                                fp_end=None if fp_end == "-" else fp_end,
                                 kind=kind, cite=cite, raw=raw,
                                 cite_line=int(cite_line)))
     return records, header, None
@@ -775,17 +815,29 @@ def build_rows(result):
         str(c["cite_line"])]) for c in result["cites"]]
 
 
+def previous_rows():
+    """The current table as row strings, or None when there is no usable table.
+
+    An unreadable table is fatal rather than treated as empty: a write against a
+    table the guard cannot parse would re-bake every row with no comparison and
+    no delta line, which is exactly the un-reviewed regeneration the refusal is
+    there to prevent.
+    """
+    if not os.path.isfile(data_path):
+        return None
+    old, _, err = read_data(data_path)
+    if old is None:
+        die("cannot compare against %s: %s" % (data_path, err))
+    return collections.Counter(
+        "\t".join([r["target"], str(r["line"]),
+                   "-" if r["end"] is None else str(r["end"]), r["fp"] or "-",
+                   r["fp_end"] or "-", r["kind"], r["cite"], r["raw"],
+                   str(r["cite_line"])]) for r in old)
+
+
 def emit_table(result):
     rows = build_rows(result)
-    old_rows = None
-    if os.path.isfile(data_path):
-        old, _, err = read_data(data_path)
-        if old is not None:
-            old_rows = collections.Counter(
-                "\t".join([r["target"], str(r["line"]),
-                           "-" if r["end"] is None else str(r["end"]), r["fp"],
-                           r["fp_end"] or "-", r["kind"], r["cite"], r["raw"],
-                           str(r["cite_line"])]) for r in old)
+    old_rows = previous_rows()
     new_rows = collections.Counter(rows)
     with open(data_path, "w", encoding="utf-8") as fh:
         fh.write("# pathline-cite-guard expectations — generated; do not hand-edit.\n"
@@ -826,15 +878,26 @@ def emit_table(result):
           % (len(result["cites"]), len(result["weak"]), len(result["ambiguous"]),
              len(result["excluded"]), result["foreign"], result["spaced"],
              result["skipped_large"], result["skipped_binary"]))
-    if old_rows is not None:
-        added, removed = new_rows - old_rows, old_rows - new_rows
-        print("write: vs the previous table: %d added, %d removed, %d unchanged"
-              % (sum(added.values()), sum(removed.values()),
-                 sum((new_rows & old_rows).values())))
-        for row in sorted(added):
-            print("  + %s" % row.replace("\t", " | "))
-        for row in sorted(removed):
-            print("  - %s" % row.replace("\t", " | "))
+    report_delta(new_rows, old_rows, "write")
+
+
+def report_delta(new_rows, old_rows, label):
+    """The added/removed listing, which is the whole point of re-baking a table.
+
+    Printed even when a write is refused: the refusal must not hide the other
+    repairs the same run would have made, or a reviewer sees "N rows refused"
+    with no way to tell whether anything else in the run changed.
+    """
+    if old_rows is None:
+        return
+    added, removed = new_rows - old_rows, old_rows - new_rows
+    print("%s: vs the previous table: %d added, %d removed, %d unchanged"
+          % (label, sum(added.values()), sum(removed.values()),
+             sum((new_rows & old_rows).values())))
+    for row in sorted(added):
+        print("  + %s" % row.replace("\t", " | "))
+    for row in sorted(removed):
+        print("  - %s" % row.replace("\t", " | "))
 
 
 if mode == "relocate":
@@ -986,7 +1049,84 @@ if mode == "relocate":
     emit_table(scan(tracked, ordered, files2, sl2, sb2))
     sys.exit(0)
 
+def laundering_suspects(result):
+    """Rows `--write` would certify as a rewrite while they are really a shift.
+
+    A row whose cite token, target file, line number and range end are unchanged
+    but whose fingerprint moved describes *different text at the same number*.
+    When the old text still occurs exactly once in the target file, that text did
+    not move to nowhere — the cite belongs on that line, and re-recording the row
+    at the stale number pins whatever now sits there. Checked for both the start
+    line and a range's end line, since either can slide under a fixed number.
+    Returns (old_record, component, new_fp, surviving_line) quadruples and a list
+    of (old_record, component, exception) triples for rows whose target could not
+    be read — those are refused rather than certified, since a re-bake that cannot
+    be checked against the old text is exactly what the refusal exists to stop.
+    """
+    if not os.path.isfile(data_path):
+        return [], []
+    old, _, err = read_data(data_path)
+    if old is None:
+        die("cannot compare against %s: %s" % (data_path, err))
+    new_by_key = {}
+    for c in result["cites"]:
+        new_by_key.setdefault((c["cite"], c["raw"], c["target"], c["line"],
+                               c["end"]), c)
+    out, unreadable = [], []
+    for r in old:
+        key = (r["cite"], r["raw"], r["target"], r["line"], r["end"])
+        c = new_by_key.get(key)
+        if c is None:
+            continue
+        for comp in ("fp", "fp_end"):
+            before, after = r[comp] or "", c[comp] or ""
+            if not before or before == after:
+                continue
+            try:
+                with open(os.path.join(root, r["target"]), encoding="utf-8") as fh:
+                    tlines = fh.read().split("\n")
+            except (UnicodeDecodeError, OSError) as exc:
+                unreadable.append((r, comp, exc))
+                break
+            hits = [i + 1 for i, ln in enumerate(tlines)
+                    if fingerprint(ln) == before]
+            if len(hits) == 1:
+                out.append((r, comp, after, hits[0]))
+                break
+    return out, unreadable
+
+
+if allow_rewrites and mode != "write":
+    die("--allow-rewrites only affects --write; it does nothing in --%s mode" % mode)
+
+
 if mode == "write":
+    suspects, unreadable = laundering_suspects(res)
+    if (suspects or unreadable) and not allow_rewrites:
+        for r, comp, after, at in suspects:
+            print("FAIL  %s:%d cites %s (%s:%d) — the recorded %s text changed in "
+                  "place (%s -> %s) while the old text still occurs at %s:%d; that "
+                  "is a shift, not a rewrite, so this row would pin unrelated text"
+                  % (r["cite"], r["cite_line"], r["raw"], r["target"], r["line"],
+                     "range-end" if comp == "fp_end" else "line", r[comp],
+                     after, r["target"], at))
+        print("FAIL  %d row(s) kept their line number while their text moved: repair "
+              "them by content and re-run --write, or run --relocate (relocate moves "
+              "each cite to the line its recorded text now occupies). --allow-rewrites "
+              "records them in place anyway, for a rewrite whose old text survives "
+              "elsewhere by coincidence." % len(suspects))
+        for r, comp, exc in unreadable:
+            print("FAIL  %s:%d cites %s (%s:%d) — the target could not be read (%s), so "
+                  "the row cannot be re-recorded: a table must not record what it "
+                  "cannot check"
+                  % (r["cite"], r["cite_line"], r["raw"], r["target"], r["line"],
+                     exc))
+        print("FAIL  nothing was written. The delta the refused regeneration would "
+              "have made follows, so that the other repairs in the same run are not "
+              "hidden by this one:")
+        report_delta(collections.Counter(build_rows(res)), previous_rows(),
+                     "write (refused)")
+        sys.exit(1)
     emit_table(res)
     sys.exit(0)
 
@@ -1045,6 +1185,11 @@ for r in records:
                                   "text to pin, so the cite cannot be validated"))
         continue
     got = fingerprint(tlines[r["line"] - 1])
+    if r["fp"] is None:
+        violations.append((label, "the recorded row carries no fingerprint — its line "
+                                  "was past EOF when the table was written, so the "
+                                  "cite was never actually checked"))
+        continue
     if got != r["fp"]:
         violations.append((label, "the target line no longer carries the recorded text "
                                   "(expected %s, found %s: %r)"

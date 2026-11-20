@@ -60,6 +60,13 @@
 #      comma/shorthand list), and a second run moves nothing;
 #   32 `--relocate` does not sweep a neighbour whose old number equals another
 #      cite's new one;
+#   33 `--write` refuses a row that kept its line number while its text moved to a
+#      unique survivor, names the surviving line, and leaves the table untouched;
+#   34 `--write --allow-rewrites` records that same shape when it is a genuine
+#      rewrite whose old text happens to survive elsewhere;
+#   35 a genuine in-place rewrite (the old text occurs nowhere in the target file)
+#      is accepted by a plain `--write`, so the refusal has no false positive to
+#      work around in the ordinary case;
 #
 # Self-contained: no network, no cargo, no compat run. Synthetic trees live
 # under `mktemp -d` and are removed on every exit path.
@@ -98,7 +105,7 @@ FLOOR_EXEMPT=""
 
 # The floor below is this suite's own self-defence (the same shape as the
 # sibling suites): `exit "$fails"` alone is happy with no assertions at all.
-MIN_CHECKS=101
+MIN_CHECKS=118
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below, not directly
 cleanup_all() {
@@ -946,6 +953,138 @@ if [ "$LAST_RC" -eq 0 ]; then
 else
   bad "relocate: the gate reds after a colliding move: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
 fi
+
+hdr 'scenario 33 — --write refuses a row whose text moved under a fixed number'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs 2)")"
+write_table
+cp "$TABLE" "$tmp/table-before.txt"
+# The shift this refusal exists for: line 2 no longer carries `two`, and `two`
+# now lives once at line 3. A re-bake alone would record whatever line 2 became.
+printf 'one\nmoved\ntwo\nthree\nfour\nfive\n' > "$TREE/fx/anchor.rs"
+write_rc=0
+write_out=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --write "$TREE" "$TABLE" 2>&1) || write_rc=$?
+if [ "$write_rc" -ne 0 ]; then
+  ok "launder: --write refused the in-place row (exit $write_rc)"
+else
+  bad 'launder: --write certified a row whose text moved under a fixed number'
+fi
+case $write_out in
+  *'still occurs at fx/anchor.rs:3'*) ok 'launder: the refusal names the surviving line' ;;
+  *) bad "launder: the refusal did not name the survivor: $(printf '%s' "$write_out" | tr '\n' ' ')" ;;
+esac
+case $write_out in
+  *'shift, not a rewrite'*) ok 'launder: the refusal says why it is a shift' ;;
+  *) bad "launder: the refusal did not explain itself: $(printf '%s' "$write_out" | tr '\n' ' ')" ;;
+esac
+if cmp -s "$tmp/table-before.txt" "$TABLE"; then
+  ok 'launder: a refused --write leaves the table untouched'
+else
+  bad 'launder: a refused --write still rewrote the table'
+fi
+case $write_out in
+  *'write (refused): vs the previous table:'*)
+    ok 'launder: the refusal still prints the delta the run would have made' ;;
+  *) bad "launder: the refusal hid the other repairs in the run: $(printf '%s' "$write_out" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 34 — --allow-rewrites records that shape anyway'
+write_rc=0
+write_out=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --write --allow-rewrites "$TREE" "$TABLE" 2>&1) || write_rc=$?
+if [ "$write_rc" -eq 0 ]; then
+  ok 'launder: --allow-rewrites accepts the row'
+else
+  bad "launder: --allow-rewrites exited $write_rc: $(printf '%s' "$write_out" | tr '\n' ' ')"
+fi
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'launder: the gate is green after an explicit override'
+else
+  bad "launder: the gate reds after an explicit override: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+
+hdr 'scenario 35 — a genuine in-place rewrite needs no override'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs 2)")"
+write_table
+# Line 2's recorded text is gone from the file entirely (it occurs zero times,
+# the other half of --relocate's never-guess rule), so this one is a rewrite.
+printf 'one\ntwo rewritten\nthree\nfour\nfive\n' > "$TREE/fx/anchor.rs"
+write_rc=0
+write_out=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --write "$TREE" "$TABLE" 2>&1) || write_rc=$?
+if [ "$write_rc" -eq 0 ]; then
+  ok 'rewrite: a vanished old text is accepted without --allow-rewrites'
+else
+  bad "rewrite: a genuine rewrite was refused: $(printf '%s' "$write_out" | tr '\n' ' ')"
+fi
+run_gate
+if [ "$LAST_RC" -eq 0 ]; then
+  ok 'rewrite: the gate is green after a genuine rewrite'
+else
+  bad "rewrite: the gate reds after a genuine rewrite: $(printf '%s' "$LAST_OUT" | tr '\n' ' ')"
+fi
+
+hdr 'scenario 36 — the refusal also covers a range-s end line'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs 2-4)")"
+write_table
+cp "$TABLE" "$tmp/table-before.txt"
+# The start line still carries `two`; the end line :4 now carries `moved`, while
+# the recorded end text `four` survives exactly once, at line 5. Same shape as
+# scenario 33 one component over — a row that keeps both numbers but slid.
+printf 'one\ntwo\nthree\nmoved\nfour\nfive\n' > "$TREE/fx/anchor.rs"
+write_rc=0
+write_out=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --write "$TREE" "$TABLE" 2>&1) || write_rc=$?
+if [ "$write_rc" -ne 0 ]; then
+  ok "launder: --write refused a range whose end line slid (exit $write_rc)"
+else
+  bad 'launder: --write certified a range whose end line slid'
+fi
+case $write_out in
+  *'range-end text changed in place'*) ok 'launder: the refusal names the range-end component' ;;
+  *) bad "launder: the refusal did not say which component moved: $(printf '%s' "$write_out" | tr '\n' ' ')" ;;
+esac
+case $write_out in
+  *'still occurs at fx/anchor.rs:5'*) ok 'launder: the range-end refusal names the surviving line' ;;
+  *) bad "launder: the range-end refusal did not name the survivor: $(printf '%s' "$write_out" | tr '\n' ' ')" ;;
+esac
+if cmp -s "$tmp/table-before.txt" "$TABLE"; then
+  ok 'launder: a refused range re-bake leaves the table untouched'
+else
+  bad 'launder: a refused range re-bake still rewrote the table'
+fi
+
+hdr 'scenario 37 — a table the guard cannot parse is fatal, not empty'
+build_tree "$TREE"
+set_notes "$(printf '<!-- see %s -->' "$(cite fx/anchor.rs 2)")"
+write_table
+cp "$TABLE" "$tmp/table-before.txt"
+printf 'not\ta\trecord\n' >> "$TABLE"
+printf 'one\nmoved\ntwo\nthree\nfour\nfive\n' > "$TREE/fx/anchor.rs"
+write_rc=0
+write_out=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --write "$TREE" "$TABLE" 2>&1) || write_rc=$?
+if [ "$write_rc" -ne 0 ]; then
+  ok 'table: --write refuses an unparsable table instead of re-baking it'
+else
+  bad 'table: --write re-baked every row against a table it could not parse'
+fi
+case $write_out in
+  *'cannot compare against'*) ok 'table: the failure says it could not compare' ;;
+  *) bad "table: the failure did not explain itself: $(printf '%s' "$write_out" | tr '\n' ' ')" ;;
+esac
+
+hdr 'scenario 38 — --allow-rewrites outside --write is refused, not ignored'
+allow_rc=0
+allow_out=$(PATHLINE_MIN_CITES=1 bash "$GUARD" --allow-rewrites "$TREE" "$TABLE" 2>&1) || allow_rc=$?
+if [ "$allow_rc" -ne 0 ]; then
+  ok 'flag: --allow-rewrites without --write exits non-zero'
+else
+  bad 'flag: --allow-rewrites without --write was silently ignored'
+fi
+case $allow_out in
+  *'only affects --write'*) ok 'flag: the message says the flag only affects --write' ;;
+  *) bad "flag: the message did not say why: $(printf '%s' "$allow_out" | tr '\n' ' ')" ;;
+esac
 
 hdr 'summary'
 if [ "$fails" -eq 0 ]; then
