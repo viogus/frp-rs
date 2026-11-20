@@ -342,14 +342,35 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
     let proxy_metrics = metrics.get_or_create(name).await;
     let _guard = ConnGuard::new(proxy_metrics.clone());
 
-    if use_encryption {
-        if let Some(key) = enc_key {
-            let key = *key;
+    // One decision table for the three shapes: encrypted work connection (the
+    // core splits it), plain with compression or a limiter (split, plain
+    // core), bare plain (fast relay with splice(2) — see `bridge_plan`).
+    let plan = match (use_encryption, enc_key) {
+        (true, Some(key)) => bridge::BridgePlan::encrypted(key, use_compression),
+        (true, None) => {
+            warn!(name = %name, "Proxy {}: encryption requested but no key available, falling back to plain", name);
+            bridge::BridgePlan::plain(use_compression)
+        }
+        (false, _) => bridge::BridgePlan::plain(use_compression),
+    };
+    let plan = plan
+        .pre_read(Vec::new())
+        .limiter(bw_limiter)
+        .metrics(Some(proxy_metrics.clone()));
+
+    match plan.choice() {
+        bridge::BridgeChoice::EncryptedWhole => {
+            let Some(key) = enc_key else {
+                // Unreachable: a plan is only `EncryptedWhole` when a key was
+                // present. Log rather than return silently if that changes.
+                warn!(name = %name, "Proxy {}: encrypted shape without a key", name);
+                return;
+            };
             let local_io = IoStream::Tcp(local);
-            if let Err(e) = frp_core::bridge::bridge_encrypted_io(
+            if let Err(e) = bridge::bridge_encrypted_io(
                 local_io,
                 work,
-                &key,
+                key,
                 use_compression,
                 Vec::new(),
                 bw_limiter,
@@ -360,39 +381,22 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
                 debug!(name = %name, error = %e, "Proxy {} encrypted bridge could not split streams", name);
             }
             debug!(name = %name, "Proxy {} encrypted bridge closed", name);
-            return;
         }
-        warn!(name = %name, "Proxy {}: encryption requested but no key available, falling back to plain", name);
-    }
-
-    // Plain path: use rate-limited bridge when bandwidth limiting or compression
-    // is active, otherwise use the fast copy_bidirectional path.
-    if use_compression || bw_limiter.is_some() {
-        let (l_r, l_w) = tokio::io::split(local);
-        let (w_r, w_w) = match split_work_conn_halves(work) {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(name = %name, error = e, "Proxy {} bridge could not split work conn: {}", name, e);
-                return;
-            }
-        };
-        bridge::bridge_plain_rate_limited(
-            l_r,
-            l_w,
-            w_r,
-            w_w,
-            use_compression,
-            Vec::new(),
-            bw_limiter,
-            Some(proxy_metrics.clone()),
-        )
-        .await;
-        debug!(name = %name, "Proxy {} rate-limited bridge closed", name);
-    } else {
-        // Fast path: raw Tcp-to-Tcp on Linux takes the zero-copy splice(2)
-        // relay (mirror of the server's relay_plain_fast); everything else
-        // falls back to the buffered bidirectional copy.
-        relay_plain_fast(local, work, name, &proxy_metrics).await;
+        bridge::BridgeChoice::PlainSplit => {
+            let (l_r, l_w) = tokio::io::split(local);
+            let (w_r, w_w) = match split_work_conn_halves(work) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(name = %name, error = e, "Proxy {} bridge could not split work conn: {}", name, e);
+                    return;
+                }
+            };
+            plan.run_plain(l_r, l_w, w_r, w_w).await;
+            debug!(name = %name, "Proxy {} rate-limited bridge closed", name);
+        }
+        bridge::BridgeChoice::PlainFastRelay => {
+            relay_plain_fast(local, work, name, &proxy_metrics).await;
+        }
     }
 }
 
