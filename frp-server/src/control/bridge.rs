@@ -619,7 +619,29 @@ async fn run_work_bridge(
         // Visitor-segment encryption/compression (if on) split the user conn
         // into wrapped halves (via `split_user_side`), re-combined via
         // `UserSide` for the same relay call.
-        if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
+        //
+        // Rows 3-6 of the decision table
+        // (docs/archive/notes/2026-11-20-server-bridge-branches.md) are one
+        // predicate, evaluated once and compared per arm. Row 3 (the
+        // XTCP/STCP fallback) is still the head of the chain; folding its body
+        // into the plan's match is the next slice. Its term is bound rather
+        // than passed as `false` so the guard above and the plan below cannot
+        // drift: if a later slice deletes that `if` and relies on the plan, a
+        // fallback request surfaces as PooledXttpFallback at the last arm,
+        // which drops the pair and logs instead of quietly taking the wrong
+        // relay.
+        let xctp_fallback = proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp");
+        let path = plain_path(
+            xctp_fallback,
+            bw_limiter.is_some(),
+            comp_key,
+            bridge_pre_read.is_empty(),
+            injector_headers.is_some(),
+            visitor_encrypted,
+            visitor_comp,
+        );
+
+        if xctp_fallback {
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
@@ -645,8 +667,11 @@ async fn run_work_bridge(
                     debug!(error = %e, "XTCP STCP fallback bridge closed: {}", e);
                 }
             }
-        } else if bw_limiter.is_some() {
-            // Bandwidth limiting active: use rate-limited plain bridge.
+        } else if path == PlainPath::RateLimited {
+            // Bandwidth limiting active: use rate-limited plain bridge. The
+            // body is copied verbatim from the arm this condition replaced
+            // (`bw_limiter.is_some()`), including the injector's decompressor
+            // ordering — `ResponseHeaderInjector` above `SnappyStreamReader`.
             let Some((u_r, u_w)) =
                 try_split_user_side(visitor_enc_key, visitor_comp, req.user_conn)
             else {
@@ -691,16 +716,7 @@ async fn run_work_bridge(
                 )
                 .await;
             }
-        } else if plain_path(
-            false,
-            false,
-            comp_key,
-            bridge_pre_read.is_empty(),
-            injector_headers.is_some(),
-            visitor_encrypted,
-            visitor_comp,
-        ) == PlainPath::FastRelay
-        {
+        } else if path == PlainPath::FastRelay {
             // Fast path: pure plain relay with no compression, no VHost
             // pre-read, no header injection, and no visitor-segment
             // encryption/compression (splice needs the raw IoStream; visitor
@@ -708,7 +724,7 @@ async fn run_work_bridge(
             // zero-copy splice for Tcp-to-Tcp; otherwise use
             // copy_bidirectional.
             relay_plain_fast(req.user_conn, work_conn, &metrics).await;
-        } else {
+        } else if path == PlainPath::Slow {
             // Slow path: compression, VHost pre-read, header injection, or
             // visitor-segment encryption.
             let Some((u_r, u_w)) =
@@ -753,6 +769,22 @@ async fn run_work_bridge(
                 )
                 .await;
             }
+        } else {
+            // `path == PooledXttpFallback` escaped the head arm above, so a
+            // future slice deleted that guard without teaching the plan. Fail
+            // closed: dropping the pair is loud and recoverable, while falling
+            // through to the slow relay would silently give up the pooled
+            // relay's no-premature-FIN semantics (audit round-8 P1) and the
+            // fast relay would lose the visitor wrapping entirely.
+            //
+            // No in-tree test drives this function with an `xtcp` proxy (the
+            // STCP `fallback_to` fixtures use `proxy_type == "stcp"`), so this
+            // arm — not an assertion — is the net; TODO slice 2 records the
+            // missing in-process test.
+            tracing::error!(
+                proxy_name = %req.proxy_name,
+                "bridge plan returned an unhandled XTCP/STCP fallback; dropping both connections"
+            );
         }
     }
     debug!(proxy_name = %req.proxy_name, "Proxy '{}' bridge completed", req.proxy_name);

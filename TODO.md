@@ -13101,7 +13101,7 @@ The month-scope simplification round shipped 12 PRs (#633–#645). These are the
 slices deliberately left, in the order they should land. Each is one PR; each
 needs the two-review rule and its own gate run.
 
-- [ ] **Collapse the server's bandwidth-limited arm onto `PlainPath`.**
+- [x] **Collapse the server's bandwidth-limited arm onto `PlainPath`.**
       `frp-server/src/control/bridge.rs` still spells the rate-limited branch
       inline after `plain_path()` was introduced (PR #644). Move the arm into
       `match plain_path(..)` with the body copied verbatim — the injector's
@@ -13110,12 +13110,22 @@ needs the two-review rule and its own gate run.
       Done when: `plain_path` returns `RateLimited` on that path, the 48
       `frp-server --lib control::bridge` tests still pass, and
       `scripts/compat-test.sh` is 86/0.
+      Done: the plan is evaluated once above the chain and rows 4-6 read that
+      one value (`path == PlainPath::RateLimited` / `FastRelay`); the rate
+      limited arm's executable lines are unchanged (its leading comment was
+      rewritten), and the fallback stays the head `if` with its term now bound
+      to the plan instead of a literal. 48 tests, compat 86/0.
 - [ ] **Collapse the XTCP/STCP fallback arm the same way.** It is the only
       caller of `relay_plain_pooled`'s `UserSide` pair; keep the pooled relay's
       own error handling (it drops both writers instead of joining forever).
       Done when: `plain_path` returns `PooledXttpFallback`, the STCP/XTCP
       visitor integration tests pass, and the fallback still logs its
       `debug!` line.
+      Carry-in: no in-tree test drives `run_work_bridge` with an `xtcp` proxy
+      (the STCP `fallback_to` fixture is `proxy_type == "stcp"`), so slice 1's
+      fail-closed last arm is currently the only net; this slice should bring
+      an in-process `Service` test that pushes bytes through an xtcp-proxy
+      plain bridge.
 - [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** Eleven flag families ×
       nine config formats; write the matrix first, then move one family per
       commit.
