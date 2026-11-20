@@ -246,55 +246,67 @@ pub struct VerifyArgs {
     pub allow_unsafe: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ReloadArgs {
-    pub config: Option<String>,
-    pub strict_config: bool,
-    pub admin_addr: Option<String>,
-    pub admin_port: Option<u16>,
-    pub admin_user: Option<String>,
-    pub admin_pwd: Option<String>,
-    /// Deadline for the whole admin HTTP call; default
-    /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
-    pub api_timeout: Duration,
+/// `frpc_admin_flag_specs`' struct arm: the five rows become the admin fields of
+/// all three admin argument structs — `ReloadArgs`, `StatusArgs`, `StopArgs`,
+/// which is why a row added to the list reaches every one of them.
+///
+/// What stays hand-written is each struct's non-admin tail (`config`,
+/// `strict_config`, and `--json` on `StatusArgs`), written **before** the
+/// generated block so the field order is exactly the one the hand-written
+/// structs had. A `macro_rules!` body can emit a whole struct, never a field
+/// group spliced after literal fields, so the tail cannot be both hand-written
+/// at the call site and declared last: the generated block is the part that has
+/// to move, and declaration order is observable (it is what `Debug` prints, and
+/// what the `git diff` of the three structs against the pre-refactor file is
+/// read for).
+///
+/// The `construct!`s in `reload_cmd`, `status_cmd` and `stop_cmd` are
+/// untouched, for the reason `frpc_root_args_struct` records: an identifier in a
+/// macro body cannot name a call-site local, so the sites that fill these
+/// structs stay written out — and are the compile check that every generated
+/// field is filled.
+///
+/// Its pattern mirrors `frpc_admin_flag_tables` in `flag_tables.rs`: both open the
+/// same list, so a change to the row shape has to change both.
+macro_rules! frpc_admin_args_structs {
+    (
+        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? $(,)? ) ),* $(,)?
+    ) => {
+        #[derive(Debug, Clone)]
+        pub struct ReloadArgs {
+            pub config: Option<String>,
+            pub strict_config: bool,
+            $( $(#[$doc])* pub $field: $ty, )*
+        }
+
+        #[derive(Debug, Clone)]
+        pub struct StatusArgs {
+            pub config: Option<String>,
+            /// Go frp v0.71.0: `--strict-config` is a persistent rootCmd flag
+            /// (cmd/frpc/sub/root.go), so `frpc status` accepts it too — and
+            /// `NewAdminCommand` passes it to `config.LoadClientConfig`
+            /// (cmd/frpc/sub/admin.go:57). Absent → true.
+            pub strict_config: bool,
+            pub json: bool,
+            $( $(#[$doc])* pub $field: $ty, )*
+        }
+
+        /// Arguments of `frpc stop` — [`StatusArgs`] without `--json`, mirroring Go's
+        /// registration (all three admin commands get the same flag set).
+        #[derive(Debug, Clone)]
+        pub struct StopArgs {
+            pub config: Option<String>,
+            /// Go frp v0.71.0: `--strict-config` is a persistent rootCmd flag
+            /// (cmd/frpc/sub/root.go), so `frpc stop` accepts it too — and
+            /// `NewAdminCommand` passes it to `config.LoadClientConfig`
+            /// (cmd/frpc/sub/admin.go:57). Absent → true.
+            pub strict_config: bool,
+            $( $(#[$doc])* pub $field: $ty, )*
+        }
+    };
 }
 
-#[derive(Debug, Clone)]
-pub struct StatusArgs {
-    pub config: Option<String>,
-    /// Go frp v0.71.0: `--strict-config` is a persistent rootCmd flag
-    /// (cmd/frpc/sub/root.go), so `frpc status` accepts it too — and
-    /// `NewAdminCommand` passes it to `config.LoadClientConfig`
-    /// (cmd/frpc/sub/admin.go:57). Absent → true.
-    pub strict_config: bool,
-    pub json: bool,
-    pub admin_addr: Option<String>,
-    pub admin_port: Option<u16>,
-    pub admin_user: Option<String>,
-    pub admin_pwd: Option<String>,
-    /// Deadline for the whole admin HTTP call; default
-    /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
-    pub api_timeout: Duration,
-}
-
-/// Arguments of `frpc stop` — [`StatusArgs`] without `--json`, mirroring Go's
-/// registration (all three admin commands get the same flag set).
-#[derive(Debug, Clone)]
-pub struct StopArgs {
-    pub config: Option<String>,
-    /// Go frp v0.71.0: `--strict-config` is a persistent rootCmd flag
-    /// (cmd/frpc/sub/root.go), so `frpc stop` accepts it too — and
-    /// `NewAdminCommand` passes it to `config.LoadClientConfig`
-    /// (cmd/frpc/sub/admin.go:57). Absent → true.
-    pub strict_config: bool,
-    pub admin_addr: Option<String>,
-    pub admin_port: Option<u16>,
-    pub admin_user: Option<String>,
-    pub admin_pwd: Option<String>,
-    /// Deadline for the whole admin HTTP call; default
-    /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
-    pub api_timeout: Duration,
-}
+frpc_admin_flag_specs!(frpc_admin_args_structs);
 
 /// Attach [`ignored_proxy_root_flags`] to one single-proxy command's own
 /// argument parser and map the pair down to the command's `FrpcCmd` variant.

@@ -278,14 +278,113 @@ macro_rules! frpc_root_flag_tables {
 
 frpc_root_flag_specs!(frpc_root_flag_tables);
 
-/// The `status`/`reload`/`stop` flags Go registers on the command itself
-/// (`cmd/frpc/sub/admin.go`): one row, `--api-timeout`.
-pub(crate) const FRPC_ADMIN_GO_FLAGS: &[GoFlagRow] = &[GoFlagRow {
-    long: "api-timeout",
+/// The `frpc status`/`reload`/`stop` flag surface as one list: the five flags
+/// all three admin commands share, one row per field of their argument structs
+/// (`ReloadArgs`, `StatusArgs`, `StopArgs`).
+///
+/// `--api-timeout` is the only row Go registers on the command itself
+/// (`cmd/frpc/sub/admin.go`, "Timeout for admin API calls (default 30s)"); the
+/// four `admin-*` rows are frp-rs extensions, because Go's admin commands reach
+/// the same API through the config file. The `ext ( … )` cells carry frp-rs's
+/// own text, not Go's, for that reason.
+///
+/// `--json` is **not** here: it is a `StatusArgs` field only, not one of the
+/// five an admin command has in common, so a row for it would put the field in
+/// all three structs. Its table row is [`FRPC_ADMIN_STATUS_ONLY_ROW`].
+///
+/// That is what the callback form buys: one list feeds both shapes —
+/// `frpc_admin_flag_tables` below emits [`FRPC_ADMIN_GO_FLAGS`] and
+/// [`FRPC_ADMIN_EXTENSION_FLAGS`], and `frpc_admin_args_structs` in `frpc.rs`
+/// emits the three structs' shared fields. The `construct!`s that fill those
+/// structs stay hand-written, for the reason `frpc_root_args_struct` records:
+/// a macro body cannot name a call-site local. They are the compile check —
+/// every field this list emits is one of them, so a row added here reddens each
+/// of the three sites with `error[E0063]: missing field … in initializer of
+/// …Args`.
+///
+/// The rows run in struct-field order, which is **not** the extension table's
+/// previous hand-written order: `admin-user` now precedes `admin-pwd`, where
+/// the table had them the other way round. Reading the list for the structs is
+/// what forces that — one list has one order — and nothing reads either table
+/// positionally: the renderer sorts by long (`frp-core/src/cli/help_render.rs`),
+/// so no rendered document or `--help` pin moves, and `surface_consults` keys a
+/// table on its **first** row, which is still `admin-addr`.
+macro_rules! frpc_admin_flag_specs {
+    ($expand:ident) => {
+        $expand! {
+            (
+                admin_addr: Option<String>,
+                ext ( long: "admin-addr", short: None, varname: Some("string"), usage: "admin address" )
+            ),
+            (
+                admin_port: Option<u16>,
+                ext ( long: "admin-port", short: None, varname: Some("int"), usage: "admin port" )
+            ),
+            (
+                admin_user: Option<String>,
+                ext ( long: "admin-user", short: None, varname: Some("string"), usage: "admin user" )
+            ),
+            (
+                admin_pwd: Option<String>,
+                ext ( long: "admin-pwd", short: None, varname: Some("string"), usage: "admin password" )
+            ),
+            (
+                /// Deadline for the whole admin HTTP call; default
+                /// [`DEFAULT_ADMIN_API_TIMEOUT`] (Go's `adminAPITimeout`).
+                api_timeout: Duration,
+                go ( long: "api-timeout", short: None, varname: Some("duration"), usage: "Timeout for admin API calls (default 30s)" )
+            ),
+        }
+    };
+}
+
+pub(crate) use frpc_admin_flag_specs;
+
+/// `frpc status --json`'s table row — the one flag on the admin surface that is
+/// not one of the five shared admin fields.
+///
+/// It is a named row rather than a sixth entry in `frpc_admin_flag_specs`
+/// because that list declares *fields*: every row of it becomes a field of all
+/// three argument structs, and only `StatusArgs` has `json`. So this row is
+/// table-only data, appended by `frpc_admin_flag_tables` after the rows it
+/// derives from the list.
+const FRPC_ADMIN_STATUS_ONLY_ROW: GoFlagRow = GoFlagRow {
+    long: "json",
     short: None,
-    varname: Some("duration"),
-    usage: "Timeout for admin API calls (default 30s)",
-}];
+    varname: None,
+    usage: "Output the status as JSON",
+};
+
+/// `frpc_admin_flag_specs`' table arm: the rows' `go ( … )` cells become
+/// [`FRPC_ADMIN_GO_FLAGS`] and their `ext ( … )` cells
+/// [`FRPC_ADMIN_EXTENSION_FLAGS`], with [`FRPC_ADMIN_STATUS_ONLY_ROW`] appended
+/// to the extension table — the row order is the list's, plus that one row last
+/// so the table still starts at `admin-addr`.
+///
+/// Its pattern mirrors `frpc_admin_args_structs` in `frpc.rs`: both open the
+/// same list, so a change to the row shape has to change both.
+macro_rules! frpc_admin_flag_tables {
+    (
+        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? $(,)? ) ),* $(,)?
+    ) => {
+        /// The `status`/`reload`/`stop` flags Go registers on the command itself
+        /// (`cmd/frpc/sub/admin.go`): one row, `--api-timeout`.
+        pub(crate) const FRPC_ADMIN_GO_FLAGS: &[GoFlagRow] = &[
+            $( $( GoFlagRow { long: $glong, short: $gshort, varname: $gvarname, usage: $gusage }, )? )*
+        ];
+
+        /// frp-rs flags on `frpc status`/`reload`/`stop` that Go has no row for. Go's
+        /// admin commands reach the same API through the config file and register only
+        /// `--api-timeout`, so these five are frp-rs extensions on every one of the
+        /// three (`--json` on `status` only).
+        pub(crate) const FRPC_ADMIN_EXTENSION_FLAGS: &[GoFlagRow] = &[
+            $( $( GoFlagRow { long: $elong, short: $eshort, varname: $evarname, usage: $eusage }, )? )*
+            FRPC_ADMIN_STATUS_ONLY_ROW,
+        ];
+    };
+}
+
+frpc_admin_flag_specs!(frpc_admin_flag_tables);
 
 /// The union of the eight single-proxy commands' own flags on Go v0.71.0
 /// (`frpc tcp --help` 2211 B and `frpc https --help` 2269 B, minus `-h`).
@@ -507,43 +606,6 @@ pub(crate) const FRPS_EXTENSION_FLAGS: &[GoFlagRow] = &[
         short: None,
         varname: Some("string"),
         usage: "log format (default \"text\")",
-    },
-];
-
-/// frp-rs flags on `frpc status`/`reload`/`stop` that Go has no row for. Go's
-/// admin commands reach the same API through the config file and register only
-/// `--api-timeout`, so these five are frp-rs extensions on every one of the
-/// three (`--json` on `status` only).
-pub(crate) const FRPC_ADMIN_EXTENSION_FLAGS: &[GoFlagRow] = &[
-    GoFlagRow {
-        long: "admin-addr",
-        short: None,
-        varname: Some("string"),
-        usage: "admin address",
-    },
-    GoFlagRow {
-        long: "admin-port",
-        short: None,
-        varname: Some("int"),
-        usage: "admin port",
-    },
-    GoFlagRow {
-        long: "admin-pwd",
-        short: None,
-        varname: Some("string"),
-        usage: "admin password",
-    },
-    GoFlagRow {
-        long: "admin-user",
-        short: None,
-        varname: Some("string"),
-        usage: "admin user",
-    },
-    GoFlagRow {
-        long: "json",
-        short: None,
-        varname: None,
-        usage: "Output the status as JSON",
     },
 ];
 
