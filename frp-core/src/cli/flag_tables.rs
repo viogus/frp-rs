@@ -167,40 +167,108 @@ macro_rules! frps_go_flag_table {
 
 frps_flag_specs!(frps_go_flag_table);
 
-/// `frpc`'s persistent root flags, measured the same way (`frpc --help`,
-/// 1370 B; `frpc verify --help` repeats exactly these under `Global Flags`).
-pub(crate) const FRPC_ROOT_GO_FLAGS: &[GoFlagRow] = &[
-    GoFlagRow {
-        long: "allow-unsafe",
-        short: None,
-        varname: Some("strings"),
-        usage: "allowed unsafe features, one or more of: TokenSourceExec",
-    },
-    GoFlagRow {
-        long: "config",
-        short: Some('c'),
-        varname: Some("string"),
-        usage: "config file of frpc (default \"./frpc.ini\")",
-    },
-    GoFlagRow {
-        long: "config-dir",
-        short: None,
-        varname: Some("string"),
-        usage: "config directory, run one frpc service for each file in config directory",
-    },
-    GoFlagRow {
-        long: "strict-config",
-        short: None,
-        varname: None,
-        usage: "strict config parsing mode, unknown fields will cause an errors (default true)",
-    },
-    GoFlagRow {
-        long: "version",
-        short: Some('v'),
-        varname: None,
-        usage: "version of frpc",
-    },
-];
+/// The `frpc` root flag surface as one list: the five rows Go frp **v0.71.0**
+/// prints persistently (`frpc --help`, 1370 B; `frpc verify --help` repeats
+/// exactly those under `Global Flags`), plus the five frp-rs extension flags
+/// that fill the same struct.
+///
+/// Each row names the `FrpcRunArgs` field the flag fills, its type, and the
+/// pflag-shaped cells of that flag's table row — `go ( … )` for a row Go
+/// registers, `ext ( … )` for one it does not. That is what the callback form
+/// buys, one list two shapes: `frpc_root_flag_tables` below emits **both**
+/// [`FRPC_ROOT_GO_FLAGS`] (from the `go ( … )` cells) and
+/// [`FRPC_ROOT_EXTENSION_FLAGS`] (from the `ext ( … )` cells), and
+/// `frpc_root_args_struct` / `frpc_root_run_construct` in `frpc.rs` emit
+/// `FrpcRunArgs` and the `construct!` that fills it, so a flag that is in one
+/// shape is in all of them.
+///
+/// The `ext ( … )` cells carry frp-rs's own text, not Go's: measured on Go
+/// v0.71.0, `frpc --log-file x --help`, `--log-level`, `--log-max-days`,
+/// `--log-format` and `--disable-log-color` are all `unknown flag` there, so
+/// there is no Go row to copy and the usage strings state the config defaults
+/// the way pflag states its own.
+///
+/// The rows run in `FrpcRunArgs` field order, which is not pflag's byte order
+/// (the Go table used to be alphabetical). Nothing reads either table
+/// positionally: the renderer sorts by long (`frp-core/src/cli/help_render.rs`),
+/// so the rendered document and its `--help` pins are unaffected, and a diff
+/// against the measurement compares sorted long names.
+///
+/// No row here needs what `frps_flag_specs` calls a cell gate: no `frpc` root
+/// flag is feature-gated. Nor is there a group marker — one struct parses all
+/// ten flags, so a family with exactly one owning struct has only one shape to
+/// name.
+macro_rules! frpc_root_flag_specs {
+    ($expand:ident) => {
+        $expand! {
+            (
+                config: String,
+                go ( long: "config", short: Some('c'), varname: Some("string"), usage: "config file of frpc (default \"./frpc.ini\")" )
+            ),
+            (
+                config_dir: Option<String>,
+                go ( long: "config-dir", short: None, varname: Some("string"), usage: "config directory, run one frpc service for each file in config directory" )
+            ),
+            (
+                strict_config: bool,
+                go ( long: "strict-config", short: None, varname: None, usage: "strict config parsing mode, unknown fields will cause an errors (default true)" )
+            ),
+            (
+                allow_unsafe: Vec<String>,
+                go ( long: "allow-unsafe", short: None, varname: Some("strings"), usage: "allowed unsafe features, one or more of: TokenSourceExec" )
+            ),
+            (
+                show_version: bool,
+                go ( long: "version", short: Some('v'), varname: None, usage: "version of frpc" )
+            ),
+            (
+                log_file: Option<String>,
+                ext ( long: "log-file", short: None, varname: Some("string"), usage: "log file (default \"console\")" )
+            ),
+            (
+                log_level: Option<String>,
+                ext ( long: "log-level", short: Some('L'), varname: Some("string"), usage: "log level (default \"info\")" )
+            ),
+            (
+                log_max_days: Option<i32>,
+                ext ( long: "log-max-days", short: None, varname: Some("int"), usage: "log max days (default 3)" )
+            ),
+            (
+                log_format: Option<String>,
+                ext ( long: "log-format", short: None, varname: Some("string"), usage: "log format (default \"text\")" )
+            ),
+            (
+                disable_log_color: bool,
+                ext ( long: "disable-log-color", short: None, varname: None, usage: "disable log color in console" )
+            ),
+        }
+    };
+}
+
+/// `frpc_root_flag_specs`' table arm: a row's `go ( … )` cell becomes a row of
+/// [`FRPC_ROOT_GO_FLAGS`] and its `ext ( … )` cell a row of
+/// [`FRPC_ROOT_EXTENSION_FLAGS`]. A row with neither cell has a field and no
+/// table row at all, which is how a flag with no pflag entry of either kind
+/// would be spelled.
+///
+/// Its pattern mirrors `frpc_root_args_struct` and `frpc_root_run_construct` in
+/// `frpc.rs`: all three open the same list, so a change to the row shape has to
+/// change all three.
+macro_rules! frpc_root_flag_tables {
+    (
+        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? ) ),* $(,)?
+    ) => {
+        pub(crate) const FRPC_ROOT_GO_FLAGS: &[GoFlagRow] = &[
+            $( $( GoFlagRow { long: $glong, short: $gshort, varname: $gvarname, usage: $gusage }, )? )*
+        ];
+
+        pub(crate) const FRPC_ROOT_EXTENSION_FLAGS: &[GoFlagRow] = &[
+            $( $( GoFlagRow { long: $elong, short: $eshort, varname: $evarname, usage: $eusage }, )? )*
+        ];
+    };
+}
+
+frpc_root_flag_specs!(frpc_root_flag_tables);
 
 /// The `status`/`reload`/`stop` flags Go registers on the command itself
 /// (`cmd/frpc/sub/admin.go`): one row, `--api-timeout`.
@@ -431,42 +499,6 @@ pub(crate) const FRPS_EXTENSION_FLAGS: &[GoFlagRow] = &[
         short: None,
         varname: Some("string"),
         usage: "log format (default \"text\")",
-    },
-];
-
-/// frp-rs flags on the `frpc` root that Go's `frpc` does not register: measured
-/// on Go v0.71.0, `frpc --log-file x --help`, `--log-level`, `--log-max-days`,
-/// `--log-format` and `--disable-log-color` are all `unknown flag` there.
-pub(crate) const FRPC_ROOT_EXTENSION_FLAGS: &[GoFlagRow] = &[
-    GoFlagRow {
-        long: "log-file",
-        short: None,
-        varname: Some("string"),
-        usage: "log file (default \"console\")",
-    },
-    GoFlagRow {
-        long: "log-level",
-        short: Some('L'),
-        varname: Some("string"),
-        usage: "log level (default \"info\")",
-    },
-    GoFlagRow {
-        long: "log-max-days",
-        short: None,
-        varname: Some("int"),
-        usage: "log max days (default 3)",
-    },
-    GoFlagRow {
-        long: "log-format",
-        short: None,
-        varname: Some("string"),
-        usage: "log format (default \"text\")",
-    },
-    GoFlagRow {
-        long: "disable-log-color",
-        short: None,
-        varname: None,
-        usage: "disable log color in console",
     },
 ];
 
