@@ -13172,9 +13172,35 @@ needs the two-review rule and its own gate run.
       than this fixture if one is ever wanted (`frp-server/tests/stcp_relay.rs`
       reaches `run_work_bridge` with hand-built V1 frames in milliseconds);
       this one lives in the client lane because it needs a real provider.
-- [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** Eleven flag families ×
-      nine config formats; write the matrix first, then move one family per
-      commit.
+- [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** The original line here
+      said "eleven flag families × nine config formats"; the matrix is now
+      written, and both numbers are true only under a chosen definition.
+      Measured 2026-11-20 at `4c1f8f73`: **8 `GoFlagRow` tables / 80 rows of that
+      type (67 Go-parity rows — 51 distinct Go flag names — plus 13 frp-rs
+      extension rows) / 92 registered spellings / 249 registration sites**,
+      over 10 rendering surfaces. Eleven is a plausible count of
+      *registration groups* (frps server; frpc root; proxy-common; tcp/udp/sudp
+      `remote-port`; the http-family extras; stcp/xtcp visitor; sudp `sk`;
+      tcpmux `mux`; frpc admin; `frps verify`; `frpc verify`); nine is a
+      plausible count of *formats* only with the two struct-plumbing entries
+      folded into one and the shorthand cross-check treated as a facet of the
+      combinator. The formats are: the bpaf combinator, the `GoFlagRow`, the
+      output-struct field, the builder-struct field + `From` arm (a **third**
+      hand-maintained copy of every field name with no compile-time link to the
+      output struct), the merge arm into `frp-core/src/config/server.rs`, the
+      `--help` byte pins, the value-taking grammar, pflag's bool grammar, the
+      shorthand letter, and the tests that name the flag. The eleventh — an env
+      lane — is **absent** (`frp-core/src/cli/` has no `env::var`). Cost is
+      19-29 lines per flag, and `bind-port` alone has to be written 12 times
+      across 7 source files (the count is of a flag name's *spellings in the
+      code that has to agree*, not of every occurrence of the string — the docs
+      and tests mention it many more times); the
+      bridge has to be a macro, because bpaf's combinator *types* are not data
+      and `macro_rules!`'s `concat!`-built bool help must keep deriving from the
+      same literal the parser registers. What must not be generated: pflag's
+      `" (default …)"` usage suffix, and the underscore twin for the three flags
+      where it is not `long.replace('-', "_")` (`mux`, `custom_domains`,
+      `token`, which has no twin).
       Done when: every family is declared as data, `--help` output is
       byte-identical to the current pinned text (the Go-parity pins in
       `frp-core/src/cli/help_doc_tests.rs` are the oracle), and
@@ -13247,6 +13273,39 @@ needs the two-review rule and its own gate run.
       them), which `ci.yml`'s pinned `TODO.md` cite count caught as 100-vs-101
       before any reviewer did — section banners sit *between* items, so they
       fall outside a doc-block-anchored unit span.
+      **Data model, first family landed 2026-11-20 (frps `svr_*`, two of the
+      three commits).** `frp-core/src/cli/flag_tables.rs` now carries one
+      `macro_rules! frps_flag_specs` row list — 29 `GoFlagRow`s plus the two
+      frp-rs extension fields, one row per flag with its struct field, type,
+      doc comment and `go ( long, short, varname, usage )` cell — and three
+      expanders consume it: the table (`FRPS_GO_FLAGS`), the `FrpsArgs` fields
+      (the hand-written struct is gone) and the six `Svr*` builder structs plus
+      `impl From<FrpsBuild> for FrpsArgs`. 93 declarations became 31 in the list
+      plus 31 at the `construct!` sites. The oracle held: 101 `cli::` tests (98
+      under `--no-default-features`), no `--help` pin changed
+      (`frp-core/src/cli/help_doc_tests.rs` is not in the diff; the other files
+      are the cite table, `ci.yml`'s data pin, and the two re-baked cites in
+      `frps/tests/cli_exit_codes.rs` and `frps/tests/log_completion.rs`), and
+      `--help` stayed byte-identical across 15 surfaces in four feature shapes
+      (`--all-features` 17,914 B, `tiny` 17,676 B, `tiny,kcp` 17,794 B,
+      `tiny,quic` 17,796 B). That the `#[cfg(feature = "kcp")]` / `("quic")`
+      gates sit on their own rows is proven by the kcp-only and quic-only
+      lanes, not by the `--no-default-features` lane: swapping the two gates
+      passes both the default and the no-default-features lanes and reddens
+      only those two shapes, and `strip_pinned_row` validates the frozen pin
+      constant rather than a rendered document. Two things to know before
+      the next family: generating per-struct fields forces the rows to be
+      grouped by owning struct, so `FRPS_GO_FLAGS` is no longer in pflag byte
+      order as a whole (nothing reads it positionally — the renderer sorts — and
+      no pin moved); and the combinator chains are **not** generated yet —
+      commit (iii) has to keep `construct!`'s 8-field ceiling, `.last()`,
+      `.adjacent()` and the `bpaf::pure(None)` feature refusals hand-written,
+      which is where the risk lives, so stopping at (ii) is the cheap exit.
+      One caveat for the next family: a fourth copy of the 31 field names still
+      exists as a struct literal at `frps/src/main.rs:1506-1541` (a test helper).
+      It is compile-checked — a literal must name every field, so it cannot drift
+      silently — but "the names now live in one place" is true of `frp-core`
+      only.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from

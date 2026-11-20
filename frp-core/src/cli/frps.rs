@@ -8,72 +8,6 @@ use super::*;
 // ──────────────────────────────────────────────────────────────────────
 // frps CLI — 30+ flags
 // ──────────────────────────────────────────────────────────────────────
-/// CLI arguments for frps (server).
-///
-/// Fields that can also appear in the config file use `Option<T>`: `Some`
-/// means the user explicitly passed the flag on the CLI and it should
-/// override the config value.  `None` means the config value is used.
-#[derive(Debug, Clone)]
-pub struct FrpsArgs {
-    /// Config file path. `None` when `-c` was not given (default
-    /// "frps.toml" is applied by [`FrpsArgs::config_path`]).
-    /// Go frp v0.70.1 parity: when `-c` is given the file is authoritative
-    /// and CLI config flags are ignored (audit task 9 finding 5).
-    pub config: Option<String>,
-    pub config_dir: Option<String>,
-    pub bind_addr: Option<String>,
-    pub bind_port: Option<u16>,
-    pub token: Option<String>,
-    pub allow_ports: Option<String>,
-    pub allow_unsafe: Vec<String>,
-    pub dashboard_addr: Option<String>,
-    pub dashboard_port: Option<u16>,
-    pub dashboard_user: Option<String>,
-    pub dashboard_pwd: Option<String>,
-    pub dashboard_tls_cert_file: Option<String>,
-    pub dashboard_tls_key_file: Option<String>,
-    pub dashboard_tls_mode: bool,
-    pub enable_prometheus: bool,
-    pub disable_log_color: bool,
-    pub log_file: Option<String>,
-    pub log_level: Option<String>,
-    pub log_max_days: Option<i32>,
-    pub log_format: Option<String>,
-    pub kcp_bind_port: Option<u16>,
-    pub quic_bind_port: Option<u16>,
-    pub max_ports_per_client: Option<u64>,
-    pub proxy_bind_addr: Option<String>,
-    pub subdomain_host: Option<String>,
-    pub tls_only: bool,
-    pub vhost_http_port: Option<u16>,
-    pub vhost_https_port: Option<u16>,
-    /// VHost HTTP response-header timeout, in seconds. Go frp registers this as
-    /// a **persistent root flag** with default 60
-    /// (`cmd.PersistentFlags().Int64VarP(&c.VhostHTTPTimeout, "vhost_http_timeout", "", 60, …)`,
-    /// `pkg/config/flags.go:237`), so `frps verify` inherits it too. `None`
-    /// means the flag was absent and the config value stands;
-    /// `ServerConfig::default()` already carries Go's 60
-    /// (`frp-core/src/config/server.rs:249`), so the absent case is Go's default.
-    /// The value is `i64`, matching `Int64VarP` and Go's `int64` config field:
-    /// Go accepts `--vhost-http-timeout -1` (its floor then applies) and refuses
-    /// only what does not fit an `int64` (measured on Go v0.71.0:
-    /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
-    /// `9223372036854775808` rc 1 `value out of range`).
-    ///
-    /// **R6(b) (`TODO.md:11218`): "accept-and-ignore matches Go" is bounded.**
-    /// The flag surface is Go's (the full `int64` accepted above), but the value
-    /// that reaches the vhost handler is clamped: `<= 0` floors at 60 s and
-    /// anything above 24 h is capped, where Go has no comparable cap. So the
-    /// bound is "values `<= 0` or below the cap behave like Go"; a positive value
-    /// above 24 h is accepted here and then silently shortened. Measured by the
-    /// unit pin `frp-server/src/vhost/tests.rs:252` (`test_clamp_vhost_timeout`):
-    /// `0 → 60`, `-1 → 60`, `86400 → 86400`, `86401 → 86400`, `i64::MAX →
-    /// 86400`; the cap is `frp-server/src/vhost.rs:128`
-    /// (`VHOST_TIMEOUT_CAP_SECS`).
-    pub vhost_http_timeout: Option<i64>,
-    pub strict_config: bool,
-    pub show_version: bool,
-}
 
 /// CLI command for frps (server): the root command's run path, or one of its
 /// child commands.
@@ -100,103 +34,54 @@ pub enum FrpsCmd {
     Verify(VerifyArgs),
 }
 
-// Intermediate builder structs — each within bpaf construct! field limits.
-pub(crate) struct SvrMeta {
-    config: Option<String>,
-    config_dir: Option<String>,
-    strict_config: bool,
-    show_version: bool,
-}
-
-pub(crate) struct SvrBind {
-    bind_addr: Option<String>,
-    bind_port: Option<u16>,
-    proxy_bind_addr: Option<String>,
-}
-
-pub(crate) struct SvrAuth {
-    token: Option<String>,
-    allow_ports: Option<String>,
-    allow_unsafe: Vec<String>,
-}
-
-pub(crate) struct SvrDashboard {
-    dashboard_addr: Option<String>,
-    dashboard_port: Option<u16>,
-    dashboard_user: Option<String>,
-    dashboard_pwd: Option<String>,
-    dashboard_tls_cert_file: Option<String>,
-    dashboard_tls_key_file: Option<String>,
-    dashboard_tls_mode: bool,
-    enable_prometheus: bool,
-}
-
-pub(crate) struct SvrLog {
-    log_file: Option<String>,
-    log_level: Option<String>,
-    log_max_days: Option<i32>,
-    log_format: Option<String>,
-    disable_log_color: bool,
-}
-
-pub(crate) struct SvrTransport {
-    kcp_bind_port: Option<u16>,
-    quic_bind_port: Option<u16>,
-    vhost_http_port: Option<u16>,
-    vhost_https_port: Option<u16>,
-    vhost_http_timeout: Option<i64>,
-    subdomain_host: Option<String>,
-    max_ports_per_client: Option<u64>,
-    tls_only: bool,
-}
-
-// Composed builder: these 6 parsers feed into the final FrpsArgs.
-pub(crate) struct FrpsBuild {
-    meta: SvrMeta,
-    bind: SvrBind,
-    auth: SvrAuth,
-    dash: SvrDashboard,
-    log: SvrLog,
-    transport: SvrTransport,
-}
-
-impl From<FrpsBuild> for FrpsArgs {
-    fn from(b: FrpsBuild) -> Self {
-        FrpsArgs {
-            config: b.meta.config,
-            config_dir: b.meta.config_dir,
-            strict_config: b.meta.strict_config,
-            show_version: b.meta.show_version,
-            bind_addr: b.bind.bind_addr,
-            bind_port: b.bind.bind_port,
-            proxy_bind_addr: b.bind.proxy_bind_addr,
-            token: b.auth.token,
-            allow_ports: b.auth.allow_ports,
-            allow_unsafe: b.auth.allow_unsafe,
-            dashboard_addr: b.dash.dashboard_addr,
-            dashboard_port: b.dash.dashboard_port,
-            dashboard_user: b.dash.dashboard_user,
-            dashboard_pwd: b.dash.dashboard_pwd,
-            dashboard_tls_cert_file: b.dash.dashboard_tls_cert_file,
-            dashboard_tls_key_file: b.dash.dashboard_tls_key_file,
-            dashboard_tls_mode: b.dash.dashboard_tls_mode,
-            enable_prometheus: b.dash.enable_prometheus,
-            log_file: b.log.log_file,
-            log_level: b.log.log_level,
-            log_max_days: b.log.log_max_days,
-            log_format: b.log.log_format,
-            disable_log_color: b.log.disable_log_color,
-            kcp_bind_port: b.transport.kcp_bind_port,
-            quic_bind_port: b.transport.quic_bind_port,
-            vhost_http_port: b.transport.vhost_http_port,
-            vhost_https_port: b.transport.vhost_https_port,
-            vhost_http_timeout: b.transport.vhost_http_timeout,
-            subdomain_host: b.transport.subdomain_host,
-            max_ports_per_client: b.transport.max_ports_per_client,
-            tls_only: b.transport.tls_only,
+/// `frps_flag_specs`' struct arm: the rows become the parser's structs.
+///
+/// `FrpsArgs` is what the flags fill and what `parse_frps_args` returns; the six
+/// `Svr*` structs are bpaf `construct!` intermediates (each within the field
+/// limit) and `FrpsBuild` composes them. `From<FrpsBuild>` moves every field
+/// across, so a row that is in the list is in all three shapes or none.
+///
+/// Its pattern mirrors `frps_go_flag_table` in `flag_tables.rs`: both open the
+/// same list, so a change to the row shape has to change both.
+macro_rules! frps_args_structs {
+    (
+        $( $sname:ident as $acc:ident {
+            $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( $(#[$gate:meta])* long: $long:literal, short: $short:expr, varname: $varname:expr, usage: $usage:literal ) )? ) ),* $(,)?
+        } )+
+    ) => {
+        /// CLI arguments for frps (server).
+        ///
+        /// Fields that can also appear in the config file use `Option<T>`: `Some`
+        /// means the user explicitly passed the flag on the CLI and it should
+        /// override the config value.  `None` means the config value is used.
+        #[derive(Debug, Clone)]
+        pub struct FrpsArgs {
+            $( $( $(#[$doc])* pub $field: $ty, )* )+
         }
-    }
+
+        // Intermediate builder structs — each within bpaf construct! field limits.
+        $(
+            pub(crate) struct $sname {
+                $( $field: $ty, )*
+            }
+        )+
+
+        // Composed builder: these 6 parsers feed into the final FrpsArgs.
+        pub(crate) struct FrpsBuild {
+            $( $acc: $sname, )+
+        }
+
+        impl From<FrpsBuild> for FrpsArgs {
+            fn from(b: FrpsBuild) -> Self {
+                FrpsArgs {
+                    $( $( $field: b.$acc.$field, )* )+
+                }
+            }
+        }
+    };
 }
+
+frps_flag_specs!(frps_args_structs);
 
 // ─── Parser combinators ──────────────────────────────────────────────
 /// The `-c`/`--config` parser of the frps **run** path.

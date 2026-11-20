@@ -23,202 +23,149 @@ pub(crate) struct GoFlagRow {
     pub(crate) usage: &'static str,
 }
 
-/// `frps`'s root flags, measured from the released Go frp **v0.71.0**
-/// darwin/arm64 binary (`frps --help`, stdout, 2394 B). Order is pflag's own
-/// (byte order of the long name, which is how the binary prints it, and how the
-/// renderer sorts), so the table stays diffable against the measurement.
+/// The `frps` root flag surface as one list: the 29 rows Go frp **v0.71.0**
+/// prints, measured from the released darwin/arm64 binary (`frps --help`,
+/// stdout, 2394 B), plus the two frp-rs extension flags that fill the same
+/// structs.
 ///
 /// The set is exactly the flags `frps verify --help` repeats under
 /// `Global Flags` — i.e. Go's persistent `rootCmd` set, and the list a row here
-/// is *missing* from is the interesting half: a flag absent from this table is
-/// either an frp-rs extension ([`FRPS_EXTENSION_FLAGS`]) or a flag frp-rs does
-/// not have.
+/// is *missing* from is the interesting half: a flag absent from Go's persistent
+/// set here is either an frp-rs extension ([`FRPS_EXTENSION_FLAGS`]) or a flag
+/// frp-rs does not have.
+///
+/// Each row names the `FrpsArgs` field the flag fills, its type, and the cells
+/// of Go's pflag row, and the rows are grouped under the bpaf `construct!`
+/// struct that parses them. That is what the callback form buys — one list, two
+/// shapes: `frps_go_flag_table` here emits [`FRPS_GO_FLAGS`], and
+/// `frps_args_structs` in `frps.rs` emits `FrpsArgs`, the six `Svr*`
+/// intermediates and the `FrpsBuild` -> `FrpsArgs` move, so the table and the
+/// structs cannot describe different flag sets. A row with no `go ( … )` cell is
+/// an frp-rs extension: it has a field, but its table row lives in
+/// [`FRPS_EXTENSION_FLAGS`] because Go has no flag of that name.
+///
+/// Grouping means the rows are **not** in pflag's byte order as a whole (each
+/// group keeps its struct's field order). Nothing reads the table positionally:
+/// the renderer sorts by long (`frp-core/src/cli/help_render.rs:233`), so the
+/// rendered document and its `--help` pins are unaffected, and a diff against
+/// the measurement compares sorted long names.
 ///
 /// Two of Go's rows describe flags frp-rs registers only under a feature:
 /// `--kcp-bind-port` (`#[cfg(feature = "kcp")]`) and `--quic-bind-port`
-/// (`#[cfg(feature = "quic")]`) in `frps::svr_transport`. They are gated here for
-/// the same reason: a build without the feature does not register the flag, so
-/// it is not part of that build's persistent set and must not be expected under
-/// `Global Flags`. With frp-core's default features on all 29 rows are present,
-/// which is the shape [`FRPS_GO_FLAGS`] was measured in.
-pub(crate) const FRPS_GO_FLAGS: &[GoFlagRow] = &[
-    GoFlagRow {
-        long: "allow-ports",
-        short: None,
-        varname: Some("string"),
-        usage: "allow ports",
-    },
-    GoFlagRow {
-        long: "allow-unsafe",
-        short: None,
-        varname: Some("strings"),
-        usage: "allowed unsafe features, one or more of: TokenSourceExec",
-    },
-    GoFlagRow {
-        long: "bind-addr",
-        short: None,
-        varname: Some("string"),
-        usage: "bind address (default \"0.0.0.0\")",
-    },
-    GoFlagRow {
-        long: "bind-port",
-        short: Some('p'),
-        varname: Some("int"),
-        usage: "bind port (default 7000)",
-    },
-    GoFlagRow {
-        long: "config",
-        short: Some('c'),
-        varname: Some("string"),
-        usage: "config file of frps",
-    },
-    GoFlagRow {
-        long: "dashboard-addr",
-        short: None,
-        varname: Some("string"),
-        usage: "dashboard address (default \"0.0.0.0\")",
-    },
-    GoFlagRow {
-        long: "dashboard-port",
-        short: None,
-        varname: Some("int"),
-        usage: "dashboard port",
-    },
-    GoFlagRow {
-        long: "dashboard-pwd",
-        short: None,
-        varname: Some("string"),
-        usage: "dashboard password (default \"admin\")",
-    },
-    GoFlagRow {
-        long: "dashboard-tls-cert-file",
-        short: None,
-        varname: Some("string"),
-        usage: "dashboard tls cert file",
-    },
-    GoFlagRow {
-        long: "dashboard-tls-key-file",
-        short: None,
-        varname: Some("string"),
-        usage: "dashboard tls key file",
-    },
-    GoFlagRow {
-        long: "dashboard-tls-mode",
-        short: None,
-        varname: None,
-        usage: "if enable dashboard tls mode",
-    },
-    GoFlagRow {
-        long: "dashboard-user",
-        short: None,
-        varname: Some("string"),
-        usage: "dashboard user (default \"admin\")",
-    },
-    GoFlagRow {
-        long: "disable-log-color",
-        short: None,
-        varname: None,
-        usage: "disable log color in console",
-    },
-    GoFlagRow {
-        long: "enable-prometheus",
-        short: None,
-        varname: None,
-        usage: "enable prometheus dashboard",
-    },
-    #[cfg(feature = "kcp")]
-    GoFlagRow {
-        long: "kcp-bind-port",
-        short: None,
-        varname: Some("int"),
-        usage: "kcp bind udp port",
-    },
-    GoFlagRow {
-        long: "log-file",
-        short: None,
-        varname: Some("string"),
-        usage: "log file (default \"console\")",
-    },
-    GoFlagRow {
-        long: "log-level",
-        short: None,
-        varname: Some("string"),
-        usage: "log level (default \"info\")",
-    },
-    GoFlagRow {
-        long: "log-max-days",
-        short: None,
-        varname: Some("int"),
-        usage: "log max days (default 3)",
-    },
-    GoFlagRow {
-        long: "max-ports-per-client",
-        short: None,
-        varname: Some("int"),
-        usage: "max ports per client",
-    },
-    GoFlagRow {
-        long: "proxy-bind-addr",
-        short: None,
-        varname: Some("string"),
-        usage: "proxy bind address (default \"0.0.0.0\")",
-    },
-    #[cfg(feature = "quic")]
-    GoFlagRow {
-        long: "quic-bind-port",
-        short: None,
-        varname: Some("int"),
-        usage: "quic bind udp port",
-    },
-    GoFlagRow {
-        long: "strict-config",
-        short: None,
-        varname: None,
-        usage: "strict config parsing mode, unknown fields will cause errors (default true)",
-    },
-    GoFlagRow {
-        long: "subdomain-host",
-        short: None,
-        varname: Some("string"),
-        usage: "subdomain host",
-    },
-    GoFlagRow {
-        long: "tls-only",
-        short: None,
-        varname: None,
-        usage: "frps tls only",
-    },
-    GoFlagRow {
-        long: "token",
-        short: Some('t'),
-        varname: Some("string"),
-        usage: "auth token",
-    },
-    GoFlagRow {
-        long: "version",
-        short: Some('v'),
-        varname: None,
-        usage: "version of frps",
-    },
-    GoFlagRow {
-        long: "vhost-http-port",
-        short: None,
-        varname: Some("int"),
-        usage: "vhost http port",
-    },
-    GoFlagRow {
-        long: "vhost-http-timeout",
-        short: None,
-        varname: Some("int"),
-        usage: "vhost http response header timeout (default 60)",
-    },
-    GoFlagRow {
-        long: "vhost-https-port",
-        short: None,
-        varname: Some("int"),
-        usage: "vhost https port",
-    },
-];
+/// (`#[cfg(feature = "quic")]`) in `frps::svr_transport`. The gate sits inside
+/// the `go ( … )` cell and gates that table row only: a build without the
+/// feature does not register the flag, so it is not part of that build's
+/// persistent set and must not be expected under `Global Flags`. The struct
+/// field stays in every build — `construct!` must name every field the parser
+/// fills, and the parser substitutes `pure(None)` when the feature is off. With
+/// frp-core's default features on all 29 rows are present, which is the shape
+/// [`FRPS_GO_FLAGS`] was measured in.
+macro_rules! frps_flag_specs {
+    ($expand:ident) => {
+        $expand! {
+            SvrMeta as meta {
+                (
+                    /// Config file path. `None` when `-c` was not given (default
+                    /// "frps.toml" is applied by [`FrpsArgs::config_path`]).
+                    /// Go frp v0.70.1 parity: when `-c` is given the file is authoritative
+                    /// and CLI config flags are ignored (audit task 9 finding 5).
+                    config: Option<String>,
+                    go ( long: "config", short: Some('c'), varname: Some("string"), usage: "config file of frps" )
+                ),
+                ( config_dir: Option<String> ),
+                ( strict_config: bool, go ( long: "strict-config", short: None, varname: None, usage: "strict config parsing mode, unknown fields will cause errors (default true)" ) ),
+                ( show_version: bool, go ( long: "version", short: Some('v'), varname: None, usage: "version of frps" ) ),
+            }
+            SvrBind as bind {
+                ( bind_addr: Option<String>, go ( long: "bind-addr", short: None, varname: Some("string"), usage: "bind address (default \"0.0.0.0\")" ) ),
+                ( bind_port: Option<u16>, go ( long: "bind-port", short: Some('p'), varname: Some("int"), usage: "bind port (default 7000)" ) ),
+                ( proxy_bind_addr: Option<String>, go ( long: "proxy-bind-addr", short: None, varname: Some("string"), usage: "proxy bind address (default \"0.0.0.0\")" ) ),
+            }
+            SvrAuth as auth {
+                ( token: Option<String>, go ( long: "token", short: Some('t'), varname: Some("string"), usage: "auth token" ) ),
+                ( allow_ports: Option<String>, go ( long: "allow-ports", short: None, varname: Some("string"), usage: "allow ports" ) ),
+                ( allow_unsafe: Vec<String>, go ( long: "allow-unsafe", short: None, varname: Some("strings"), usage: "allowed unsafe features, one or more of: TokenSourceExec" ) ),
+            }
+            SvrDashboard as dash {
+                ( dashboard_addr: Option<String>, go ( long: "dashboard-addr", short: None, varname: Some("string"), usage: "dashboard address (default \"0.0.0.0\")" ) ),
+                ( dashboard_port: Option<u16>, go ( long: "dashboard-port", short: None, varname: Some("int"), usage: "dashboard port" ) ),
+                ( dashboard_user: Option<String>, go ( long: "dashboard-user", short: None, varname: Some("string"), usage: "dashboard user (default \"admin\")" ) ),
+                ( dashboard_pwd: Option<String>, go ( long: "dashboard-pwd", short: None, varname: Some("string"), usage: "dashboard password (default \"admin\")" ) ),
+                ( dashboard_tls_cert_file: Option<String>, go ( long: "dashboard-tls-cert-file", short: None, varname: Some("string"), usage: "dashboard tls cert file" ) ),
+                ( dashboard_tls_key_file: Option<String>, go ( long: "dashboard-tls-key-file", short: None, varname: Some("string"), usage: "dashboard tls key file" ) ),
+                ( dashboard_tls_mode: bool, go ( long: "dashboard-tls-mode", short: None, varname: None, usage: "if enable dashboard tls mode" ) ),
+                ( enable_prometheus: bool, go ( long: "enable-prometheus", short: None, varname: None, usage: "enable prometheus dashboard" ) ),
+            }
+            SvrLog as log {
+                ( disable_log_color: bool, go ( long: "disable-log-color", short: None, varname: None, usage: "disable log color in console" ) ),
+                ( log_file: Option<String>, go ( long: "log-file", short: None, varname: Some("string"), usage: "log file (default \"console\")" ) ),
+                ( log_level: Option<String>, go ( long: "log-level", short: None, varname: Some("string"), usage: "log level (default \"info\")" ) ),
+                ( log_max_days: Option<i32>, go ( long: "log-max-days", short: None, varname: Some("int"), usage: "log max days (default 3)" ) ),
+                ( log_format: Option<String> ),
+            }
+            SvrTransport as transport {
+                ( kcp_bind_port: Option<u16>, go ( #[cfg(feature = "kcp")] long: "kcp-bind-port", short: None, varname: Some("int"), usage: "kcp bind udp port" ) ),
+                ( quic_bind_port: Option<u16>, go ( #[cfg(feature = "quic")] long: "quic-bind-port", short: None, varname: Some("int"), usage: "quic bind udp port" ) ),
+                ( max_ports_per_client: Option<u64>, go ( long: "max-ports-per-client", short: None, varname: Some("int"), usage: "max ports per client" ) ),
+                ( subdomain_host: Option<String>, go ( long: "subdomain-host", short: None, varname: Some("string"), usage: "subdomain host" ) ),
+                ( tls_only: bool, go ( long: "tls-only", short: None, varname: None, usage: "frps tls only" ) ),
+                ( vhost_http_port: Option<u16>, go ( long: "vhost-http-port", short: None, varname: Some("int"), usage: "vhost http port" ) ),
+                ( vhost_https_port: Option<u16>, go ( long: "vhost-https-port", short: None, varname: Some("int"), usage: "vhost https port" ) ),
+                (
+                    /// VHost HTTP response-header timeout, in seconds. Go frp registers this as
+                    /// a **persistent root flag** with default 60
+                    /// (`cmd.PersistentFlags().Int64VarP(&c.VhostHTTPTimeout, "vhost_http_timeout", "", 60, …)`,
+                    /// `pkg/config/flags.go:237`), so `frps verify` inherits it too. `None`
+                    /// means the flag was absent and the config value stands;
+                    /// `ServerConfig::default()` already carries Go's 60
+                    /// (`frp-core/src/config/server.rs:259-261`), so the absent case is Go's default.
+                    /// The value is `i64`, matching `Int64VarP` and Go's `int64` config field:
+                    /// Go accepts `--vhost-http-timeout -1` (its floor then applies) and refuses
+                    /// only what does not fit an `int64` (measured on Go v0.71.0:
+                    /// `-9223372036854775808` rc 0, `9223372036854775807` rc 0,
+                    /// `9223372036854775808` rc 1 `value out of range`).
+                    ///
+                    /// **R6(b) (`TODO.md:11218`): "accept-and-ignore matches Go" is bounded.**
+                    /// The flag surface is Go's (the full `int64` accepted above), but the value
+                    /// that reaches the vhost handler is clamped: `<= 0` floors at 60 s and
+                    /// anything above 24 h is capped, where Go has no comparable cap. So the
+                    /// bound is "values `<= 0` or below the cap behave like Go"; a positive value
+                    /// above 24 h is accepted here and then silently shortened. Measured by the
+                    /// unit pin `frp-server/src/vhost/tests.rs:252` (`test_clamp_vhost_timeout`):
+                    /// `0 → 60`, `-1 → 60`, `86400 → 86400`, `86401 → 86400`, `i64::MAX →
+                    /// 86400`; the cap is `frp-server/src/vhost.rs:128`
+                    /// (`VHOST_TIMEOUT_CAP_SECS`).
+                    vhost_http_timeout: Option<i64>,
+                    go ( long: "vhost-http-timeout", short: None, varname: Some("int"), usage: "vhost http response header timeout (default 60)" )
+                ),
+            }
+        }
+    };
+}
+
+pub(crate) use frps_flag_specs;
+
+/// `frps_flag_specs`' table arm: the rows' `go ( … )` cells become
+/// [`FRPS_GO_FLAGS`]. A row without one is an frp-rs extension and contributes
+/// no table row here.
+///
+/// Its pattern mirrors `frps_args_structs` in `frps.rs`: both open the same
+/// list, so a change to the row shape has to change both.
+macro_rules! frps_go_flag_table {
+    (
+        $( $sname:ident as $acc:ident {
+            $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( $(#[$gate:meta])* long: $long:literal, short: $short:expr, varname: $varname:expr, usage: $usage:literal ) )? ) ),* $(,)?
+        } )+
+    ) => {
+        pub(crate) const FRPS_GO_FLAGS: &[GoFlagRow] = &[
+            $( $(
+                $( $(#[$gate])* GoFlagRow { long: $long, short: $short, varname: $varname, usage: $usage }, )?
+            )* )+
+        ];
+    };
+}
+
+frps_flag_specs!(frps_go_flag_table);
 
 /// `frpc`'s persistent root flags, measured the same way (`frpc --help`,
 /// 1370 B; `frpc verify --help` repeats exactly these under `Global Flags`).

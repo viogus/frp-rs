@@ -1881,7 +1881,7 @@ fn version_short_shorthand_clusters_and_equals_spelling_match_go() {
 ///
 /// **What this does not prove.** Only that the argv was *accepted* and a server
 /// came up: with `-c` the config file is authoritative for the transport
-/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli/frps.rs:672`), so
+/// section (`cli_overrides_enabled()` is false, `frp-core/src/cli/frps.rs:557`), so
 /// the parsed `tls_only = false` never reaches the service — a mutant that
 /// consumed `=false` but stored `true` would still pass this test. The value
 /// actually being applied is pinned in
@@ -2456,7 +2456,7 @@ fn verify_handles_vhost_http_timeout_go_signed_int64_range() {
 /// `cmd.PersistentFlags().StringVarP(&c.Log.Level, "log_level", "", …)`), so
 /// `frps -c cfg -l ""` is rc **1** there too — but pflag's wording is
 /// `unknown shorthand flag: 'l' in -l`. frp-rs registers no `-l` short at all:
-/// `svr_log` has only the long spellings (`frp-core/src/cli/frps.rs:401`), and
+/// `svr_log` has only the long spellings (`frp-core/src/cli/frps.rs:286`), and
 /// `VALUE_TAKING_SHORTS_FRPS_ROOT` (`frp-core/src/cli/argv.rs:100`) is not the reason
 /// — it only governs a **two-character** `-xy` token. Measured over a *valid*
 /// config and over a missing one alike: rc **1**, **0 B stdout**, 44 B stderr
