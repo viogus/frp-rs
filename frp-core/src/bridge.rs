@@ -766,7 +766,9 @@ impl<'a> BridgePlan<'a> {
         WR: AsyncReadExt + Unpin,
         WW: AsyncWriteExt + Unpin,
     {
-        debug_assert!(matches!(self.crypto, Crypto::Plain));
+        if !matches!(self.crypto, Crypto::Plain) {
+            unreachable!("BridgePlan::run_plain is only reached from the plain entry points")
+        }
         let (compress, decompress_read, _) = self.core_flags();
         bridge_plain_core(
             user_r,
@@ -3302,6 +3304,13 @@ mod tests {
     /// axis, which stopped decompressing `bridge_encrypted(read_is_decrypted =
     /// true, compression on)`.
     #[test]
+    ///
+    /// It pins the derivation only: deleting a `.limiter(limiter)` or a
+    /// `.read_is_plaintext(read_is_decrypted)` from an entry point's builder
+    /// chain would still pass, because the table never sees a plan built by a
+    /// wrapper. The pipe tests cover the limiter paths
+    /// (`test_bridge_plain_rate_limited_bandwidth` and friends); nothing covers
+    /// a wrapper that forgets to pass it.
     fn bridge_plan_keeps_the_entry_point_semantics() {
         let key = [0u8; 16];
         let cases: Vec<(&str, BridgePlan<'_>, (bool, bool, bool))> = vec![

@@ -1,8 +1,11 @@
 # The bridge entry points, as data
 
-**Status:** slice 1 of 3 shipped. The nine public bridge functions are now thin
-wrappers over one `BridgePlan`; the two dispatchers still derive the case
-analysis by hand, and 53 call sites still pick a function by name.
+**Status:** slice 1 of 3 shipped. The seven flag-bearing public bridge functions
+are now thin wrappers over one `BridgePlan` (`relay_plain_pooled` and
+`splice::bridge_splice` stay outside it: they are chosen by capability, not
+configuration); the two dispatchers still derive the case analysis by hand, and
+26 non-test call sites in `frp-server/src` and `frp-client/src` still pick a
+function by name.
 
 ## The shape that was there
 
@@ -73,6 +76,8 @@ of which is the case the first draft got wrong —
 `without_read_decompression_keeps_the_write_side_compressing` pins the axis that
 is easy to collapse again. The existing byte-moving tests in `frp-core/src/bridge.rs`'s
 `mod tests` were untouched and still pass; they cover most but **not all** entry
-points (the two `_rate_limited` variants have no unit test — their only callers
-are `frp-server/src/control/bridge.rs` and `frp-client/src/proxy.rs`), so the
-flag table above is the evidence for those two, not the pipe tests.
+points (the two `*_decompressed_read` variants have no dedicated test; the
+`_rate_limited` pair is exercised by `test_bridge_plain_rate_limited_bandwidth`
+and friends), so the flag table above is the evidence for those, not the pipe
+tests — and it pins only the derivation, not what each wrapper passes to its
+builder.
