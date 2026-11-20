@@ -892,7 +892,7 @@ fn stop_bad_api_timeout_is_rejected_before_any_connection() {
 /// leading root flags, so `frpc --api-timeout 1s stop …` runs `stop` with the
 /// flag (measured on Go v0.71.0: one connection to the admin port, then
 /// `Post "…/api/stop": context deadline exceeded`, rc 1). frp-rs's shared
-/// `frpc` hoist (`frp-core/src/cli/mod.rs`, `TODO.md:4710`) resolves the same way,
+/// `frpc` hoist (`frp-core/src/cli/root.rs`, `TODO.md:4710`) resolves the same way,
 /// so the flag is *used* here and the deadline is what the rc reflects — this
 /// test used to pin the refusal as a divergence and now pins the connection.
 #[test]

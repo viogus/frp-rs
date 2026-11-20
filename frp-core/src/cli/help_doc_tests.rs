@@ -1,3 +1,6 @@
+use bpaf::Parser;
+use std::ffi::OsString;
+
 use super::*;
 
 /// Render the document the binary prints for `--help` on one surface.

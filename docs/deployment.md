@@ -686,7 +686,7 @@ running total wraps and can still survive its own range checks — measured, two
 2^63 ns groups wrap to 0 and Go reports `context deadline exceeded` — while
 frp-rs rejects the input with `time: invalid duration`. frp-rs is stricter on
 that class, never looser, and never panics; `TODO.md` carries the measurements
-and `frp-core/src/cli/mod.rs` the unit pin. The deadline covers the whole
+and `frp-core/src/cli/tests.rs` the unit pin. The deadline covers the whole
 admin call (connect, write, read); when it runs out — or had already passed
 before dialing — the command prints `reload failed:` / `status query failed:` /
 `stop failed:` followed by `admin request timed out after <duration>` on stderr
@@ -699,7 +699,7 @@ accept the underscore spelling too (measured for `--api_timeout` and
 `--strict_config`; `--admin_addr` is `unknown flag` because no such flag exists
 there). The one placement difference that used to remain here — Go's cobra also
 accepts the flag **before** the subcommand (`frpc --api-timeout 1s stop …`) —
-is gone: the shared `frpc` hoist (`frp-core/src/cli/mod.rs`, `TODO.md:4710`) now
+is gone: the shared `frpc` hoist (`frp-core/src/cli/root.rs`, `TODO.md:4710`) now
 resolves a leading subcommand after root flags, so that argv dials the admin port
 on both binaries and both stop at the 1 s deadline (measured on Go v0.71.0 and
 this branch: rc 1, one connection, Go `Post "…/api/stop": context deadline

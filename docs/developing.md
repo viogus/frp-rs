@@ -263,7 +263,7 @@ mytcp must be an accepted store proxy type: Err(InvalidArgument("invalid proxy t
 Two neighbouring lists are **not** on this path, and it is worth knowing why so
 you do not hunt them: `const VALID_VISITOR_TYPES` (`frp-client/src/store.rs:19`,
 `["stcp", "sudp", "xtcp"]`) enumerates *visitor* types, and `const
-FRPC_SUBCOMMANDS` (`frp-core/src/cli/mod.rs:3157`, a `[&str; 12]` pinned in both
+FRPC_SUBCOMMANDS` (`frp-core/src/cli/root.rs:232`, a `[&str; 12]` pinned in both
 directions by the tests beside it) enumerates `frpc <subcommand>` names — it needs
 your type only if you are also adding an `frpc <type>` subcommand, which the
 minimal path does not.
@@ -2147,7 +2147,7 @@ with pflag `StringVarP` in a package-level initializer (`cmd/frpc/sub/root.go`),
 so each occurrence overwrites the last and repetition is never an error. frp-rs's
 bpaf parser exited before loading anything with
 ``argument `-c` cannot be used multiple times in this context``. Every frpc
-config argument now goes through `config_arg()` (`frp-core/src/cli/mod.rs`), which is
+config argument now goes through `config_arg()` (`frp-core/src/cli/root.rs`), which is
 `.last()` — bpaf's contradicting-options combinator — wrapped in the same
 `fallback`/`optional` each command already had. Measured, both binaries:
 
@@ -2165,7 +2165,7 @@ config argument now goes through `config_arg()` (`frp-core/src/cli/mod.rs`), whi
 The last two rows are the guard rails: an empty value stays a value (no fallback
 to the `127.0.0.1:7400` default) and a dangling occurrence is still an error, not
 a reused previous value. Pinned by `frpc/tests/cli_inputs.rs` and the
-parser-level tests in `frp-core/src/cli/mod.rs`. `frps` is unchanged — a separate
+parser-level tests in `frp-core/src/cli/tests.rs`. `frps` is unchanged — a separate
 surface, not part of that item.
 
 Three argv shapes around that change were **still divergent** at the head of
@@ -2588,7 +2588,7 @@ this branch's base `f5437e6`), it already took `-foo.toml`, `-nonexistent.toml`
 and `-=v` (unknown multi-character tokens are demoted to `Arg::Word`), and
 refused only the flag-shaped `--strict-config=false`, `-x`, `-c`, `-a=b` and
 `--long`. A shared pre-parse pass (`prepared_cli_argv` →
-`rewrite_config_dash_values`, `frp-core/src/cli/mod.rs`) therefore rewrites exactly
+`rewrite_config_dash_values`, `frp-core/src/cli/frpc.rs`) therefore rewrites exactly
 the config-selecting occurrences — `-c`, `--config`, `--config-dir`, the frp-rs
 `--config_dir` alias — whose next token starts with `-` into the attached
 `-c=VALUE` spelling before bpaf sees argv. Both entry points call that one
@@ -2637,7 +2637,7 @@ names a child command, the child is selected and `argsMinusFirstX` removes it
 before the child's pflag parse. bpaf instead picks a branch *before* dispatch,
 so `frpc -c pA.toml status` used to fall through to run mode and answer rc 1
 ``Error: no such command or positional: `status`, did you mean `https`?``.
-`frp-core/src/cli/mod.rs`'s `hoist_leading_subcommand` now moves that token to the
+`frp-core/src/cli/root.rs`'s `hoist_leading_subcommand` now moves that token to the
 front of the argv before bpaf runs (`TODO.md:4710`).
 
 Composition, because it is load-bearing: the entry points call `cli_args`
@@ -2645,7 +2645,7 @@ Composition, because it is load-bearing: the entry points call `cli_args`
 which applies `rewrite_config_dash_values` **first** and
 `hoist_leading_subcommand` **second**. **Both binaries run the hoist**; which
 root command's command-and-bool-flag sets it reads is `RootCommand`
-(`frp-core/src/cli/mod.rs`), because those are exactly the two facts cobra's
+(`frp-core/src/cli/root.rs`), because those are exactly the two facts cobra's
 `stripFlags` and `Find` read and they differ per binary. The sentence this
 paragraph used to carry — "`frpc` only (`has_subcommands`; Go's `frps` declares
 no subcommands, so its behaviour is byte-identical to before)" — was **false**:
@@ -2836,7 +2836,7 @@ Pinned by `every_single_proxy_command_ignores_all_five_persistent_root_flags`,
 `dangling_config_flag_and_bad_bool_value_still_fail` and
 `positional_arguments_are_still_refused` in `frpc/tests/cli_persistent_flags.rs`
 (6 of the 7 fail at the base head; the positional one passes on both trees by
-design), plus the parser-level tests in `frp-core/src/cli/mod.rs`
+design), plus the parser-level tests in `frp-core/src/cli/tests.rs`
 (`every_single_proxy_command_accepts_the_five_persistent_root_flags`,
 `tcp_config_flag_value_is_parsed_and_dropped`,
 `persistent_root_flags_tolerate_pflag_repetition`,
@@ -2878,7 +2878,7 @@ an argv where Go starts a server, and treating `--tls-only` as a consumer would
 leave `frps --tls-only verify -c cfg` refused where Go verifies. Both sets and
 both boundaries are pinned by
 `the_bool_root_flag_sets_are_per_root_command` and
-`frps_hoists_verify_past_its_own_root_flags` (`frp-core/src/cli/mod.rs`), and the
+`frps_hoists_verify_past_its_own_root_flags` (`frp-core/src/cli/hoist_tests.rs`), and the
 end-to-end rows by `verify_resolves_leading_root_flags_and_ignores_the_rest`
 (`frps/tests/cli_exit_codes.rs`).
 
@@ -2964,13 +2964,13 @@ Three things this table does **not** claim:
   tokenSource cfg>` is rc 1 without it and rc 0 with `--allow-unsafe
   TokenSourceExec` (the rows the bullet above measures). frp-rs's `verify` reads
   the same three fields — `cfgFile`, `strictConfigMode` and `--allow-unsafe`
-  (`VerifyArgs` in `frp-core/src/cli/mod.rs`) — and the precise claim is "every root
+  (`VerifyArgs` in `frp-core/src/cli/frps.rs`) — and the precise claim is "every root
   flag frp-rs **models**"; the surviving exception is a flag frp-rs models as a
   different *kind*: `--dashboard-tls-mode` (a string on Go, a bool here) is
   refused in the `=auto`/space spellings and **read as `true`** in the bare
   trailing spelling — which Go answers with `flag needs an argument` and frp-rs
   answers `syntax is ok`, rc 0. That row is a false **ok**, not an ignore, and it
-  is why the sentence in `frp-core/src/cli/mod.rs` and `CHANGELOG.md` says "every
+  is why the sentence in `frp-core/src/cli/frps.rs` and `CHANGELOG.md` says "every
   root flag frp-rs models". The other exception this bullet used to name — a
   flag frp-rs did not model at all, `--vhost-http-timeout` — is registered and
   no longer applies.
@@ -2991,7 +2991,7 @@ Pinned by `verify_valid_config_prints_go_line_and_exits_0`,
 `the_frps_command_list_is_exactly_the_parser_branches`,
 `the_hoisted_frps_argv_parses_as_verify` and the extended
 `--strict-config` table (`frps verify` is now one of its seven parsers) in
-`frp-core/src/cli/mod.rs`.
+`frp-core/src/cli/hoist_tests.rs`.
 
 #### `--strict-config`: the space-separated value form
 
@@ -3163,7 +3163,7 @@ Why the extension is kept, as the measured trade the done-when asks for:
 
 Carriers, all of which agree:
 
-- the **warning**: `STRICT_CONFIG_SPACE_FORM_WARNING` (`frp-core/src/cli/mod.rs`),
+- the **warning**: `STRICT_CONFIG_SPACE_FORM_WARNING` (`frp-core/src/cli/values.rs`),
   printed from `parse_frps_args`/`parse_frpc_args` after a successful parse and
   gated by `strict_config_space_form_used`, which mirrors bpaf's consumption rule
   (a `--strict-config`/`--strict_config` token immediately followed by a
@@ -3174,11 +3174,11 @@ Carriers, all of which agree:
   (real binary, one row per `frpc` parser, plus the silent `=` rows) and
   `space_form_strict_config_warns_on_stderr` (`frps/tests/cli_exit_codes.rs`);
 - the **help text** of every parser that takes the flag, from one definition
-  (`strict_config_parser` in `frp-core/src/cli/mod.rs`) — the bare-form line names
+  (`strict_config_parser` in `frp-core/src/cli/values.rs`) — the bare-form line names
   the Go-faithful spellings, states that frp-rs additionally consumes a
   space-separated value "which Go's pflag does not", and says a warning is
   printed; the `=BOOL` line names the Go-faithful value spelling. Pinned by
-  `strict_config_help_text_states_the_extension` (`frp-core/src/cli/mod.rs`), which
+  `strict_config_help_text_states_the_extension` (`frp-core/src/cli/tests.rs`), which
   asserts **each entry separately** — the rendered `--help` of all six parsers
   must contain the squashed help const *and* the const must still carry its
   meaning (independent literals), so neither a deleted value-form `.help()` nor
@@ -3189,7 +3189,7 @@ Carriers, all of which agree:
   `strict_config_bare_flag_is_true`, `strict_config_equals_true_parses`,
   `strict_config_equals_false_parses_and_disables`,
   `strict_config_space_separated_value_parses` and
-  `strict_config_invalid_value_errors_cleanly` (`frp-core/src/cli/mod.rs`), each run
+  `strict_config_invalid_value_errors_cleanly` (`frp-core/src/cli/tests.rs`), each run
   across all six parsers (their `.unwrap()`s carry the parser label, so a
   failure names which parser broke);
 - the real-binary pins `verify_strict_config_spellings_match_their_measured_rows`
@@ -3224,7 +3224,7 @@ the rest as more shorthands, while only `-v=<bool>` is a value.
 frp-rs registered the ten as bpaf `.switch()`es, which implement only the bare
 form, so argv Go accepts exited 1 here with `` `false` is not expected in this
 context `` (`TODO.md:3498`). They now all go through one macro,
-`go_bool_flag!` (`frp-core/src/cli/mod.rs`): a `parse_go_bool` value branch marked
+`go_bool_flag!` (`frp-core/src/cli/macros.rs`): a `parse_go_bool` value branch marked
 `.adjacent()` — only `--flag=<value>` is a value — plus the bare
 `.flag(true, false)` fallback, so present → `true` and absent → `false`, exactly
 the `.switch()` it replaces. The space-separated form is deliberately **not**
@@ -3268,7 +3268,7 @@ the intended usage-line spelling (`(--version=BOOL | [-v])` instead of
 `Args::current_args` also produces for an unreadable argv[0].
 
 The sweep — every bpaf `.switch()` on either binary. At the base commit
-`grep -n "\.switch()" frp-core/src/cli/mod.rs` returned those ten sites (plus the
+`grep -rn "\.switch()" frp-core/src/cli/` returned those ten sites (plus the
 one match inside a doc comment); all ten are now on the shared parser, and the
 list below is what the sweep found:
 
@@ -3489,12 +3489,12 @@ Carriers, all of which agree:
 
 - the **parser**: `go_bool_flag!` and its two documented variants
   (`go_bool_flag_go_string!` for `--dashboard-tls-mode`,
-  `go_bool_flag_rs_only!` for `--json`) in `frp-core/src/cli/mod.rs`, so the help
+  `go_bool_flag_rs_only!` for `--json`) in `frp-core/src/cli/macros.rs`, so the help
   text's claim about Go is derived from which macro the call site uses and the
   flag name in the help is the name the parser registers (`concat!`, not a
   second literal);
 - the **entry points**: `expand_bool_short_value_form` plus `cli_args`/`run_cli`
-  (`frp-core/src/cli/mod.rs`), which expand pflag's `-v=<bool>` short spelling (never
+  (`frp-core/src/cli/macros.rs`), which expand pflag's `-v=<bool>` short spelling (never
   past a `--`) and hand bpaf the same `Args` (`set_name` only when argv[0] yields
   a name, `print_message(100)`, `exit_code()`) that `OptionParser::run` would
   have built; pinned at unit level by
@@ -3507,7 +3507,7 @@ Carriers, all of which agree:
 - the parser tests `every_go_bool_flag_accepts_the_pflag_value_spellings`,
   `every_go_bool_flag_refuses_non_bool_values_and_the_space_form`,
   `every_go_bool_flag_help_states_its_own_spelling` and
-  `every_go_bool_flag_rejects_a_repeated_flag` (`frp-core/src/cli/mod.rs`), which
+  `every_go_bool_flag_rejects_a_repeated_flag` (`frp-core/src/cli/tests.rs`), which
   read their flag list from one `GO_BOOL_SITES` table so a site cannot be
   dropped from the sweep without the count moving;
 - the real-binary pins `version_flag_value_spelling_decides_what_happens`,
@@ -3583,7 +3583,7 @@ matched class and are also not fixed:
   values (`--help=foo`, `--help=`, `--help=yes` → stderr 102 B, rc 1), where the
   base printed help; the **text** is frp-rs's spelling of pflag's message.
 
-The implementation is two pre-parse passes in `frp-core/src/cli/mod.rs`, both
+The implementation is two pre-parse passes in `frp-core/src/cli/argv.rs` and `frp-core/src/cli/root.rs`, both
 reading the argv `rewrite_config_dash_values` and `hoist_leading_subcommand` have
 already produced (`prepared_cli_argv` carries the order and why it is
 load-bearing):
@@ -3619,7 +3619,7 @@ load-bearing):
   with 114 B; `frpc tcp --disable-log-color -h`, `--ue -h`, `--uc -h`, `stcp --tls_enable -h` were
   errors where both trees print help). A name frp-rs does not register is deliberately **not** in the
   list even where Go accepts it. `--bind-port` is **not** an example of that: frp-rs registers both
-  spellings (`frp-core/src/cli/mod.rs` `svr_bind`, `long("bind-port").short('p').long("bind_port")`) and
+  spellings (`frp-core/src/cli/frps.rs` `svr_bind`, `long("bind-port").short('p').long("bind_port")`) and
   it **is** listed (`-` and `_` names both appear, because Go's `config.WordSepNormalizeFunc` folds
   one into the other). Measured with it listed: `frps verify --bind-port --help=false -c CFG` is
   **rc 1 on stderr** with `` couldn't parse `--help=false`: invalid digit found in string `` (68 B)
@@ -3711,7 +3711,7 @@ file" divergence, which the base shows with no help flag in argv at all.
 | `--help=false -c cfg` | rc 1 | rc 0, root usage | rc 0, root usage | the pre-existing root divergence above, deliberately unchanged |
 | `--help=0` / `--help=false` / `--help=false notacommand` / `--help=true notacommand` | rc 1 | rc 0 help | rc 0 help | unchanged: no command word, or a word that is not one |
 | `-h -v -c` | rc 1 stderr | rc 0 help | rc 0 help | a value-taking short separated from the help short by a token that is not itself value-taking; bpaf's help short-circuit wins. The refusal pairs a bare help flag only with the short **immediately** after it |
-| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L` and bpaf hands the token to `-h`. `-L` is frp-rs's alias for `--log-level` (`frp-core/src/cli/mod.rs`, the `run_mode` parser's `log_level`) and **not** a Go shorthand — Go registers `log_level` with `StringVarP(..., "", ...)` (`pkg/config/flags.go:161`), so its own refusal is `unknown shorthand flag: 'L' in -L` |
+| `-hLinfo` | rc 1 stderr | rc 0 help | rc 0 help | a trailing `-hL<value>` cluster: pflag hands `info` to `-L` and bpaf hands the token to `-h`. `-L` is frp-rs's alias for `--log-level` (`frp-core/src/cli/frpc.rs`, the `run_mode` parser's `log_level`) and **not** a Go shorthand — Go registers `log_level` with `StringVarP(..., "", ...)` (`pkg/config/flags.go:161`), so its own refusal is `unknown shorthand flag: 'L' in -L` |
 | `frpc -hL` | rc 1 stderr (1351 B) | rc 0 root help | **rc 1 stderr (41 B)** | fixed on rc and stream; the message is pflag's `flag needs an argument: 'L' in -L` against Go's `unknown shorthand flag: 'L' in -L` **because frp-rs registers `-L` and Go does not** |
 | `frpc status -hL`, `frpc tcp -hL` | rc 1 stderr | rc 0 help | rc 0 help | unchanged: those subcommands have no `-L`, so nothing is claimed and no missing-argument line is fabricated for a short frp-rs does not register there |
 | `frps verify -hL` | rc 1, stderr 2108 B | rc 1, **stderr 45 B** (`\`-hL\` is not expected in this context`) | rc 1, **stderr 45 B** (same) | **base == head**, and the root split changed nothing here: `verify` is a subcommand, so `-L` was already out of its set. (An earlier revision of this table claimed "base rc 0 help / head rc 0 help" for this row; it is rc 1 on both.) |
@@ -3744,7 +3744,7 @@ Verified rather than assumed: `frpc --help`, `frpc -h`, `frpc --help=true`, ever
 in the documented help-document bytes). The unit rows are
 `help_bool_value_form_rows_match_go`,
 `help_bool_value_form_uses_go_bool_spellings` and
-`shorthand_cluster_needing_a_value_is_detected` (`frp-core/src/cli/mod.rs`); the
+`shorthand_cluster_needing_a_value_is_detected` (`frp-core/src/cli/hoist_tests.rs`); the
 `frpc` integration lanes are untouched, so `env.FRPC_TINY_CLI_TESTS` stays `11`
 and `env.FRPS_CLI_TESTS` stays `27` — those two are that round's values, not the
 current ones: the `auth.method` round moved them to `13` and `29`
@@ -4089,7 +4089,7 @@ not the wording: `frps` says `` `help` is not expected in this context `` /
 `` `completion` is not expected in this context ``, while `frpc help` answers
 with its positional-suggestion sentence (`no such command or positional: …`,
 with a `did you mean` hint) because `frpc` has that parser and `frps` does not.
-`FRPS_SUBCOMMANDS` (`frp-core/src/cli/mod.rs`) therefore lists only `verify`, and the
+`FRPS_SUBCOMMANDS` (`frp-core/src/cli/root.rs`) therefore lists only `verify`, and the
 list is pinned against the parser's branches in both directions by
 `the_frps_command_list_is_exactly_the_parser_branches`. **Decision: recorded, not
 implemented** — shell-completion scripts are not part of the product surface on

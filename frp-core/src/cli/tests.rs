@@ -1,3 +1,7 @@
+use bpaf::Parser;
+use std::ffi::OsString;
+use std::time::Duration;
+
 use super::*;
 
 /// The `frps` **run-path** parser, which is `frps_args()` — the module's

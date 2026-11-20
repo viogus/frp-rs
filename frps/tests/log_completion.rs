@@ -56,7 +56,7 @@
 //! `cli_empty_log_level_does_not_raise_the_files_warn`,
 //! `cli_empty_log_file_keeps_the_files_destination` and
 //! `cli_zero_log_max_days_keeps_the_files_retention` sections below:
-//! `FrpsArgs::override_server_config` (`frp-core/src/cli/mod.rs`) now treats every
+//! `FrpsArgs::override_server_config` (`frp-core/src/cli/frps.rs`) now treats every
 //! zero value in the three Go `[log]` CLI fields as "flag not supplied" — an
 //! empty `--log-level ""`, an empty `--log-file ""` and an explicit
 //! `--log-max-days 0` leave the loaded file's `[log]` value in place, so
@@ -465,7 +465,7 @@ fn cli_empty_log_file_keeps_logging_on_stdout() {
 // ── the three `[log]` CLI zero values are "flag not supplied" ───────────────
 //
 // The lane matrix above ends at completion. This section pins the **overlay**
-// one layer up: `FrpsArgs::override_server_config` (`frp-core/src/cli/mod.rs`) writes
+// one layer up: `FrpsArgs::override_server_config` (`frp-core/src/cli/frps.rs`) writes
 // CLI values into the struct before `cfg.complete()` runs, so an empty
 // `--log-level ""` used to overwrite the file's `[log] level` with `""` and
 // completion then filled it to `"info"` — *raising* the level. The same rewrite
@@ -702,7 +702,7 @@ fn cli_nonempty_log_level_flag_does_not_override_the_config_file() {
 
     // Arm 3: the *implicit* lane's own control. The same flag without `-c` must
     // still raise the level — that is the override #427 kept and the contract at
-    // `frp-core/src/cli/mod.rs:5090-5097`, and it is what proves the mask is scoped
+    // `frp-core/src/cli/frps.rs:667-674`, and it is what proves the mask is scoped
     // to the `-c` lane rather than disabling the CLI log flags wholesale.
     let port = free_port();
     let cfg = level_config(port, "warn");

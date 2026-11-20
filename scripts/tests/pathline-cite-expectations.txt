@@ -20,7 +20,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=604 weak=136 ambiguous=2 excluded=101 foreign_reported=1161 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=5c563b39137fa714
+#   pins: checked=604 weak=136 ambiguous=2 excluded=101 foreign_reported=1161 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=f5479fe59504a3b4
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2384	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2384	1524
@@ -157,13 +157,13 @@ frp-core/src/bridge.rs	76	80	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-cor
 frp-core/src/bridge.rs	86	-	cc814c422d3534ae	-	continuation	frp-core/benches/crypto_bridge.rs	86	55
 frp-core/src/bridge.rs	95	99	84c0f11e1cae2010	d10b36aa74a59bcf	shorthand	frp-core/benches/crypto_bridge.rs	:95-99	56
 frp-core/src/buffer_pool.rs	101	-	b0b43e07c8ef0b27	-	absolute	docs/developing.md	frp-core/src/buffer_pool.rs:101	1163
-frp-core/src/cli/mod.rs	1223	-	b3788263618278ef	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli/mod.rs:1223	2460
-frp-core/src/cli/mod.rs	3157	-	03b79d887c373b4c	-	absolute	docs/developing.md	frp-core/src/cli/mod.rs:3157	266
-frp-core/src/cli/mod.rs	5090	5097	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli/mod.rs:5090-5097	705
-frp-core/src/cli/mod.rs	5095	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli/mod.rs:5095	1884
-frp-core/src/cli/mod.rs	590	-	2c2d7efbf5a5fc67	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli/mod.rs:590	301
-frp-core/src/cli/mod.rs	930	-	a298ba38f2e79bca	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli/mod.rs:930	2459
-frp-core/src/cli/tests.rs	794	796	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli/tests.rs:794-796	411
+frp-core/src/cli/argv.rs	100	-	6e07551895cbef02	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli/argv.rs:100	2460
+frp-core/src/cli/frps.rs	401	-	387fb6e012f25b5a	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli/frps.rs:401	2459
+frp-core/src/cli/frps.rs	667	674	6d77160d3daa2abd	d10b36aa74a59bcf	absolute	frps/tests/log_completion.rs	frp-core/src/cli/frps.rs:667-674	705
+frp-core/src/cli/frps.rs	672	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/cli/frps.rs:672	1884
+frp-core/src/cli/mod.rs	35	-	f9b7ca85ee08a398	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli/mod.rs:35	301
+frp-core/src/cli/root.rs	232	-	b3819b53728e0442	-	absolute	docs/developing.md	frp-core/src/cli/root.rs:232	266
+frp-core/src/cli/tests.rs	798	800	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli/tests.rs:798-800	411
 frp-core/src/config/client.rs	1016	-	758e9072b5d69f64	-	absolute	docs/developing.md	frp-core/src/config/client.rs:1016	196
 frp-core/src/config/client.rs	1052	-	b67f9b842f524947	-	absolute	docs/developing.md	frp-core/src/config/client.rs:1052	4123
 frp-core/src/config/client.rs	1090	-	d10b36aa74a59bcf	-	absolute	frp-client/tests/end_to_end.rs	frp-core/src/config/client.rs:1090	124
@@ -173,7 +173,7 @@ frp-core/src/config/client.rs	256	-	044d5563c14d5e76	-	absolute	frp-core/src/con
 frp-core/src/config/client.rs	264	270	635a40897cff968e	613ab80ad4f1eed1	absolute	frp-core/src/config/tests.rs	frp-core/src/config/client.rs:264-270	3087
 frp-core/src/config/client.rs	282	288	d9f2fd21b4ba5832	bf0982916becc838	absolute	docs/config.md	frp-core/src/config/client.rs:282-288	381
 frp-core/src/config/client.rs	331	332	0f386c3f37583985	a32737f58a962599	absolute	docs/developing.md	frp-core/src/config/client.rs:331-332	781
-frp-core/src/config/client.rs	741	-	f8d397a33fcb9725	-	absolute	frp-core/src/cli/mod.rs	frp-core/src/config/client.rs:741	4771
+frp-core/src/config/client.rs	741	-	f8d397a33fcb9725	-	absolute	frp-core/src/cli/frpc.rs	frp-core/src/config/client.rs:741	907
 frp-core/src/config/client.rs	786	-	02aed6eab8f39a70	-	absolute	docs/developing.md	frp-core/src/config/client.rs:786	480
 frp-core/src/config/file.rs	127	-	d9486680c5126dae	-	absolute	docs/deployment.md	frp-core/src/config/file.rs:127	825
 frp-core/src/config/file.rs	158	-	e048b3f845a8e047	-	absolute	frp-core/src/config/tests.rs	frp-core/src/config/file.rs:158	9358
@@ -291,8 +291,8 @@ frp-core/src/config/normalize.rs	949	956	8e671e550d95ad22	df3982fd61017359	absol
 frp-core/src/config/normalize.rs	949	956	8e671e550d95ad22	df3982fd61017359	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/normalize.rs:949-956	557
 frp-core/src/config/server.rs	1493	-	c76767988b0d75ba	-	absolute	docs/developing.md	frp-core/src/config/server.rs:1493	202
 frp-core/src/config/server.rs	165	-	9acced459a4d1711	-	absolute	frp-core/src/config/file.rs	frp-core/src/config/server.rs:165	465
-frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/mod.rs	frp-core/src/config/server.rs:249	583
-frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/tests.rs	frp-core/src/config/server.rs:249	624
+frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/frps.rs	frp-core/src/config/server.rs:249	56
+frp-core/src/config/server.rs	249	-	d10b36aa74a59bcf	-	absolute	frp-core/src/cli/tests.rs	frp-core/src/config/server.rs:249	628
 frp-core/src/config/server.rs	39	41	7f4dc7c9a19c10f0	e8ce8b12b33170f3	absolute	docs/config.md	frp-core/src/config/server.rs:39-41	22
 frp-core/src/config/server.rs	42	43	6c60b85e59ef9571	10cd5aec687621e8	absolute	frp-core/tests/server_tls_enable_warning.rs	frp-core/src/config/server.rs:42-43	22
 frp-core/src/config/server.rs	42	56	6c60b85e59ef9571	f2c9c1112b74d0d9	absolute	frp-core/src/config/tests.rs	frp-core/src/config/server.rs:42-56	3011
@@ -323,10 +323,10 @@ frp-core/src/feature_gate.rs	9	-	597ac40f8d3d51a2	-	absolute	docs/developing.md	
 frp-core/src/lib.rs	102	-	8a0e6dcc6381dbdd	-	absolute	frp-core/tests/xtcp_p2p.rs	frp-core/src/lib.rs:102	10
 frp-core/src/lib.rs	107	-	e28e0788331a6fc7	-	absolute	frp-core/tests/kcp.rs	frp-core/src/lib.rs:107	6
 frp-core/src/lib.rs	115	-	304783d142df6a51	-	absolute	frp-core/tests/xtcp_p2p.rs	frp-core/src/lib.rs:115	10
-frp-core/src/logging.rs	108	-	eda0ae88f07a4b13	-	absolute	frp-core/src/cli/mod.rs	frp-core/src/logging.rs:108	761
-frp-core/src/logging.rs	113	-	b0eb0bbff0ab3b69	-	absolute	frp-core/src/cli/tests.rs	frp-core/src/logging.rs:113	711
-frp-core/src/logging.rs	152	-	b7dba6439e9cac30	-	shorthand	frp-core/src/cli/tests.rs	:152	711
-frp-core/src/logging.rs	207	-	d74cd5833ceec95f	-	shorthand	frp-core/src/cli/tests.rs	:207	711
+frp-core/src/logging.rs	108	-	eda0ae88f07a4b13	-	absolute	frp-core/src/cli/frps.rs	frp-core/src/logging.rs:108	232
+frp-core/src/logging.rs	113	-	b0eb0bbff0ab3b69	-	absolute	frp-core/src/cli/tests.rs	frp-core/src/logging.rs:113	715
+frp-core/src/logging.rs	152	-	b7dba6439e9cac30	-	shorthand	frp-core/src/cli/tests.rs	:152	715
+frp-core/src/logging.rs	207	-	d74cd5833ceec95f	-	shorthand	frp-core/src/cli/tests.rs	:207	715
 frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:443	1098
 frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:443	1117
 frp-core/src/logging.rs	443	-	b586228d2c96d87a	-	absolute	frps/tests/log_completion.rs	frp-core/src/logging.rs:443	832
@@ -416,7 +416,7 @@ frp-server/src/control/proxy_ops/registry.rs	374	-	4d3d6e1d372181bd	-	absolute	d
 frp-server/src/control/proxy_ops/registry.rs	48	-	ac88edc29838c3d4	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/registry.rs:48	286
 frp-server/src/control/proxy_ops/teardown.rs	179	180	bbb5660d746e725b	57c25670e494c7c9	absolute	docs/developing.md	frp-server/src/control/proxy_ops/teardown.rs:179-180	354
 frp-server/src/control/proxy_ops/validate.rs	38	-	6da09ee45ea980d1	-	absolute	docs/developing.md	frp-server/src/control/proxy_ops/validate.rs:38	272
-frp-server/src/control/proxy_ops/vhost.rs	33	-	787e374a86d83213	-	absolute	frp-core/src/cli/mod.rs	frp-server/src/control/proxy_ops/vhost.rs:33	4777
+frp-server/src/control/proxy_ops/vhost.rs	33	-	787e374a86d83213	-	absolute	frp-core/src/cli/frpc.rs	frp-server/src/control/proxy_ops/vhost.rs:33	913
 frp-server/src/dashboard.rs	1138	1139	bbb5660d746e725b	f3494f034620a6c9	absolute	docs/developing.md	frp-server/src/dashboard.rs:1138-1139	359
 frp-server/src/dashboard.rs	1577	-	45322955dbd8ea36	-	absolute	docs/developing.md	frp-server/src/dashboard.rs:1577	240
 frp-server/src/dashboard.rs	2145	-	85024fba1c724b6d	-	absolute	docs/developing.md	frp-server/src/dashboard.rs:2145	240
@@ -474,17 +474,17 @@ frp-server/src/ssh_gateway/args.rs	163	-	6259e6f69cdc367a	-	absolute	docs/develo
 frp-server/src/ssh_gateway/args.rs	296	-	3fe2fc211efa85e3	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:296	244
 frp-server/src/ssh_gateway/args.rs	335	469	47052f2fbf3be8c7	358ba3f2223784d8	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:335-469	245
 frp-server/src/ssh_gateway/args.rs	373	-	5a0b431903afdf69	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:373	248
-frp-server/src/ssh_gateway/args.rs	692	-	4b95694ba039dbe2	-	absolute	frp-core/src/cli/mod.rs	frp-server/src/ssh_gateway/args.rs:692	4770
+frp-server/src/ssh_gateway/args.rs	692	-	4b95694ba039dbe2	-	absolute	frp-core/src/cli/frpc.rs	frp-server/src/ssh_gateway/args.rs:692	906
 frp-server/src/ssh_gateway/args.rs	711	-	456f77076adffbd3	-	absolute	docs/developing.md	frp-server/src/ssh_gateway/args.rs:711	238
-frp-server/src/state.rs	312	-	3d951b591cc4db05	-	absolute	docs/architecture.md	frp-server/src/state.rs:312	911
+frp-server/src/state.rs	312	-	3d951b591cc4db05	-	absolute	docs/architecture.md	frp-server/src/state.rs:312	921
 frp-server/src/state.rs	344	-	e92677c5aa9585e3	-	absolute	docs/developing.md	frp-server/src/state.rs:344	408
 frp-server/src/tcpmux.rs	34	-	ddf64e37a6476ed7	-	absolute	docs/developing.md	frp-server/src/tcpmux.rs:34	340
 frp-server/src/tcpmux.rs	34	-	ddf64e37a6476ed7	-	absolute	docs/developing.md	frp-server/src/tcpmux.rs:34	425
-frp-server/src/tcpmux.rs	665	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:665	898
-frp-server/src/tcpmux.rs	680	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:680	898
-frp-server/src/tcpmux.rs	714	-	eeda7a21f4350fd6	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:714	918
+frp-server/src/tcpmux.rs	665	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:665	908
+frp-server/src/tcpmux.rs	680	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:680	908
+frp-server/src/tcpmux.rs	714	-	eeda7a21f4350fd6	-	absolute	docs/architecture.md	frp-server/src/tcpmux.rs:714	928
 frp-server/src/vhost.rs	128	-	752b2da5acdbe137	-	absolute	docs/config.md	frp-server/src/vhost.rs:128	37
-frp-server/src/vhost.rs	128	-	752b2da5acdbe137	-	absolute	frp-core/src/cli/mod.rs	frp-server/src/vhost.rs:128	598
+frp-server/src/vhost.rs	128	-	752b2da5acdbe137	-	absolute	frp-core/src/cli/frps.rs	frp-server/src/vhost.rs:128	71
 frp-server/src/vhost.rs	184	-	0002a5e2948a13c7	-	shorthand	docs/config.md	:184	37
 frp-server/src/vhost.rs	204	-	fe64fdd023dd4187	-	absolute	frp-server/src/vhost_h2c.rs	frp-server/src/vhost.rs:204	145
 frp-server/src/vhost.rs	204	214	fe64fdd023dd4187	69e9dba33d2ed8ae	absolute	frp-server/src/vhost_h2c.rs	frp-server/src/vhost.rs:204-214	128
@@ -492,11 +492,11 @@ frp-server/src/vhost.rs	28	-	671ed1b494803e29	-	absolute	docs/developing.md	frp-
 frp-server/src/vhost.rs	353	-	8334d6b28e600491	-	absolute	frp-server/src/vhost_h2c.rs	frp-server/src/vhost.rs:353	164
 frp-server/src/vhost.rs	368	-	e3c89ee2c87fb1d3	-	shorthand	frp-server/src/vhost_h2c.rs	:368	164
 frp-server/src/vhost.rs	721	727	06314547b2cc0d82	2e51f44992222aad	absolute	frp-server/src/vhost_h2c.rs	frp-server/src/vhost.rs:721-727	387
-frp-server/src/vhost.rs	723	-	64f52e3c0e73ce7a	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:723	892
-frp-server/src/vhost.rs	723	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:723	893
-frp-server/src/vhost.rs	765	-	3f73f969262b4297	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:765	916
-frp-server/src/vhost/https.rs	157	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost/https.rs:157	897
-frp-server/src/vhost/https.rs	171	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:171	897
+frp-server/src/vhost.rs	723	-	64f52e3c0e73ce7a	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:723	902
+frp-server/src/vhost.rs	723	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:723	903
+frp-server/src/vhost.rs	765	-	3f73f969262b4297	-	absolute	docs/architecture.md	frp-server/src/vhost.rs:765	926
+frp-server/src/vhost/https.rs	157	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost/https.rs:157	907
+frp-server/src/vhost/https.rs	171	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:171	907
 frp-server/src/vhost/https.rs	25	-	11314c6e379da4e8	-	absolute	frp-server/tests/vhost_https_sni.rs	frp-server/src/vhost/https.rs:25	14
 frp-server/src/vhost/https.rs	268	-	681cccdd32848bbf	-	absolute	frp-server/src/service.rs	frp-server/src/vhost/https.rs:268	65
 frp-server/src/vhost/https.rs	268	-	681cccdd32848bbf	-	absolute	frp-server/tests/vhost_https_sni.rs	frp-server/src/vhost/https.rs:268	15
@@ -504,9 +504,9 @@ frp-server/src/vhost/https.rs	281	-	fb2d5afb5bd956ae	-	absolute	frp-server/tests
 frp-server/src/vhost/https.rs	68	-	942981dd3bae1997	-	absolute	frp-server/src/vhost_h2c.rs	frp-server/src/vhost/https.rs:68	132
 frp-server/src/vhost/router.rs	262	-	251d634ce68ced5e	-	absolute	docs/developing.md	frp-server/src/vhost/router.rs:262	339
 frp-server/src/vhost/router.rs	262	-	251d634ce68ced5e	-	absolute	docs/developing.md	frp-server/src/vhost/router.rs:262	432
-frp-server/src/vhost/tests.rs	252	-	4e534f384740e0d0	-	absolute	frp-core/src/cli/mod.rs	frp-server/src/vhost/tests.rs:252	596
-frp-server/src/vhost_h2c.rs	363	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost_h2c.rs:363	899
-frp-server/src/vhost_h2c.rs	393	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:393	899
+frp-server/src/vhost/tests.rs	252	-	4e534f384740e0d0	-	absolute	frp-core/src/cli/frps.rs	frp-server/src/vhost/tests.rs:252	69
+frp-server/src/vhost_h2c.rs	363	-	16ce323110aea37d	-	absolute	docs/architecture.md	frp-server/src/vhost_h2c.rs:363	909
+frp-server/src/vhost_h2c.rs	393	-	64f52e3c0e73ce7a	-	shorthand	docs/architecture.md	:393	909
 frp-server/tests/common/mod.rs	135	-	bb2ec6dfccd8bb19	-	shorthand	docs/developing.md	:135	619
 frp-server/tests/common/mod.rs	22	-	575a0ae30262fd7e	-	absolute	docs/developing.md	frp-server/tests/common/mod.rs:22	619
 frp-server/tests/common/mod.rs	608	-	7f05826a6d63e68e	-	shorthand	docs/developing.md	:608	621
@@ -567,10 +567,10 @@ frps/src/main.rs	605	-	62aa77e345d29d40	-	absolute	frps/tests/cli_exit_codes.rs	
 frps/src/main.rs	623	-	c4f46bb4348b0a25	-	absolute	frps/src/main.rs	frps/src/main.rs:623	568
 frps/src/main.rs	624	-	3cf9ec4325ec7c3d	-	absolute	frps/src/main.rs	frps/src/main.rs:624	565
 frps/src/main.rs	656	-	3b1d13e9f2d6d744	-	absolute	frps/tests/log_completion.rs	frps/src/main.rs:656	726
-frps/src/main.rs	657	-	2d6eefb2878ba725	-	absolute	frp-core/src/cli/mod.rs	frps/src/main.rs:657	754
+frps/src/main.rs	657	-	2d6eefb2878ba725	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:657	225
 frps/src/main.rs	657	-	2d6eefb2878ba725	-	absolute	frp-core/src/logging.rs	frps/src/main.rs:657	78
 frps/src/main.rs	657	-	2d6eefb2878ba725	-	absolute	frps/tests/log_completion.rs	frps/src/main.rs:657	727
-frps/src/main.rs	673	-	37d90fa7f53c8366	-	absolute	frp-core/src/cli/mod.rs	frps/src/main.rs:673	755
+frps/src/main.rs	673	-	37d90fa7f53c8366	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:673	226
 frps/src/main.rs	699	-	1ed9b264418f3460	-	absolute	frps/tests/cli_exit_codes.rs	frps/src/main.rs:699	53
 frps/src/main.rs	699	-	1ed9b264418f3460	-	absolute	frps/tests/cli_exit_codes.rs	frps/src/main.rs:699	588
 frps/src/main.rs	830	-	4ca83935d9293895	-	absolute	frps/tests/cli_exit_codes.rs	frps/src/main.rs:830	1098
@@ -583,7 +583,7 @@ frps/src/main.rs	951	-	4ca83935d9293895	-	absolute	frps/tests/cli_exit_codes.rs	
 frps/src/main.rs	951	-	4ca83935d9293895	-	absolute	frps/tests/cli_exit_codes.rs	frps/src/main.rs:951	1598
 frps/src/main.rs	951	-	4ca83935d9293895	-	absolute	frps/tests/warn_delivery.rs	frps/src/main.rs:951	1709
 frps/tests/cli_exit_codes.rs	1945	-	5914cbd55c17bdea	-	absolute	frps/src/main.rs	frps/tests/cli_exit_codes.rs:1945	603
-frps/tests/log_completion.rs	605	-	1cb0f8efdd3d926b	-	absolute	frp-core/src/cli/mod.rs	frps/tests/log_completion.rs:605	5081
+frps/tests/log_completion.rs	605	-	1cb0f8efdd3d926b	-	absolute	frp-core/src/cli/frps.rs	frps/tests/log_completion.rs:605	658
 scripts/compat-test.sh	1065	-	167146c8c87c738a	-	absolute	docs/developing.md	scripts/compat-test.sh:1065	678
 scripts/compat-test.sh	1128	-	e9d55a694a15888a	-	absolute	docs/developing.md	scripts/compat-test.sh:1128	679
 scripts/compat-test.sh	1128	1204	e9d55a694a15888a	f539d49e295e573a	absolute	docs/developing.md	scripts/compat-test.sh:1128-1204	778
