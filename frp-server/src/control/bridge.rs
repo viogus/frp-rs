@@ -62,6 +62,54 @@ impl Drop for ActiveGuard {
 /// swallowed by Tokio (audit round 5, MEDIUM). The RAII `ConnGuard` still
 /// releases the connection slot during unwind, but the panic cause was lost
 /// — `catch_unwind` at the spawn sites preserves the diagnostic.
+/// The plain path has four shapes, in priority order. Spelled inline the
+/// condition for the third one is six terms long and, in the round that added
+/// the visitor-segment wrapping, an omitted term there silently sent wrapped
+/// halves to `splice(2)`; naming the predicate makes that list reviewable and
+/// testable, and forces a comment for every term.
+///
+/// 1. `PooledXttpFallback` — the XTCP/STCP fallback (see the comment above it:
+///    a visitor-segment connection cannot take `splice`, and the pooled relay
+///    drops both writers instead of joining forever when one side is idle).
+/// 2. `RateLimited` — a bandwidth limit is configured.
+/// 3. `FastRelay` — compression off, no VHost pre-read, no header injector, and
+///    no visitor-segment wrapping: the only shape where `splice(2)` applies.
+/// 4. `Slow` — everything else: split both sides and let the plain core
+///    (de)compress and inject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlainPath {
+    PooledXttpFallback,
+    RateLimited,
+    FastRelay,
+    Slow,
+}
+
+/// Which [`PlainPath`] a plain (unencrypted work connection) request takes.
+fn plain_path(
+    xctp_visitor_fallback: bool,
+    bw_limited: bool,
+    comp_key: bool,
+    pre_read_is_empty: bool,
+    has_header_injector: bool,
+    visitor_encrypted: bool,
+    visitor_comp: bool,
+) -> PlainPath {
+    if xctp_visitor_fallback {
+        PlainPath::PooledXttpFallback
+    } else if bw_limited {
+        PlainPath::RateLimited
+    } else if !comp_key
+        && pre_read_is_empty
+        && !has_header_injector
+        && !visitor_encrypted
+        && !visitor_comp
+    {
+        PlainPath::FastRelay
+    } else {
+        PlainPath::Slow
+    }
+}
+
 fn log_bridge_panic(proxy_name: &str, what: &str, p: Box<dyn std::any::Any + Send>) {
     let msg = p
         .downcast_ref::<&str>()
@@ -649,11 +697,15 @@ async fn run_work_bridge(
                 )
                 .await;
             }
-        } else if !comp_key
-            && bridge_pre_read.is_empty()
-            && injector_headers.is_none()
-            && !visitor_encrypted
-            && !visitor_comp
+        } else if plain_path(
+            false,
+            false,
+            comp_key,
+            bridge_pre_read.is_empty(),
+            injector_headers.is_some(),
+            visitor_encrypted,
+            visitor_comp,
+        ) == PlainPath::FastRelay
         {
             // Fast path: pure plain relay with no compression, no VHost
             // pre-read, no header injection, and no visitor-segment

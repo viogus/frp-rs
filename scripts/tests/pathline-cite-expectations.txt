@@ -353,7 +353,7 @@ frp-server/Cargo.toml	46	-	5f892a3adab944b5	-	absolute	docs/developing.md	frp-se
 frp-server/Cargo.toml	47	-	517eb8fa69c9ff42	-	absolute	docs/developing.md	frp-server/Cargo.toml:47	4068
 frp-server/Cargo.toml	69	-	7beb050a2fe3096c	-	absolute	.github/workflows/ci.yml	frp-server/Cargo.toml:69	4356
 frp-server/Cargo.toml	69	-	7beb050a2fe3096c	-	absolute	docs/developing.md	frp-server/Cargo.toml:69	1082
-frp-server/src/control/bridge.rs	314	-	574cd08384c40fbb	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:314	470
+frp-server/src/control/bridge.rs	362	-	574cd08384c40fbb	-	absolute	docs/developing.md	frp-server/src/control/bridge.rs:362	470
 frp-server/src/control/bridge/assign.rs	88	-	71bfc8393d65b736	-	absolute	docs/developing.md	frp-server/src/control/bridge/assign.rs:88	469
 frp-server/src/control/login.rs	302	-	ad991b5380f15db1	-	absolute	frp-server/tests/http_plugin.rs	frp-server/src/control/login.rs:302	297
 frp-server/src/control/login.rs	386	-	b6948e8a2ed7a833	-	shorthand	frp-server/tests/http_plugin.rs	:386	300

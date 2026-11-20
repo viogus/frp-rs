@@ -2094,3 +2094,56 @@ async fn injector_mid_body_snappy_decode_failure_after_head_is_clean_eof() {
         "corrupt frame bytes must never reach the wire: {out:?}"
     );
 }
+
+#[test]
+fn plain_path_picks_the_fast_relay_only_when_every_term_holds() {
+    // The six-term condition that guards splice(2). Dropping any single term
+    // must fall off the fast path: the wrapped/pre-read/injected shapes cannot
+    // be spliced.
+    assert_eq!(
+        plain_path(false, false, false, true, false, false, false),
+        PlainPath::FastRelay
+    );
+    for (name, args) in [
+        (
+            "compression on",
+            (false, false, true, true, false, false, false),
+        ),
+        (
+            "pre-read bytes",
+            (false, false, false, false, false, false, false),
+        ),
+        (
+            "header injector",
+            (false, false, false, true, true, false, false),
+        ),
+        (
+            "visitor encrypted",
+            (false, false, false, true, false, true, false),
+        ),
+        (
+            "visitor compressed",
+            (false, false, false, true, false, false, true),
+        ),
+    ] {
+        assert_eq!(
+            plain_path(args.0, args.1, args.2, args.3, args.4, args.5, args.6),
+            PlainPath::Slow,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn plain_path_priorities_put_the_fallback_and_the_limit_first() {
+    // A rate-limited or fallback-shaped request never reaches the fast relay,
+    // even when every fast-path term also holds.
+    assert_eq!(
+        plain_path(true, true, false, true, false, false, false),
+        PlainPath::PooledXttpFallback
+    );
+    assert_eq!(
+        plain_path(false, true, false, true, false, false, false),
+        PlainPath::RateLimited
+    );
+}
