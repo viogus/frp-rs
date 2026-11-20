@@ -13247,9 +13247,42 @@ needs the two-review rule and its own gate run.
       them), which `ci.yml`'s pinned `TODO.md` cite count caught as 100-vs-101
       before any reviewer did — section banners sit *between* items, so they
       fall outside a doc-block-anchored unit span.
-- [ ] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
+- [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from
       `origin/main`, retarget exactly the one row whose fingerprint moved, and
       change `ci.yml` only for count literals — then `guard_data_pin`.
       Done when: the guard reports 604 cites / 0 violations before every push.
+      **Done 2026-11-20.** The procedure above is a reviewer's diff, which is a
+      weak gate, so the one laundering shape that is decidable from the tree is
+      now refused mechanically: `--write` exits 1 when a row keeps its cite
+      token and target line number — or, for a `:N-M` range, its end line —
+      while its fingerprint changes *and* the old text still occurs exactly once
+      in the target file; it names that surviving line and says to run
+      `--relocate`. That is precisely the shape the slice-3 re-bake certified
+      silently (a row re-recorded in place at a line that had become a bare `}`
+      while the rule it was written against lived three lines lower, so the
+      guard then validated generic punctuation). Zero occurrences (a genuine
+      in-place rewrite) and more than one (text not identifiable) still pass,
+      the same never-guess rule `--relocate` uses; `--allow-rewrites` is the
+      explicit override, and is itself refused outside `--write` so it cannot
+      be a silent no-op. A refused `--write` leaves the table byte-identical but
+      still prints the added/removed listing, so the other repairs in the same
+      run stay visible, and a table the guard cannot parse — or a suspect row
+      whose target it cannot read — is fatal rather than skipped. Six fixture
+      scenarios pin it (`scripts/tests/pathline-cite-fixtures.sh` scenarios
+      33-38: refusal, override, the no-false-positive rewrite, the range-end
+      component, the unparsable table, and the flag outside `--write`), 101 →
+      118 `ok` lines, and `guard_pin` / `guard_subject_pin` / `guard_data_pin` /
+      `guard_exact` / `guard_floor` moved in the same commit; the same `--write`
+      that re-pinned the header reported `0 added, 0 removed, 604 unchanged`,
+      which is the guard reporting that nothing was laundered while it was being
+      built. What it cannot see, and does not claim to: every *weak* row (136 of
+      the 604 — a cited line whose text repeats in its target always yields more
+      than one survivor, so a shift there is never decidable), two survivors
+      anywhere, a move to a different file, a failed `--relocate` followed by a
+      bare `--write` (documented in `docs/onboarding.md` trap 2), and the
+      citing-side half — a re-bake that records a *correct* line number after a
+      wrong retarget, which no fingerprint can see. Not encoded, deliberately:
+      `--relocate`'s content-vs-history ambiguity, which is why `--derive` still
+      exists and why a reviewer still reads the table diff.

@@ -88,14 +88,26 @@ claim; see [`developing.md`](developing.md).
 2. **The citation table is line-exact.** Any edit above an existing citation
    shifts it. `--write` re-reads the tree and records whatever the (possibly
    stale) line now says, so a run without a content check silently turns a
-   broken pointer into a "passing" one. For the common case — an insert above a
+   broken pointer into a "passing" one. The one laundering shape that is
+   decidable from the tree is refused mechanically: if a row keeps its line
+   number (or a range's end line) but its text moved, and the old text still occurs exactly once in the
+   target file, `--write` exits 1 naming that survivor and telling you to
+   `--relocate` (`--allow-rewrites` records it in place anyway, for a genuine
+   rewrite whose old text survives elsewhere by coincidence, and is refused
+   itself outside `--write` so it cannot be a silent no-op). The refusal is not
+   a substitute for reading `--relocate`'s output: a *failed* `--relocate` exits
+   1 with its edits applied and does not re-bake, so following it with a bare
+   `--write` is the one sequence that can still certify a shift — read the
+   unresolved list first. For the common
+   case — an insert above a
    cited line — `--relocate` moves the cite to the one line that still carries
    the recorded text and refuses when that text is gone or ambiguous — it is
    content-addressed, not history-aware, so a *rewritten* line whose old text
    survives elsewhere is moved too and looks like a shift: confirm each
    `relocate` line with `--derive`; otherwise
    re-point by *content* by hand. Either way finish with `--write` and re-pin
-   `guard_data_pin`. New files must be `git add`ed first — the guard
+   `guard_data_pin`. A table the guard cannot parse, or a suspect row whose
+   target it cannot read, is fatal rather than skipped. New files must be `git add`ed first — the guard
    scans tracked files only and will silently drop their rows.
 3. **Feature stubs drift.** Under `--no-default-features` the KCP, STUN and
    XTCP types are stubs in [`../frp-core/src/lib.rs`](../frp-core/src/lib.rs)
