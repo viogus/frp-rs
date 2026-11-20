@@ -334,11 +334,168 @@ macro_rules! frpc_admin_flag_specs {
                 api_timeout: Duration,
                 go ( long: "api-timeout", short: None, varname: Some("duration"), usage: "Timeout for admin API calls (default 30s)" )
             ),
+
+/// The rows behind the eight single-proxy commands: one `common { … }` block for
+/// the eight flags every one of them takes with the same type, then one group
+/// per command for the rest.
+///
+/// This list is opened twice, once per arm, both in `frpc.rs`:
+/// `proxy_args_structs` emits the eight argument structs and
+/// `proxy_cmd_parsers` emits the eight parsers. A row's type, long, aliases,
+/// shorthand and metavar are therefore stated once and land in both — before
+/// this round the same eight fields were re-declared in every struct and
+/// re-spelled in every parser, 84 field declarations for the 28 distinct rows
+/// here.
+///
+/// A row's `$kind` picks the parser combinator. There are four kinds in six
+/// rules, because the two value kinds take an optional `fallback:` cell:
+///
+/// | kind | field type | parser |
+/// |---|---|---|
+/// | `str` | `String` | `argument::<String>`, required unless `fallback:` |
+/// | `u16` | `u16` | `argument::<u16>`, required unless `fallback:` |
+/// | `opt_str` | `Option<String>` | `argument::<String>().optional()` |
+/// | `go_bool` | `bool` | `go_bool_flag_with_aliases!` (aliases + meaning) |
+///
+/// `go_bool` is the only kind whose parser is not built from `long(…)` here: Go
+/// registers the pair as pflag bools, so the row carries the meaning string and
+/// the hidden frp-rs spellings, and the existing macro supplies the
+/// `--ue=<bool>` value branch. No row needs a fifth kind.
+///
+/// `$short` is `Option<char>`, and the `None` case is load-bearing rather than
+/// cosmetic. sudp's `--remote-port` is an frp-rs extension that Go's `frpc sudp`
+/// does not register at all; it carries no `-r` so it can never be mistaken for
+/// the tcp/udp row, and
+/// `every_proxy_surface_renders_exactly_the_go_rows_that_surface_implements`
+/// pins that absence. bpaf's `NamedArg::short` takes a `char`, never an
+/// `Option<char>`, so the cell is spent by `named_with_short`.
+///
+/// Rows are per **command**, never per Go flag name, because two flags are
+/// typed twice: `sk` is `String` on stcp/xtcp and `Option<String>` on sudp, and
+/// `custom_domains` is `String` on http/https and `Option<String>` on tcpmux. A
+/// row yields one field type, so each group states the type its own struct has.
+///
+/// The `[ … ]` cell lists hidden aliases. They are emitted *after* the primary
+/// `long`, which is the spelling bpaf renders and the `--help` pins measure; an
+/// alias parses and never shows.
+macro_rules! proxy_flag_specs {
+    ($expand:ident) => {
+        $expand! {
+            common {
+                ( local_ip: String, str, "local-ip", ["local_ip"], Some('i'), "IP", fallback: "127.0.0.1" ),
+                ( local_port: u16, u16, "local-port", ["local_port"], Some('l'), "PORT" ),
+                ( server_addr: String, str, "server-addr", ["server_addr"], Some('s'), "HOST", fallback: "127.0.0.1" ),
+                ( server_port: u16, u16, "server-port", ["server_port"], Some('P'), "PORT", fallback: 7000 ),
+                ( token: Option<String>, opt_str, "token", [], Some('t'), "TOKEN" ),
+                // Go registers this pair on every proxy surface as `--uc` ("use
+                // compression") and `--ue` ("use encryption"), both pflag bools;
+                // frp-rs used to spell them out and accept neither of Go's names.
+                // Go's names are the primary longs (the only ones rendered) and
+                // the old spellings are hidden aliases, so both command lines
+                // parse. The value grammar is Go's — measured,
+                // `frpc tcp --ue=false …` is accepted by Go and the proxy runs.
+                ( use_encryption: bool, go_bool, "ue", ["use-encryption", "use_encryption"], "use encryption" ),
+                ( use_compression: bool, go_bool, "uc", ["use-compression", "use_compression"], "use compression" ),
+                (
+                    /// Go's `-n/--proxy-name`. On the stcp and xtcp surfaces
+                    /// frp-rs's `--tls-server-name` double-duties as the proxy
+                    /// name (a pre-existing mismatch with Go, where it sets the
+                    /// client's TLS SNI); when both are given `--proxy-name`
+                    /// wins.
+                    proxy_name: Option<String>,
+                    opt_str, "proxy-name", ["proxy_name"], Some('n'), "NAME"
+                ),
+            }
+            TcpArgs as Tcp, tcp_cmd, "tcp" {
+                ( remote_port: u16, u16, "remote-port", ["remote_port"], Some('r'), "PORT" ),
+            }
+            UdpArgs as Udp, udp_cmd, "udp" {
+                ( remote_port: u16, u16, "remote-port", ["remote_port"], Some('r'), "PORT" ),
+            }
+            HttpArgs as Http, http_cmd, "http" {
+                ( custom_domains: String, str, "custom-domain", ["custom-domains", "custom_domain"], Some('d'), "DOMAINS" ),
+                ( subdomain: Option<String>, opt_str, "sd", ["subdomain"], None, "SUB" ),
+                ( locations: Option<String>, opt_str, "locations", [], None, "LOCS" ),
+                ( http_user: Option<String>, opt_str, "http-user", ["http_user"], None, "USER" ),
+                ( http_pwd: Option<String>, opt_str, "http-pwd", ["http_pwd"], None, "PWD" ),
+                ( host_header_rewrite: Option<String>, opt_str, "host-header-rewrite", ["host_header_rewrite"], None, "HOST" ),
+            }
+            HttpsArgs as Https, https_cmd, "https" {
+                ( custom_domains: String, str, "custom-domain", ["custom-domains", "custom_domain"], Some('d'), "DOMAINS" ),
+                ( subdomain: Option<String>, opt_str, "sd", ["subdomain"], None, "SUB" ),
+            }
+            StcpArgs as Stcp, stcp_cmd, "stcp" {
+                ( sk: String, str, "sk", [], None, "SECRET" ),
+                ( server_name: Option<String>, opt_str, "tls-server-name", ["server-name", "server_name"], None, "NAME" ),
+            }
+            XtcpArgs as Xtcp, xtcp_cmd, "xtcp" {
+                ( sk: String, str, "sk", [], None, "SECRET" ),
+                ( server_name: Option<String>, opt_str, "tls-server-name", ["server-name", "server_name"], None, "NAME" ),
+            }
+            SudpArgs as Sudp, sudp_cmd, "sudp" {
+                (
+                    /// frp-rs extension: Go's `frpc sudp` registers **no**
+                    /// `remote_port` at all (and, measured on the v0.71.0 binary,
+                    /// refuses both `-r` and `--remote-port`). The long form
+                    /// predates this branch and stays for command lines written
+                    /// against it; the row's `None` shorthand keeps it from ever
+                    /// being mistaken for Go's tcp/udp row. It is still
+                    /// **required** (no fallback): that is pre-existing behaviour
+                    /// this round did not change, and it is recorded as a
+                    /// residual — a Go-shaped `frpc sudp --sk s -l 1` parses on
+                    /// Go but not on frp-rs.
+                    remote_port: u16,
+                    u16, "remote-port", ["remote_port"], None, "PORT"
+                ),
+                (
+                    /// Go's `--sk` on this surface (`ProxyConfig::sk`, honoured
+                    /// by the server's visitor sign-key path). Optional like Go's,
+                    /// which defaults it to "".
+                    sk: Option<String>,
+                    opt_str, "sk", [], None, "SECRET"
+                ),
+            }
+            TcpmuxArgs as Tcpmux, tcpmux_cmd, "tcpmux" {
+                (
+                    /// frp-rs extension: a port the tcpmux path never used (the
+                    /// server routes by domain and reads `multiplexer`, not this).
+                    /// Defaults to 0 when omitted.
+                    mux_port: u16,
+                    u16, "mux-port", ["mux_port"], None, "PORT", fallback: 0
+                ),
+                (
+                    /// Go's `--mux string`: the multiplexer name. `None` means
+                    /// Go's default (`httpconnect`), which is all frp-rs's server
+                    /// implements. The same spelling means the same thing in
+                    /// frp-server's SSH gateway (`frp-server/src/ssh_gateway/args.rs:692`),
+                    /// and `ProxyConfig::multiplexer`
+                    /// (`frp-core/src/config/client.rs:1142`) is where it lands.
+                    mux: Option<String>,
+                    opt_str, "mux", [], None, "MUX"
+                ),
+                (
+                    /// Go's `-d/--custom-domain strings` on this surface,
+                    /// comma-joined like the http/https surfaces (Go's
+                    /// StringSlice, narrowed to the same grammar). Go registers
+                    /// the same domain pair here as on http/https (`custom_domain`
+                    /// `-d`, `sd`); frp-rs's server already routes on them
+                    /// (`frp-server/src/control/proxy_ops/vhost.rs:33`).
+                    custom_domains: Option<String>,
+                    opt_str, "custom-domain", ["custom-domains", "custom_domain"], Some('d'), "DOMAINS"
+                ),
+                (
+                    /// Go's `--sd`.
+                    subdomain: Option<String>,
+                    opt_str, "sd", ["subdomain"], None, "SUB"
+                ),
+            }
         }
     };
 }
 
 pub(crate) use frpc_admin_flag_specs;
+
+pub(crate) use proxy_flag_specs;
 
 /// `frpc status --json`'s table row — the one flag on the admin surface that is
 /// not one of the five shared admin fields.

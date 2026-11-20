@@ -81,139 +81,55 @@ macro_rules! frpc_root_args_struct {
 
 frpc_root_flag_specs!(frpc_root_args_struct);
 
-#[derive(Debug, Clone)]
-pub struct TcpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub remote_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-    pub proxy_name: Option<String>,
+/// `proxy_flag_specs`' struct arm: the rows become the eight single-proxy
+/// argument structs.
+///
+/// A struct has to be generated **whole** — a macro cannot expand to struct
+/// fields (`struct S { fields!() }` is `error: unexpected token: '!'`) — so one
+/// expansion emits both halves, the common rows first and the command's own rows
+/// after. That is what the `common $common:tt` carrier is for:
+/// `proxy_args_structs` takes the `common { … }` block as a single token tree
+/// and hands it to `proxy_args_struct` for each command, whose pattern
+/// destructures it beside that command's rows.
+///
+/// Nesting the two row repetitions in one output repetition instead — the
+/// obvious first draft — does not compile: it is `error: meta-variable 'cf'
+/// repeats 2 times, but 'f' repeats 1 time`, because the outer repetition drives
+/// both.
+///
+/// The emitted field order is common-then-own, not the order the hand-written
+/// structs used (stcp/xtcp declared `sk` and `server_name` first). Nothing reads
+/// it: none of these structs derives `Serialize`/`Deserialize`, every
+/// `construct!` fills by field name, the help renderer sorts by long
+/// (`frp-core/src/cli/help_render.rs`), and no test asserts `Debug` output.
+///
+/// This arm ignores the group's variant, function name and command name; the
+/// parser arm spends them.
+macro_rules! proxy_args_struct {
+    (
+        { $( ( $(#[$cdoc:meta])* $cfield:ident : $cty:ty, $($crest:tt)* ) ),* $(,)? }
+        | $sname:ident | $variant:ident | $fn:ident | $command:literal
+        | $( ( $(#[$fdoc:meta])* $field:ident : $ty:ty, $($rest:tt)* ) ),* $(,)?
+    ) => {
+        #[derive(Debug, Clone)]
+        pub struct $sname {
+            $( $(#[$cdoc])* pub $cfield: $cty, )*
+            $( $(#[$fdoc])* pub $field: $ty, )*
+        }
+    };
 }
 
-#[derive(Debug, Clone)]
-pub struct UdpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub remote_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-    pub proxy_name: Option<String>,
+/// `proxy_flag_specs`' struct arm, applied to every command group.
+macro_rules! proxy_args_structs {
+    (
+        common $common:tt
+        $( $sname:ident as $variant:ident, $fn:ident, $command:literal { $( $row:tt )* } )+
+    ) => {
+        $( proxy_args_struct! { $common | $sname | $variant | $fn | $command | $( $row )* } )+
+    };
 }
 
-#[derive(Debug, Clone)]
-pub struct HttpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub custom_domains: String,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub subdomain: Option<String>,
-    pub locations: Option<String>,
-    pub http_user: Option<String>,
-    pub http_pwd: Option<String>,
-    pub host_header_rewrite: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpsArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub custom_domains: String,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub subdomain: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct StcpArgs {
-    pub sk: String,
-    pub server_name: Option<String>,
-    pub local_ip: String,
-    pub local_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    /// Go's `-n/--proxy-name`. frp-rs's `--tls-server-name` double-duties as the
-    /// proxy name here (a pre-existing mismatch with Go, where it sets the
-    /// client's TLS SNI); when both are given `--proxy-name` wins.
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct XtcpArgs {
-    pub sk: String,
-    pub server_name: Option<String>,
-    pub local_ip: String,
-    pub local_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    /// See [`StcpArgs::proxy_name`].
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SudpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    /// frp-rs extension: Go's `frpc sudp` registers **no** `remote_port` at all
-    /// (and, measured on the v0.71.0 binary, refuses both `-r` and
-    /// `--remote-port`). The long form predates this branch and stays for
-    /// command lines written against it; it carries no `-r` shorthand, so it can
-    /// never be mistaken for Go's row.
-    pub remote_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    /// Go's `--sk` on this surface (`ProxyConfig::sk`, honoured by the server's
-    /// visitor sign-key path). Optional like Go's, which defaults it to "".
-    pub sk: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct TcpmuxArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    /// frp-rs extension: a port the tcpmux path never used (the server routes by
-    /// domain and reads `multiplexer`, not this). Defaults to 0 when omitted.
-    pub mux_port: u16,
-    /// Go's `--mux string`: the multiplexer name. `None` means Go's default
-    /// (`httpconnect`), which is all frp-rs's server implements.
-    pub mux: Option<String>,
-    /// Go's `-d/--custom-domain strings` on this surface, comma-joined like the
-    /// http/https surfaces (Go's StringSlice, narrowed to the same grammar).
-    pub custom_domains: Option<String>,
-    /// Go's `--sd`.
-    pub subdomain: Option<String>,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
+proxy_flag_specs!(proxy_args_structs);
 
 #[derive(Debug, Clone)]
 pub struct VerifyArgs {
