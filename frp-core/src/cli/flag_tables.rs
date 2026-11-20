@@ -245,6 +245,8 @@ macro_rules! frpc_root_flag_specs {
     };
 }
 
+pub(crate) use frpc_root_flag_specs;
+
 /// `frpc_root_flag_specs`' table arm: a row's `go ( … )` cell becomes a row of
 /// [`FRPC_ROOT_GO_FLAGS`] and its `ext ( … )` cell a row of
 /// [`FRPC_ROOT_EXTENSION_FLAGS`]. A row with neither cell has a field and no

@@ -43,19 +43,32 @@ pub enum FrpcCmd {
     Stop(StopArgs),
 }
 
-#[derive(Debug, Clone)]
-pub struct FrpcRunArgs {
-    pub config: String,
-    pub config_dir: Option<String>,
-    pub strict_config: bool,
-    pub allow_unsafe: Vec<String>,
-    pub show_version: bool,
-    pub log_file: Option<String>,
-    pub log_level: Option<String>,
-    pub log_max_days: Option<i32>,
-    pub log_format: Option<String>,
-    pub disable_log_color: bool,
+/// `frpc_root_flag_specs`' struct arm: the rows become [`FrpcRunArgs`].
+///
+/// This is the one shape here that the list can emit. `construct!` cannot: it
+/// fills each field from a local of the same name in [`run_mode`], and an
+/// identifier written in a macro body — or handed through one, as the rows are —
+/// carries that expansion's syntax context, so it cannot name a local at the
+/// call site ("an identifier with the same name exists, but is not accessible
+/// due to macro hygiene"). The `construct!` call therefore stays hand-written,
+/// but it is checked rather than free: every field this arm emits is a field
+/// that struct literal must fill, so a row added to the list breaks the build
+/// until the site names it too.
+///
+/// Its pattern mirrors `frpc_root_flag_tables` in `flag_tables.rs`: both open
+/// the same list, so a change to the row shape has to change both.
+macro_rules! frpc_root_args_struct {
+    (
+        $( ( $(#[$doc:meta])* $field:ident : $ty:ty $(, go ( long: $glong:literal, short: $gshort:expr, varname: $gvarname:expr, usage: $gusage:literal ) )? $(, ext ( long: $elong:literal, short: $eshort:expr, varname: $evarname:expr, usage: $eusage:literal ) )? ) ),* $(,)?
+    ) => {
+        #[derive(Debug, Clone)]
+        pub struct FrpcRunArgs {
+            $( $(#[$doc])* pub $field: $ty, )*
+        }
+    };
 }
+
+frpc_root_flag_specs!(frpc_root_args_struct);
 
 #[derive(Debug, Clone)]
 pub struct TcpArgs {
