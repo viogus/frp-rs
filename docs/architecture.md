@@ -88,21 +88,25 @@ frp-rs/
                           hoist_tests.rs, help_doc_tests.rs
       admin_auth.rs       HTTP Basic Auth middleware (admin API / dashboard)
       auth.rs             MD5 token authentication + OIDC verification
+                          (tests in auth/tests.rs + auth/oidc_impl/tests.rs)
       bridge.rs           Encrypted/compressed data bridge (streaming CFB)
+                          (tests in bridge/tests.rs)
       cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt (CipherReader/CipherWriter)
       config/             TOML/YAML/JSON/INI config structs + Go→Rust compat normalization
       config_store.rs     Runtime config store (client proxy/visitor CRUD)
       encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
       crypto.rs           V2 AEAD algorithms (AES-256-GCM / XChaCha20-Poly1305)
       v2_handshake.rs     V2 ClientHello/ServerHello + capability negotiation
-      kcp/                KCP transport (protocol, mod, session, socket, stream, listener, config)
+      kcp/                KCP transport (protocol, mod, session, socket, stream, listener,
+                          config; protocol's tests in kcp/protocol/tests.rs)
       kcp_compat.rs       KCP interop helpers
       metrics.rs          ProxyMetricsRegistry + ConnGuard (per-proxy counters)
-      msg.rs              Wire protocol message structs
+      msg.rs              Wire protocol message structs (tests in msg/tests.rs)
       mux.rs              TCP multiplexing (yamux)
-      protocol.rs         V1/V2 frame read/write
+      protocol.rs         V1/V2 frame read/write (tests in protocol/tests.rs)
       transport/          transport.rs → directory: tcp.rs, tls.rs, kcp.rs, quic.rs,
-                          websocket.rs (manual RFC 6455), yamux.rs, cipher.rs, aead.rs,
+                          websocket.rs (manual RFC 6455; tests in
+                          transport/websocket/tests.rs), yamux.rs, cipher.rs, aead.rs,
                           ssh_channel.rs, pre_read.rs, buffered_read.rs — IoStream
                           is a Box<dyn Transport> newtype
       udp_binary.rs       V2 UDP packet binary codec (frame type 19, Go v0.71.0)
@@ -121,13 +125,16 @@ frp-rs/
       lib.rs
       service.rs          Accept loop, connection dispatch, SIGUSR1 reload
       state.rs            AppState, InternalMsg, run_id → control routing
+                          (tests in state/tests.rs)
       handlers/           Connection dispatch helpers (work/visitor/NAT hole)
       registry.rs         ProxyManager registry + port allocation
       proxy.rs            ProxyInfo, proxy registration
       control/
         mod.rs            Per-client control handler, select loop
         dispatch.rs       Inbound control message dispatch
-        login.rs          Login handshake + run_id
+        login.rs          Login handshake + run_id (tests in
+                          login/login_order_tests.rs; four small behaviour
+                          modules stay inline)
         pool.rs           Work connection pool + pending request queue
         proxy_ops/        NewProxy/CloseProxy handler, listen_and_proxy
         bridge.rs         Encrypted/plain bridge (+ proxy auth)

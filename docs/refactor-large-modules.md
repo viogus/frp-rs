@@ -212,12 +212,36 @@ Before any production code moves, do this in every file that has a large inline
 `#[cfg(test)] mod tests`:
 
 ```bash
-git mv frp-server/src/control/proxy_ops.rs frp-server/src/control/proxy_ops/mod.rs
-# declare the test modules, then move each body into a sibling file
-#   #[cfg(test)] pub(crate) mod unregister_generation_tests;
-#   #[cfg(test)] mod subdomain_conflict_tests;
-#   #[cfg(test)] mod tcp_auto_bind_retry_tests;
+scripts/split_inline_tests.py --check frp-server/src/control/proxy_ops.rs   # report
+scripts/split_inline_tests.py frp-server/src/control/proxy_ops.rs           # split
+# for a file that already lives at <name>/mod.rs, the sibling is <name>/tests.rs
 ```
+
+`scripts/split_inline_tests.py` (added with PR #634) does the mechanical half:
+it finds the file's trailing `#[cfg(test)] mod …` block, writes the body to a
+sibling file, and leaves `#[cfg(test)] mod …;` behind, carrying any visibility
+prefix (`pub(crate) mod x`) through to the declaration. It de-indents **only
+code lines** — a multi-line string literal keeps its columns (the help-text
+pins lost four columns per line to a blind dedent) — and it deliberately takes
+the block to the end of the file rather than brace-matching: a lexer that lost
+one brace to a literal once moved a boundary into the middle of a module.
+
+What it refuses is as important as what it does: a file with **more than one**
+`#[cfg(test)] mod …` block, or with a block that is **not the file's last
+item**, stops the run with a message instead of guessing which boundary is the
+body. Two files in this tree were therefore split by hand in more than one
+pass — `frp-core/src/auth.rs` (a top-level block plus one nested inside
+`mod oidc_impl`) and `frp-server/src/control/login.rs` (whose trailing
+`login_order_tests` moved out while four small behaviour modules —
+`auth_signal_tests`, `send_login_error_deadline_tests`, `pool_count_tests`,
+`oidc_throttle_tests` — are still inline in it). "The inline modules are gone"
+is true file-by-file, not tree-wide.
+
+The proof is unchanged either way: the `--list` set of test names must be
+identical before and after. Re-running the script on an already-split file
+reports `no inline test module` and writes nothing, so the committed siblings
+are reproducible: run it on `main`'s copy of each parent and the output is the
+committed file after `rustfmt` (verified for the ten single-block parents).
 
 This is **zero-risk and unusually high-yield**, because a file module and an
 inline module have the *same module path* and the same `use super::*` semantics
