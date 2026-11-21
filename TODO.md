@@ -12935,7 +12935,7 @@ kept out of the main P2 list so that adding them does not renumber every later
   withdrawn "+23%" stays retracted in
   `docs/archive/notes/2026-11-10-real-host-throughput.md` section 6.
 
-- [ ] **KCP bulk streams: closed out 2026-11-15 — parity with TLS on, behind with it off.**
+- [x] **KCP bulk streams: closed out 2026-11-15 — parity with TLS on, ahead with it off.**
 
   Settled by `docs/archive/notes/2026-11-15-kcp-window-autotune.md`: with the
   server's KCP driver moved to its own runtime thread
@@ -12970,13 +12970,53 @@ kept out of the main P2 list so that adding them does not renumber every later
   `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. That mixed-binary
   matrix was taken on the TLS-**off** shape: with Go as the client the same
   servers carry 80-83 MiB/s, with frp-rs as the client 61-66, so the client end
-  is the limiter *there* — not the server, and not the KCP core.
+  was the limiter *there* — not the server, and not the KCP core. That band
+  predates **both** the 2026-11-14 KCP driver thread
+  (`docs/archive/notes/2026-11-12-worker-thread-count.md:119-121`) and the
+  2026-11-15 read coalescing; no mixed-binary run has been taken since, so it is
+  stale rather than superseded. 86.4 does not stand in for it: that is an
+  frp-rs↔frp-rs row, and the coalescing is read-side only
+  (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:108-110`) while frp-rs is
+  the **sender** in the band's frp-rs-client limb
+  (`docs/archive/notes/2026-11-12-kcp-go-flush-model.md:116`).
 
-  **Done-when:** met on both shapes — TLS on is parity (1.04×) and TLS off is
-  now ahead (1.13×). What remains is not a KCP item: with TLS off the whole
-  shape is still slower than the same engine with TLS on (86 against 111
-  MiB/s), which is the read-granularity cost the coalescing reduced but did not
-  remove.
+  **Done-when:** met on both shapes — TLS on is parity (1.04× on medians of
+  three) and TLS off is now ahead (1.14× on means, 1.12× on medians). What
+  remains is outside this done-when, not out of scope: with TLS off the whole
+  shape is still slower than the same engine with TLS on (86 against 111 MiB/s),
+  and `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:111-113` calls that
+  residue **unexplained** and points at `TODO.md` for it — so it is filed as its
+  own item directly below rather than absorbed into a verdict.
+
+  **Ticked 2026-11-21.** The done-when was met on 2026-11-15 by the two notes
+  above; the checkbox did not move, and the body grew past its own verdict, so
+  the item read as open work while describing a closed one. Verified against the
+  sources rather than the summary: `docs/archive/notes/2026-11-15-kcp-window-autotune.md:111`
+  carries the 110.3 / 111.5 / 113.7 against 102.3 / 106.7 / 107.7 (1.04×) row,
+  and `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:78-82` carries
+  63.0 → 86.4 against a Go mean of 75.9 (0.83× → 1.14× on means, 0.81× → 1.12×
+  on medians). The done-when said 1.13×; the note's arithmetic is 1.14× on means
+  and 1.12× on medians, and an earlier bullet of `1e113d9a`'s commit message reached
+  1.13× by dividing the coalesced **mean** by Go's **median** — the mis-paired
+  statistic the notes warn about, where its own later bullet already said 1.14×.
+  No code change rides on this tick.
+
+- [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**
+
+  The TLS-off arm's nine-pair mean is 86.4 MiB/s against the TLS-on arm's mean of
+  110.2, same engine, host and shape
+  (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:74,78-82,111-113`). The
+  self-gap was 48 MiB/s before the coalescing and is 24 after it, so that change
+  removed **about half** of it, not most — and the note calls what is left
+  **unexplained**. The item above closed on the cross-stack comparison — 1.04×
+  with TLS, 1.14× without — which is a different question from why the naked row
+  trails its own TLS shape, and nothing else in this file owns it.
+
+  **Done-when:** a TLS-off row whose three interleaved block medians clear the
+  TLS-on arm's mean — the naked arm's own samples span 81-99, so one lucky run
+  does not count — or a named candidate that
+  `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:99-110` does not already
+  exclude is measured and ruled out.
 ---
 
 ## P2 — structural (scheduling)

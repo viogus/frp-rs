@@ -184,9 +184,10 @@ Method, host details, the retractions and the limits:
 [`docs/archive/notes/2026-11-10-real-host-throughput.md`](docs/archive/notes/2026-11-10-real-host-throughput.md).
 
 **Not every shape is faster.** On bulk KCP streams — one to four flows of a
-2048 MiB one-way transfer over loopback, `tcpMux` and TLS on — frp-rs moves
-65-66 MiB/s where Go moves 99-102, at about 1.5× the CPU per byte (69 against 45
-CPU-seconds per 2048 MiB), while KCP's small-payload latency is far better
+2048 MiB one-way transfer over loopback, `tcpMux` and TLS on, measured with the
+default worker pool on a four-vCPU VM — frp-rs moves 65-66 MiB/s where Go moves
+99-102, at about 1.5× the CPU per byte (69 against 45 CPU-seconds per
+2048 MiB), while KCP's small-payload latency is far better
 (394 round trips/s against 40 — a different harness and host, so direction
 only). That gap was 49 versus 103 when it was first measured: the AVX2 parity
 pass, one `sendmmsg` per flush and tick, filling segments before sending them,
