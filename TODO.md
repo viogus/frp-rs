@@ -13420,6 +13420,17 @@ needs the two-review rule and its own gate run.
       `ProxyConfig` unless someone edits the impl, because nothing reads the
       struct exhaustively. Closing that is the next family's real work, not
       another macro.
+      Two cells the `--help` pins cannot see are now witnessed directly, after
+      the adversarial review measured that both could be wrong with every suite
+      green: the `fallback:` cell (parsing a minimal command line per surface
+      and comparing the resolved default with the text the row prints — changing
+      `server_port`'s `7000` to `7001` left the document claiming 7000) and the
+      alias cell (one argv per declared alias; dropping `"http_user"` from the
+      http row or `"remote_port"` from the tcp row silently refused command
+      lines that used to parse). The alias witness transcribes the row list's
+      cells into `tests.rs`'s `COMMON`/`PER_SURFACE` tables, so it is a fourth
+      copy — deliberately, as an oracle: it reds when a row loses an alias,
+      which is exactly the edit no other test notices.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from

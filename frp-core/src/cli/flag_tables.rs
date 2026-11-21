@@ -9,12 +9,16 @@ use super::*;
 /// pflag's ` (default …)` suffix verbatim when the flag's default is non-zero.
 ///
 /// `short` is Go's shorthand. It is **checked against** the parser's, never
-/// rendered from here: [`render_cobra_help`] debug-asserts that the parser's
-/// shorthand for a rendered row equals Go's, so a row whose shorthand the parser
-/// does not carry cannot silently become a rendered lie. Rows for flags frp-rs
-/// does not implement at all (Go also registers `-r`/`-n` on `stcp`/`xtcp`,
-/// `--allow-users`, `--sk` on `sudp`, and a dozen others) keep Go's shorthand
-/// but are never rendered, because no parser flag names them.
+/// rendered from here: [`render_cobra_help`] debug-asserts that, *when the
+/// parser carries a shorthand at all*, it equals Go's — that is what keeps the
+/// two `verify` documents byte-exact. The converse does not hold: a row may
+/// claim a shorthand the parser does not carry, and the check passes, because
+/// the parser's `None` short-circuits it (measured by the adversarial review of
+/// #656: giving an extension row a wrong shorthand left both suites and every
+/// pin green). The check is also `debug_assert!`, so release binaries do not run
+/// it at all. Rows for flags frp-rs does not implement (Go also registers `-r`/`-n`
+/// on `stcp`/`xtcp`, `--allow-users`, `--sk` on `sudp`, and a dozen others) keep
+/// Go's shorthand but are never rendered, because no parser flag names them.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct GoFlagRow {
     pub(crate) long: &'static str,
@@ -380,7 +384,10 @@ macro_rules! frpc_admin_flag_specs {
 ///
 /// The `[ … ]` cell lists hidden aliases. They are emitted *after* the primary
 /// `long`, which is the spelling bpaf renders and the `--help` pins measure; an
-/// alias parses and never shows.
+/// alias parses and never shows. Nothing in `--help` depends on this cell, so
+/// until the two `every_proxy_surface_accepts_…` tests in `tests.rs` were added
+/// a dropped alias was invisible to every suite (measured by the adversarial
+/// review of #656).
 macro_rules! proxy_flag_specs {
     ($expand:ident) => {
         $expand! {

@@ -1524,7 +1524,7 @@ fn the_go_only_proxy_rows_carry_their_recorded_help_text() {
 /// surface actually prints (`None` when Go's own row carries no shorthand).
 type GoRowPin = (&'static str, Option<char>);
 
-const GO_PROXY_ROWS_UNIVERSAL: [GoRowPin; 8] = [
+pub(crate) const GO_PROXY_ROWS_UNIVERSAL: [GoRowPin; 8] = [
     ("local-ip", Some('i')),
     ("local-port", Some('l')),
     ("proxy-name", Some('n')),
@@ -1541,7 +1541,7 @@ const GO_PROXY_ROWS_UNIVERSAL: [GoRowPin; 8] = [
 /// frp-rs implements. Sudp's `remote-port` is the one deliberate divergence:
 /// Go registers the row on tcp/udp only, and frp-rs keeps the long form on sudp
 /// as an extension, so the shorthand is `None` there where tcp/udp print `-r`.
-const GO_PROXY_ROWS_PER_SURFACE: [(&str, &[GoRowPin]); 8] = [
+pub(crate) const GO_PROXY_ROWS_PER_SURFACE: [(&str, &[GoRowPin]); 8] = [
     ("frpc tcp", &[("remote-port", Some('r'))]),
     ("frpc udp", &[("remote-port", Some('r'))]),
     (
