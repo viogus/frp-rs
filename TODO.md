@@ -13172,7 +13172,7 @@ needs the two-review rule and its own gate run.
       than this fixture if one is ever wanted (`frp-server/tests/stcp_relay.rs`
       reaches `run_work_bridge` with hand-built V1 frames in milliseconds);
       this one lives in the client lane because it needs a real provider.
-- [ ] **Table-driven `frp-core/src/cli.rs` flag specs.** The original line here
+- [x] **Table-driven `frp-core/src/cli.rs` flag specs.** The original line here
       said "eleven flag families × nine config formats"; the matrix is now
       written, and both numbers are true only under a chosen definition.
       Measured 2026-11-20 at `4c1f8f73`: **8 `GoFlagRow` tables / 80 rows of that
@@ -13460,6 +13460,56 @@ needs the two-review rule and its own gate run.
       cells into `tests.rs`'s `COMMON`/`PER_SURFACE` tables, so it is a fourth
       copy — deliberately, as an oracle: it reds when a row loses an alias,
       which is exactly the edit no other test notices.
+      **Done 2026-11-21 — as (i)+(ii), for five families.** Names and types now
+      have one source of truth, except the three copies listed below: `frps`
+      (31 rows), `frpc` root (10), `frpc` admin (5) and the eight single-proxy
+      surfaces (8 common + 20 own) are each generated from one row list, and the
+      readers the compiler can be made to check are exhaustive —
+      `override_server_config` (31 rows) opens with `let Self { … } = self;`, the
+      eight `to_proxy_config` impls each destructure `self`, and `run_normal`
+      destructures `FrpcRunArgs` once. Adding a row is therefore an `E0027` at
+      those sites. **It is not a compile error everywhere**: `frps/src/main.rs`
+      reads its flags by name (`cli.disable_log_color`, 13 such accesses), and
+      `init_logging` / `worker_threads_from_args` take the values `run_normal`
+      hands them, so a row that must be applied at either place is caught by
+      behaviour tests rather than by the compiler. The bound is unchanged
+      everywhere: the compiler asks for a destination, not a correct one
+      (`field: _` compiles), which is why the discards are named and the
+      collected values are pinned by tests.
+      Three copies survive, deliberately and recorded here so "one source of
+      truth" is not read as more than it is: the bpaf **combinator chains**; the
+      **underscore alias spellings**, which are not a row cell at all
+      (`GoFlagRow.long` holds one spelling, so `--allow_ports`,
+      `--dashboard_addr` and ten more live only in the chains, with no witness
+      outside `frp-core/src/cli/frps.rs`); and the **usage text of the six bool
+      rows**, where the row cell and the `go_bool_flag!` literal are pinned
+      separately and never compared — they have already drifted in case for
+      `--version` (`version of frps` in the row, `Version of frps` in the chain).
+      **Commit (iii) — generating the combinator chains — is deliberately not
+      done, though it was measured feasible**, and the reason is cost versus
+      payoff rather than impossibility: a kind-tagged `macro_rules!` row list
+      that emits `let <field> = …;` then `construct!(Struct { fields })`
+      reproduces the hand-written `svr_transport` and `svr_log` help byte for
+      byte, including a parser passed in as a `$slot` parameter (a slot carried
+      *inside* the row list cannot name a call-site local —
+      `error[E0425]: cannot find value … in this scope` — so the shape has to be
+      a generated binder fn per family). What that measurement also showed is
+      what makes it expensive: 22 of the 31 rows share the
+      `long(a)[.short(c)].long(b).argument::<T>(M).optional()` shape and 9 do
+      not (`bind_port` is a five-call sibling; `allow_unsafe`,
+      `dashboard_tls_mode`, `tls_only`, `strict_config`, `show_version`,
+      `enable_prometheus`, `disable_log_color`, `log_format` are the rest), and
+      three of the seven `construct!` groups (`svr_meta`, `svr_log`,
+      `frps_build`) take parsers as parameters — but the row list also does not
+      carry the alias cell or a render-order cell, and bpaf renders in
+      `construct!` order while `FRPS_GO_FLAGS`'s transport rows are
+      alphabetical, so a generator drops twelve accepted spellings and reorders
+      every `frps --help` pin unless both cells are added first. Payoff is zero
+      observable — parser, row table, structs, `From`, overlay and readers
+      already agree — and the residual risk is which parser sits in which slot,
+      the shape `#656` had to repair. Stopping here is the cheap exit this
+      item's own text named.
+      named.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from
