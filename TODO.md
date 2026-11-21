@@ -13482,9 +13482,17 @@ needs the two-review rule and its own gate run.
       (`GoFlagRow.long` holds one spelling, so `--allow_ports`,
       `--dashboard_addr` and ten more live only in the chains, with no witness
       outside `frp-core/src/cli/frps.rs`); and the **usage text of the six bool
-      rows**, where the row cell and the `go_bool_flag!` literal are pinned
-      separately and never compared — they have already drifted in case for
-      `--version` (`version of frps` in the row, `Version of frps` in the chain).
+      rows**, where the row cell and the `go_bool_flag!` literal are never
+      compared: seven of the ten bool sites drift — six only in case (`version
+      of frps` in the row, `Version of frps` in the literal), and
+      `--dashboard-tls-mode` in wording too (Go's `if enable dashboard tls
+      mode` against `Enable dashboard TLS mode`) — while `--ue`/`--uc`/`--json`
+      agree exactly. That one is inert rather
+      than a defect: the only production path that sees bpaf's document replaces
+      it before printing (`frp-core/src/cli/root.rs:36` renders the cobra
+      document, which takes the row's `usage` cell), so the row is what a user
+      reads. Recorded at the macro definition instead of "fixed", because
+      changing either side alone breaks one of the two pins.
       **Commit (iii) — generating the combinator chains — is deliberately not
       done, though it was measured feasible**, and the reason is cost versus
       payoff rather than impossibility: a kind-tagged `macro_rules!` row list
