@@ -12997,6 +12997,36 @@ kept out of the main P2 list so that adding them does not renumber every later
   Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
   2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
 
+  **Measured 2026-11-21 (macOS arm64, 8 cores, loopback, `tcp` with
+  `tcp_mux = false`, three reps at one and at eight client workers, two at two
+  and at four; method, per-arm numbers and the raw-loopback ceiling in
+  [`2026-11-21-worker-fan-in-macos.md`](docs/archive/notes/2026-11-21-worker-fan-in-macos.md)):**
+  one connection is flat at one worker and at the default pool (363-366 MiB/s,
+  means identical at 364.5) and slightly lower at two and four (350.2, 347.9);
+  eight connections are not flat (682-720 at one worker, 782-800 at two, 822-836
+  at four, 864-935 at eight), so **one worker carries 77-79% of the default
+  pool's aggregate**, with most of the gain arriving at two workers and none of
+  it between two and four. The ~900 MiB/s plateau is the bridge, not the
+  loopback: with frp out of the path the same harness reaches 2295-2312 on one
+  connection and 8508-8697 on eight.
+
+  What the probe cannot do, which is why this does not close the item:
+  `worker_threads` sizes `frpc`'s one process-wide runtime
+  (`frpc/src/main.rs:453-457`), so the one-worker arm also serialises control,
+  accept and handshake rather than bridge tasks alone, and `tcp_mux = false`
+  means no yamux task exists in these arms at all. Pinning only bridge/yamux onto
+  another runtime is untested here.
+
+  What it does change is the trigger above: that trigger already sits inside its
+  own threshold — 2266 MiB/s at eight sessions against 2570 on one flow is
+  **0.88×**, and that host's four-worker eight-session figure (2867) is 1.12× its
+  one-flow rate
+  (`docs/archive/notes/2026-11-13-splice-wrapper-peel.md:80-83`). An absolute
+  8/1 ratio measures the host and the byte counting; what holds across both hosts
+  is the worker-relative figure (77-79% here, 2266/2867 = 79% there), so re-open
+  on a change in that, or in the 1→2 step and anything beyond four — two to four
+  is flat here.
+
 ## P2 — measured: `websocket` + TLS + `tcpMux` stalls intermittently
 
 Evidence (2026-11-16, `scripts/bench-vs-go.py`, 4 vCPU EPYC-Milan, commit
