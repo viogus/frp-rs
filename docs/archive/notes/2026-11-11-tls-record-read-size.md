@@ -98,3 +98,29 @@ for i in 1 2 3 4; do bash /root/bench/tcmp.sh /root/pr7 base 1; \
 `tcmp.sh` writes a TLS-forced server config and a TLS client config with one TCP
 proxy, starts `abbench sink` on 19054, waits for the proxy port 19056, then runs
 `abbench stream 19056 4096 <flows>` and prints MiB/s plus the summed CPU ticks.
+
+## 6. What was tried next, and did not ship
+
+With the deframer fixed, the largest remaining user-space entry on the sending
+side was `Vec::<u8>::resize` from rustls again — 7.2% of frpc's samples — this
+time in `ChunkVecBuffer::append_limited_copy`, which allocates one `Vec` per
+record (`ChunkVecBuffer` drops it once written). A third patch that recycles the
+drained chunk into a `spare` buffer (so the 16 KiB memset disappears) measured:
+
+| shape | before | after | delta |
+| --- | --- | --- | --- |
+| one flow, both orders, 8 pairs | 529.0 | 556.8 | **+5.3%** (CPU −3.2%) |
+| four flows, both orders, 7 pairs | 558.3 | 561.6 | +0.6% (noise) |
+
+It was **not adopted**: the gain is single-connection only, while each TLS
+connection would hold up to two spare record buffers (~32 KiB), i.e. ~320 MiB at
+10 000 connections — a worse trade than the read-size patch above, which buys
++4.2% everywhere for ~14 KiB. The branch (`perf/tls-send-buffer-reuse`) keeps
+the patch if the memory trade ever looks acceptable.
+
+**Method note (applies to every A/B in these notes):** this harness has a
+position bias. Measuring base-then-variant only, the four-flow change looked like
+−2.7%; measuring variant-then-base gave +4.0% for the same pair of builds, and
+the two orders cancel to +0.6%. Any A/B here must be run in **both orders** (or
+at least interleaved with the order flipped), otherwise the second process in the
+pair looks faster regardless of what changed.
