@@ -13369,7 +13369,8 @@ needs the two-review rule and its own gate run.
       `use_compression`, `proxy_name`, each with its aliases, shorthand,
       metavar and fallback/optionality) and one group per command for the other
       20 — in place of 84 field declarations and 579 lines of hand-written
-      combinators spelling 229 flags. Four kinds in six rules cover it (`str`
+      combinators spelling 229 flag spellings (84 primary `long`s, 92 hidden
+      aliases, 53 shorthands). Four kinds in six rules cover it (`str`
       and `u16`, each with an optional `fallback:` cell, `opt_str`, `go_bool`);
       no row needed a fifth. Two shapes are load-bearing and neither is a
       Go-name-keyed table: `sk` is `String` on stcp/xtcp and `Option<String>`
@@ -13380,8 +13381,10 @@ needs the two-review rule and its own gate run.
       halves of a command are generated from the same rows — the struct (Rust
       forbids a macro expanding to fields, so the common rows travel into the
       per-command arm as one `tt` it destructures; nesting the two repetitions
-      in a single output repetition instead fails with `meta-variable 'c'
-      repeats 2 times, but 'f' repeats 3 times`) and the parser, whose `let`
+      in a single output repetition instead fails with a repetition mismatch
+      naming the two mets and carrying one count per list — reproduced
+      standalone with three common and two command rows as
+      meta-variable `cf` repeats 3 times, but `f` repeats 2 times) and the parser, whose `let`
       bindings are emitted by the expansion that emits the `construct!`. That
       is the inverse of the `frpc` root family above: there the construct stays
       hand-written because a macro-emitted `construct!` cannot name `run_mode`'s

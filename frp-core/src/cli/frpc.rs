@@ -93,9 +93,11 @@ frpc_root_flag_specs!(frpc_root_args_struct);
 /// destructures it beside that command's rows.
 ///
 /// Nesting the two row repetitions in one output repetition instead — the
-/// obvious first draft — does not compile: it is `error: meta-variable 'cf'
-/// repeats 2 times, but 'f' repeats 1 time`, because the outer repetition drives
-/// both.
+/// obvious first draft — does not compile, because the outer repetition drives
+/// both: the error is a repetition mismatch naming the common rows' meta and the
+/// command rows' meta, and its two counts are the two lists' lengths. Reproduced
+/// standalone with three common rows and two command rows, where the compiler
+/// said: meta-variable `cf` repeats 3 times, but `f` repeats 2 times.
 ///
 /// The emitted field order is common-then-own, not the order the hand-written
 /// structs used (stcp/xtcp declared `sk` and `server_name` first). Nothing reads
