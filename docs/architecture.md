@@ -105,7 +105,8 @@ frp-rs/
       mux.rs              TCP multiplexing (yamux)
       protocol.rs         V1/V2 frame read/write (tests in protocol/tests.rs)
       transport/          transport.rs → directory: tcp.rs, tls.rs, kcp.rs, quic.rs,
-                          websocket.rs (manual RFC 6455), yamux.rs, cipher.rs, aead.rs,
+                          websocket.rs (manual RFC 6455; tests in
+                          transport/websocket/tests.rs), yamux.rs, cipher.rs, aead.rs,
                           ssh_channel.rs, pre_read.rs, buffered_read.rs — IoStream
                           is a Box<dyn Transport> newtype
       udp_binary.rs       V2 UDP packet binary codec (frame type 19, Go v0.71.0)
@@ -124,13 +125,16 @@ frp-rs/
       lib.rs
       service.rs          Accept loop, connection dispatch, SIGUSR1 reload
       state.rs            AppState, InternalMsg, run_id → control routing
+                          (tests in state/tests.rs)
       handlers/           Connection dispatch helpers (work/visitor/NAT hole)
       registry.rs         ProxyManager registry + port allocation
       proxy.rs            ProxyInfo, proxy registration
       control/
         mod.rs            Per-client control handler, select loop
         dispatch.rs       Inbound control message dispatch
-        login.rs          Login handshake + run_id
+        login.rs          Login handshake + run_id (tests in
+                          login/login_order_tests.rs; four small behaviour
+                          modules stay inline)
         pool.rs           Work connection pool + pending request queue
         proxy_ops/        NewProxy/CloseProxy handler, listen_and_proxy
         bridge.rs         Encrypted/plain bridge (+ proxy auth)

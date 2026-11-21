@@ -6,11 +6,16 @@ production code without scrolling past them.  `docs/refactor-large-modules.md`
 § Step 0 describes the move; this script is the mechanical half of it.
 
 What it does, per input file:
-  * finds every `#[cfg(test)]` + `mod name { … }` block at the top level of the
-    file, token-aware (braces and quotes in char/str/raw-str/comment literals
-    are not counted),
-  * writes each block's body to a sibling file — `a/b/tests.rs` for
-    `a/b/mod.rs`, `a/b/tests.rs` for `a/b.rs` — dedented by one level,
+  * finds the file's `#[cfg(test)]` + `mod name { … }` block, token-aware
+    (braces and quotes in char/str/raw-str/comment literals are not counted),
+  * refuses rather than guesses: the block must be the file's last item and
+    there must be exactly one of them, so a file with two test modules, or a
+    test module followed by production code, stops the run with a message
+    instead of moving a boundary into the middle of the file,
+  * writes the block's body to a sibling file — `a/b/tests.rs` for
+    `a/b/mod.rs` or `a/b.rs` — dedented by one level, keeping string-literal
+    columns, and carries a visibility prefix (`pub(crate) mod x`) through to
+    the declaration,
   * replaces the block in the parent with `#[cfg(test)]` + `mod name;`.
 
 Dedent safety: lines that *start inside* a string literal are left alone.  The
@@ -36,7 +41,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-MOD_HEADER = re.compile(r"^(?P<indent>\s*)mod (?P<name>\w+) \{\s*$")
+MOD_HEADER = re.compile(
+    r"^(?P<indent>\s*)(?P<vis>(?:pub(?:\([^)]*\))?\s+)?)mod (?P<name>\w+) \{\s*$"
+)
 ATTR = re.compile(r"^\s*#\[cfg\(test\)\]\s*$")
 
 
@@ -47,6 +54,7 @@ class Block:
     open: int  # line index of `mod name {`
     close: int  # line index of the closing `}`
     inner: list[str]
+    decl: str = ""  # indentation + visibility, carried to the declaration
 
 
 def _scan_states(lines: list[str]) -> list[str]:
@@ -130,23 +138,38 @@ def find_blocks(lines: list[str]) -> list[Block]:
     2 000-line test module, and a wrong boundary is worse than no split.  The
     caller proves the move instead — the `--list` set of test names must be
     identical, which a wrong boundary cannot survive.
+
+    Two shapes are refused rather than guessed at: more than one candidate
+    block (which one is "the" test module?), and a candidate that is not the
+    file's last item (the tail scan would take the code after it along, and
+    delete it from the parent while exit 0 — the failure that made this exit
+    non-zero).
     """
-    last = None
-    for i in range(len(lines) - 1):
-        if ATTR.match(lines[i]):
-            m = MOD_HEADER.match(lines[i + 1])
-            if m:
-                last = (i, m)
-    if last is None:
+    candidates = [
+        (i, m)
+        for i in range(len(lines) - 1)
+        if ATTR.match(lines[i]) and (m := MOD_HEADER.match(lines[i + 1]))
+    ]
+    if not candidates:
         return []
-    i, m = last
+    if len(candidates) > 1:
+        where = ", ".join(str(i + 1) for i, _ in candidates)
+        raise SystemExit(
+            f"refusing: {where} each open a #[cfg(test)] module; "
+            "move the extra ones by hand first"
+        )
+    i, m = candidates[0]
     tail = [line for line in lines[i + 2 :] if line.strip()]
     if not tail or tail[-1].strip() != "}":
-        return []
+        raise SystemExit(
+            f"refusing: the #[cfg(test)] module at line {i + 1} is not the "
+            "file's last item, so its tail is not its body"
+        )
     close = len(lines) - 1
     while close > i and not lines[close].strip():
         close -= 1
-    return [Block(m.group("name"), i, i + 1, close, lines[i + 2 : close])]
+    decl = m.group("indent") + m.group("vis")
+    return [Block(m.group("name"), i, i + 1, close, lines[i + 2 : close], decl)]
 
 
 def dedent(inner: list[str]) -> list[str]:
@@ -171,7 +194,6 @@ def split(path: Path, write: bool) -> int:
     if not blocks:
         print(f"  {path}: no inline test module")
         return 0
-    drop: set[int] = set()
     replacements: list[tuple[int, int, str]] = []
     for b in blocks:
         target = sibling_path(path, b.name)
@@ -185,12 +207,11 @@ def split(path: Path, write: bool) -> int:
                 body.pop()
             target.write_text("\n".join(body) + "\n")
         replacements.append(
-            (b.start, b.close, f"#[cfg(test)]\nmod {b.name};")
+            (b.start, b.close, f"#[cfg(test)]\n{b.decl}mod {b.name};")
         )
     if write:
         for start, close, replacement in sorted(replacements, reverse=True):
             lines[start : close + 1] = replacement.split("\n")
-        _ = drop
         path.write_text("\n".join(lines) + "\n")
     return len(blocks)
 
