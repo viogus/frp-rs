@@ -13043,7 +13043,10 @@ kept out of the main P2 list so that adding them does not renumber every later
 
   **Status (2026-11-14): the driver half is shipped** — every KCP socket runs its
   driver on a private runtime, and `tcp`/`tcpMux` showed no worker-count penalty
-  at all, so what remains is only whether bridge/yamux tasks should follow it.
+  at all. The yamux half of the follow-up question was measured 2026-11-21 (below)
+  and needs no private thread; what remains open is the per-connection bridge
+  path, where one worker still carries ~85% of the pool's aggregate without a
+  mechanism.
   Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
   2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
 
@@ -13067,13 +13070,44 @@ kept out of the main P2 list so that adding them does not renumber every later
   means no yamux task exists in these arms at all. Pinning only bridge/yamux onto
   another runtime is untested here.
 
+  **Measured 2026-11-21 (same macOS host, `tcpMux` on and off, eight connections,
+  five interleaved reps per cell, `scripts/worker-fan-in-probe.sh`; method,
+  per-rep numbers and the withdrawn first draft in
+  [`2026-11-21-worker-migration-mux.md`](docs/archive/notes/2026-11-21-worker-migration-mux.md)):**
+  with `tcpMux` **off**, one client worker carries **0.84×** of the default
+  pool's aggregate (0.88× by median; per-rep 0.69-0.96), reproducing the fan-in
+  deficit above; with `tcpMux` **on**, one worker carries **0.94×** (0.95×
+  median; three of five reps at 0.98, and two runs on a quiet host measured 0.93).
+  So the yamux path leaves a **5-6%** deficit: the pool is still ahead, by much
+  less — one worker is never the faster choice. One connection is flat at every
+  worker count in both modes (0.99×), so this is fan-in, not a slow runtime.
+
+  An earlier draft of the same probe reported **1.06×** for the `tcpMux` arm, and
+  this item briefly claimed one worker was faster there. That was a measurement
+  fault, not a finding: the arms were blocked rather than interleaved, and the
+  one-worker arm is the load-sensitive one (12% spread across runs against the
+  pool's 1.6%), so on a contended host a 5% effect changes sign. The committed
+  probe interleaves the arms and truncates each rep's JSON; the note records the
+  correction.
+
+  That answers the half this item left open: pinning **yamux** tasks onto a
+  private runtime has no deficit worth recovering — 5-6% does not justify
+  splitting a session across two runtimes, which is the defect this item exists
+  to remove. The 0.84× lives in the per-connection bridge path, where the remedy
+  is more workers, not a private thread. Two things this probe does not settle:
+  bridge-only pinning is not isolated (it also folds eight work connections into
+  one, and `tcpMux` costs ~28% of throughput by itself, so the `tcpMux` ratios sit
+  in a different regime), and the split between "the yamux task" and "the fold"
+  is open — an exploratory `pool_count = 8` arm kept the pool ahead in 4/4 reps,
+  consistent with the yamux reading and not proof of it.
+
   What it does change is the trigger above: that trigger already sits inside its
   own threshold — 2266 MiB/s at eight sessions against 2570 on one flow is
   **0.88×**, and that host's four-worker eight-session figure (2867) is 1.12× its
   one-flow rate
   (`docs/archive/notes/2026-11-13-splice-wrapper-peel.md:80-83`). An absolute
   8/1 ratio measures the host and the byte counting; what holds across both hosts
-  is the worker-relative figure (77-79% here, 2266/2867 = 79% there), so re-open
+  is the worker-relative figure (0.84-0.88 here, 2266/2867 = 79% there), so re-open
   on a change in that, or in the 1→2 step and anything beyond four — two to four
   is flat here.
 
