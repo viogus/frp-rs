@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 
 // `bpaf::*` re-exports the combinator functions but not this builder type, which
-// [`go_bool_named`] returns.
+// [`go_bool_named`] and [`named_with_aliases`] return.
 use bpaf::parsers::NamedArg;
 use bpaf::Parser;
 use bpaf::*;
@@ -152,16 +152,22 @@ pub(crate) fn go_bool_named(
     named.help(help)
 }
 
-/// [`go_bool_named`] for a bool that frp-rs spells out but Go registers under a
-/// short name (`--uc`/`--ue`): the aliases are appended as bpaf's hidden longs,
-/// so only the first (`name`) is rendered while every spelling parses. The
-/// string flags use the same pattern for `--custom-domain`/`--sd`/`--mux`/
-/// `--tls-server-name`.
-pub(crate) fn go_bool_named_with_aliases(
+/// A row's spelling list: the primary long first (the only spelling bpaf
+/// renders), then the hidden aliases, then the shorthand when the row has one.
+///
+/// Every flag the proxy surfaces spell differently from Go (`--custom-domain`,
+/// `--sd`, `--mux`, `--tls-server-name`, `--ue`, `--uc`) takes Go's spelling as
+/// the primary and keeps frp-rs's older spelling as an alias, so one order —
+/// primary, aliases, short — has to hold everywhere or the rendered `--help`
+/// starts showing a spelling its byte pins do not expect.
+///
+/// `short` is an `Option<char>` and not a `char` because a row may have no
+/// shorthand at all (sudp's `--remote-port`), and bpaf offers no way to say that
+/// by omission.
+pub(crate) fn named_with_aliases(
     name: &'static str,
     aliases: &'static [&'static str],
     short: Option<char>,
-    help: &'static str,
 ) -> NamedArg {
     let mut named = long(name);
     for alias in aliases {
@@ -170,5 +176,19 @@ pub(crate) fn go_bool_named_with_aliases(
     if let Some(short) = short {
         named = named.short(short);
     }
-    named.help(help)
+    named
+}
+
+/// [`go_bool_named`] for a bool that frp-rs spells out but Go registers under a
+/// short name (`--uc`/`--ue`): the aliases are appended as bpaf's hidden longs,
+/// so only the first (`name`) is rendered while every spelling parses. The
+/// string flags use the same pattern for `--custom-domain`/`--sd`/`--mux`/
+/// `--tls-server-name`, through [`named_with_aliases`].
+pub(crate) fn go_bool_named_with_aliases(
+    name: &'static str,
+    aliases: &'static [&'static str],
+    short: Option<char>,
+    help: &'static str,
+) -> NamedArg {
+    named_with_aliases(name, aliases, short).help(help)
 }

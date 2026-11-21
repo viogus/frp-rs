@@ -1515,6 +1515,215 @@ fn every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases() {
     }
 }
 
+/// Every proxy surface accepts each alias the row list declares for it.
+///
+/// The alias column of `proxy_flag_specs` is invisible to `--help` — aliases
+/// never render — so before this test only the `go_bool` rows had a runtime
+/// witness ([`every_proxy_surface_accepts_go_bool_names_and_their_frp_rs_aliases`]).
+/// The adversarial review of #656 measured that deleting `"http_user"` from
+/// the http row, or `"remote_port"` from the tcp row, left **both** suites and
+/// every `--help` pin green while silently refusing command lines that used to
+/// parse. This table is that column transcribed: one entry per `(surface,
+/// canonical long, alias)`, so a dropped alias reds a named assertion instead
+/// of vanishing.
+///
+/// The five common rows' aliases are declared on all eight surfaces, so they
+/// are applied to every surface here and stated once; the per-surface tails
+/// are listed per surface. `go_bool` rows are excluded because the test above
+/// already walks them by argv.
+#[test]
+fn every_proxy_surface_accepts_the_aliases_its_rows_declare() {
+    /// `(long, alias)` for the eight fields every proxy command declares.
+    const COMMON: [(&str, &str); 5] = [
+        ("local-ip", "local_ip"),
+        ("local-port", "local_port"),
+        ("proxy-name", "proxy_name"),
+        ("server-addr", "server_addr"),
+        ("server-port", "server_port"),
+    ];
+    /// `(surface, [(long, alias)])` for the rows only that surface declares.
+    const PER_SURFACE: [(&str, &[(&str, &str)]); 8] = [
+        ("tcp", &[("remote-port", "remote_port")]),
+        ("udp", &[("remote-port", "remote_port")]),
+        (
+            "http",
+            &[
+                ("custom-domain", "custom-domains"),
+                ("custom-domain", "custom_domain"),
+                ("host-header-rewrite", "host_header_rewrite"),
+                ("http-pwd", "http_pwd"),
+                ("http-user", "http_user"),
+                ("sd", "subdomain"),
+            ],
+        ),
+        (
+            "https",
+            &[
+                ("custom-domain", "custom-domains"),
+                ("custom-domain", "custom_domain"),
+                ("sd", "subdomain"),
+            ],
+        ),
+        (
+            "stcp",
+            &[
+                ("tls-server-name", "server-name"),
+                ("tls-server-name", "server_name"),
+            ],
+        ),
+        (
+            "xtcp",
+            &[
+                ("tls-server-name", "server-name"),
+                ("tls-server-name", "server_name"),
+            ],
+        ),
+        ("sudp", &[("remote-port", "remote_port")]),
+        (
+            "tcpmux",
+            &[
+                ("custom-domain", "custom-domains"),
+                ("custom-domain", "custom_domain"),
+                ("sd", "subdomain"),
+            ],
+        ),
+    ];
+    fn value(long: &str) -> &'static str {
+        match long {
+            "custom-domain" => "h.example",
+            "host-header-rewrite" => "h",
+            "http-pwd" => "p",
+            "http-user" => "u",
+            "local-ip" => "10.0.0.1",
+            "local-port" => "1",
+            "proxy-name" => "p",
+            "remote-port" => "2",
+            "sd" => "sub",
+            "server-addr" => "10.0.0.2",
+            "server-port" => "7001",
+            "tls-server-name" => "n",
+            other => panic!("no sample value for the proxy row `{other}`"),
+        }
+    }
+    for (surface, extras) in PER_SURFACE {
+        let required: &[&str] = match surface {
+            "tcp" => &["--local-port", "1", "--remote-port", "2"],
+            "udp" => &["--local-port", "1", "--remote-port", "2"],
+            "http" => &["--local-port", "1", "--custom-domain", "h.example"],
+            "https" => &["--local-port", "1", "--custom-domain", "h.example"],
+            "stcp" | "xtcp" => &["--local-port", "1", "--sk", "s"],
+            "sudp" => &["--local-port", "1", "--remote-port", "1"],
+            "tcpmux" => &["--local-port", "1"],
+            other => panic!("no minimal argv for `{other}`"),
+        };
+        let aliases = COMMON.iter().copied().chain(extras.iter().copied());
+        for (long, alias) in aliases {
+            let canonical = format!("--{long}");
+            let spelling = format!("--{alias}");
+            let mut argv: Vec<String> = vec![surface.to_string()];
+            let mut substituted = false;
+            for arg in required {
+                if *arg == canonical {
+                    argv.push(spelling.clone());
+                    substituted = true;
+                } else {
+                    argv.push((*arg).to_string());
+                }
+            }
+            if !substituted {
+                argv.push(spelling.clone());
+                argv.push(value(long).to_string());
+            }
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            parse_frpc_proxy(&refs).unwrap_or_else(|e| {
+                panic!(
+                    "`{spelling}` is the alias `proxy_flag_specs` declares for `--{long}` \
+                     on `frpc {surface}`, but `{}` was refused: {e:?}",
+                    refs.join(" ")
+                )
+            });
+        }
+    }
+}
+
+/// Each proxy row's `fallback:` cell matches the default its own usage prints.
+///
+/// The two live in different places — the fallback in `proxy_flag_specs`, the
+/// `(default …)` text in the `FRPC_PROXY_GO_FLAGS` row that renders — so a row
+/// can dial one port while its help claims another. Changing
+/// `server_port`'s `fallback: 7000` to `7001` was measured to leave every test
+/// and every `--help` pin green: a correct-looking document from a wrong row
+/// list. This is the "one statement, two derivations" check for that cell.
+#[test]
+fn every_proxy_row_fallback_matches_the_default_its_usage_prints() {
+    fn printed_default(long: &str) -> String {
+        let row = FRPC_PROXY_GO_FLAGS
+            .iter()
+            .find(|row| row.long == long)
+            .unwrap_or_else(|| panic!("no Go row for `{long}`"));
+        let start = row
+            .usage
+            .find("(default ")
+            .unwrap_or_else(|| panic!("`{long}`'s usage prints no default: {:?}", row.usage))
+            + "(default ".len();
+        let rest = &row.usage[start..];
+        let end = rest
+            .find(')')
+            .unwrap_or_else(|| panic!("`{long}`'s default is unterminated: {:?}", row.usage));
+        rest[..end].trim_matches('"').to_string()
+    }
+    const SURFACES: [(&str, &[&str]); 8] = [
+        ("tcp", &["--local-port", "1", "--remote-port", "2"]),
+        ("udp", &["--local-port", "1", "--remote-port", "2"]),
+        (
+            "http",
+            &["--local-port", "1", "--custom-domain", "h.example"],
+        ),
+        (
+            "https",
+            &["--local-port", "1", "--custom-domain", "h.example"],
+        ),
+        ("stcp", &["--local-port", "1", "--sk", "s"]),
+        ("xtcp", &["--local-port", "1", "--sk", "s"]),
+        ("sudp", &["--local-port", "1", "--remote-port", "1"]),
+        ("tcpmux", &["--local-port", "1"]),
+    ];
+    for (surface, required) in SURFACES {
+        let mut argv: Vec<&str> = vec![surface];
+        argv.extend_from_slice(required);
+        let command = parse_frpc_proxy(&argv).unwrap_or_else(|e| panic!("frpc {surface}: {e:?}"));
+        let (local_ip, server_addr, server_port) = match &command {
+            FrpcCmd::Tcp(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Udp(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Http(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Https(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Stcp(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Xtcp(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Sudp(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            FrpcCmd::Tcpmux(a) => (a.local_ip.clone(), a.server_addr.clone(), a.server_port),
+            other => panic!("expected a proxy command, got {other:?}"),
+        };
+        assert_eq!(
+            local_ip,
+            printed_default("local-ip"),
+            "frpc {surface}: the `local_ip` fallback disagrees with the default \
+             `--local-ip` prints"
+        );
+        assert_eq!(
+            server_addr,
+            printed_default("server-addr"),
+            "frpc {surface}: the `server_addr` fallback disagrees with the default \
+             `--server-addr` prints"
+        );
+        assert_eq!(
+            server_port.to_string(),
+            printed_default("server-port"),
+            "frpc {surface}: the `server_port` fallback disagrees with the default \
+             `--server-port` prints"
+        );
+    }
+}
+
 #[test]
 fn every_go_bool_flag_rejects_a_repeated_flag() {
     // Recorded divergence, not a claim of parity: Go's pflag is last-wins

@@ -81,139 +81,57 @@ macro_rules! frpc_root_args_struct {
 
 frpc_root_flag_specs!(frpc_root_args_struct);
 
-#[derive(Debug, Clone)]
-pub struct TcpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub remote_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-    pub proxy_name: Option<String>,
+/// `proxy_flag_specs`' struct arm: the rows become the eight single-proxy
+/// argument structs.
+///
+/// A struct has to be generated **whole** — a macro cannot expand to struct
+/// fields (`struct S { fields!() }` is `error: unexpected token: '!'`) — so one
+/// expansion emits both halves, the common rows first and the command's own rows
+/// after. That is what the `common $common:tt` carrier is for:
+/// `proxy_args_structs` takes the `common { … }` block as a single token tree
+/// and hands it to `proxy_args_struct` for each command, whose pattern
+/// destructures it beside that command's rows.
+///
+/// Nesting the two row repetitions in one output repetition instead — the
+/// obvious first draft — does not compile, because the outer repetition drives
+/// both: the error is a repetition mismatch naming the common rows' meta and the
+/// command rows' meta, and its two counts are the two lists' lengths. Reproduced
+/// standalone with three common rows and two command rows, where the compiler
+/// said: meta-variable `cf` repeats 3 times, but `f` repeats 2 times.
+///
+/// The emitted field order is common-then-own, not the order the hand-written
+/// structs used (stcp/xtcp declared `sk` and `server_name` first). Nothing reads
+/// it: none of these structs derives `Serialize`/`Deserialize`, every
+/// `construct!` fills by field name, the help renderer sorts by long
+/// (`frp-core/src/cli/help_render.rs`), and no test asserts `Debug` output.
+///
+/// This arm ignores the group's variant, function name and command name; the
+/// parser arm spends them.
+macro_rules! proxy_args_struct {
+    (
+        { $( ( $(#[$cdoc:meta])* $cfield:ident : $cty:ty, $($crest:tt)* ) ),* $(,)? }
+        | $sname:ident | $variant:ident | $fn:ident | $command:literal
+        | $( ( $(#[$fdoc:meta])* $field:ident : $ty:ty, $($rest:tt)* ) ),* $(,)?
+    ) => {
+        #[derive(Debug, Clone)]
+        pub struct $sname {
+            $( $(#[$cdoc])* pub $cfield: $cty, )*
+            $( $(#[$fdoc])* pub $field: $ty, )*
+        }
+    };
 }
 
-#[derive(Debug, Clone)]
-pub struct UdpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub remote_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-    pub proxy_name: Option<String>,
+/// `proxy_flag_specs`' struct arm, applied to every command group.
+macro_rules! proxy_args_structs {
+    (
+        common $common:tt
+        $( $sname:ident as $variant:ident, $fn:ident, $command:literal { $( $row:tt )* } )+
+    ) => {
+        $( proxy_args_struct! { $common | $sname | $variant | $fn | $command | $( $row )* } )+
+    };
 }
 
-#[derive(Debug, Clone)]
-pub struct HttpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub custom_domains: String,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub subdomain: Option<String>,
-    pub locations: Option<String>,
-    pub http_user: Option<String>,
-    pub http_pwd: Option<String>,
-    pub host_header_rewrite: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpsArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    pub custom_domains: String,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub subdomain: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct StcpArgs {
-    pub sk: String,
-    pub server_name: Option<String>,
-    pub local_ip: String,
-    pub local_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    /// Go's `-n/--proxy-name`. frp-rs's `--tls-server-name` double-duties as the
-    /// proxy name here (a pre-existing mismatch with Go, where it sets the
-    /// client's TLS SNI); when both are given `--proxy-name` wins.
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct XtcpArgs {
-    pub sk: String,
-    pub server_name: Option<String>,
-    pub local_ip: String,
-    pub local_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    /// See [`StcpArgs::proxy_name`].
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct SudpArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    /// frp-rs extension: Go's `frpc sudp` registers **no** `remote_port` at all
-    /// (and, measured on the v0.71.0 binary, refuses both `-r` and
-    /// `--remote-port`). The long form predates this branch and stays for
-    /// command lines written against it; it carries no `-r` shorthand, so it can
-    /// never be mistaken for Go's row.
-    pub remote_port: u16,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    /// Go's `--sk` on this surface (`ProxyConfig::sk`, honoured by the server's
-    /// visitor sign-key path). Optional like Go's, which defaults it to "".
-    pub sk: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct TcpmuxArgs {
-    pub local_ip: String,
-    pub local_port: u16,
-    /// frp-rs extension: a port the tcpmux path never used (the server routes by
-    /// domain and reads `multiplexer`, not this). Defaults to 0 when omitted.
-    pub mux_port: u16,
-    /// Go's `--mux string`: the multiplexer name. `None` means Go's default
-    /// (`httpconnect`), which is all frp-rs's server implements.
-    pub mux: Option<String>,
-    /// Go's `-d/--custom-domain strings` on this surface, comma-joined like the
-    /// http/https surfaces (Go's StringSlice, narrowed to the same grammar).
-    pub custom_domains: Option<String>,
-    /// Go's `--sd`.
-    pub subdomain: Option<String>,
-    pub server_addr: String,
-    pub server_port: u16,
-    pub token: Option<String>,
-    pub proxy_name: Option<String>,
-    pub use_encryption: bool,
-    pub use_compression: bool,
-}
+proxy_flag_specs!(proxy_args_structs);
 
 #[derive(Debug, Clone)]
 pub struct VerifyArgs {
@@ -428,586 +346,88 @@ pub(crate) fn run_mode() -> impl Parser<FrpcRunArgs> {
     })
 }
 
-// ─── Subcommand parsers (inlined — bpaf construct! doesn't support destructuring tuples from parser fns) ───
-pub(crate) fn tcp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    let remote_port = long("remote-port")
-        .long("remote_port")
-        .short('r')
-        .argument::<u16>("PORT");
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    // Go registers this pair on every proxy surface as `--uc` ("use
-    // compression") and `--ue` ("use encryption"), both pflag bools; frp-rs
-    // used to spell them out and accept neither of Go's names. Go's names are
-    // now the primary longs (the only ones rendered) and the old spellings are
-    // hidden aliases, so both command lines parse. The value grammar is Go's —
-    // measured, `frpc tcp --ue=false …` is accepted by Go and the proxy runs.
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let args = construct!(TcpArgs {
-        local_ip,
-        local_port,
-        remote_port,
-        server_addr,
-        server_port,
-        token,
-        use_encryption,
-        use_compression,
-        proxy_name,
-    });
-    single_proxy_cmd(args, FrpcCmd::Tcp)
-        .to_options()
-        .command("tcp")
-        .help("Run frpc with a single tcp proxy")
+// ─── The eight single-proxy parsers, generated from `proxy_flag_specs` ───
+
+/// One row's flag as a parser expression — the four kinds [`proxy_flag_specs`]
+/// declares.
+///
+/// Each rule expands to an **expression**, and the `let` that names it is
+/// written by `proxy_cmd_parser`, not here: the row's tokens carry the row
+/// list's syntax context, so a binder emitted inside this macro would not be the
+/// binding its own initialiser produces. That is the same hygiene rule that
+/// keeps the `construct!` call in `proxy_cmd_parser`.
+///
+/// Aliases are chained *after* the primary `long`, which is the only one bpaf
+/// renders. An alias parses and never shows, which is what keeps the `--help`
+/// pins measuring exactly one spelling per row.
+macro_rules! proxy_field_parser {
+    ( str, $long:literal, [ $( $alias:literal ),* ], $short:expr, $metavar:literal ) => {
+        named_with_aliases($long, &[ $( $alias ),* ], $short).argument::<String>($metavar)
+    };
+    ( str, $long:literal, [ $( $alias:literal ),* ], $short:expr, $metavar:literal, fallback: $fallback:expr ) => {
+        named_with_aliases($long, &[ $( $alias ),* ], $short)
+            .argument::<String>($metavar)
+            .fallback($fallback.into())
+    };
+    ( u16, $long:literal, [ $( $alias:literal ),* ], $short:expr, $metavar:literal ) => {
+        named_with_aliases($long, &[ $( $alias ),* ], $short).argument::<u16>($metavar)
+    };
+    ( u16, $long:literal, [ $( $alias:literal ),* ], $short:expr, $metavar:literal, fallback: $fallback:expr ) => {
+        named_with_aliases($long, &[ $( $alias ),* ], $short)
+            .argument::<u16>($metavar)
+            .fallback($fallback)
+    };
+    ( opt_str, $long:literal, [ $( $alias:literal ),* ], $short:expr, $metavar:literal ) => {
+        named_with_aliases($long, &[ $( $alias ),* ], $short)
+            .argument::<String>($metavar)
+            .optional()
+    };
+    ( go_bool, $long:literal, [ $( $alias:literal ),* ], $meaning:literal ) => {
+        go_bool_flag_with_aliases!($long, &[ $( $alias ),* ], None, $meaning)
+    };
 }
 
-pub(crate) fn udp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    let remote_port = long("remote-port")
-        .long("remote_port")
-        .short('r')
-        .argument::<u16>("PORT");
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(UdpArgs {
-        local_ip,
-        local_port,
-        remote_port,
-        server_addr,
-        server_port,
-        token,
-        use_encryption,
-        use_compression,
-        proxy_name,
-    });
-    single_proxy_cmd(args, FrpcCmd::Udp)
-        .to_options()
-        .command("udp")
-        .help("Run frpc with a single udp proxy")
+/// `proxy_flag_specs`' parser arm, one command at a time.
+///
+/// Every `let` and the `construct!` that consumes them come out of this one
+/// expansion, which is what makes the construct site legal: a macro cannot name
+/// a local at its call site (the constraint recorded on `frpc_root_args_struct`),
+/// but it can emit the local itself and name that. [`proxy_args_struct`]
+/// generates the struct the same way from the same rows, so the names in this
+/// call are the names in that struct by construction rather than by review.
+///
+/// The command's help text comes from `FRPC_COMMAND_SHORTS`, the table the root
+/// document renders — one statement of the text instead of a fourth copy that
+/// only a byte pin would catch drifting.
+macro_rules! proxy_cmd_parser {
+    (
+        { $( ( $(#[$cdoc:meta])* $cfield:ident : $cty:ty, $($crest:tt)* ) ),* $(,)? }
+        | $sname:ident | $variant:ident | $fn:ident | $command:literal
+        | $( ( $(#[$fdoc:meta])* $field:ident : $ty:ty, $($rest:tt)* ) ),* $(,)?
+    ) => {
+        pub(crate) fn $fn() -> impl Parser<FrpcCmd> {
+            $( let $cfield = proxy_field_parser!($($crest)*); )*
+            $( let $field = proxy_field_parser!($($rest)*); )*
+            let args = construct!($sname { $( $cfield, )* $( $field, )* });
+            single_proxy_cmd(args, FrpcCmd::$variant)
+                .to_options()
+                .command($command)
+                .help(command_short(RootCommand::Frpc, $command))
+        }
+    };
 }
 
-pub(crate) fn http_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    let custom_domains = long("custom-domain")
-        .long("custom-domains")
-        .long("custom_domain")
-        .short('d')
-        .argument::<String>("DOMAINS");
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    let subdomain = long("sd")
-        .long("subdomain")
-        .argument::<String>("SUB")
-        .optional();
-    let locations = long("locations").argument::<String>("LOCS").optional();
-    let http_user = long("http-user")
-        .long("http_user")
-        .argument::<String>("USER")
-        .optional();
-    let http_pwd = long("http-pwd")
-        .long("http_pwd")
-        .argument::<String>("PWD")
-        .optional();
-    let host_header_rewrite = long("host-header-rewrite")
-        .long("host_header_rewrite")
-        .argument::<String>("HOST")
-        .optional();
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(HttpArgs {
-        local_ip,
-        local_port,
-        custom_domains,
-        server_addr,
-        server_port,
-        token,
-        subdomain,
-        locations,
-        http_user,
-        http_pwd,
-        host_header_rewrite,
-        proxy_name,
-        use_encryption,
-        use_compression,
-    });
-    single_proxy_cmd(args, FrpcCmd::Http)
-        .to_options()
-        .command("http")
-        .help("Run frpc with a single http proxy")
+/// `proxy_flag_specs`' parser arm, applied to every command group.
+macro_rules! proxy_cmd_parsers {
+    (
+        common $common:tt
+        $( $sname:ident as $variant:ident, $fn:ident, $command:literal { $( $row:tt )* } )+
+    ) => {
+        $( proxy_cmd_parser! { $common | $sname | $variant | $fn | $command | $( $row )* } )+
+    };
 }
 
-pub(crate) fn https_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    let custom_domains = long("custom-domain")
-        .long("custom-domains")
-        .long("custom_domain")
-        .short('d')
-        .argument::<String>("DOMAINS");
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    let subdomain = long("sd")
-        .long("subdomain")
-        .argument::<String>("SUB")
-        .optional();
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(HttpsArgs {
-        local_ip,
-        local_port,
-        custom_domains,
-        server_addr,
-        server_port,
-        token,
-        subdomain,
-        proxy_name,
-        use_encryption,
-        use_compression,
-    });
-    single_proxy_cmd(args, FrpcCmd::Https)
-        .to_options()
-        .command("https")
-        .help("Run frpc with a single https proxy")
-}
-
-pub(crate) fn stcp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    let sk = long("sk").argument::<String>("SECRET");
-    let server_name = long("tls-server-name")
-        .long("server-name")
-        .long("server_name")
-        .argument::<String>("NAME")
-        .optional();
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    // Go registers `-n/--proxy-name` on every proxy surface, this one included;
-    // frp-rs's `--tls-server-name` above is where the name used to come from.
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(StcpArgs {
-        sk,
-        server_name,
-        local_ip,
-        local_port,
-        server_addr,
-        server_port,
-        token,
-        proxy_name,
-        use_encryption,
-        use_compression,
-    });
-    single_proxy_cmd(args, FrpcCmd::Stcp)
-        .to_options()
-        .command("stcp")
-        .help("Run frpc with a single stcp proxy")
-}
-
-pub(crate) fn xtcp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    let sk = long("sk").argument::<String>("SECRET");
-    let server_name = long("tls-server-name")
-        .long("server-name")
-        .long("server_name")
-        .argument::<String>("NAME")
-        .optional();
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(XtcpArgs {
-        sk,
-        server_name,
-        local_ip,
-        local_port,
-        server_addr,
-        server_port,
-        token,
-        proxy_name,
-        use_encryption,
-        use_compression,
-    });
-    single_proxy_cmd(args, FrpcCmd::Xtcp)
-        .to_options()
-        .command("xtcp")
-        .help("Run frpc with a single xtcp proxy")
-}
-
-pub(crate) fn sudp_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    // frp-rs extension: Go's `frpc sudp` registers **no** remote-port flag at
-    // all, and the v0.71.0 binary refuses both spellings (`unknown shorthand
-    // flag: 'r'`, `unknown flag: --remote-port`). The long form predates this
-    // branch and stays for command lines written against it; it deliberately
-    // carries no `-r`, so it can never be mistaken for Go's tcp/udp row. It is
-    // still **required** here (no fallback): that is pre-existing behaviour this
-    // round did not change, and it is recorded as a residual — a Go-shaped
-    // `frpc sudp --sk s -l 1` parses on Go but not on frp-rs.
-    let remote_port = long("remote-port")
-        .long("remote_port")
-        .argument::<u16>("PORT");
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    // Go registers `--sk` on this surface too; frp-rs used to leave sudp with
-    // no way to set the visitor secret key. Optional, like Go (default "").
-    let sk = long("sk").argument::<String>("SECRET").optional();
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(SudpArgs {
-        local_ip,
-        local_port,
-        remote_port,
-        server_addr,
-        server_port,
-        token,
-        sk,
-        proxy_name,
-        use_encryption,
-        use_compression,
-    });
-    single_proxy_cmd(args, FrpcCmd::Sudp)
-        .to_options()
-        .command("sudp")
-        .help("Run frpc with a single sudp proxy")
-}
-
-pub(crate) fn tcpmux_cmd() -> impl Parser<FrpcCmd> {
-    let local_ip = long("local-ip")
-        .long("local_ip")
-        .short('i')
-        .argument::<String>("IP")
-        .fallback("127.0.0.1".into());
-    let local_port = long("local-port")
-        .long("local_port")
-        .short('l')
-        .argument::<u16>("PORT");
-    // frp-rs's own tcpmux port flag, kept for compatibility with command lines
-    // written against it. Go's `frpc tcpmux` has **no** port flag at all: its
-    // help carries neither `--remote-port` nor anything else numeric beyond
-    // `--local-port`, because the front listens on the server's
-    // `tcpmuxHTTPConnectPort`, and frp-rs's server never reads a tcpmux proxy's
-    // `remote_port` either. It is optional (Go's own command line does not carry
-    // it) and its row is an frp-rs extension.
-    let mux_port = long("mux-port")
-        .long("mux_port")
-        .argument::<u16>("PORT")
-        .fallback(0);
-    // Go's `--mux string` names the multiplexer — it is **not** the port. The
-    // same spelling means the same thing in frp-server's SSH gateway
-    // (`frp-server/src/ssh_gateway/args.rs:692`), and `ProxyConfig::multiplexer`
-    // (frp-core/src/config/client.rs:1142) is where it lands. A literal
-    // `--mux-port`→`--mux` rename would have rendered `--mux int` and rejected
-    // Go's string value; this is the flag Go actually has.
-    let mux = long("mux").argument::<String>("MUX").optional();
-    // Go registers the same domain pair here as on http/https (`custom_domain`
-    // `-d`, `sd`); frp-rs's server already routes on them
-    // (`frp-server/src/control/proxy_ops/vhost.rs:33`). Comma-joined like http.
-    let custom_domains = long("custom-domain")
-        .long("custom-domains")
-        .long("custom_domain")
-        .short('d')
-        .argument::<String>("DOMAINS")
-        .optional();
-    let subdomain = long("sd")
-        .long("subdomain")
-        .argument::<String>("SUB")
-        .optional();
-    let server_addr = long("server-addr")
-        .long("server_addr")
-        .short('s')
-        .argument::<String>("HOST")
-        .fallback("127.0.0.1".into());
-    let server_port = long("server-port")
-        .long("server_port")
-        .short('P')
-        .argument::<u16>("PORT")
-        .fallback(7000);
-    let token = long("token")
-        .short('t')
-        .argument::<String>("TOKEN")
-        .optional();
-    let proxy_name = long("proxy-name")
-        .long("proxy_name")
-        .short('n')
-        .argument::<String>("NAME")
-        .optional();
-    let use_encryption = go_bool_flag_with_aliases!(
-        "ue",
-        &["use-encryption", "use_encryption"],
-        None,
-        "use encryption",
-    );
-    let use_compression = go_bool_flag_with_aliases!(
-        "uc",
-        &["use-compression", "use_compression"],
-        None,
-        "use compression",
-    );
-    let args = construct!(TcpmuxArgs {
-        local_ip,
-        local_port,
-        mux_port,
-        mux,
-        custom_domains,
-        subdomain,
-        server_addr,
-        server_port,
-        token,
-        proxy_name,
-        use_encryption,
-        use_compression,
-    });
-    single_proxy_cmd(args, FrpcCmd::Tcpmux)
-        .to_options()
-        .command("tcpmux")
-        .help("Run frpc with a single tcpmux proxy")
-}
+proxy_flag_specs!(proxy_cmd_parsers);
 
 pub(crate) fn verify_cmd() -> impl Parser<FrpcCmd> {
     // `-c` is required here and last-wins on repetition — see [`config_arg`].
