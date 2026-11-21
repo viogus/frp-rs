@@ -30,6 +30,26 @@
 /// and `concat!` is the only way to build the per-flag help while keeping the
 /// flag name in the rendered text *derived from the name the parser registers*
 /// — the help cannot end up naming a different flag.
+///
+/// `$meaning` is **not** the text a user reads. It feeds the `Doc` bpaf builds,
+/// and the only production path that sees a `Doc` replaces it before printing
+/// (`frp-core/src/cli/root.rs:36` hands it to [`render_cobra_help`], which takes
+/// each flag's description from the `GoFlagRow.usage` cell instead). So there
+/// are two copies of every bool's description — this literal, pinned by
+/// `frp-core/src/cli/tests.rs`'s
+/// `every_go_bool_flag_help_states_its_own_spelling` (which reads it out of
+/// bpaf's rendered document), and the row cell, pinned by the `--help` byte
+/// documents — and they are **not compared with each other**. Seven of the ten
+/// bool sites drift: six differ only in case, the literals being
+/// sentence-capitalised (`"Version of frps"`) where the rows keep Go's lowercase
+/// (`"version of frps"`); `--dashboard-tls-mode` differs in wording as well — the
+/// row carries Go's `"if enable dashboard tls mode"`, the literal says
+/// `"Enable dashboard TLS mode"`; and `--ue`/`--uc`/`--json` agree exactly. All
+/// of that is harmless for the same reason and would not be if the literal were
+/// the text printed. Do not "fix" one side to
+/// match the other without knowing which document the change is about: the row
+/// is what prints, the literal is only what bpaf's own document would have
+/// printed.
 macro_rules! go_bool_flag {
     ($name:literal, $alias:expr, $short:expr, $meaning:literal $(,)?) => {
         go_bool_flag_impl!(

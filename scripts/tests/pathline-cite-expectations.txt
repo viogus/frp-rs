@@ -20,7 +20,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=611 weak=132 ambiguous=2 excluded=101 foreign_reported=1163 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=b868ac7b5291e983 ambiguous_set=fbd8449054b4b1a2 excluded_set=611f43121f84b344
+#   pins: checked=612 weak=132 ambiguous=2 excluded=101 foreign_reported=1163 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=b868ac7b5291e983 ambiguous_set=fbd8449054b4b1a2 excluded_set=611f43121f84b344
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2384	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2384	1524
@@ -164,6 +164,7 @@ frp-core/src/cli/frps.rs	557	-	9f6d56b8ef9681ab	-	absolute	frps/tests/cli_exit_c
 frp-core/src/cli/help_render.rs	233	-	925493ffd462096a	-	absolute	frp-core/src/cli/flag_tables.rs	frp-core/src/cli/help_render.rs:233	53
 frp-core/src/cli/mod.rs	35	-	f9b7ca85ee08a398	-	absolute	scripts/tests/todo-cite-guard-fixtures.sh	frp-core/src/cli/mod.rs:35	301
 frp-core/src/cli/root.rs	232	-	b3819b53728e0442	-	absolute	docs/developing.md	frp-core/src/cli/root.rs:232	266
+frp-core/src/cli/root.rs	36	-	514615e99dae35e8	-	absolute	frp-core/src/cli/macros.rs	frp-core/src/cli/root.rs:36	36
 frp-core/src/cli/tests.rs	798	800	9f192f8f06883190	ac1c80de0313cad2	absolute	frp-core/src/config/server.rs	frp-core/src/cli/tests.rs:798-800	411
 frp-core/src/config/client.rs	1016	-	758e9072b5d69f64	-	absolute	docs/developing.md	frp-core/src/config/client.rs:1016	196
 frp-core/src/config/client.rs	1052	-	b67f9b842f524947	-	absolute	docs/developing.md	frp-core/src/config/client.rs:1052	4123
