@@ -13427,16 +13427,21 @@ needs the two-review rule and its own gate run.
       client-side fields (`server_addr`, `server_port`, `token`) are named and
       discarded on purpose. What the compiler asks for is a destination, not a
       correct one: `field: _` compiles, so the three discards above are honest
-      only because the header says where those fields go. The same hazard is
-      untouched on the three field-by-field readers that are not builders —
-      `override_server_config` (`frp-core/src/cli/frps.rs:588`, a chain of
-      `if let Some(ref v) = self.token` arms), the `frpc` root flags (read at
-      hand-written sites: `frpc/src/main.rs:317` `worker_threads_from_args`,
-      `:540` `init_logging`, and the `run_normal` body) and the admin flags (six
-      positional arguments to `resolve_admin_connection` at
-      `frpc/src/main.rs:78`, called from `:1096`, `:1125`, `:1158`) — nothing
-      there is exhaustive, so a new row can compile and be read by nobody. The
-      same destructure is what would close each of them.
+      only because the header says where those fields go.
+      The same hazard was untouched on the field-by-field readers that are not
+      builders. `override_server_config` (`frp-core/src/cli/frps.rs:588`) is one
+      of them, and is now closed the same way: `frps` carries 31 rows and seven
+      of them are deliberately not overlaid (`config`, `config_dir`,
+      `strict_config`, `show_version`, `allow_unsafe`, `disable_log_color`,
+      `dashboard_tls_mode`), so the function's destructure names all 31 with a
+      per-field comment saying where the seven go, and a new row reddens it with
+      `E0027` (plus `E0063` from the generated parser and `From`). Two readers
+      are left: the `frpc` root flags (hand-written sites —
+      `frpc/src/main.rs:317` `worker_threads_from_args`, `:540` `init_logging`,
+      the `run_normal` body) and the admin flags (six positional arguments to
+      `resolve_admin_connection` at `frpc/src/main.rs:78`, called from `:1096`,
+      `:1125`, `:1158`); neither is exhaustive, so a new row there can compile
+      and be read by nobody.
       Two cells the `--help` pins cannot see are now witnessed directly, after
       the adversarial review measured that both could be wrong with every suite
       green: the `fallback:` cell (parsing a minimal command line per surface
