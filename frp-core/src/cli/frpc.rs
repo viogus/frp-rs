@@ -672,19 +672,42 @@ pub fn build_single_proxy_config(
 }
 
 // ─── ProxyConfig builders for each subcommand type ───────────────────
+//
+// Each `to_proxy_config` opens with an **exhaustive** destructure of its own
+// argument struct. That is the only thing holding the row list to the config
+// it feeds: the struct is generated from `proxy_flag_specs`, so a row added
+// there without a destination here fails to compile (`E0027`, "pattern does
+// not mention field `…`") instead of parsing into a field nothing reads.
+// The compiler asks for a destination, it does not prove one is right: binding
+// a field to `_` compiles, so the guarantee is "no field is forgotten", not
+// "no field is dropped". The three client-side fields every command carries —
+// `server_addr`, `server_port`, `token` — are discarded *here* precisely
+// because they are consumed at the call site: `run_single_proxy` in
+// `frpc/src/main.rs` hands them to `build_single_proxy_config`, which writes
+// them into `ClientConfig`.
 impl TcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
+        let Self {
+            local_ip,
+            local_port,
+            remote_port,
+            proxy_name,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .unwrap_or_else(|| format!("tcp-{}->{}", self.local_port, self.remote_port)),
+                .unwrap_or_else(|| format!("tcp-{}->{}", local_port, remote_port)),
             proxy_type: "tcp".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
-            remote_port: self.remote_port,
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
+            remote_port: *remote_port,
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -692,17 +715,27 @@ impl TcpArgs {
 
 impl UdpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
+        let Self {
+            local_ip,
+            local_port,
+            remote_port,
+            proxy_name,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .unwrap_or_else(|| format!("udp-{}->{}", self.local_port, self.remote_port)),
+                .unwrap_or_else(|| format!("udp-{}->{}", local_port, remote_port)),
             proxy_type: "udp".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
-            remote_port: self.remote_port,
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
+            remote_port: *remote_port,
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -710,31 +743,44 @@ impl UdpArgs {
 
 impl HttpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
-        let domains: Vec<String> = self
-            .custom_domains
+        let Self {
+            local_ip,
+            local_port,
+            custom_domains,
+            subdomain,
+            locations,
+            http_user,
+            http_pwd,
+            host_header_rewrite,
+            proxy_name,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
+        let domains: Vec<String> = custom_domains
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .unwrap_or_else(|| format!("http-{}", self.local_port)),
+                .unwrap_or_else(|| format!("http-{}", local_port)),
             proxy_type: "http".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
             custom_domains: domains,
-            subdomain: self.subdomain.clone().unwrap_or_default(),
-            locations: self
-                .locations
+            subdomain: subdomain.clone().unwrap_or_default(),
+            locations: locations
                 .clone()
                 .map(|l| l.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default(),
-            http_user: self.http_user.clone().unwrap_or_default(),
-            http_pwd: self.http_pwd.clone().unwrap_or_default(),
-            host_header_rewrite: self.host_header_rewrite.clone().unwrap_or_default(),
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            http_user: http_user.clone().unwrap_or_default(),
+            http_pwd: http_pwd.clone().unwrap_or_default(),
+            host_header_rewrite: host_header_rewrite.clone().unwrap_or_default(),
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -742,23 +788,33 @@ impl HttpArgs {
 
 impl HttpsArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
-        let domains: Vec<String> = self
-            .custom_domains
+        let Self {
+            local_ip,
+            local_port,
+            custom_domains,
+            subdomain,
+            proxy_name,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
+        let domains: Vec<String> = custom_domains
             .split(',')
             .map(|s| s.trim().to_string())
             .collect();
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .unwrap_or_else(|| format!("https-{}", self.local_port)),
+                .unwrap_or_else(|| format!("https-{}", local_port)),
             proxy_type: "https".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
             custom_domains: domains,
-            subdomain: self.subdomain.clone().unwrap_or_default(),
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            subdomain: subdomain.clone().unwrap_or_default(),
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -766,18 +822,29 @@ impl HttpsArgs {
 
 impl StcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
+        let Self {
+            local_ip,
+            local_port,
+            proxy_name,
+            server_name,
+            sk,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .or_else(|| self.server_name.clone())
+                .or_else(|| server_name.clone())
                 .unwrap_or_else(|| "stcp-proxy".into()),
             proxy_type: "stcp".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
-            sk: self.sk.clone(),
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
+            sk: sk.clone(),
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -785,18 +852,29 @@ impl StcpArgs {
 
 impl XtcpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
+        let Self {
+            local_ip,
+            local_port,
+            proxy_name,
+            server_name,
+            sk,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .or_else(|| self.server_name.clone())
+                .or_else(|| server_name.clone())
                 .unwrap_or_else(|| "xtcp-proxy".into()),
             proxy_type: "xtcp".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
-            sk: self.sk.clone(),
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
+            sk: sk.clone(),
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -804,18 +882,29 @@ impl XtcpArgs {
 
 impl SudpArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
+        let Self {
+            local_ip,
+            local_port,
+            remote_port,
+            proxy_name,
+            sk,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .unwrap_or_else(|| format!("sudp-{}->{}", self.local_port, self.remote_port)),
+                .unwrap_or_else(|| format!("sudp-{}->{}", local_port, remote_port)),
             proxy_type: "sudp".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
-            remote_port: self.remote_port,
-            sk: self.sk.clone().unwrap_or_default(),
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
+            remote_port: *remote_port,
+            sk: sk.clone().unwrap_or_default(),
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }
@@ -823,24 +912,36 @@ impl SudpArgs {
 
 impl TcpmuxArgs {
     pub fn to_proxy_config(&self) -> crate::config::ProxyConfig {
+        let Self {
+            local_ip,
+            local_port,
+            custom_domains,
+            subdomain,
+            mux,
+            mux_port,
+            proxy_name,
+            server_addr: _,
+            server_port: _,
+            token: _,
+            use_encryption,
+            use_compression,
+        } = self;
         crate::config::ProxyConfig {
-            name: self
-                .proxy_name
+            name: proxy_name
                 .clone()
-                .unwrap_or_else(|| format!("tcpmux-{}", self.local_port)),
+                .unwrap_or_else(|| format!("tcpmux-{}", local_port)),
             proxy_type: "tcpmux".into(),
-            local_ip: self.local_ip.clone(),
-            local_port: self.local_port,
-            custom_domains: self
-                .custom_domains
+            local_ip: local_ip.clone(),
+            local_port: *local_port,
+            custom_domains: custom_domains
                 .clone()
                 .map(|d| d.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default(),
-            subdomain: self.subdomain.clone().unwrap_or_default(),
-            remote_port: self.mux_port,
-            multiplexer: self.mux.clone().unwrap_or_else(|| "httpconnect".into()),
-            use_encryption: self.use_encryption,
-            use_compression: self.use_compression,
+            subdomain: subdomain.clone().unwrap_or_default(),
+            remote_port: *mux_port,
+            multiplexer: mux.clone().unwrap_or_else(|| "httpconnect".into()),
+            use_encryption: *use_encryption,
+            use_compression: *use_compression,
             ..Default::default()
         }
     }

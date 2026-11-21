@@ -1724,6 +1724,158 @@ fn every_proxy_row_fallback_matches_the_default_its_usage_prints() {
     }
 }
 
+/// Each surface's `to_proxy_config` maps the flags it parsed where they belong.
+///
+/// The exhaustive destructure in each builder makes the compiler ask for a
+/// destination; it cannot ask whether the destination is *right*. The
+/// adversarial review of #657 measured that by mutating one mapping at a time:
+/// `proxy_type` swapped wrong, `remote_port` zeroed, `sk` dropped, the
+/// `httpconnect` default dropped, `locations` emptied, `local_ip` emptied —
+/// sixteen such mutations left every test green, because nothing asserted the
+/// built config at all. This test is that assertion: one command line per
+/// surface with distinctive values, then the fields that line names.
+#[test]
+fn every_proxy_surface_builds_the_config_its_flags_describe() {
+    fn built(argv: &[&str]) -> crate::config::ProxyConfig {
+        let command =
+            parse_frpc_proxy(argv).unwrap_or_else(|e| panic!("{}: {e:?}", argv.join(" ")));
+        match &command {
+            FrpcCmd::Tcp(a) => a.to_proxy_config(),
+            FrpcCmd::Udp(a) => a.to_proxy_config(),
+            FrpcCmd::Http(a) => a.to_proxy_config(),
+            FrpcCmd::Https(a) => a.to_proxy_config(),
+            FrpcCmd::Stcp(a) => a.to_proxy_config(),
+            FrpcCmd::Xtcp(a) => a.to_proxy_config(),
+            FrpcCmd::Sudp(a) => a.to_proxy_config(),
+            FrpcCmd::Tcpmux(a) => a.to_proxy_config(),
+            other => panic!("expected a proxy command, got {other:?}"),
+        }
+    }
+    const WRAPPED: [&str; 4] = ["--ue", "--uc", "--server-addr", "10.9.9.9"];
+
+    for proxy_type in ["tcp", "udp"] {
+        let mut argv = vec![proxy_type, "--local-port", "4321", "--remote-port", "4322"];
+        argv.extend_from_slice(&WRAPPED);
+        let config = built(&argv);
+        assert_eq!(config.proxy_type, proxy_type);
+        assert_eq!(config.name, format!("{proxy_type}-4321->4322"));
+        assert_eq!(config.local_ip, "127.0.0.1", "{proxy_type}: local_ip");
+        assert_eq!(config.local_port, 4321, "{proxy_type}: local_port");
+        assert_eq!(config.remote_port, 4322, "{proxy_type}: remote_port");
+        assert!(config.use_encryption, "{proxy_type}: --ue");
+        assert!(config.use_compression, "{proxy_type}: --uc");
+    }
+
+    let http = built(&[
+        "http",
+        "--local-port",
+        "4321",
+        "--custom-domain",
+        "a.example, b.example",
+        "--sd",
+        "sub",
+        "--locations",
+        "/one, /two",
+        "--http-user",
+        "u",
+        "--http-pwd",
+        "p",
+        "--host-header-rewrite",
+        "h",
+    ]);
+    assert_eq!(http.proxy_type, "http");
+    assert_eq!(http.name, "http-4321");
+    assert_eq!(http.custom_domains, ["a.example", "b.example"]);
+    assert_eq!(http.subdomain, "sub");
+    assert_eq!(http.locations, ["/one", "/two"]);
+    assert_eq!(http.http_user, "u");
+    assert_eq!(http.http_pwd, "p");
+    assert_eq!(http.host_header_rewrite, "h");
+
+    let https = built(&[
+        "https",
+        "--local-port",
+        "4321",
+        "--custom-domain",
+        "a.example,b.example",
+        "--sd",
+        "sub",
+    ]);
+    assert_eq!(https.proxy_type, "https");
+    assert_eq!(https.name, "https-4321");
+    assert_eq!(https.custom_domains, ["a.example", "b.example"]);
+    assert_eq!(https.subdomain, "sub");
+
+    for proxy_type in ["stcp", "xtcp"] {
+        let named = built(&[
+            proxy_type,
+            "--local-port",
+            "4321",
+            "--sk",
+            "SECRET",
+            "--proxy-name",
+            "given",
+        ]);
+        assert_eq!(named.proxy_type, proxy_type);
+        assert_eq!(named.name, "given", "{proxy_type}: --proxy-name wins");
+        assert_eq!(named.sk, "SECRET", "{proxy_type}: --sk");
+        // Recorded frp-rs quirk: with no `--proxy-name`, stcp/xtcp derive the
+        // proxy name from `--tls-server-name`, which is Go's visitor-side TLS
+        // name and not a proxy name at all (`docs/developing.md`).
+        let unnamed = built(&[proxy_type, "--local-port", "4321", "--sk", "S"]);
+        assert_eq!(unnamed.name, format!("{proxy_type}-proxy"));
+        let from_server_name = built(&[
+            proxy_type,
+            "--local-port",
+            "4321",
+            "--sk",
+            "S",
+            "--tls-server-name",
+            "tls.example",
+        ]);
+        assert_eq!(
+            from_server_name.name, "tls.example",
+            "{proxy_type}: --tls-server-name is the fallback the code documents"
+        );
+    }
+
+    let sudp = built(&[
+        "sudp",
+        "--local-port",
+        "4321",
+        "--remote-port",
+        "4322",
+        "--sk",
+        "SECRET",
+    ]);
+    assert_eq!(sudp.proxy_type, "sudp");
+    assert_eq!(sudp.name, "sudp-4321->4322");
+    assert_eq!(sudp.remote_port, 4322);
+    assert_eq!(sudp.sk, "SECRET");
+
+    let tcpmux = built(&["tcpmux", "--local-port", "4321", "--mux-port", "4322"]);
+    assert_eq!(tcpmux.proxy_type, "tcpmux");
+    assert_eq!(tcpmux.name, "tcpmux-4321");
+    assert_eq!(tcpmux.remote_port, 4322, "--mux-port becomes remote_port");
+    assert_eq!(tcpmux.multiplexer, "httpconnect", "the documented default");
+    let explicit = built(&[
+        "tcpmux",
+        "--local-port",
+        "4321",
+        "--mux-port",
+        "4322",
+        "--mux",
+        "http2",
+        "--custom-domain",
+        "a.example,b.example",
+        "--sd",
+        "sub",
+    ]);
+    assert_eq!(explicit.multiplexer, "http2");
+    assert_eq!(explicit.custom_domains, ["a.example", "b.example"]);
+    assert_eq!(explicit.subdomain, "sub");
+}
+
 #[test]
 fn every_go_bool_flag_rejects_a_repeated_flag() {
     // Recorded divergence, not a claim of parity: Go's pflag is last-wins

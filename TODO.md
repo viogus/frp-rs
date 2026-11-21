@@ -13415,11 +13415,28 @@ needs the two-review rule and its own gate run.
       (`FRPC_PROXY_GO_FLAGS`) and `FRPC_PROXY_EXTENSION_FLAGS` are the oracle
       the generated rows are checked against, so generating them from the same
       list would make the check compare the list with itself; and the eight
-      `to_proxy_config` impls are the one remaining place a field can be lost
-      silently — a new row parses, lands in the struct, and never reaches
-      `ProxyConfig` unless someone edits the impl, because nothing reads the
-      struct exhaustively. Closing that is the next family's real work, not
-      another macro.
+      `to_proxy_config` impls stay hand-written — they are the config semantics,
+      not another spelling of the list.
+      Those impls used to be the one remaining place a field could be lost
+      silently: a new row parsed, landed in the struct, and never reached
+      `ProxyConfig` unless someone edited the impl, because nothing read the
+      struct exhaustively. They now each open with an exhaustive destructure
+      (`let Self { … } = self;`, measured: adding a `Tcp` row reddens
+      `frp-core/src/cli/frpc.rs` with `error[E0027]: pattern does not mention
+      field \`xtra\``), so the compiler asks for a destination and the three
+      client-side fields (`server_addr`, `server_port`, `token`) are named and
+      discarded on purpose. What the compiler asks for is a destination, not a
+      correct one: `field: _` compiles, so the three discards above are honest
+      only because the header says where those fields go. The same hazard is
+      untouched on the three field-by-field readers that are not builders —
+      `override_server_config` (`frp-core/src/cli/frps.rs:588`, a chain of
+      `if let Some(ref v) = self.token` arms), the `frpc` root flags (read at
+      hand-written sites: `frpc/src/main.rs:317` `worker_threads_from_args`,
+      `:540` `init_logging`, and the `run_normal` body) and the admin flags (six
+      positional arguments to `resolve_admin_connection` at
+      `frpc/src/main.rs:78`, called from `:1096`, `:1125`, `:1158`) — nothing
+      there is exhaustive, so a new row can compile and be read by nobody. The
+      same destructure is what would close each of them.
       Two cells the `--help` pins cannot see are now witnessed directly, after
       the adversarial review measured that both could be wrong with every suite
       green: the `fallback:` cell (parsing a minimal command line per surface
