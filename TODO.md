@@ -13362,6 +13362,61 @@ needs the two-review rule and its own gate run.
       table on its first row, still `admin-addr`); the cite table was re-baked
       for the three citing-line shifts in `frpc.rs` (targets unmoved) and
       `ci.yml`'s `guard_data_pin` moved with it.
+      The eight single-proxy surfaces then landed in two commits
+      (`proxy_flag_specs`): 28 rows — one `common { … }` block holding the
+      eight fields all eight commands declare identically (`local_ip`,
+      `local_port`, `server_addr`, `server_port`, `token`, `use_encryption`,
+      `use_compression`, `proxy_name`, each with its aliases, shorthand,
+      metavar and fallback/optionality) and one group per command for the other
+      20 — in place of 84 field declarations and 579 lines of hand-written
+      combinators spelling 229 flags. Four kinds in six rules cover it (`str`
+      and `u16`, each with an optional `fallback:` cell, `opt_str`, `go_bool`);
+      no row needed a fifth. Two shapes are load-bearing and neither is a
+      Go-name-keyed table: `sk` is `String` on stcp/xtcp and `Option<String>`
+      on sudp, `custom_domains` is `String` on http/https and `Option<String>`
+      on tcpmux, so rows are per **command**; and `$short` is `Option<char>`
+      where `None` is a statement (sudp's `--remote-port` is an frp-rs
+      extension that must never grow a `-r`) rather than an omitted cell. Both
+      halves of a command are generated from the same rows — the struct (Rust
+      forbids a macro expanding to fields, so the common rows travel into the
+      per-command arm as one `tt` it destructures; nesting the two repetitions
+      in a single output repetition instead fails with `meta-variable 'c'
+      repeats 2 times, but 'f' repeats 3 times`) and the parser, whose `let`
+      bindings are emitted by the expansion that emits the `construct!`. That
+      is the inverse of the `frpc` root family above: there the construct stays
+      hand-written because a macro-emitted `construct!` cannot name `run_mode`'s
+      locals, and here it can be generated precisely because the binders are
+      generated too. The command help text stopped being a fourth copy (it
+      comes from `FRPC_COMMAND_SHORTS` through `command_short(RootCommand::Frpc,
+      …)`), and the primary-long/aliases/shorthand order that keeps rendering
+      stable now lives once, in `named_with_aliases`.
+      Evidence: the same 10 `--help` surfaces byte-identical against `main` in
+      all three binary tiers (30 documents, default included) — root 1,517 B, tcp/udp 992, http 1,338, https 1,074,
+      stcp/xtcp 1,117, sudp 1,035, tcpmux 1,170, verify 543 — 102 `cli::` tests
+      (99 under `--no-default-features`), 164 `frpc --all-features` tests,
+      clippy `-D warnings` and `fmt --check` clean, and the eight structs
+      expanded with `-Zunpretty=expanded` still carry the same 84 name:type
+      pairs (9/9/14/10/10/10/10/12) as `main`, now in common-first order.
+      The one user-visible delta in the whole change is a diagnostic: bpaf names
+      the first missing required flag in `construct!` order, so bare
+      `frpc stcp` / `frpc xtcp` now report `` `--local-port=PORT` `` where
+      `main` reported `` `--sk=SECRET` `` (the other six already reported
+      `--local-port`). No spelling, accepted value, default or document changed;
+      `hoist_tests::every_known_subcommand_name_selects_its_own_branch` pinned
+      that text as its evidence, so it now supplies `--local-port 1` and still
+      requires `--sk` to be the complaint — stronger than the string it lost.
+      General rule for the next family: normalising a construct's order changes
+      which *missing required flag* bpaf names first, and that text is not a
+      contract — when a test pins it, the test is what to fix, not the order.
+      What stays hand-written, and why: the 14-row Go witness
+      (`FRPC_PROXY_GO_FLAGS`) and `FRPC_PROXY_EXTENSION_FLAGS` are the oracle
+      the generated rows are checked against, so generating them from the same
+      list would make the check compare the list with itself; and the eight
+      `to_proxy_config` impls are the one remaining place a field can be lost
+      silently — a new row parses, lands in the struct, and never reaches
+      `ProxyConfig` unless someone edits the impl, because nothing reads the
+      struct exhaustively. Closing that is the next family's real work, not
+      another macro.
 - [x] **Cite-table hygiene, encoded.** Every slice above shares one hazard: a
       comment added to `.github/workflows/ci.yml` moves that file's own cited
       lines. Restore `scripts/tests/pathline-cite-expectations.txt` from

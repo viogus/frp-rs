@@ -334,6 +334,9 @@ macro_rules! frpc_admin_flag_specs {
                 api_timeout: Duration,
                 go ( long: "api-timeout", short: None, varname: Some("duration"), usage: "Timeout for admin API calls (default 30s)" )
             ),
+        }
+    };
+}
 
 /// The rows behind the eight single-proxy commands: one `common { … }` block for
 /// the eight flags every one of them takes with the same type, then one group
