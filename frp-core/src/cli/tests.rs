@@ -3549,3 +3549,93 @@ fn proxy_command_shorthands_parse_to_their_go_long_flag() {
         )
     );
 }
+
+/// Every row the overlay may apply reaches its own config field.
+///
+/// The destructure in `FrpsArgs::override_server_config`
+/// (`frp-core/src/cli/frps.rs`) proves a row cannot be *forgotten*: a row added
+/// to `frps_flag_specs` without an overlay decision fails to compile. It cannot
+/// prove the decision is *right* — `dashboard_user: _` for a flag that should
+/// have been applied compiles, and the adversarial review measured that even a
+/// swap of two `String` destinations (`dashboard_user` into
+/// `web_server.password`, `dashboard_pwd` into `web_server.user`) left every
+/// other test in the tree green. This test pins the mapping, one field per row,
+/// with a value that differs from `ServerConfig::default()` so a dropped or
+/// mis-addressed write cannot pass.
+///
+/// The arguments are built directly rather than parsed: the mapping is what this
+/// test is about, and a struct literal is where a new row first asks for a
+/// decision of its own (`missing field` in an initializer, the same ask as
+/// `E0027`).
+#[test]
+fn override_server_config_applies_every_row_to_its_own_field() {
+    let args = FrpsArgs {
+        config: None,
+        config_dir: None,
+        strict_config: false,
+        show_version: false,
+        bind_addr: Some("10.0.0.1".to_string()),
+        bind_port: Some(7001),
+        proxy_bind_addr: Some("10.0.0.2".to_string()),
+        token: Some("overlay-token".to_string()),
+        allow_ports: Some("1000-2000".to_string()),
+        allow_unsafe: Vec::new(),
+        dashboard_addr: Some("10.0.0.3".to_string()),
+        dashboard_port: Some(7501),
+        dashboard_user: Some("dashboard-user".to_string()),
+        dashboard_pwd: Some("dashboard-pwd".to_string()),
+        dashboard_tls_cert_file: Some("cert.pem".to_string()),
+        dashboard_tls_key_file: Some("key.pem".to_string()),
+        dashboard_tls_mode: false,
+        enable_prometheus: true,
+        disable_log_color: true,
+        log_file: Some("frps.log".to_string()),
+        log_level: Some("debug".to_string()),
+        log_max_days: Some(7),
+        log_format: Some("json".to_string()),
+        kcp_bind_port: Some(7100),
+        quic_bind_port: Some(7200),
+        vhost_http_port: Some(8081),
+        vhost_https_port: Some(8444),
+        vhost_http_timeout: Some(42),
+        subdomain_host: Some("overlay.example".to_string()),
+        max_ports_per_client: Some(13),
+        tls_only: true,
+    };
+
+    let mut cfg = crate::config::ServerConfig::default();
+    args.override_server_config(&mut cfg);
+
+    assert_eq!(cfg.bind_addr, "10.0.0.1", "bind-addr");
+    assert_eq!(cfg.bind_port, 7001, "bind-port");
+    assert_eq!(cfg.proxy_bind_addr, "10.0.0.2", "proxy-bind-addr");
+    assert_eq!(cfg.auth.token, "overlay-token", "token");
+    assert_eq!(cfg.allow_ports, "1000-2000", "allow-ports");
+    assert_eq!(cfg.web_server.addr, "10.0.0.3", "dashboard-addr");
+    assert_eq!(cfg.web_server.port, 7501, "dashboard-port");
+    assert_eq!(cfg.web_server.user, "dashboard-user", "dashboard-user");
+    assert_eq!(cfg.web_server.password, "dashboard-pwd", "dashboard-pwd");
+    assert_eq!(
+        cfg.web_server.tls_cert_file, "cert.pem",
+        "dashboard-tls-cert-file"
+    );
+    assert_eq!(
+        cfg.web_server.tls_key_file, "key.pem",
+        "dashboard-tls-key-file"
+    );
+    assert!(cfg.web_server.enable_prometheus, "enable-prometheus");
+    assert_eq!(cfg.log.file, "frps.log", "log-file");
+    assert_eq!(cfg.log.level, "debug", "log-level");
+    assert_eq!(cfg.log.max_days, 7, "log-max-days");
+    assert_eq!(cfg.log.format, "json", "log-format");
+    assert_eq!(cfg.vhost_http_port, 8081, "vhost-http-port");
+    assert_eq!(cfg.vhost_https_port, 8444, "vhost-https-port");
+    assert_eq!(cfg.vhost_http_timeout, 42, "vhost-http-timeout");
+    assert_eq!(cfg.sub_domain_host, "overlay.example", "subdomain-host");
+    assert_eq!(cfg.max_ports_per_client, 13, "max-ports-per-client");
+    assert!(cfg.tls_only, "tls-only");
+    #[cfg(feature = "kcp")]
+    assert_eq!(cfg.kcp_bind_port, 7100, "kcp-bind-port");
+    #[cfg(feature = "quic")]
+    assert_eq!(cfg.quic_bind_port, 7200, "quic-bind-port");
+}

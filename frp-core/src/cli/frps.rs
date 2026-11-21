@@ -592,18 +592,32 @@ impl FrpsArgs {
         // Exhaustive on purpose: every field the row list generates is named
         // here, so a row added to `frps_flag_specs` without an overlay decision
         // fails to compile (`E0027`) instead of being parsed and then ignored.
-        // The compiler asks for a decision, not a correct one — `dash_mode: _`
+        // The compiler asks for a decision, not a correct one — `config: _`
         // compiles — so the discarded bindings below each say where the value
         // is consumed instead, and the applied ones are read from the bindings
-        // rather than from `self`.
+        // rather than from `self`. The strongest case is a row that arrives
+        // with its parser arm: `dashboard_user: _` for a flag the overlay
+        // should have applied compiles and is caught by no test unless the
+        // overlay is witnessed field by field.
+        // The seven rows this overlay does not apply, and where each is read
+        // instead: `config`/`strict_config` by `FrpsArgs::config_path` (the
+        // loader's input and its strict-parse decision), `config_dir` by
+        // `FrpsArgs::cli_overrides_enabled` and the config-dir lane
+        // (`frps/src/main.rs:656`), `show_version` at `frps/src/main.rs:645-647`
+        // (printed, never merged), `allow_unsafe` at `frps/src/main.rs:651`,
+        // `disable_log_color` at `frps/src/main.rs:606`, and
+        // `dashboard_tls_mode`, which has no effective field:
+        // `web_server.tls.enable` is inert (`frp-core/src/config/server.rs:975`)
+        // and TLS is decided by the two files
+        // (`frp-server/src/dashboard.rs:3768`).
         let Self {
-            config: _,             // `FrpsArgs::config_path`, read by the loader
-            config_dir: _,         // `config_dir_path`, read by the loader
-            strict_config,         // read by the loader, not by this overlay
-            show_version,          // printed by `frps/src/main.rs`, never merged
-            allow_unsafe: _,       // `frps/src/main.rs:651`, the loader's unsafe set
-            disable_log_color: _,  // `frps/src/main.rs:606`, the logger's setup
-            dashboard_tls_mode: _, // no config field: TLS is implied by both files
+            config: _,
+            config_dir: _,
+            strict_config: _,
+            show_version: _,
+            allow_unsafe: _,
+            disable_log_color: _,
+            dashboard_tls_mode: _,
             bind_addr,
             bind_port,
             proxy_bind_addr,
@@ -629,10 +643,6 @@ impl FrpsArgs {
             vhost_http_timeout,
             max_ports_per_client,
         } = self;
-        // `strict_config` and `show_version` are named so the destructure stays
-        // exhaustive but this overlay never applies them; silently dropping the
-        // bindings would be indistinguishable from forgetting a field.
-        let _ = (strict_config, show_version);
         // A build without the listener still carries the field (the struct is
         // feature-independent, the parser substitutes `pure(None)`), so the
         // binding is unused in that build by design.

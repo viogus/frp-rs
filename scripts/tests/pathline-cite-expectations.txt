@@ -20,7 +20,7 @@
 #   checked — an out-of-tree token names a file this tree does not
 #   contain, so pinning it would forbid citing Go frp by
 #   `file:line`, which this repo's own convention requires.
-#   pins: checked=607 weak=135 ambiguous=2 excluded=101 foreign_reported=1163 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=611f43121f84b344
+#   pins: checked=611 weak=135 ambiguous=2 excluded=101 foreign_reported=1163 spaced_reported=0 skipped_large=0 skipped_binary=0 weak_set=7df618ccbbc52bb8 ambiguous_set=fbd8449054b4b1a2 excluded_set=611f43121f84b344
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-matrix.sh	.github/workflows/ab-matrix.yml:15-17	32
 .github/workflows/ab-matrix.yml	15	17	d3ca8d7588c88a54	c35eb273098ddf0f	absolute	scripts/ab-measurable-delta.sh	.github/workflows/ab-matrix.yml:15-17	20
 .github/workflows/ci.yml	2384	-	e9765b5fb64124d3	-	absolute	frp-server/src/service.rs	.github/workflows/ci.yml:2384	1524
@@ -301,6 +301,7 @@ frp-core/src/config/server.rs	48	51	4059c7cc6a64e278	7a8a19c93dc35fd5	absolute	d
 frp-core/src/config/server.rs	502	504	dae399deaf9cd4f1	fa7c1f09e7380c32	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/config/server.rs:502-504	543
 frp-core/src/config/server.rs	502	504	dae399deaf9cd4f1	fa7c1f09e7380c32	absolute	frps/tests/cli_exit_codes.rs	frp-core/src/config/server.rs:502-504	707
 frp-core/src/config/server.rs	539	540	1313ee3c592e7c09	a2c2339691fc48fb	absolute	frp-core/src/config/tests.rs	frp-core/src/config/server.rs:539-540	3028
+frp-core/src/config/server.rs	975	-	10e4a58bc6840284	-	absolute	frp-core/src/cli/frps.rs	frp-core/src/config/server.rs:975	610
 frp-core/src/config/strict.rs	287	-	4ba34283495667da	-	absolute	docs/developing.md	frp-core/src/config/strict.rs:287	2438
 frp-core/src/config/strict.rs	31	-	42daa6fe1deb76a8	-	absolute	docs/config.md	frp-core/src/config/strict.rs:31	22
 frp-core/src/config/strict.rs	558	-	85c345d89f06ebb1	-	absolute	docs/config.md	frp-core/src/config/strict.rs:558	972
@@ -427,6 +428,7 @@ frp-server/src/dashboard.rs	2690	-	cc363926b55d0695	-	shorthand	docs/developing.
 frp-server/src/dashboard.rs	3670	-	2451763aee02af1c	-	absolute	frp-client/src/admin.rs	frp-server/src/dashboard.rs:3670	988
 frp-server/src/dashboard.rs	3672	-	62de99fb3c802b4f	-	continuation	frp-client/src/admin.rs	3672	988
 frp-server/src/dashboard.rs	3696	-	7b5b191d51cb0d90	-	continuation	frp-client/src/admin.rs	3696	988
+frp-server/src/dashboard.rs	3768	-	dec414d74d96bdac	-	absolute	frp-core/src/cli/frps.rs	frp-server/src/dashboard.rs:3768	612
 frp-server/src/dashboard.rs	3773	-	9c65b9b57fb64ebf	-	shorthand	frp-server/tests/common/mod.rs	:3773	869
 frp-server/src/dashboard.rs	3786	-	5c821f00d98f4219	-	absolute	frp-server/tests/common/mod.rs	frp-server/src/dashboard.rs:3786	869
 frp-server/src/dashboard.rs	659	-	a89c5c6a8dc0eba2	-	absolute	docs/developing.md	frp-server/src/dashboard.rs:659	239
@@ -565,10 +567,12 @@ frps/src/main.rs	570	-	bc8a7f503ffafc9d	-	absolute	docs/developing.md	frps/src/m
 frps/src/main.rs	570	-	bc8a7f503ffafc9d	-	absolute	frps/tests/log_completion.rs	frps/src/main.rs:570	1177
 frps/src/main.rs	605	-	62aa77e345d29d40	-	absolute	frps/tests/cli_exit_codes.rs	frps/src/main.rs:605	1889
 frps/src/main.rs	605	-	62aa77e345d29d40	-	absolute	frps/tests/cli_exit_codes.rs	frps/src/main.rs:605	1931
-frps/src/main.rs	606	-	b1a5741528dee5fb	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:606	605
+frps/src/main.rs	606	-	b1a5741528dee5fb	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:606	608
 frps/src/main.rs	623	-	c4f46bb4348b0a25	-	absolute	frps/src/main.rs	frps/src/main.rs:623	568
 frps/src/main.rs	624	-	3cf9ec4325ec7c3d	-	absolute	frps/src/main.rs	frps/src/main.rs:624	565
-frps/src/main.rs	651	-	20489db9c6a6f168	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:651	604
+frps/src/main.rs	645	647	b2eb5f2c2cbe1e3f	40150ca559334920	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:645-647	606
+frps/src/main.rs	651	-	20489db9c6a6f168	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:651	607
+frps/src/main.rs	656	-	3b1d13e9f2d6d744	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:656	606
 frps/src/main.rs	656	-	3b1d13e9f2d6d744	-	absolute	frps/tests/log_completion.rs	frps/src/main.rs:656	726
 frps/src/main.rs	657	-	2d6eefb2878ba725	-	absolute	frp-core/src/cli/frps.rs	frps/src/main.rs:657	110
 frps/src/main.rs	657	-	2d6eefb2878ba725	-	absolute	frp-core/src/logging.rs	frps/src/main.rs:657	78
