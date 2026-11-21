@@ -589,20 +589,72 @@ impl FrpsArgs {
         &self,
         cfg: &mut crate::config::ServerConfig,
     ) -> crate::config::AppliedReaderGatedPorts {
+        // Exhaustive on purpose: every field the row list generates is named
+        // here, so a row added to `frps_flag_specs` without an overlay decision
+        // fails to compile (`E0027`) instead of being parsed and then ignored.
+        // The compiler asks for a decision, not a correct one — `dash_mode: _`
+        // compiles — so the discarded bindings below each say where the value
+        // is consumed instead, and the applied ones are read from the bindings
+        // rather than from `self`.
+        let Self {
+            config: _,             // `FrpsArgs::config_path`, read by the loader
+            config_dir: _,         // `config_dir_path`, read by the loader
+            strict_config,         // read by the loader, not by this overlay
+            show_version,          // printed by `frps/src/main.rs`, never merged
+            allow_unsafe: _,       // `frps/src/main.rs:651`, the loader's unsafe set
+            disable_log_color: _,  // `frps/src/main.rs:606`, the logger's setup
+            dashboard_tls_mode: _, // no config field: TLS is implied by both files
+            bind_addr,
+            bind_port,
+            proxy_bind_addr,
+            token,
+            allow_ports,
+            dashboard_addr,
+            dashboard_port,
+            dashboard_user,
+            dashboard_pwd,
+            dashboard_tls_cert_file,
+            dashboard_tls_key_file,
+            enable_prometheus,
+            log_file,
+            log_level,
+            log_max_days,
+            log_format,
+            subdomain_host,
+            tls_only,
+            kcp_bind_port,
+            quic_bind_port,
+            vhost_http_port,
+            vhost_https_port,
+            vhost_http_timeout,
+            max_ports_per_client,
+        } = self;
+        // `strict_config` and `show_version` are named so the destructure stays
+        // exhaustive but this overlay never applies them; silently dropping the
+        // bindings would be indistinguishable from forgetting a field.
+        let _ = (strict_config, show_version);
+        // A build without the listener still carries the field (the struct is
+        // feature-independent, the parser substitutes `pure(None)`), so the
+        // binding is unused in that build by design.
+        #[cfg(not(feature = "kcp"))]
+        let _ = kcp_bind_port;
+        #[cfg(not(feature = "quic"))]
+        let _ = quic_bind_port;
+
         let mut applied = crate::config::AppliedReaderGatedPorts::default();
-        if let Some(ref v) = self.token {
+        if let Some(ref v) = token {
             cfg.auth.token = v.clone();
         }
-        if let Some(ref v) = self.allow_ports {
+        if let Some(ref v) = allow_ports {
             cfg.allow_ports = v.clone();
         }
-        if let Some(ref v) = self.bind_addr {
+        if let Some(ref v) = bind_addr {
             cfg.bind_addr = v.clone();
         }
-        if let Some(v) = self.bind_port {
-            cfg.bind_port = v;
+        if let Some(v) = bind_port {
+            cfg.bind_port = *v;
         }
-        if let Some(ref v) = self.proxy_bind_addr {
+        if let Some(ref v) = proxy_bind_addr {
             cfg.proxy_bind_addr = v.clone();
         }
 
@@ -619,25 +671,25 @@ impl FrpsArgs {
         // file's value too (both binaries, measured on v0.71.0), and this lane
         // also read a config file (`config_path()` defaults to `frps.toml`),
         // so the file's value must survive.
-        if let Some(ref v) = self.log_file {
+        if let Some(ref v) = log_file {
             if !v.is_empty() {
                 cfg.log.file = v.clone();
             }
         }
-        if let Some(ref v) = self.log_level {
+        if let Some(ref v) = log_level {
             if !v.is_empty() {
                 cfg.log.level = v.clone();
             }
         }
-        if let Some(v) = self.log_max_days {
-            if v != 0 {
-                cfg.log.max_days = v;
+        if let Some(v) = log_max_days {
+            if *v != 0 {
+                cfg.log.max_days = *v;
             }
         }
         // `--log-format` has no `LogConfig::complete` slot and no Go analogue
         // on the file lane, so it keeps the raw write-through; see the
         // `log_flag_zero_values_do_not_override_the_config_file` pin below.
-        if let Some(ref v) = self.log_format {
+        if let Some(ref v) = log_format {
             cfg.log.format = v.clone();
         }
 
@@ -654,58 +706,58 @@ impl FrpsArgs {
         // supplied" on the file path too (`port_requested`), so it is not
         // reported.
         #[cfg(feature = "kcp")]
-        if let Some(v) = self.kcp_bind_port {
-            cfg.kcp_bind_port = v;
-            applied.kcp_bind_port = v != 0;
+        if let Some(v) = kcp_bind_port {
+            cfg.kcp_bind_port = *v;
+            applied.kcp_bind_port = *v != 0;
         }
         #[cfg(feature = "quic")]
-        if let Some(v) = self.quic_bind_port {
-            cfg.quic_bind_port = v;
-            applied.quic_bind_port = v != 0;
+        if let Some(v) = quic_bind_port {
+            cfg.quic_bind_port = *v;
+            applied.quic_bind_port = *v != 0;
         }
-        if let Some(v) = self.vhost_http_port {
-            cfg.vhost_http_port = v;
+        if let Some(v) = vhost_http_port {
+            cfg.vhost_http_port = *v;
         }
-        if let Some(v) = self.vhost_https_port {
-            cfg.vhost_https_port = v;
+        if let Some(v) = vhost_https_port {
+            cfg.vhost_https_port = *v;
         }
-        if let Some(v) = self.vhost_http_timeout {
-            cfg.vhost_http_timeout = v;
+        if let Some(v) = vhost_http_timeout {
+            cfg.vhost_http_timeout = *v;
         }
-        if let Some(ref v) = self.subdomain_host {
+        if let Some(ref v) = subdomain_host {
             cfg.sub_domain_host = v.clone();
         }
-        if let Some(v) = self.max_ports_per_client {
-            cfg.max_ports_per_client = v;
+        if let Some(v) = max_ports_per_client {
+            cfg.max_ports_per_client = *v;
         }
-        if self.tls_only {
+        if *tls_only {
             cfg.tls_only = true;
         }
 
         // Dashboard
-        if let Some(ref v) = self.dashboard_addr {
+        if let Some(ref v) = dashboard_addr {
             cfg.web_server.addr = v.clone();
         }
-        if let Some(v) = self.dashboard_port {
-            cfg.web_server.port = v;
+        if let Some(v) = dashboard_port {
+            cfg.web_server.port = *v;
             // A zero port is "not supplied" on the file path too
             // (`sub_port_requested`); only a real request is reported, so
             // `--dashboard-port 0` stays as silent as `port = 0`.
-            applied.web_server_port = v != 0;
+            applied.web_server_port = *v != 0;
         }
-        if let Some(ref v) = self.dashboard_user {
+        if let Some(ref v) = dashboard_user {
             cfg.web_server.user = v.clone();
         }
-        if let Some(ref v) = self.dashboard_pwd {
+        if let Some(ref v) = dashboard_pwd {
             cfg.web_server.password = v.clone();
         }
-        if self.enable_prometheus {
+        if *enable_prometheus {
             cfg.web_server.enable_prometheus = true;
         }
-        if let Some(ref v) = self.dashboard_tls_cert_file {
+        if let Some(ref v) = dashboard_tls_cert_file {
             cfg.web_server.tls_cert_file = v.clone();
         }
-        if let Some(ref v) = self.dashboard_tls_key_file {
+        if let Some(ref v) = dashboard_tls_key_file {
             cfg.web_server.tls_key_file = v.clone();
         }
         // dashboard_tls_mode: no config field needed — TLS activates when both
