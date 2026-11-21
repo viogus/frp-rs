@@ -1000,3 +1000,74 @@ fn api_timeout_bounds_a_black_hole_admin_listener_for_each_subcommand() {
         );
     }
 }
+
+// ── `--admin-user` / `--admin-pwd`: the credential pair ──────────────────────
+
+/// The `--admin-user` and `--admin-pwd` rows are the only place a credential
+/// pair is decided, and both reach `AdminCli` as `Option<&str>` — so
+/// `AdminCli { user: admin_pwd, pwd: admin_user }` compiles, and before this
+/// test nothing in the tree passed either flag: the swap would have gone out as
+/// `Basic base64("pw:user")` with every suite green.
+///
+/// Asserting the *encoded pair* rather than each half is what makes the swap
+/// visible: `YWxpY2U6czNzY3JldA==` is "alice:s3cret", and its reverse is a
+/// different string.
+///
+/// The address pair is supplied as well, because the `--admin-*` rows are an
+/// frp-rs extension that applies *only* when both `--admin-addr` and
+/// `--admin-port` are given; otherwise the `[webServer]` block of the config
+/// file wins, credentials included (pinned by
+/// `reload_admin_flags_override_the_config_address_after_a_successful_load`).
+/// Measured while writing this test: with the credential flags alone the
+/// request carried no `Authorization` header at all, which is that rule and not
+/// a bug.
+#[test]
+fn reload_sends_the_admin_credentials_as_basic_auth() {
+    let dir = TempDir::new();
+    let (port, request_rx, handle) = mock_admin("HTTP/1.1 200 OK", "{\"msg\":\"ok\"}");
+    let cfg = config_for_port(&dir, port);
+
+    let port_arg = port.to_string();
+    let out = run_frpc(&[
+        "reload",
+        "--admin-addr",
+        "127.0.0.1",
+        "--admin-port",
+        &port_arg,
+        "--admin-user",
+        "alice",
+        "--admin-pwd",
+        "s3cret",
+        "-c",
+        &cfg,
+    ]);
+
+    assert_eq!(
+        exit_code(&out),
+        0,
+        "stdout={:?} stderr={:?}",
+        stdout_of(&out),
+        stderr_of(&out)
+    );
+    let captured = request_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("mock admin received a request");
+    handle.join().expect("mock admin thread");
+    let head = String::from_utf8_lossy(&captured).to_string();
+    let expected = format!(
+        "Authorization: Basic {}\r\n",
+        frp_core::base64::encode(b"alice:s3cret")
+    );
+    assert!(
+        head.contains(&expected),
+        "the two credential rows must reach user:password in that order; head={head:?}"
+    );
+    let reversed = format!(
+        "Authorization: Basic {}\r\n",
+        frp_core::base64::encode(b"s3cret:alice")
+    );
+    assert!(
+        !head.contains(&reversed),
+        "the credential pair was sent reversed; head={head:?}"
+    );
+}

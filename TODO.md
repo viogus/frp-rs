@@ -13428,20 +13428,27 @@ needs the two-review rule and its own gate run.
       discarded on purpose. What the compiler asks for is a destination, not a
       correct one: `field: _` compiles, so the three discards above are honest
       only because the header says where those fields go.
-      The same hazard was untouched on the field-by-field readers that are not
-      builders. `override_server_config` (`frp-core/src/cli/frps.rs:588`) is one
+      The same hazard applied to the field-by-field readers that are not
+      builders. `override_server_config` (`frp-core/src/cli/frps.rs:588`) was one
       of them, and is now closed the same way: `frps` carries 31 rows and seven
       of them are deliberately not overlaid (`config`, `config_dir`,
       `strict_config`, `show_version`, `allow_unsafe`, `disable_log_color`,
       `dashboard_tls_mode`), so the function's destructure names all 31 with a
       per-field comment saying where the seven go, and a new row reddens it with
-      `E0027` (plus `E0063` from the generated parser and `From`). Two readers
-      are left: the `frpc` root flags (hand-written sites —
-      `frpc/src/main.rs:317` `worker_threads_from_args`, `:540` `init_logging`,
-      the `run_normal` body) and the admin flags (six positional arguments to
-      `resolve_admin_connection` at `frpc/src/main.rs:78`, called from `:1096`,
-      `:1125`, `:1158`); neither is exhaustive, so a new row there can compile
-      and be read by nobody.
+      `E0027` (plus `E0063` from the generated parser and `From`). The two
+      remaining readers were the `frpc` root flags (`worker_threads_from_args`,
+      `init_logging`, the `run_normal` body) and the admin flags (four positional
+      options into `resolve_admin_connection`, called from `reload`/`status`/
+      `stop`); neither was exhaustive, so a new row there compiled and was read
+      by nobody. Both are now closed the same way: `run_normal` opens one
+      `let FrpcRunArgs { … } = args;` and hands the five log rows to
+      `init_logging` through a `LogOverrides` value, `worker_threads_from_args`
+      takes the three values it reads, and each admin command destructures its
+      struct before building an `AdminCli`. A new row reddens every reader with
+      `E0027`. The bound is unchanged — `show_version: _` compiles — and
+      `AdminCli` adds a second, independent gain: two of its four fields are
+      `Option<&str>`, so the old positional call let a caller swap the user and
+      the password silently.
       Two cells the `--help` pins cannot see are now witnessed directly, after
       the adversarial review measured that both could be wrong with every suite
       green: the `fallback:` cell (parsing a minimal command line per surface

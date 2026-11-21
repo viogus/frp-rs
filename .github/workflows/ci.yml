@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=fab581a500a64cf2dfe4f65272da18ecbacd0eee76b778528b47f1eb44fdad45
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=05b99ab96fa3307eed1d2774cd92f0c0e87b19a4af3fcf2ea8b09ac763384dd7
+          guard_data_pin=ae3b963cb865021c9df8b64fad432cd3f23786d11b6bf60cc4ade909546ce99a
           guard_exact=118
           guard_floor=118
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2145,9 +2145,9 @@ jobs:
       # at "Run frpc CLI tests (admin address resolution)", which is the only
       # step that runs `cargo test -p frpc` and therefore the only place a count
       # for the package as a whole can live. Re-derived on this tree with
-      # `cargo test -p frpc -- --list` (120 `: test` lines), which decomposes as
+      # `cargo test -p frpc -- --list` (123 `: test` lines), which decomposes as
       # the bin's 17 inline unit tests (`cargo test -p frpc --bin frpc --
-      # --list`) plus 103 integration tests over 8 files: admin_cli.rs 25,
+      # --list`) plus 104 integration tests over 8 files: admin_cli.rs 26,
       # admin_config_get_warning.rs 0 (it compiles to no tests in this feature
       # set — its `Running` line is still required as a target witness, see the
       # step), cli_exit_codes.rs 23, cli_inputs.rs 34,
@@ -2156,12 +2156,12 @@ jobs:
       # counted nothing: deleting any of those files left the lane green, which
       # is why the step now keeps a per-target witness list as well as the
       # total.
-      FRPC_CLI_TESTS: "121"
+      FRPC_CLI_TESTS: "123"
       # Absolute floor under the declared count above, for the reason spelled
       # out at `FRPS_CLI_TESTS_FLOOR`: the equality check cannot tell a
       # legitimate count from a test deleted together with its literal. This
       # independent literal is the second edit a delete-plus-lower has to move.
-      FRPC_CLI_TESTS_FLOOR: "111"
+      FRPC_CLI_TESTS_FLOOR: "113"
       # Test binaries are linked, never shipped, so their DWARF is pure cost.
       # The full rationale, and how to get a backtrace back for a CI-only
       # failure, sits with the sibling lanes below (`CARGO_PROFILE_DEV_DEBUG`).
@@ -2922,8 +2922,8 @@ jobs:
       - name: Run frpc's log-completion spawn test (the client control)
         # `frpc/tests/log_completion.rs` is the **control** for the empty-CLI-value
         # rule the `frps` log-completion step below pins. The client has never
-        # overlaid its flags onto the loaded config — `frpc/src/main.rs:541-563`
-        # passes `cli.log_level` straight to `resolve_log_level` — so "an empty
+        # overlaid its flags onto the loaded config — `frpc/src/main.rs:599-621`
+        # passes the CLI's `--log-level` value straight to `resolve_log_level` — so "an empty
         # `--log-level` leaves the file's `[log] level` alone" is the outcome it
         # has always had, on both the `-c` and the `--config-dir` lane. The file
         # makes that an executable contract: a future "alignment" that gives
@@ -3415,11 +3415,11 @@ jobs:
           echo "frpc admin config-GET guard ok: $n tests listed (expected $want, floor $want_floor), 0 failed"
       - name: Run frpc's `web_server.tls.enable` warning-delivery tests with the admin feature
         # The `admin`-on half of the `frpc` warning-delivery pair, and the only
-        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:718`)
+        # lane that witnesses the `--config-dir` call site (`frpc/src/main.rs:696`)
         # in an admin build: the step above this one runs the same file with
         # `admin` off (the no-dashboard clause expected), and the admin config-GET
         # step runs a different file, so before this step a hardcoded `false` at
-        # `frpc/src/main.rs:719` survived every lane in CI. Same three-check guard shape as its
+        # `frpc/src/main.rs:801` survived every lane in CI. Same three-check guard shape as its
         # siblings, with the admin build already warm from the step above.
         shell: bash
         run: |

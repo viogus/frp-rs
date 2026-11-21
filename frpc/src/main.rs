@@ -62,6 +62,24 @@ impl std::fmt::Display for AdminResolveError {
     }
 }
 
+/// The four admin rows of `reload`/`status`/`stop` (`frpc_admin_flag_specs`) as
+/// one bundle: the rows those subcommands consult, named at the call site
+/// instead of passed as four positional arguments.
+///
+/// Naming the slots is what this buys, and it is worth being exact about what
+/// it does not: **three** of the four are `Option<&str>` (`addr`, `user`,
+/// `pwd`), so the struct still cannot make `user` and `pwd` distinguishable to
+/// the compiler — `AdminCli { user: admin_pwd, pwd: admin_user }` compiles and
+/// sends the pair reversed. What stops that being invisible is
+/// `admin_cli_credentials_reach_the_connection_by_name`, which asserts the two
+/// slots reach `AdminConnection::user` / `::password` in that order.
+struct AdminCli<'a> {
+    addr: Option<&'a str>,
+    port: Option<u16>,
+    user: Option<&'a str>,
+    pwd: Option<&'a str>,
+}
+
 /// Resolve admin server address, user, and password.
 ///
 /// A config path, when given, is **always** loaded and validated; a load error
@@ -76,13 +94,16 @@ impl std::fmt::Display for AdminResolveError {
 /// no such flags (`cmd/frpc/sub/admin.go:34-50`), so they can never compensate
 /// for a config that fails to load.
 fn resolve_admin_connection(
-    cli_addr: Option<&str>,
-    cli_port: Option<u16>,
-    cli_user: Option<&str>,
-    cli_pwd: Option<&str>,
+    cli: AdminCli<'_>,
     config_path: Option<&str>,
     strict_config: bool,
 ) -> Result<AdminConnection, AdminResolveError> {
+    let AdminCli {
+        addr: cli_addr,
+        port: cli_port,
+        user: cli_user,
+        pwd: cli_pwd,
+    } = cli;
     if let Some(path) = config_path {
         let cfg = load_client_config(path, strict_config)
             .map_err(|e| AdminResolveError::Config(e.to_string()))?;
@@ -287,7 +308,9 @@ fn main() {
     // Measurements: `docs/archive/notes/2026-11-16-worker-thread-default.md`.
     let worker_threads = match &cmd {
         // `--version` has nothing to do with a config: do not read one for it.
-        FrpcCmd::Run(args) if !args.show_version => worker_threads_from_args(args),
+        FrpcCmd::Run(args) if !args.show_version => {
+            worker_threads_from_args(&args.config, args.config_dir.as_deref(), args.strict_config)
+        }
         // The single-proxy lanes have no config file, but the env var still
         // applies to them: `frpc tcp` is a first-class long-running mode, and
         // the documented precedence (config > env > default) has no lane
@@ -314,9 +337,14 @@ fn main() {
 /// path: the services start one per file, so the count must come from those
 /// files — a count read from `frpc.toml` while the services run `sites/*.toml`
 /// would be silently wrong.
-fn worker_threads_from_args(args: &FrpcRunArgs) -> usize {
-    let configured = match &args.config_dir {
-        Some(dir) => match worker_threads_from_dir(Path::new(dir), args.strict_config) {
+///
+/// It takes the three rows it reads — `--config`, `--config-dir`,
+/// `--strict-config` — rather than `&FrpcRunArgs`, so its dependency is its
+/// signature: the rest of the root flag list has no bearing on the runtime's
+/// size.
+fn worker_threads_from_args(config: &str, config_dir: Option<&str>, strict_config: bool) -> usize {
+    let configured = match config_dir {
+        Some(dir) => match worker_threads_from_dir(Path::new(dir), strict_config) {
             Ok(value) => value,
             Err(message) => {
                 eprintln!("frpc: {message}");
@@ -324,13 +352,13 @@ fn worker_threads_from_args(args: &FrpcRunArgs) -> usize {
             }
         },
         None => {
-            let path = if args.config.is_empty() {
+            let path = if config.is_empty() {
                 "frpc.toml"
             } else {
-                args.config.as_str()
+                config
             };
             if is_regular_file(Path::new(path)) {
-                load_client_config(path, args.strict_config)
+                load_client_config(path, strict_config)
                     .ok()
                     .and_then(|cfg| cfg.worker_threads)
             } else {
@@ -537,29 +565,59 @@ async fn async_main(cmd: FrpcCmd) {
 
 // ── Logging / tracing init ────────────────────────────────────────────────────
 
-fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
+/// The five `frpc run` CLI log rows `init_logging` applies — `--log-level`,
+/// `--log-file`, `--log-max-days`, `--log-format`, `--disable-log-color` — as
+/// values. Taking exactly those five, instead of `&FrpcRunArgs`, keeps the
+/// logging setup's dependency visible in its signature.
+///
+/// They are owned rather than borrowed so the bundle can be built *before*
+/// `run_normal` consumes `args`, which is what lets [`log_overrides_of`] be the
+/// single mapping from rows to slots and a unit test name each slot's row: the
+/// fields are two `Option<String>` and an `Option<i32>`, so a hand-written
+/// literal in the caller would compile with `level` and `file` swapped (nothing
+/// distinguishes them by type) and only a test of the mapping catches it.
+struct LogOverrides {
+    level: Option<String>,
+    file: Option<String>,
+    max_days: Option<i32>,
+    format: Option<String>,
+    disable_color: bool,
+}
+
+/// The one place the five log rows become the five slots `init_logging` reads.
+fn log_overrides_of(args: &FrpcRunArgs) -> LogOverrides {
+    LogOverrides {
+        level: args.log_level.clone(),
+        file: args.log_file.clone(),
+        max_days: args.log_max_days,
+        format: args.log_format.clone(),
+        disable_color: args.disable_log_color,
+    }
+}
+
+fn init_logging(cli: &LogOverrides, cfg: Option<&ClientConfig>) {
     let level = logging::resolve_log_level(
-        cli.log_level.clone(),
+        cli.level.clone(),
         cfg.map(|c| c.log.level.as_str()),
         "debug,yamux=trace",
     );
     let file = logging::resolve_log_file(
-        cli.log_file.clone(),
+        cli.file.clone(),
         cfg.map(|c| c.log.file.as_str()).unwrap_or(""),
     );
     // Same zero-value rule as `frps`: Go completes `--log_max_days 0` to 3
     // (`pkg/config/v1/common.go:122`). The client's sibling shape is the config
     // file, which `LogConfig::complete` fills; this covers the flag.
-    let max_days = logging::resolve_log_max_days(cli.log_max_days, cfg.map(|c| c.log.max_days));
+    let max_days = logging::resolve_log_max_days(cli.max_days, cfg.map(|c| c.log.max_days));
     let format = logging::resolve_log_format(
-        cli.log_format.clone(),
+        cli.format.clone(),
         cfg.map(|c| c.log.format.as_str()).unwrap_or("text"),
     );
     // Go frp v0.70.1 compat: log.disablePrintColor from the config file is
     // honored (audit task 9 finding 9); the CLI --disable-log-color flag
     // takes precedence when both are set.
     let ansi = logging::resolve_ansi(
-        cli.disable_log_color || cfg.map(|c| c.log.disable_print_color).unwrap_or(false),
+        cli.disable_color || cfg.map(|c| c.log.disable_print_color).unwrap_or(false),
     );
     #[cfg(not(feature = "otel"))]
     logging::init_tracing(&level, file, max_days, &format, ansi, "frpc.log");
@@ -598,20 +656,44 @@ fn init_logging(cli: &FrpcRunArgs, cfg: Option<&ClientConfig>) {
     }
 }
 
-async fn run_normal(mut args: FrpcRunArgs) {
-    if args.show_version {
+async fn run_normal(args: FrpcRunArgs) {
+    // The five log rows are read by `log_overrides_of` — the one mapping, pinned
+    // by `log_overrides_carry_each_row_to_its_own_slot` — and are named `_` here
+    // only so a row added to `frpc_root_flag_specs` fails to compile in this
+    // function too.
+    let log_overrides = log_overrides_of(&args);
+    // Exhaustive on purpose: every field `frpc_root_flag_specs` generates is
+    // named here, so a row added to that list without a reader decision in this
+    // function fails to compile (`E0027`, "pattern does not mention field
+    // `…`") instead of being parsed and then read by nobody. The compiler asks
+    // for a decision, not a correct one — `log_level: _` compiles — which is why
+    // each binding below is used, and why the collected rows are pinned by a
+    // test rather than by the naming.
+    let FrpcRunArgs {
+        config,
+        config_dir,
+        strict_config,
+        allow_unsafe,
+        show_version,
+        log_file: _,
+        log_level: _,
+        log_max_days: _,
+        log_format: _,
+        disable_log_color: _,
+    } = args;
+
+    if show_version {
         println!("frpc {}", frp_core::VERSION);
         process::exit(0);
     }
 
     // Build UnsafeFeatures from CLI --allow-unsafe flag
-    let allow_unsafe = std::mem::take(&mut args.allow_unsafe);
     let refs: Vec<&str> = allow_unsafe.iter().map(|s| s.as_str()).collect();
     let unsafe_features = UnsafeFeatures::new(&refs);
 
     // Config directory mode
-    if let Some(ref dir) = args.config_dir {
-        init_logging(&args, None);
+    if let Some(ref dir) = config_dir {
+        init_logging(&log_overrides, None);
 
         // SIGINT/SIGTERM → graceful shutdown of every directory service.
         // One process-wide handler sets SHUTDOWN_REQUESTED and iterates the
@@ -710,7 +792,7 @@ async fn run_normal(mut args: FrpcRunArgs) {
         let mut load_failures: Vec<(usize, i32)> = Vec::new();
         for (file_index, path) in files.iter().enumerate() {
             let path_str = path.display().to_string();
-            match load_client_config_with_presence(&path_str, args.strict_config) {
+            match load_client_config_with_presence(&path_str, strict_config) {
                 Ok((cfg, presence)) => {
                     // `init_logging` ran at the top of this branch, so the sink
                     // exists. The loader cannot warn (it would be silent on the
@@ -807,7 +889,7 @@ async fn run_normal(mut args: FrpcRunArgs) {
     }
 
     // Single config mode
-    let (cfg, presence) = match load_client_config_with_presence(&args.config, args.strict_config) {
+    let (cfg, presence) = match load_client_config_with_presence(&config, strict_config) {
         Ok(loaded) => loaded,
         Err(e) => {
             // Go frp v0.71.0: a `frpc -c <bad>` config failure is
@@ -829,7 +911,7 @@ async fn run_normal(mut args: FrpcRunArgs) {
         }
     };
 
-    init_logging(&args, Some(&cfg));
+    init_logging(&log_overrides, Some(&cfg));
 
     // The sink exists from here on. `[web_server.tls] enable` is inert and the
     // loader cannot warn about it — on this path the load above deliberately
@@ -846,7 +928,7 @@ async fn run_normal(mut args: FrpcRunArgs) {
 
     tracing::info!(version = %frp_core::VERSION, "frpc (Rust) v{} connecting...", frp_core::VERSION);
     let service = Arc::new(
-        match Service::with_unsafe_features(cfg, Some(args.config.clone()), unsafe_features.clone())
+        match Service::with_unsafe_features(cfg, Some(config.clone()), unsafe_features.clone())
             .await
         {
             Ok(svc) => svc,
@@ -1093,13 +1175,29 @@ async fn run_verify(config_path: &str, strict_config: bool, allow_unsafe: &[Stri
 }
 
 async fn run_reload(args: ReloadArgs) {
+    // Exhaustive on purpose: every field `frpc_admin_flag_specs` generates is
+    // named here, so a row added to that list fails to compile here (`E0027`)
+    // instead of being parsed and then read by nobody. The compiler asks for a
+    // decision, not a correct one — `api_timeout: _` compiles — so the
+    // bindings below are what the request is built from.
+    let ReloadArgs {
+        config,
+        strict_config,
+        admin_addr,
+        admin_port,
+        admin_user,
+        admin_pwd,
+        api_timeout,
+    } = args;
     let conn = match resolve_admin_connection(
-        args.admin_addr.as_deref(),
-        args.admin_port,
-        args.admin_user.as_deref(),
-        args.admin_pwd.as_deref(),
-        args.config.as_deref(),
-        args.strict_config,
+        AdminCli {
+            addr: admin_addr.as_deref(),
+            port: admin_port,
+            user: admin_user.as_deref(),
+            pwd: admin_pwd.as_deref(),
+        },
+        config.as_deref(),
+        strict_config,
     ) {
         Ok(conn) => conn,
         Err(e) => {
@@ -1111,8 +1209,8 @@ async fn run_reload(args: ReloadArgs) {
             process::exit(EXIT_RUNTIME);
         }
     };
-    let body = format!(r#"{{"strictConfig":{}}}"#, args.strict_config);
-    match admin_post_json(&conn, "/api/reload", &body, args.api_timeout).await {
+    let body = format!(r#"{{"strictConfig":{}}}"#, strict_config);
+    match admin_post_json(&conn, "/api/reload", &body, api_timeout).await {
         Ok(summary) => println!("reload success: {summary}"),
         Err(e) => {
             eprintln!("reload failed: {e}");
@@ -1122,13 +1220,29 @@ async fn run_reload(args: ReloadArgs) {
 }
 
 async fn run_status(args: StatusArgs) {
+    // Exhaustive on purpose, for the reason `run_reload` records: a row added
+    // to `frpc_admin_flag_specs` fails to compile here rather than being parsed
+    // and never read. `json` is not one of those five rows — it is
+    // `StatusArgs`' own field (`FRPC_ADMIN_STATUS_ONLY_ROW`).
+    let StatusArgs {
+        config,
+        strict_config,
+        json,
+        admin_addr,
+        admin_port,
+        admin_user,
+        admin_pwd,
+        api_timeout,
+    } = args;
     let conn = match resolve_admin_connection(
-        args.admin_addr.as_deref(),
-        args.admin_port,
-        args.admin_user.as_deref(),
-        args.admin_pwd.as_deref(),
-        args.config.as_deref(),
-        args.strict_config,
+        AdminCli {
+            addr: admin_addr.as_deref(),
+            port: admin_port,
+            user: admin_user.as_deref(),
+            pwd: admin_pwd.as_deref(),
+        },
+        config.as_deref(),
+        strict_config,
     ) {
         Ok(conn) => conn,
         Err(e) => {
@@ -1138,7 +1252,7 @@ async fn run_status(args: StatusArgs) {
             process::exit(EXIT_RUNTIME);
         }
     };
-    let body = match admin_get(&conn, "/api/status", args.api_timeout).await {
+    let body = match admin_get(&conn, "/api/status", api_timeout).await {
         Ok(b) => b,
         Err(e) => {
             eprintln!("status query failed: {e}");
@@ -1146,7 +1260,7 @@ async fn run_status(args: StatusArgs) {
         }
     };
 
-    if args.json {
+    if json {
         println!("{body}");
         return;
     }
@@ -1155,13 +1269,27 @@ async fn run_status(args: StatusArgs) {
 }
 
 async fn run_stop(args: StopArgs) {
+    // Exhaustive on purpose, for the reason `run_reload` records: a row added
+    // to `frpc_admin_flag_specs` fails to compile here rather than being parsed
+    // and never read.
+    let StopArgs {
+        config,
+        strict_config,
+        admin_addr,
+        admin_port,
+        admin_user,
+        admin_pwd,
+        api_timeout,
+    } = args;
     let conn = match resolve_admin_connection(
-        args.admin_addr.as_deref(),
-        args.admin_port,
-        args.admin_user.as_deref(),
-        args.admin_pwd.as_deref(),
-        args.config.as_deref(),
-        args.strict_config,
+        AdminCli {
+            addr: admin_addr.as_deref(),
+            port: admin_port,
+            user: admin_user.as_deref(),
+            pwd: admin_pwd.as_deref(),
+        },
+        config.as_deref(),
+        strict_config,
     ) {
         Ok(conn) => conn,
         Err(e) => {
@@ -1178,7 +1306,7 @@ async fn run_stop(args: StopArgs) {
     // the remaining headers differ: Go sends `User-Agent: Go-http-client/1.1`
     // and `Accept-Encoding: gzip`, frp-rs sends `Content-Type:
     // application/json` and `Connection: close`.
-    match admin_post_json(&conn, "/api/stop", "", args.api_timeout).await {
+    match admin_post_json(&conn, "/api/stop", "", api_timeout).await {
         Ok(_) => println!("stop success"),
         Err(e) => {
             eprintln!("stop failed: {e}");
@@ -1266,13 +1394,42 @@ mod tests {
         assert!(header.contains("YWRtaW46YWRtaW4="));
     }
 
+    /// `log_overrides_of` is the only place the five log rows become the five
+    /// slots `init_logging` reads, and three of those slots are the same type
+    /// (`Option<String>`): a literal that put `log_file`'s value in `level`
+    /// compiles, lints clean and disables the console sink silently. This test
+    /// names each row and asserts the slot it landed in.
+    #[test]
+    fn log_overrides_carry_each_row_to_its_own_slot() {
+        let args = FrpcRunArgs {
+            config: "c.toml".to_string(),
+            config_dir: None,
+            strict_config: true,
+            allow_unsafe: Vec::new(),
+            show_version: false,
+            log_file: Some("row-file.log".to_string()),
+            log_level: Some("row-level".to_string()),
+            log_max_days: Some(7),
+            log_format: Some("row-format".to_string()),
+            disable_log_color: true,
+        };
+        let overrides = log_overrides_of(&args);
+        assert_eq!(overrides.level.as_deref(), Some("row-level"));
+        assert_eq!(overrides.file.as_deref(), Some("row-file.log"));
+        assert_eq!(overrides.max_days, Some(7));
+        assert_eq!(overrides.format.as_deref(), Some("row-format"));
+        assert!(overrides.disable_color);
+    }
+
     #[test]
     fn test_resolve_admin_connection_cli_priority() {
         let conn = resolve_admin_connection(
-            Some("10.0.0.1"),
-            Some(1234),
-            Some("u"),
-            Some("p"),
+            AdminCli {
+                addr: Some("10.0.0.1"),
+                port: Some(1234),
+                user: Some("u"),
+                pwd: Some("p"),
+            },
             None, // no config file
             true,
         )
@@ -1284,7 +1441,17 @@ mod tests {
 
     #[test]
     fn test_resolve_admin_connection_defaults() {
-        let conn = resolve_admin_connection(None, None, None, None, None, true).unwrap();
+        let conn = resolve_admin_connection(
+            AdminCli {
+                addr: None,
+                port: None,
+                user: None,
+                pwd: None,
+            },
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(conn.addr, "127.0.0.1:7400");
         assert_eq!(conn.user, "");
         assert_eq!(conn.password, "");
@@ -1293,15 +1460,33 @@ mod tests {
     #[test]
     fn test_resolve_admin_connection_cli_addr_only_falls_through() {
         // addr without port is not enough — falls to defaults
-        let conn =
-            resolve_admin_connection(Some("10.0.0.1"), None, Some("u"), Some("p"), None, true)
-                .unwrap();
+        let conn = resolve_admin_connection(
+            AdminCli {
+                addr: Some("10.0.0.1"),
+                port: None,
+                user: Some("u"),
+                pwd: Some("p"),
+            },
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(conn.addr, "127.0.0.1:7400");
     }
 
     #[test]
     fn test_resolve_admin_connection_cli_port_only_falls_through() {
-        let conn = resolve_admin_connection(None, Some(9999), None, None, None, true).unwrap();
+        let conn = resolve_admin_connection(
+            AdminCli {
+                addr: None,
+                port: Some(9999),
+                user: None,
+                pwd: None,
+            },
+            None,
+            true,
+        )
+        .unwrap();
         assert_eq!(conn.addr, "127.0.0.1:7400");
     }
 
@@ -1309,8 +1494,17 @@ mod tests {
     fn test_resolve_admin_connection_explicit_port_zero_is_rejected() {
         // `--admin-port 0` is not "not supplied": it is refused with Go's
         // web-server message instead of silently falling back to the default.
-        let err = resolve_admin_connection(Some("127.0.0.1"), Some(0), None, None, None, true)
-            .unwrap_err();
+        let err = resolve_admin_connection(
+            AdminCli {
+                addr: Some("127.0.0.1"),
+                port: Some(0),
+                user: None,
+                pwd: None,
+            },
+            None,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(
             err.to_string(),
             "web server port should be set if you want to use this feature"
@@ -1322,10 +1516,12 @@ mod tests {
         // A config path that cannot be loaded must not fall back to a default
         // address; the error text is the load error, printed verbatim.
         let err = resolve_admin_connection(
-            None,
-            None,
-            None,
-            None,
+            AdminCli {
+                addr: None,
+                port: None,
+                user: None,
+                pwd: None,
+            },
             Some("/nonexistent/frpc-does-not-exist.toml"),
             true,
         )
@@ -1345,21 +1541,6 @@ mod tests {
 #[cfg(test)]
 mod worker_thread_tests {
     use super::*;
-
-    fn run_args(config: &str, config_dir: Option<&str>) -> FrpcRunArgs {
-        FrpcRunArgs {
-            config: config.to_string(),
-            config_dir: config_dir.map(str::to_string),
-            strict_config: true,
-            allow_unsafe: Vec::new(),
-            show_version: false,
-            log_file: None,
-            log_level: None,
-            log_max_days: None,
-            log_format: None,
-            disable_log_color: false,
-        }
-    }
 
     /// A temp directory that removes itself, including when an assertion in the
     /// test panics — a bare `remove_dir_all` at the end of the body leaks a
@@ -1449,8 +1630,8 @@ mod worker_thread_tests {
             "serverAddr = \"127.0.0.1\"\nserverPort = 7000\nworkerThreads = 3\n",
         )
         .expect("write config");
-        let args = run_args(&path.display().to_string(), None);
-        assert_eq!(worker_threads_from_args(&args), 3);
+        let config = path.display().to_string();
+        assert_eq!(worker_threads_from_args(&config, None, true), 3);
     }
 
     /// The env var is the middle rung and it is read from the process
@@ -1463,22 +1644,25 @@ mod worker_thread_tests {
         let dir = temp_dir("absent");
         let path = dir.join("frpc.toml");
         std::fs::write(&path, "serverAddr = \"127.0.0.1\"\n").expect("write config");
-        let args = run_args(&path.display().to_string(), None);
+        let config = path.display().to_string();
 
         let scoped = ScopedEnv::set("6");
-        assert_eq!(worker_threads_from_args(&args), 6);
+        assert_eq!(worker_threads_from_args(&config, None, true), 6);
         drop(scoped);
 
         let scoped = ScopedEnv::set("0");
         assert_eq!(
-            worker_threads_from_args(&args),
+            worker_threads_from_args(&config, None, true),
             default_worker_threads(),
             "a zero is ignored rather than handed to tokio, so the default applies"
         );
         drop(scoped);
 
         let scoped = ScopedEnv::unset();
-        assert_eq!(worker_threads_from_args(&args), default_worker_threads());
+        assert_eq!(
+            worker_threads_from_args(&config, None, true),
+            default_worker_threads()
+        );
         drop(scoped);
     }
 
