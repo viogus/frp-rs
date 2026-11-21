@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=fab581a500a64cf2dfe4f65272da18ecbacd0eee76b778528b47f1eb44fdad45
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=cc02066de7e2c12774dfb17187e13821b584326a1dbbd524c3bb3624ee5d95a1
+          guard_data_pin=73431121eff90d1dbc200a2e07169f9ddc586a62d27c4d96d0250d1abd81ebc2
           guard_exact=118
           guard_floor=118
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -1890,6 +1890,107 @@ jobs:
             exit 1
           fi
           echo "cite guard fixtures ok: $guard_exact checks hold (floor $guard_floor), M1 witness present, guard/table/subject pins verified, real tree $guard_cites cites 0 violations, sabotage converse red"
+      # The throughput-floor gate has two failure modes no runtime check can see:
+      # a renamed emitter token (`BELOW|`) makes the reader loop print nothing,
+      # and deleting `--floors scripts/protocol-matrix.floors` from compat.yml
+      # turns the gate off while the matrix keeps running green. This step is the
+      # fixture suite's home: it pins the suite, the matrix and the caller by
+      # sha256, requires the suite's exact check total, and asserts the caller
+      # still passes the floors file.
+      - name: Throughput-floor gate fixtures
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          floors_file=scripts/tests/protocol-matrix-floors.sh
+          floors_pin=b82f56844cf332ee774491faa9cbcfcaa3c0d1c080bee6368d2dd162d490c151
+          matrix_file=scripts/protocol-matrix.sh
+          matrix_pin=2992d118eddf43e4f49dbe27ba08030316e4848e9ac2f974c48ca772bf3c3649
+          compat_file=.github/workflows/compat.yml
+          compat_pin=e84d5e46d244480baef55970708ffeb821ef312b1bfe01580b6b5c1d51457689
+          floors_exact=25
+          floors_floor=25
+          log=/tmp/frp-protocol-matrix-floors.$$.log
+          # Builtins only on the read-back path, for the same reason the cite
+          # guard step records: a hasher named late on `PATH` is what a broken
+          # image would hide behind.
+          hasher=''
+          probe_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+          for cand in /usr/bin/sha256sum /bin/sha256sum /sbin/sha256sum /usr/sbin/sha256sum /usr/local/bin/sha256sum; do
+            [ -x "$cand" ] || continue
+            got_probe=$(printf 'abc' | "$cand" 2>/dev/null)
+            [ "${got_probe%% *}" = "$probe_abc" ] || continue
+            hasher=$cand
+            break
+          done
+          if [ -z "$hasher" ]; then
+            for cand in /usr/bin/shasum /bin/shasum /usr/local/bin/shasum; do
+              [ -x "$cand" ] || continue
+              got_probe=$(printf 'abc' | "$cand" -a 256 2>/dev/null)
+              [ "${got_probe%% *}" = "$probe_abc" ] || continue
+              hasher="$cand -a 256"
+              break
+            done
+          fi
+          if [ -z "$hasher" ]; then
+            echo "::error::no working sha256 hasher found; the floor-gate pins cannot be verified"
+            exit 1
+          fi
+          # shellcheck disable=SC2086  # $hasher is the word-split "<abs path> [-a 256]"
+          pin_of() { $hasher "$1" | awk '{print $1}'; }
+          for pair in "$floors_file:$floors_pin" "$matrix_file:$matrix_pin" "$compat_file:$compat_pin"; do
+            file=${pair%%:*}
+            want=${pair##*:}
+            if [ ! -f "$file" ]; then
+              echo "::error::$file is missing; the throughput-floor gate cannot be verified"
+              status=1
+              continue
+            fi
+            got=$(pin_of "$file")
+            if [ "$got" != "$want" ]; then
+              echo "::error::$file is not the pinned revision ($got != $want); a change to the gate, its fixture or the caller has to move this pin in the same commit"
+              status=1
+            fi
+          done
+          if bash "$floors_file" > "$log" 2>&1; then :; else status=1; fi
+          floors_ok=$(grep -c '^  ok' "$log" || true)
+          floors_fail=$(grep -c '^  FAIL' "$log" || true)
+          if [ "$floors_ok" != "$floors_exact" ]; then
+            echo "::error::$floors_file printed $floors_ok ' ok' lines, expected $floors_exact; a smaller total means a case stopped running"
+            status=1
+          fi
+          if [ "$floors_fail" != "0" ]; then
+            echo "::error::$floors_file printed $floors_fail FAIL line(s):"
+            grep '^  FAIL' "$log" || true
+            status=1
+          fi
+          if ! grep -Fq "RESULT: $floors_exact fixture check(s) hold" "$log"; then
+            echo "::error::$floors_file did not end with 'RESULT: $floors_exact fixture check(s) hold'"
+            status=1
+          fi
+          # The flag has to sit on an executable line: a plain `grep -F` counts a
+          # comment, and "delete the flag, leave its name in a comment" is the
+          # edit this check exists for. Comment lines are dropped first and the
+          # trailing continuation is required — the matrix invocation continues
+          # onto the next argument, a note about it does not.
+          # Not `grep -v … | grep -q …`: under `pipefail` a pipeline into
+          # `grep -q` can read a match as a miss, and the repo's health gate
+          # refuses the shape.
+          wiring=$(grep -v '^[[:space:]]*#' "$compat_file" || true)
+          if ! grep -Fq -- '--floors scripts/protocol-matrix.floors \' <<<"$wiring"; then
+            echo "::error::$compat_file no longer passes '--floors scripts/protocol-matrix.floors' on an executable line; the matrix would run with the gate disabled and stay green"
+            status=1
+          fi
+          if [ "$floors_ok" -lt "$floors_floor" ]; then
+            echo "::error::the floor fixture reported only $floors_ok checks (floor $floors_floor)"
+            status=1
+          fi
+          if [ "$status" != "0" ]; then
+            echo "::error::the throughput-floor gate is not biting as pinned: fixture=$floors_exact checks, matrix and caller pinned by sha256, caller must pass --floors scripts/protocol-matrix.floors"
+            cat "$log" || true
+            exit 1
+          fi
+          echo "throughput-floor gate fixtures ok: $floors_exact checks hold, matrix and caller pins verified, --floors wiring present"
   tests-unit:
     name: Tests (unit)
     runs-on: ubuntu-latest

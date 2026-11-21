@@ -12863,7 +12863,31 @@ Filed by the protocol-matrix throughput-floor change (`scripts/protocol-matrix.f
 kept out of the main P2 list so that adding them does not renumber every later
 `TODO.md:<n>` cite (see the item below).
 
-- [ ] **`apply_floors` has no fixture, and the CI wiring is unpinned.**
+- [x] **`apply_floors` has no fixture, and the CI wiring is unpinned.**
+
+  **Closed 2026-11-21.** `scripts/tests/protocol-matrix-floors.sh` drives
+  `apply_floors` through every verdict it can reach — below-floor (absolute and
+  ratio), unknown row, unfloored row, unmeasured row, unparseable floor line,
+  unparseable rate entry, missing floors file, undecodable (non-UTF-8) floors
+  file, all-rows-unmeasured, report-only, and two distinct no-verdict routes —
+  plus three source pins for the tokens the reader loop depends on (`BELOW|`,
+  the `checked|N|M` terminator, the executed-only guard) and the
+  `--floors scripts/protocol-matrix.floors` wiring in
+  `.github/workflows/compat.yml`. 23 checks, `MIN_CHECKS=23` and an ordered
+  `SHAPE` list so a case that stops running moves the labels.
+
+  The suite runs `apply_floors` in the current shell, not a command
+  substitution: the checker reports through the sourced script's `FAIL` /
+  `FAILURES` globals, and a subshell throws those away — a first draft of this
+  suite read every failing case as passing for exactly that reason, which is
+  the fixture's own version of the gate it guards.
+
+  CI: the `Throughput-floor gate fixtures` step in the `health` job pins the
+  suite, `scripts/protocol-matrix.sh` and `.github/workflows/compat.yml` by
+  sha256, requires exactly 23 `ok` lines and `RESULT: 23 fixture check(s)
+  hold`, refuses any `FAIL` line, and greps the caller for the `--floors`
+  flag — so deleting the flag from `compat.yml` now reds CI even though the
+  matrix itself would keep passing.
   Evidence: the throughput-floor gate added with `scripts/protocol-matrix.floors`
   is enforced by a python checker inside `scripts/protocol-matrix.sh`
   (`apply_floors`). `scripts/tests/` has no fixture for it — the only matrix
