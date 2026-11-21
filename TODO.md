@@ -13067,6 +13067,25 @@ kept out of the main P2 list so that adding them does not renumber every later
   means no yamux task exists in these arms at all. Pinning only bridge/yamux onto
   another runtime is untested here.
 
+  **Measured 2026-11-21 (same macOS host, `tcpMux` on and off, eight connections,
+  three reps per arm at each worker count, `scripts/worker-fan-in-probe.sh`;
+  method and numbers in
+  [`2026-11-21-worker-migration-mux.md`](docs/archive/notes/2026-11-21-worker-migration-mux.md)):**
+  with `tcpMux` **off**, one client worker carries 0.81x of the default pool's
+  aggregate (639.5 against 794.2 MiB/s, both directions), reproducing the
+  fan-in deficit above; with `tcpMux` **on**, one worker carries **1.06x**
+  (523.2 against 495.9) — the eight sessions multiplex onto one connection, so
+  the pool buys nothing and costs about 5%. One connection is flat at every
+  worker count in both modes (0.99x), so this is fan-in, not a slow runtime.
+
+  That answers the half this item left open: pinning **yamux** tasks onto a
+  private runtime has no deficit to recover — with a yamux task in the path the
+  pool is already the slower choice. The 0.81x lives in the per-connection
+  bridge path, where the remedy is more workers, not a private thread; the arm
+  that would still be worth running is bridge-only pinning, which this probe
+  does not isolate (it also folds eight work connections into one, and `tcpMux`
+  is 20-35% slower overall here, so 1.06x is a ratio inside a different regime).
+
   What it does change is the trigger above: that trigger already sits inside its
   own threshold — 2266 MiB/s at eight sessions against 2570 on one flow is
   **0.88×**, and that host's four-worker eight-session figure (2867) is 1.12× its
