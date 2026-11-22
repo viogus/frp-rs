@@ -13050,6 +13050,15 @@ kept out of the main P2 list so that adding them does not renumber every later
   Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
   2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
 
+  **Fixed 2026-11-22 (mux write path, 4-core Linux VPS):** frps emitted every
+  mux frame as two segments because `PreReadStream` had no
+  `poll_write_vectored` (`frp-core/src/transport/mod.rs:2565`); forwarding it,
+  with a single-vectored-frame writer in the vendored muxer, measures +8.9% at
+  eight streams (1108 -> 1207 MiB/s, out-segments per MiB 96.2 -> 87.3) and no
+  change at one stream or on the `tcp_mux = false` control. The window and the
+  payload copy were falsified first, so the note records three numbers that did
+  not move: `docs/archive/notes/2026-11-22-mux-write-path-vectored.md`.
+
   **Measured 2026-11-21 (macOS arm64, 8 cores, loopback, `tcp` with
   `tcp_mux = false`, three reps at one and at eight client workers, two at two
   and at four; method, per-arm numbers and the raw-loopback ceiling in
