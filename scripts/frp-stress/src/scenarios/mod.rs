@@ -5,6 +5,8 @@ pub mod latency;
 pub mod longevity;
 pub mod memory;
 pub mod mixed;
+pub mod sink;
+pub mod stream;
 pub mod throughput;
 pub mod udp;
 
@@ -15,10 +17,8 @@ use std::pin::Pin;
 
 /// Run all scenarios sequentially. Each exits non-zero on failure.
 pub async fn run_all(cli: &Cli) -> Result<()> {
-    let scenarios: &[(
-        &str,
-        fn(&Cli) -> Pin<Box<dyn Future<Output = Result<()>> + '_>>,
-    )] = &[
+    type ScenarioFn = fn(&Cli) -> Pin<Box<dyn Future<Output = Result<()>> + '_>>;
+    let scenarios: &[(&str, ScenarioFn)] = &[
         ("memory", |c| {
             Box::pin(memory::run_with_mode(c, "idle_hold"))
         }),
