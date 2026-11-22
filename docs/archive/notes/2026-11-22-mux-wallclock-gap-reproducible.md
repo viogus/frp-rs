@@ -22,14 +22,14 @@ per rep, macOS arm64 loopback, load < 2 on 8 cores. MiB/s; MiB/CPU-s is
 #### Eight streams
 
 | arm | frp-rs MiB/s | Go frp MiB/s | wall ratio | frp-rs MiB/CPU-s | Go MiB/CPU-s | CPU ratio |
-|---|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- | --- |
 | `tcpMux = false` | 1780 / 1795 / 1780 (**1789**) | 1483 / 1534 / 1546 (**1521**) | **1.18×** | 597 / 591 / 599 (**596**) | 477 / 478 / 484 (**480**) | **1.24×** |
 | `tcpMux = true` | 652 / 659 / 665 (**659**) | 771 / 727 / 721 (**740**) | **0.89×** | 395 / 394 / 402 (**397**) | 282 / 283 / 280 (**282**) | **1.41×** |
 
 #### One stream
 
 | arm | frp-rs MiB/s | Go frp MiB/s | wall ratio (median) | frp-rs MiB/CPU-s | Go MiB/CPU-s |
-|---|---|---|---|---|---|
+| --- | --- | --- | --- | --- | --- |
 | `tcpMux = false` | 994 / 988 / 928 | 1068 / 582 / 1069 | 0.93× | 549 | 526 |
 | `tcpMux = true` | 729 / 314 / 696 | 723 / 729 / 727 | 0.96× | 454 | 318 |
 
@@ -105,3 +105,39 @@ deficit is therefore *parallelism of the per-byte work*, not the 4 µs frame hop
 and not a lock. The next measurement is a per-stream offload experiment: hand the
 decrypted payload of each stream to its own task before the bridge copy, and see
 whether throughput follows the extra cores.
+
+## Third machine: a 4-core Linux VPS, where it does not reproduce
+
+Same harness, same configs, no frp on the same box as the load generator
+(loopback there too). Four pairings x 2 reps x 8 streams x 10 s, `tcpMux = true`
+everywhere, CPU is both processes:
+
+| pairing | MiB/s (2 reps) | MiB/CPU-s |
+| --- | --- | --- |
+| rust srv + rust cli | 650 / 707 (**679**) | 295 / 321 |
+| rust srv + Go cli | 722 / 686 (**704**) | 328 / 298 |
+| Go srv + rust cli | 492 / 649 (**571**) | 234 / 295 |
+| Go srv + Go cli | 536 / 525 (**531**) | 243 / 238 |
+
+On that box frp-rs is **ahead, not behind**, in both the same-impl and the
+mixed rows, and it still spends fewer CPU-seconds per byte. So the 0.89x above
+is not "the mux path": it is the mux path **on an 8-core macOS host**, where the
+same code loses 11% of wall-clock while using less CPU. Two things follow.
+
+First, the previous section's "server impl dominates" reading came from a
+different machine with a different pairing; on this one the Go server is the
+slow side and the client impl barely moves the result. Neither statement
+generalises, and both are now labelled with the box they were measured on.
+
+Second, two candidate explanations survive and neither is measured: macOS
+per-wakeup cost (`__sendto`/`__recvfrom` self time, kqueue vs epoll), or
+oversubscription on 8 cores with a load generator that is itself an 8-task
+process. A Linux run cannot separate them; a Mac run with fewer streams than
+cores, or with the load generator pinned to other cores, could.
+
+One retraction, recorded because it cost a detour: a first pass on the macOS
+host reported `rust frpc + Go frps + tcpMux = true` failing at login with
+`unexpected EOF`. It does not reproduce: on this VPS the same pairing registers
+and streams. The local failure was the client starting before the Go server had
+bound its port with `loginFailExit` on — a harness ordering bug, not a
+compatibility defect.
