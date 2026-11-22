@@ -5,7 +5,7 @@
 
 ## What the mux penalty actually is
 
-`tcpMux = true` runs at 1111-1141 MiB/s where `tcpMux = false` runs at
+`tcpMux = true` runs at 1111-1141 MiB/s (1108 in the interleaved pair runs below) where `tcpMux = false` runs at
 3096-3280 MiB/s on the same box with TLS off. That gap is not a defect: the
 non-mux path hands the socket pair to `splice(2)` on Linux, and a framed
 transport cannot splice — it must see the bytes. The number that matters is
@@ -30,11 +30,13 @@ therefore the mux path against Go's mux path, which is where frp-rs is ahead
 
 ## The defect the third hypothesis uncovered
 
-`impl AsyncWrite for PreReadStream` (`frp-core/src/transport/mod.rs:2565`) had
+`impl AsyncWrite for PreReadStream` (`frp-core/src/transport/mod.rs:2559`) had
 `poll_write`, `poll_flush`, `poll_shutdown` — and no `poll_write_vectored`, so
 tokio's default applied and every mux frame left frps as two segments: a 12-byte
-header and a 64 KiB body. `frpc` builds its mux rail without that wrapper, which
-is why the client half of the frame already went out as one write.
+header and a 64 KiB body. `frpc` builds its mux rail without that wrapper, and its adapter
+(tokio-util's `WriteCompat`) has no vectored method either, so the client split
+frames too; the forwarding in `frp-core/src/mux.rs` (`VectoredWrite`) is the
+second half of the fix, without which only frps would have gained.
 
 Forwarding the method, plus the single-vectored-frame writer, measures:
 

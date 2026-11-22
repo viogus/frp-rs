@@ -13052,7 +13052,7 @@ kept out of the main P2 list so that adding them does not renumber every later
 
   **Fixed 2026-11-22 (mux write path, 4-core Linux VPS):** frps emitted every
   mux frame as two segments because `PreReadStream` had no
-  `poll_write_vectored` (`frp-core/src/transport/mod.rs:2565`); forwarding it,
+  `poll_write_vectored` (`frp-core/src/transport/mod.rs:2559`); forwarding it,
   with a single-vectored-frame writer in the vendored muxer, measures +8.9% at
   eight streams (1108 -> 1207 MiB/s, out-segments per MiB 96.2 -> 87.3) and no
   change at one stream or on the `tcp_mux = false` control. The window and the
