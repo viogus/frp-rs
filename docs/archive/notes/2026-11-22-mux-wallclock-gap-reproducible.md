@@ -19,14 +19,14 @@ writes, one saturating stream per connection, arms interleaved, order flipped
 per rep, macOS arm64 loopback, load < 2 on 8 cores. MiB/s; MiB/CPU-s is
 `mbps × duration / cpu‑seconds` from `ps -o time` deltas.
 
-**Eight streams**
+#### Eight streams
 
 | arm | frp-rs MiB/s | Go frp MiB/s | wall ratio | frp-rs MiB/CPU-s | Go MiB/CPU-s | CPU ratio |
 |---|---|---|---|---|---|---|
 | `tcpMux = false` | 1780 / 1795 / 1780 (**1789**) | 1483 / 1534 / 1546 (**1521**) | **1.18×** | 597 / 591 / 599 (**596**) | 477 / 478 / 484 (**480**) | **1.24×** |
 | `tcpMux = true` | 652 / 659 / 665 (**659**) | 771 / 727 / 721 (**740**) | **0.89×** | 395 / 394 / 402 (**397**) | 282 / 283 / 280 (**282**) | **1.41×** |
 
-**One stream**
+#### One stream
 
 | arm | frp-rs MiB/s | Go frp MiB/s | wall ratio (median) | frp-rs MiB/CPU-s | Go MiB/CPU-s |
 |---|---|---|---|---|---|
@@ -67,3 +67,41 @@ is read by median; the eight-stream arms spread ~1% and are read by mean.
   whether a hop that cheap can cost 11% of a saturating eight-stream throughput
   is exactly what the next measurement has to answer, with the shape that shows
   the gap rather than the shape that was used to size it.
+
+## Follow-up: the shape of the limit, not the size of the gap
+
+A separate session tried to localise the gap on a **different, loaded** host
+(load 6-13 on 8 cores), where it did not reproduce: rust mux 477/446 vs Go 361/361
+MiB/s, i.e. frp-rs ahead in the same cell. So the numbers above stand only for a
+quiet host, and the localisation below is about *where the work sits*, not about
+how big the deficit is.
+
+Four things that host did establish, all structural:
+
+1. **The server impl dominates the pairing.** 8-stream mux medians: rust srv +
+   rust cli **663**, rust srv + Go cli **561**, Go srv + rust cli **471**, Go srv
+   + Go cli **431** MiB/s. The client implementation moves the result 9-18%; the
+   server implementation 40%. A deficit in this cell is a *server-side ingress*
+   question first.
+2. **More client workers do not help.** `worker_threads` 1 / 8 / default →
+   564-574 / 535-646 / 503-588 MiB/s, CPU flat — inside noise. Whatever limits
+   the cell is inside one task, not in how tasks are shared out.
+3. **That task is saturated and not blocked.** `sample` on an unstripped frpc
+   during the cell: 8 tokio workers, one busy; with `worker_threads = 1` the
+   single worker held 4353/4353 samples with only 153 (3.5%) in `park_internal`.
+   Top self frames: `__sendto` (23% of the worker's samples), ring
+   `aes_gcm_dec`, rustls `vecbuf Vec::resize`, `__recvfrom`, `_platform_memmove`.
+   No lock spinning, no park. So the per-byte path (decrypt, resize, copy,
+   syscall) runs on **one** thread and never exceeds ~1 core.
+4. **Splitting the streams across connections restores little.** 1 conn × 1
+   stream 729, 1 conn × 8 streams 664, 8 conns × 1 stream 778/755 MiB/s (summed).
+   A 17% recovery at 8x the connections, so the per-connection driver is not a
+   hard serialisation point — the work itself is.
+
+Read together with the CPU column above, the picture is: frp-rs does all
+per-stream byte work on one connection task (≈1 core, 397 MiB/CPU-s), Go spreads
+it over per-stream goroutines (≈2.6 cores at 740 MiB/s, 282 MiB/CPU-s). The
+deficit is therefore *parallelism of the per-byte work*, not the 4 µs frame hop
+and not a lock. The next measurement is a per-stream offload experiment: hand the
+decrypted payload of each stream to its own task before the bridge copy, and see
+whether throughput follows the extra cores.
