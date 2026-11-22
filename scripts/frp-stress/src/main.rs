@@ -11,8 +11,8 @@ mod scenarios;
 #[derive(Parser)]
 #[command(name = "frp-stress", about = "frp-rs stress testing framework")]
 struct Cli {
-    /// Scenario to run (memory, connections, throughput, longevity, burst, mixed,
-    /// udp, udp-echo, all)
+    /// Scenario to run (memory, connections, throughput, stream, longevity,
+    /// burst, mixed, udp, udp-echo, echo, sink, latency, all)
     #[arg(short, long, default_value = "all")]
     scenario: String,
 
@@ -105,10 +105,12 @@ async fn main() -> Result<()> {
         "memory" => scenarios::memory::run(&cli).await?,
         "connections" => scenarios::connections::run(&cli).await?,
         "throughput" => scenarios::throughput::run(&cli).await?,
+        "stream" => scenarios::stream::run(&cli).await?,
         "longevity" => scenarios::longevity::run(&cli).await?,
         "burst" => scenarios::burst::run(&cli).await?,
         "mixed" => scenarios::mixed::run(&cli).await?,
         "echo" => scenarios::echo::run(&cli).await?,
+        "sink" => scenarios::sink::run(&cli).await?,
         "udp" => scenarios::udp::run(&cli).await?,
         "udp-echo" => scenarios::udp::run_echo(&cli).await?,
         "latency" => scenarios::latency::run(&cli).await?,
