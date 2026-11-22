@@ -58,5 +58,12 @@ separately from a 64 KiB body costs.
   it.
 - WAN. Loopback has no segments-in-flight cost, so removing a small segment is
   worth more on a real path than these numbers show.
-- The vendored crate has no unit tests, so frame framing is covered only by
-  `frp-core`'s mux/protocol tests (120) and the protocol matrix.
+- The vendored crate's own test drives the writer with an accept-everything
+  `Vec<u8>` sink (`cargo test --manifest-path vendor/yamux/Cargo.toml`), so it
+  checks frame bytes but cannot see a short write; the short-write accounting is
+  covered by the adversarial review's probes, not by a committed test.
+- QUIC and KCP do not gain this. Their stream types (`frp-core/src/quic.rs:782`,
+  `frp-core/src/kcp/stream.rs:272`) still have no `poll_write_vectored`, so
+  tcp-mux over those transports keeps splitting a frame into a 12-byte header and
+  the body — identical to before this change, and worth a follow-up only if mux
+  over QUIC/KCP ever shows the same segment cost.
