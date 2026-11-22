@@ -64,13 +64,31 @@ pub async fn run(cli: &Cli) -> Result<()> {
             if let Err(e) = stream.set_nodelay(true) {
                 tracing::warn!("could not disable Nagle on the load socket: {e}");
             }
-            while tokio::time::Instant::now() < deadline {
-                tokio::time::timeout(io_timeout, stream.write_all(&payload))
-                    .await
-                    .map_err(|_| {
-                        anyhow::anyhow!("stream {} write timed out (stalled bridge?)", i)
-                    })??;
-                total.fetch_add(PAYLOAD_SIZE as u64, Ordering::Relaxed);
+            loop {
+                // Race the deadline rather than budgeting the write by it: a
+                // write capped by the last sub-millisecond slice of the window
+                // fails for arithmetic, not for a stalled bridge. Ending the
+                // window is a clean break; only a genuine stall (no progress
+                // for `io_timeout`) is an error.
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(remaining) => break,
+                    done = tokio::time::timeout(io_timeout, stream.write_all(&payload)) => {
+                        match done {
+                            Err(_) => {
+                                return Err(anyhow::anyhow!(
+                                    "stream {} write timed out (stalled bridge?)",
+                                    i
+                                ))
+                            }
+                            Ok(r) => r?,
+                        }
+                        total.fetch_add(PAYLOAD_SIZE as u64, Ordering::Relaxed);
+                    }
+                }
             }
             Ok::<(), anyhow::Error>(())
         }));
