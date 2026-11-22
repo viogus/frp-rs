@@ -571,6 +571,17 @@ impl AsyncWrite for IoStream {
         Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
     }
 
+    /// Forwarded so a `writev`-capable socket underneath stays one syscall
+    /// per frame (yamux emits a frame header + body as one vectored write);
+    /// tokio's default would write only the first non-empty slice.
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
@@ -2554,6 +2565,17 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
+    /// Forwarded so the frps accepted-stream path keeps `writev`: tokio's
+    /// default writes only the first non-empty slice, which splits every
+    /// yamux frame (header + body) into two syscalls.
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
@@ -3367,7 +3389,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2343).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2354).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

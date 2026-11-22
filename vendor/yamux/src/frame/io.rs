@@ -17,7 +17,8 @@ use crossbeam_queue::ArrayQueue;
 use futures::{prelude::*, ready, Sink};
 use std::{
     collections::VecDeque,
-    fmt, io,
+    fmt,
+    io::{self, IoSlice},
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -70,7 +71,8 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 /// GoAway, stream resets, window updates) always precede queued data frames.
 /// Only one frame is ever in flight (`WriteState`): a frame's header and body
 /// must reach the socket contiguously, so a new frame is only started once the
-/// previous one is fully written.
+/// previous one is fully written. Header and body are written as one vectored
+/// write (`writev`) — one syscall per frame.
 #[derive(Debug)]
 pub(crate) struct Writer<W> {
     id: Id,
@@ -160,16 +162,19 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
 }
 
 /// The stages of writing a new `Frame`.
+///
+/// frp-rs patch: a frame's header and body are handed to the socket as ONE
+/// vectored write, so a 64 KiB data frame costs one `sendmsg` instead of a
+/// header `write` plus a body `write`. The two offsets record how much of
+/// each slice the socket has accepted: a vectored write may stop anywhere,
+/// including part-way through the 12-byte header.
 enum WriteState {
     Init,
-    Header {
+    Frame {
         header: [u8; header::HEADER_SIZE],
-        buffer: Vec<u8>,
-        offset: usize,
-    },
-    Body {
-        buffer: Vec<u8>,
-        offset: usize,
+        header_offset: usize,
+        body: Vec<u8>,
+        body_offset: usize,
     },
     Poisoned,
 }
@@ -178,15 +183,18 @@ impl fmt::Debug for WriteState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             WriteState::Init => f.write_str("(WriteState::Init)"),
-            WriteState::Header { offset, .. } => {
-                write!(f, "(WriteState::Header (offset {offset}))")
-            }
-            WriteState::Body { offset, buffer } => {
+            WriteState::Frame {
+                header_offset,
+                body,
+                body_offset,
+                ..
+            } => {
                 write!(
                     f,
-                    "(WriteState::Body (offset {}) (buffer-len {}))",
-                    offset,
-                    buffer.len()
+                    "(WriteState::Frame (header-offset {}) (body-offset {} of {}))",
+                    header_offset,
+                    body_offset,
+                    body.len()
                 )
             }
             WriteState::Poisoned => f.write_str("(WriteState::Poisoned)"),
@@ -203,82 +211,77 @@ impl<W: AsyncWrite + Unpin> Sink<Frame<()>> for Writer<W> {
             log::trace!("{}: write: {:?}", this.id, this.write_state);
             match &mut this.write_state {
                 WriteState::Init => return Poll::Ready(Ok(())),
-                WriteState::Header {
+                WriteState::Frame {
                     header,
-                    buffer,
-                    ref mut offset,
-                } => match Pin::new(&mut this.io).poll_write(cx, &header[*offset..]) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(n)) => {
-                        if n == 0 {
-                            return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                        }
-                        *offset += n;
-
-                        if *offset > header.len() {
-                            let err = io::Error::other(format!(
-                                "Writer header returned invalid write count n={n}: {offset} > {} ",
-                                header.len(),
-                            ));
-
-                            this.write_state = WriteState::Poisoned;
-
-                            return Poll::Ready(Err(err));
-                        }
-
-                        if *offset == header.len() {
-                            if !buffer.is_empty() {
-                                let buffer = std::mem::take(buffer);
-                                this.write_state = WriteState::Body { buffer, offset: 0 };
-                            } else {
-                                this.write_state = WriteState::Init;
-                            }
-                        }
-                    }
-                },
-                WriteState::Body {
-                    buffer,
-                    ref mut offset,
-                } => match Pin::new(&mut this.io).poll_write(cx, &buffer[*offset..]) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(n)) => {
-                        if n == 0 {
-                            return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
-                        }
-                        *offset += n;
-
-                        if *offset > buffer.len() {
-                            let err = io::Error::other(format!(
-                                "Writer body returned invalid write count n={n}: {offset} > {} ",
-                                buffer.len(),
-                            ));
-
-                            this.write_state = WriteState::Poisoned;
-
-                            return Poll::Ready(Err(err));
-                        }
-
-                        if *offset == buffer.len() {
-                            let buffer = std::mem::take(buffer);
+                    ref mut header_offset,
+                    body,
+                    ref mut body_offset,
+                } => {
+                    // Only non-empty slices are offered to the socket: an
+                    // empty leading slice would let a vectored write report
+                    // progress it did not make.
+                    let head = &header[*header_offset..];
+                    let tail = &body[*body_offset..];
+                    let slices = [IoSlice::new(head), IoSlice::new(tail)];
+                    let bufs: &[IoSlice<'_>] = match (head.is_empty(), tail.is_empty()) {
+                        (false, false) => &slices[..],
+                        (false, true) => &slices[..1],
+                        (true, false) => &slices[1..],
+                        // Both slices are fully written; the frame completed
+                        // on the write that emptied them.
+                        (true, true) => {
                             this.write_state = WriteState::Init;
-                            // frp-rs patch: the body is fully on the wire and
-                            // exclusively owned here — return it to the
-                            // connection-scoped pool for reuse by the next
-                            // `Stream::poll_write`. Best-effort: a full pool
-                            // or a buffer above the default split-send size
-                            // (custom `split_send_size`) is simply dropped.
-                            // Buffers lost to WriteZero / Poisoned / teardown
-                            // are fine — the pool dies with the connection.
-                            if !buffer.is_empty()
-                                && buffer.capacity() <= this.split_send_size
-                            {
-                                let _ = this.body_pool.push(buffer);
+                            continue;
+                        }
+                    };
+                    match Pin::new(&mut this.io).poll_write_vectored(cx, bufs) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Ready(Ok(n)) => {
+                            if n == 0 {
+                                return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                            }
+                            if n > head.len() + tail.len() {
+                                let err = io::Error::other(format!(
+                                    "Writer returned invalid write count n={n}: {} > {}",
+                                    n,
+                                    head.len() + tail.len(),
+                                ));
+
+                                this.write_state = WriteState::Poisoned;
+
+                                return Poll::Ready(Err(err));
+                            }
+                            if n < head.len() {
+                                // Header not yet complete: keep the frame in
+                                // flight and let the caller poll again.
+                                *header_offset += n;
+                                continue;
+                            }
+                            let body_n = n - head.len();
+                            *header_offset = header.len();
+                            *body_offset += body_n;
+                            debug_assert!(*body_offset <= body.len());
+                            if *body_offset == body.len() {
+                                let buffer = std::mem::take(body);
+                                this.write_state = WriteState::Init;
+                                // frp-rs patch: the body is fully on the wire
+                                // and exclusively owned here — return it to
+                                // the connection-scoped pool for reuse by the
+                                // next `Stream::poll_write`. Best-effort: a
+                                // full pool or a buffer above the configured
+                                // split size is simply dropped. Buffers lost
+                                // to WriteZero / Poisoned / teardown are fine
+                                // — the pool dies with the connection.
+                                if !buffer.is_empty()
+                                    && buffer.capacity() <= this.split_send_size
+                                {
+                                    let _ = this.body_pool.push(buffer);
+                                }
                             }
                         }
                     }
-                },
+                }
                 WriteState::Poisoned => {
                     return Poll::Ready(Err(io::Error::other(
                         "Sink is in poisoned state due to previous write error",
@@ -291,10 +294,11 @@ impl<W: AsyncWrite + Unpin> Sink<Frame<()>> for Writer<W> {
     fn start_send(self: Pin<&mut Self>, f: Frame<()>) -> Result<(), Self::Error> {
         let header = header::encode(&f.header);
         let buffer = f.body;
-        self.get_mut().write_state = WriteState::Header {
+        self.get_mut().write_state = WriteState::Frame {
             header,
-            buffer,
-            offset: 0,
+            header_offset: 0,
+            body: buffer,
+            body_offset: 0,
         };
         Ok(())
     }

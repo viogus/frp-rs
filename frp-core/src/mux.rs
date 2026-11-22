@@ -28,9 +28,7 @@ use std::sync::{
     Arc,
 };
 #[cfg(feature = "tcp-mux")]
-use tokio_util::compat::{
-    Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt,
-};
+use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 #[cfg(feature = "tcp-mux")]
 use tracing::{debug, warn};
 
@@ -305,6 +303,24 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
         result
     }
 
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        // Forwarded, not left to tokio's default (which writes only the
+        // first non-empty slice): yamux emits a frame's header + body as one
+        // vectored write and this must stay a single `writev` on the wire.
+        let result = std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        match &result {
+            std::task::Poll::Pending => this.stall.pending(),
+            std::task::Poll::Ready(Ok(n)) if *n > 0 => this.stall.progress(),
+            _ => {}
+        }
+        result
+    }
+
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -324,6 +340,49 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<(), std::io::Error>> {
         std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+/// Bridge a tokio write half to the `futures` `AsyncWrite` that yamux requires,
+/// keeping `poll_write_vectored` intact.
+///
+/// frp-rs patch: `tokio_util::compat::WriteCompat` does not implement the
+/// vectored method, so it falls back to the trait default — write the first
+/// non-empty slice only — and yamux's one-`writev`-per-frame emission would
+/// silently degrade to two syscalls per frame.
+#[cfg(feature = "tcp-mux")]
+struct VectoredWrite<W>(W);
+
+#[cfg(feature = "tcp-mux")]
+impl<W: tokio::io::AsyncWrite + Unpin> futures_util::io::AsyncWrite for VectoredWrite<W> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
     }
 }
 
@@ -748,7 +807,7 @@ where
     let io = ActivityIo::new(stream, activity.clone(), stall.clone());
     let (read, write) = tokio::io::split(io);
     let mut conn =
-        Connection::new_split(read.compat(), write.compat_write(), yamux_cfg, Mode::Server);
+        Connection::new_split(read.compat(), VectoredWrite(write), yamux_cfg, Mode::Server);
 
     // Accept the first stream — this is the control channel. Bounded by
     // the caller's accept deadline: without it, a client that completes
@@ -973,7 +1032,7 @@ where
     let io = ActivityIo::new(stream, activity.clone(), stall.clone());
     let (read, write) = tokio::io::split(io);
     let mut conn =
-        Connection::new_split(read.compat(), write.compat_write(), yamux_cfg, Mode::Client);
+        Connection::new_split(read.compat(), VectoredWrite(write), yamux_cfg, Mode::Client);
 
     // Open the first stream — this is the control channel.
     let control = poll_fn(|cx| conn.poll_new_outbound(cx))
