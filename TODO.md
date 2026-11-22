@@ -13101,6 +13101,14 @@ kept out of the main P2 list so that adding them does not renumber every later
   is open — an exploratory `pool_count = 8` arm kept the pool ahead in 4/4 reps,
   consistent with the yamux reading and not proof of it.
 
+  The UDP-over-mux shape that carried the 2026-11-09 inline-write experiment has
+  also moved: that experiment targeted 118 µs/datagram at one flow, this tree
+  measures 23.4 (a 1.31× mux tax on that arm) and the driver hand-off itself
+  now reads 4 µs on a 5,000-datagram probe. The four-flow no-mux arm is blocked
+  on connection setup and is not comparable. The kept experiment is therefore
+  not worth porting; its reopen trigger is a re-measurement, not this item
+  (`docs/archive/notes/2026-11-22-yamux-inline-write-no-longer-applies.md`).
+
   What it does change is the trigger above: that trigger already sits inside its
   own threshold — 2266 MiB/s at eight sessions against 2570 on one flow is
   **0.88×**, and that host's four-worker eight-session figure (2867) is 1.12× its
