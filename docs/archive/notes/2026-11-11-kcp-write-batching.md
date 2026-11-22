@@ -80,9 +80,13 @@ against Go frp.
 
 ## 4. Limits
 
-- `WRITE_BATCH = 4` is a guess with one measurement behind it; the gain comes
-  from fewer flushes, and going deeper trades wakeup latency for throughput
-  without a measured optimum.
+- `WRITE_BATCH = 4` was a guess with one measurement behind it. Going deeper
+  is now measured and neutral: a cap of 32 writes / 1 MiB never binds (mean
+  depth 3.8; 75% of batches are closed by a `Flush` from the producer at depth
+  4-5 — exactly 5, essentially always — and none reaches 7) and buys nothing
+  because the flush's own bookkeeping is 6.8% of the server's CPU while the
+  datagram send it ends in is 63.7% — see
+  [`2026-11-23-kcp-write-batch-deeper.md`](2026-11-23-kcp-write-batch-deeper.md).
 - One flow, one host, TLS on. Multi-flow and other transports were not measured.
 - A short write that arrives while another session is still feeding the batch
   waits for the tick (≤10 ms) instead of leaving in the same wakeup: the
