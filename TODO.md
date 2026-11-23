@@ -13007,8 +13007,11 @@ kept out of the main P2 list so that adding them does not renumber every later
   (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +17.4% at eight
   streams (119.3 → 140.0 MiB/s, 6/6 interleaved pairs) and +23.4% at one, but
   the server goes from 1.06 to 1.72 cores — 0.0089 → 0.0122 cores per MiB — and
-  two independent frps+frpc pairs on the same four-vCPU box sum to 173.0/175.2
-  against a baseline 186.9/178.4. Tail latency moves the same way: echo p99
+  two independent frps+frpc pairs on the same four-vCPU box sum to **174.9 against
+  a baseline 184.8** (four interleaved reps: 186.1/187.1/184.6/181.2 against
+  170.7/175.9/171.8/181.3, three negative and one at parity). It also adds a
+  second OS thread per `KcpSocket`, and with `tcpMux = false` every work
+  connection owns one. Tail latency moves the same way: echo p99
   0.92-1.20 → 1.56-1.65 ms, because the run queue is FIFO behind bulk data. The
   syscall count is a symptom, not the cost — `sendmmsg` calls *fall* (16,402 →
   14,483 per 8 s, 43 → 60 datagrams per call) while `recvmmsg` doubles (28,690 →

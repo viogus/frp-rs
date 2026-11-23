@@ -80,6 +80,24 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- **KCP tunnels move 17-23% more data once the send syscalls leave the driver
+  thread.** A bulk KCP stream put ~70% of the server's single driver thread
+  inside `sendmmsg`, so the whole tunnel was capped by one core's kernel-side
+  send path. The datagrams a flush has already produced are now handed to a
+  dedicated `frp-kcp-send` thread, which keeps the socket's only producer — a
+  full queue drops the run instead of writing it from the driver, because two
+  producers reorder segments and KCP answers that with retransmissions (an
+  inline fallback measured 40% *below* the old code). Eight interleaved pairs on
+  a 4-vCPU VM: **119.0 → 139.0 MiB/s at eight streams (+16.7%)** and
+  **108.3 → 133.7 (+23.4%) at one**, which is ahead of Go frp v0.72.0's ~127.
+  The gain is parallelism, not efficiency, and it is visible: server CPU goes
+  from 0.009 to 0.012 cores per MiB (+38%), a host already saturated by two
+  independent tunnels loses ~5% (184.8 → 174.9 MiB/s aggregate), and echo p99
+  rises from ~1.0 to ~1.6 ms because the run queue is FIFO behind bulk data. If
+  you run many KCP tunnels on one small box, this is a regression; if you run
+  one, it is the largest single win in the KCP data path so far. Measurements:
+  [`docs/archive/notes/2026-11-23-kcp-send-thread.md`](docs/archive/notes/2026-11-23-kcp-send-thread.md).
+
 - **The client now defaults to one worker per core, like the server and Go.**
   `frpc` used to build a single-threaded runtime, which caps every
   multi-connection proxy — each bridged connection lives on one thread, so four
