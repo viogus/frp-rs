@@ -1191,7 +1191,7 @@ impl KcpSocket {
     /// for a single peer, so they share this. With a sender thread this is the
     /// fallback for a socket whose thread is missing or dead
     /// (`Dispatch::NoThread`); the worker calls `send_udp_batch` directly.
-    pub(crate) fn send_packets(
+    fn send_packets(
         socket: &UdpSocket,
         pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
         packets: Vec<Vec<u8>>,
@@ -1326,7 +1326,7 @@ impl KcpSocket {
     /// each buffer that actually goes out. Only the driver's inline fallback
     /// path fills that queue now: the sender thread blocks on writability
     /// instead of parking datagrams (`super::send_thread`).
-    pub(crate) fn drain_pending(
+    fn drain_pending(
         socket: &UdpSocket,
         pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
         pool: &ArrayQueue<Vec<u8>>,
