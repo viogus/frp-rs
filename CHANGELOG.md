@@ -84,7 +84,9 @@ User-facing release notes for frp-rs.
   thread.** A bulk KCP stream put ~70% of the server's single driver thread
   inside `sendmmsg`, so the whole tunnel was capped by one core's kernel-side
   send path. The datagrams a flush has already produced are now handed to a
-  dedicated `frp-kcp-send` thread, which keeps the socket's only producer — a
+  small pool of `frp-kcp-send` threads (one per core, at most four, started
+  lazily — a socket binds to one of them for its lifetime, so ordering holds
+  while connections share a thread), which keeps the socket's only producer — a
   full queue drops the run instead of writing it from the driver, because two
   producers reorder segments and KCP answers that with retransmissions (an
   inline fallback measured 40% *below* the old code). Eight interleaved pairs on

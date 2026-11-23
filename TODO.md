@@ -13009,21 +13009,22 @@ kept out of the main P2 list so that adding them does not renumber every later
   the server goes from 1.06 to 1.72 cores — 0.0089 → 0.0122 cores per MiB — and
   two independent frps+frpc pairs on the same four-vCPU box sum to **174.9 against
   a baseline 184.8** (four interleaved reps: 186.1/187.1/184.6/181.2 against
-  170.7/175.9/171.8/181.3, three negative and one at parity). It also adds a
-  second OS thread per `KcpSocket`, and with `tcpMux = false` every work
-  connection owns one. Tail latency moves the same way: echo p99
-  0.92-1.20 → 1.56-1.65 ms, because the run queue is FIFO behind bulk data. The
-  syscall count is a symptom, not the cost — `sendmmsg` calls *fall* (16,402 →
-  14,483 per 8 s, 43 → 60 datagrams per call) while `recvmmsg` doubles (28,690 →
-  65,082), and making the read arm loop on partial batches cut that by 12%
-  without moving throughput or CPU.
+  170.7/175.9/171.8/181.3, three negative and one at parity). Sender threads are
+  pooled — one per core capped at four, started lazily, one bound per socket for
+  ordering — so the client carries four instead of ten on the `tcpMux = false`
+  eight-stream shape (22 threads with no sender thread, 31 per-socket, 25
+  pooled). Tail latency moves the same way: echo p99 0.92-1.20 → 1.56-1.65 ms,
+  because the run queue is FIFO behind bulk data. The syscall count is a symptom,
+  not the cost — `sendmmsg` calls *fall* (16,402 → 15,819 per 8 s at the two
+  arms' own rates, i.e. ~17% more datagrams per call) while `recvmmsg` doubles
+  (28,690 → 65,989), and making the read arm loop on partial batches cut that by
+  12% without moving throughput or CPU.
 
   **Done-when:** either the single-pair gain survives at ≤1.1× the single-threaded
   cores per MiB with `par-test.sh 2 8 10` back at or above baseline, or the
   trade-off is recorded as the accepted shape for the deployments that matter
   (a single tunnel on an otherwise idle box) with the saturated case named in
-  the perf baselines. Candidates, none measured: one sender shared by all
-  sockets on a host instead of one thread per socket, `SO_REUSEPORT` sharding of
+  the perf baselines. Candidates, none measured: `SO_REUSEPORT` sharding of
   the receive side, and a non-FIFO lane for non-bulk runs.
 
 - [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**

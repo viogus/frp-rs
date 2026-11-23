@@ -25,12 +25,21 @@ history; this note assumes that cap is not the lever.
 
 ## The change
 
-A `frp-kcp-send` OS thread per socket owns the datagram writes
+A pool of `frp-kcp-send` OS threads owns the datagram writes
 (`frp-core/src/kcp/send_thread.rs`). The driver keeps computing, and hands each
 run of datagrams — the `Vec<Vec<u8>>` a `force_flush` already produces — over a
 bounded `sync_channel`. It must be a thread and not a `tokio::spawn`: the driver
 runtime is `new_current_thread` and its own docs forbid extra tasks there
 (`frp-core/src/kcp/driver_thread.rs:66-68`).
+
+The pool is sized `available_parallelism` capped at four (`MAX_WORKERS`) and its
+workers start lazily, so a process with one KCP socket starts one send thread.
+Each socket binds to one worker at construction and never migrates — that binding
+is what keeps a socket's runs in one FIFO while several sockets share a thread.
+A first version spawned one thread per socket (it is what the throughput rows
+below were first measured on); it costs one thread per connection on the
+`tcpMux = false` path, which is every work connection, so it was pooled before
+landing.
 
 The load-bearing detail is the **single-producer** rule. When the channel is
 full, the run is dropped; it is never sent from the driver. An inline fallback
@@ -48,7 +57,8 @@ Interleaved A/B pairs, MiB/s, `main` vs candidate:
 | shape | before | after | delta | pairs positive |
 |---|---|---|---|---|
 | 8 streams, mux + TLS (6 pairs) | 119.3 | 140.0 | **+17.4%** | 6/6 (sign test p≈0.03) |
-| 8 streams, mux + TLS (4 pairs, final tree) | 119.0 | 138.9 | **+16.7%** | 4/4 (p≈0.13) |
+| 8 streams, mux + TLS (4 pairs, per-socket thread) | 119.0 | 138.9 | **+16.7%** | 4/4 (p≈0.13) |
+| 8 streams, mux + TLS (4 pairs, shared pool) | 119.3 | 137.3 | **+15.1%** | 4/4 (p≈0.13) |
 | 1 stream, mux + TLS (3 pairs) | 108.3 | 133.7 | +23.4% | 3/3 (p≈0.25) |
 | 8 streams, mux off, TLS on (2 pairs) | 99.9 | 130.5 | +30.6% | 2/2 (p≈0.25) |
 | 8 streams, mux off, TLS off (2 pairs) | 99.8 | 134.8 | +35.0% | 2/2 (p≈0.25) |
@@ -69,15 +79,23 @@ This buys parallelism, not efficiency, and the bill is visible in three places.
   **0.0089 → 0.0122 cores per MiB (+38%)**. Client CPU per MiB improves
   (0.0113 → 0.0095) because the same cycles now move more data.
 - **Aggregate capacity on a busy box.** Interleaved, four reps of two
-  independent frps+frpc pairs on the same box: baseline 186.1 / 187.1 / 184.6 /
-  181.2 (mean **184.8**), candidate 170.7 / 175.9 / 171.8 / 181.3 (mean
-  **174.9**) — **−5.3%**, three of four reps negative and one at parity. The win
-  needs idle cores; a host already saturated by many client sockets goes
-  backwards.
-- **One thread per socket.** This adds a second OS thread per `KcpSocket`, on top
-  of the driver thread — and with `tcpMux = false` every work connection dials
-  its own socket, so the eight-stream shape above carries eight extra client
-  threads. Nothing is pooled per host yet (see the TODO item).
+  independent frps+frpc pairs on the same box, per-socket sender: baseline
+  186.1 / 187.1 / 184.6 / 181.2 (mean **184.8**), candidate 170.7 / 175.9 /
+  171.8 / 181.3 (mean **174.9**) — **−5.3%**, three of four reps negative and one
+  at parity. The shared pool does not change that (−2.3% and −6.7% on the two
+  reps where both arms stayed valid; the other two lost a stream): the cost is
+  CPU, and pooling changes thread count, not work.
+- **Threads.** Pooled, the cost is bounded: workers are started lazily, one per
+  core capped at four, and a socket binds to exactly one of them at construction.
+  Measured with `tcpMux = false` and eight streams (ten sockets per side, so one
+  sender each without a pool), client-side threads: **22 with no sender thread,
+  31 per-socket, 25 pooled** — ten senders become four. Ordering survives the
+  sharing because a socket never migrates between workers: all of its runs enter
+  one FIFO.
+- **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
+  64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
+  1.56-1.65 ms**, because the queue is FIFO and interactive traffic waits behind
+  a bulk run.
 - **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
   64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
   1.56-1.65 ms**, because the queue is FIFO and interactive traffic waits behind
@@ -100,7 +118,11 @@ the TODO item is open. The note makes no claim past the numbers.
 ## Limits
 
 One host, loopback, 4 vCPUs, one KCP socket carrying 8 streams, FEC 10+3, default
-MTU 1400. **All numbers are Linux.** Off Linux the worker has no `sendmmsg`
+MTU 1400. A stalled socket now also stalls the sockets sharing its worker — the
+bound is `MAX_STALLS` per run, but a pathological peer costs its neighbours
+latency rather than only itself. With `tcpMux = false` and more than four
+concurrent sockets, sends queue behind each other on four workers; the pool width
+is `available_parallelism` capped at 4 (`MAX_WORKERS`). **All numbers are Linux.** Off Linux the worker has no `sendmmsg`
 (`send_udp_batch` returns 0 and each datagram takes its own `try_send_to`) and a
 `WouldBlock` waits a fixed 5 ms slice, bounded per run by `MAX_STALLS` — so a
 stalled socket costs up to 200 slices before the run is handed back to KCP. That

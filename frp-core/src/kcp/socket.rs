@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
 
 use super::config::{KcpConfig, KCP_WIRE_OVERHEAD, MAX_KCP_MTU};
-use super::send_thread::{Dispatch, SendJob, SendThread};
+use super::send_thread::{Dispatch, SendJob, SenderPool, Worker};
 use super::session::KcpSession;
 use super::stream::KcpStream;
 
@@ -287,10 +287,10 @@ pub(crate) struct KcpSocket {
     /// driver returns consumed chunks here after segmenting them into the
     /// session's send queue.
     chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
-    /// Sender thread for this socket: the driver hands each run of datagrams
-    /// off instead of spending its own cycles in `sendmmsg`. See
-    /// [`super::send_thread`] for why that split exists and what it costs.
-    send_thread: SendThread,
+    /// The pool worker this socket sends through. Bound once, at construction:
+    /// all of a socket's runs enter one FIFO, which is what keeps datagrams in
+    /// order while several sockets share a worker. See [`super::send_thread`].
+    sender: &'static Worker,
     start: Instant,
     /// UDP packets that could not be sent immediately because the socket
     /// send buffer was full (try_send_to). Drained on the next tick — keeps
@@ -341,7 +341,7 @@ impl KcpSocket {
         let write_notify = Arc::new(Notify::new());
         let alive_streams = Arc::new(AtomicUsize::new(0));
         let chunk_pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
-        let send_thread = SendThread::spawn(Arc::clone(&socket), Arc::clone(&chunk_pool));
+        let sender = SenderPool::pick();
         let this = Self {
             socket,
             config,
@@ -359,7 +359,7 @@ impl KcpSocket {
             write_notify: write_notify.clone(),
             alive_streams: alive_streams.clone(),
             chunk_pool: chunk_pool.clone(),
-            send_thread,
+            sender,
             start: Instant::now(),
             pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
@@ -816,7 +816,7 @@ impl KcpSocket {
                         match session.update(now_ms) {
                             Ok(packets) => {
                                 Self::send_run(
-                                    &self.send_thread,
+                                    self.sender,
                                     &self.socket,
                                     &mut self.pending_udp,
                                     &self.chunk_pool,
@@ -1141,17 +1141,23 @@ impl KcpSocket {
     /// is mutably borrowed — the tick loop sends retransmissions from inside
     /// its `iter_mut`.
     fn send_run(
-        send_thread: &SendThread,
-        socket: &UdpSocket,
+        sender: &Worker,
+        socket: &Arc<UdpSocket>,
         pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
-        pool: &ArrayQueue<Vec<u8>>,
+        pool: &Arc<ArrayQueue<Vec<u8>>>,
         peer: SocketAddr,
         packets: Vec<Vec<u8>>,
     ) {
         if packets.is_empty() {
             return;
         }
-        match send_thread.try_dispatch(SendJob { peer, packets }) {
+        let job = SendJob {
+            socket: Arc::clone(socket),
+            pool: Arc::clone(pool),
+            peer,
+            packets,
+        };
+        match sender.try_dispatch(job) {
             Dispatch::Queued => {}
             // No sender thread, or it died since: nobody else will write this
             // socket, so the driver is still the only producer and the inline
@@ -1370,7 +1376,7 @@ impl KcpSocket {
         };
         let n = packets.len();
         Self::send_run(
-            &self.send_thread,
+            self.sender,
             &self.socket,
             &mut self.pending_udp,
             &self.chunk_pool,
