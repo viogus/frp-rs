@@ -10,8 +10,10 @@
 //! So the driver hands a run of datagrams to a pool worker and moves on to the
 //! next write batch while the kernel drains the socket. Ordering is preserved
 //! because a socket is bound to exactly one worker at construction and never
-//! migrates: every send on that socket (flush path and tick path) enters the
-//! same FIFO, so a peer cannot see run *n+1* before run *n*.
+//! migrates: every queued run on that socket (flush path and tick path) enters
+//! one FIFO, so a peer cannot see run *n+1* before run *n*. A run that never
+//! enters the queue — dropped when the worker is full — is the one exception,
+//! and it is safe for the same reason: the driver is then the only writer.
 //!
 //! The pool exists because one thread per socket is expensive to own: with
 //! `tcpMux = false` every work connection dials its own `KcpSocket`, so a busy
@@ -25,7 +27,7 @@
 //! or spinning on `try_send_to`: a flush is a run of segments that must reach
 //! the wire, and the wait is exactly the backpressure the bounded queue needs —
 //! it stalls one worker, not the driver's receive loop. The wait is bounded
-//! ([`MAX_STALLS`]), so a socket that never drains hands the run back to KCP's
+//! ([`STALL_BUDGET`]), so a socket that never drains hands the run back to KCP's
 //! retransmission instead of wedging every session sharing that worker.
 
 use std::net::SocketAddr;
@@ -53,18 +55,26 @@ const SEND_QUEUE_DEPTH: usize = 128;
 /// with more send threads than it can keep busy.
 const MAX_WORKERS: usize = 4;
 
-/// How long one writability wait may last before the thread re-checks its
-/// shutdown flag. Not a send deadline: a blocked run keeps waiting.
+/// How long one writability wait may last before the worker retries the batch.
+/// Not a send deadline: a blocked run keeps waiting, up to [`STALL_BUDGET`].
 const WAIT_SLICE: Duration = Duration::from_millis(5);
 
-/// Writability waits one run may spend before it is handed back to KCP.
+/// Wall-clock budget one run may spend waiting for socket room before it is
+/// handed back to KCP.
 ///
 /// Without a bound a socket whose peer stopped reading would pin its worker
 /// (and every socket sharing it) for as long as the peer is gone; KCP
-/// retransmits a dropped run anyway, so giving up is the cheaper failure. The
-/// count also bounds a pathological `poll` that reports writability while
-/// `try_send_to` still answers `WouldBlock`.
-const MAX_STALLS: u32 = 200;
+/// retransmits a dropped run anyway, so giving up is the cheaper failure. It is
+/// a deadline rather than a count of waits because `poll` may report
+/// writability that `try_send_to` immediately contradicts — a wakeup storm
+/// would otherwise spend the whole budget in microseconds and drop a run on a
+/// socket that is draining normally.
+const STALL_BUDGET: Duration = Duration::from_millis(50);
+
+/// Whether a run that has waited `elapsed` must hand its remainder back.
+fn stalled_out(elapsed: Duration) -> bool {
+    elapsed >= STALL_BUDGET
+}
 
 /// One run of datagrams addressed to a single peer, plus what the worker needs
 /// to write it. The socket and the chunk pool travel with the job because a
@@ -220,7 +230,7 @@ fn send_run_blocking(
     packets: Vec<Vec<u8>>,
 ) {
     let mut remaining = packets;
-    let mut stalls: u32 = 0;
+    let started = std::time::Instant::now();
     while !remaining.is_empty() {
         #[cfg(target_os = "linux")]
         let sent = KcpSocket::send_udp_batch(socket, &remaining, peer);
@@ -241,9 +251,8 @@ fn send_run_blocking(
                 chunk_pool_push(pool, pkt);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                stalls += 1;
-                if stalls > MAX_STALLS {
-                    // The socket has not drained for MAX_STALLS waits: hand the
+                if stalled_out(started.elapsed()) {
+                    // The socket has not drained for the whole budget: hand the
                     // rest back to KCP (it re-sends unacked segments) instead of
                     // holding every session on this socket hostage.
                     tracing::debug!(
@@ -406,23 +415,77 @@ mod tests {
     fn an_undeliverable_run_returns_its_buffers_to_the_pool() {
         runtime().block_on(async {
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            // Unroutable: the send fails and the datagram is dropped, not parked.
-            let peer: SocketAddr = "0.0.0.0:9".parse().unwrap();
+            // Unroutable: the send fails and the datagram is dropped, not
+            // parked. `0.0.0.0` would route to loopback and succeed, so this has
+            // to be an address the kernel refuses (`EHOSTUNREACH`/`ENETUNREACH`).
+            let peer: SocketAddr = "240.0.0.1:9".parse().unwrap();
             let pool = pool(8);
             send_run_blocking(&socket, &pool, peer, vec![vec![1u8; 4], vec![2u8; 4]]);
             assert_eq!(pool.len(), 2, "a failed run must return its buffers");
         });
     }
 
-    /// Every socket must get a worker, and the pool must not grow past its cap.
+    /// The pool must stay inside its cap, and `pick` must hand out a worker
+    /// every time: a `None` here would mean a socket silently losing its
+    /// sender. Stickiness across runs is the caller's doing — `KcpSocket` stores
+    /// the pointer once (`frp-core/src/kcp/socket.rs` `SenderPool::pick()` in
+    /// `new`) and passes it to every `send_run`.
     #[test]
-    fn sockets_share_a_bounded_pool() {
-        let first = SenderPool::pick() as *const Worker;
-        let second = SenderPool::pick() as *const Worker;
-        assert_eq!(SenderPool::width().min(1), 1, "the pool is never empty");
+    fn the_pool_is_bounded_and_always_answers() {
         assert!(SenderPool::width() <= MAX_WORKERS, "the cap must hold");
+        let first = SenderPool::pick() as *const Worker;
+        assert!(!first.is_null());
         if SenderPool::width() > 1 {
-            assert_ne!(first, second, "round-robin must hand out distinct workers");
+            assert_ne!(
+                first,
+                SenderPool::pick() as *const Worker,
+                "round-robin must spread sockets across workers"
+            );
         }
+    }
+
+    /// The give-up decision is a deadline, not a count: a `poll` that reports
+    /// writability while the send still answers `WouldBlock` must not spend the
+    /// whole budget in microseconds and drop a run on a draining socket.
+    #[test]
+    fn a_run_gives_up_on_a_deadline_not_on_a_wakeup_count() {
+        assert!(!stalled_out(StdDuration::ZERO));
+        assert!(!stalled_out(STALL_BUDGET - Duration::from_millis(1)));
+        assert!(stalled_out(STALL_BUDGET));
+        assert!(stalled_out(STALL_BUDGET + Duration::from_secs(1)));
+    }
+
+    /// A full kernel buffer must not cost the run: the worker waits, retries the
+    /// remainder, and returns every buffer when it finally goes out.
+    #[test]
+    fn a_blocked_run_retries_instead_of_dropping() {
+        runtime().block_on(async {
+            let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer = receiver.local_addr().unwrap();
+            let pool = pool(8);
+            let packets: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 8]).collect();
+            // On a real run this executes on a pool worker, i.e. a foreign OS
+            // thread with no ambient runtime: `try_send_to` then always attempts
+            // the syscall, whereas inside a runtime context tokio may answer
+            // `WouldBlock` from cached readiness without one.
+            let handed = Arc::clone(&pool);
+            // The sleep is not pacing: on a current-thread runtime, blocking on
+            // `join` before the first await starves the IO driver that has to
+            // observe the receiver's readiness, so the datagrams look lost.
+            let h = std::thread::spawn(move || send_run_blocking(&socket, &handed, peer, packets));
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            h.join().unwrap();
+            assert_eq!(pool.len(), 3, "every buffer must come back");
+            let mut buf = [0u8; 2048];
+            for i in 0..3u8 {
+                let (n, _) =
+                    tokio::time::timeout(StdDuration::from_secs(2), receiver.recv_from(&mut buf))
+                        .await
+                        .expect("datagram did not arrive")
+                        .unwrap();
+                assert_eq!(&buf[..n], &vec![i; 8][..], "datagram {i} changed");
+            }
+        });
     }
 }

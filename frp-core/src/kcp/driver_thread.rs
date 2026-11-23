@@ -217,10 +217,13 @@ pub(crate) async fn dial_driver(
                 let _ = go_rx.await;
                 kcp_socket.run().await;
             });
-            // The driver is done; tell whoever is watching the handle. The
-            // thread handle itself is detached on purpose — the driver stops
-            // itself (see `KcpSocket::run`), and joining here would block the
-            // caller's runtime on a thread that may outlive a dropped stream.
+            // The driver is done; tell whoever is watching the handle. A run it
+            // already handed to a sender worker may still be writing on this
+            // socket for up to one stall budget, so "done" means the receive
+            // loop has stopped, not that the socket is idle. The thread handle
+            // itself is detached on purpose — the driver stops itself (see
+            // `KcpSocket::run`), and joining here would block the caller's
+            // runtime on a thread that may outlive a dropped stream.
             let _ = done_tx.send(true);
         })?;
     drop(thread);

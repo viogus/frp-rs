@@ -13003,20 +13003,21 @@ kept out of the main P2 list so that adding them does not renumber every later
 
 - [ ] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.**
 
-  The send path moved off the driver thread
-  (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +17.4% at eight
-  streams (119.3 → 140.0 MiB/s, 6/6 interleaved pairs) and +23.4% at one, but
-  the server goes from 1.06 to 1.72 cores — 0.0089 → 0.0122 cores per MiB — and
+  Moving the send path off the driver thread
+  (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +15.1% at eight
+  streams on the pooled build (119.3 → 137.3 MiB/s, 4/4 interleaved pairs; the
+  per-socket build measured +17.4% over six pairs) and +23.4% at one, but the
+  server goes from 1.06 to 1.72 cores — 0.0089 → 0.0123 cores per MiB — and
   two independent frps+frpc pairs on the same four-vCPU box sum to **174.9 against
   a baseline 184.8** (four interleaved reps: 186.1/187.1/184.6/181.2 against
   170.7/175.9/171.8/181.3, three negative and one at parity). Sender threads are
   pooled — one per core capped at four, started lazily, one bound per socket for
   ordering — so the client carries four instead of ten on the `tcpMux = false`
   eight-stream shape (22 threads with no sender thread, 31 per-socket, 25
-  pooled). Tail latency moves the same way: echo p99 0.92-1.20 → 1.56-1.65 ms,
+  pooled; the totals are sampled, not a subtraction). Tail latency moves the same way: echo p99 0.92-1.20 → 1.56-1.65 ms,
   because the run queue is FIFO behind bulk data. The syscall count is a symptom,
   not the cost — `sendmmsg` calls *fall* (16,402 → 15,819 per 8 s at the two
-  arms' own rates, i.e. ~17% more datagrams per call) while `recvmmsg` doubles
+  arms' own rates, i.e. ~23% more bytes per call) while `recvmmsg` more than doubles
   (28,690 → 65,989), and making the read arm loop on partial batches cut that by
   12% without moving throughput or CPU.
 

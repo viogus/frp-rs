@@ -985,9 +985,10 @@ impl KcpSocket {
                             // must reach the peer before the bridge data that
                             // follows it, so it cannot still be sitting in this
                             // socket's send queue when the next write is queued.
-                            // The ack means "queued in the only producer", not
-                            // "on the wire" — the sender thread is FIFO, so that
-                            // is enough for ordering.
+                            // The ack means "accepted by the only producer, or
+                            // dropped under backpressure" — never "on the wire".
+                            // An accepted run is FIFO, so ordering holds; a
+                            // dropped one is retransmitted by KCP.
                             // No backlog decrement — poll_flush does not
                             // increment the backlog (it uses a oneshot for
                             // wakeup, not the backlog gate).
@@ -1178,7 +1179,7 @@ impl KcpSocket {
             // driver: two producers writing the same socket would reorder
             // segments against the queued runs.
             Dispatch::QueueFull(job) => {
-                tracing::trace!(
+                tracing::debug!(
                     peer = %job.peer,
                     packets = job.packets.len(),
                     "KCP SEND: queue full, dropping run"

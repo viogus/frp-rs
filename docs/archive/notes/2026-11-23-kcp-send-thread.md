@@ -2,10 +2,10 @@
 
 2026-11-23. Measured on a 4-vCPU Linux VPS, loopback, `frp-stress` `stream`/`sink`
 shapes (one-way, 10 s, 8 streams unless noted, arms interleaved and order-flipped
-per rep). Superseded numbers: the tables below are from a re-run of the final
-tree (`/root/bin-e`); the first-pass measurements quoted in the commit message
-agree within the run-to-run spread. Baseline: `main` at `b48ef8a7`. Candidate: the same tree plus a sender
-thread for the KCP socket's UDP writes.
+per rep). Baseline: `main` at `b48ef8a7`. Candidate: the same tree plus sender
+threads for the KCP socket's UDP writes. Every row below is labelled with the
+build that produced it — the per-socket and pooled designs differ only in how the
+threads are owned, and the pooled one is what ships.
 
 ## The claim, and where it came from
 
@@ -68,15 +68,17 @@ consistently positive but not separable from a coin flip at that n, so read them
 as "no row went the other way", not as measured magnitudes. Per-rep 8-stream
 numbers, six-pair run: before 122.7 / 123.8 / 118.8 / 118.4 / 112.5 / 119.3,
 after 139.3 / 139.8 / 139.5 / 144.2 / 139.2 / 137.8. Against Go frp v0.72.0's
-127.2 on the same shape, the tunnel moves from ~6% behind (118 on the earlier
-comparison run) to ~10% ahead.
+127.2 on the same shape, the tunnel moves from **6% behind** (119.3) to **8%
+ahead** on the pooled row (137.3) and 10% ahead on the six-pair per-socket row
+(140.0). Compare like with like: the baseline in each pair is a Rust build, Go
+was measured once, separately, and is context rather than an arm.
 
 ## What it costs
 
-This buys parallelism, not efficiency, and the bill is visible in three places.
+This buys parallelism, not efficiency, and the bill is visible in four places.
 
 - **CPU per byte.** Server cores go from 1.06 to 1.72 at the higher rate, i.e.
-  **0.0089 → 0.0122 cores per MiB (+38%)**. Client CPU per MiB improves
+  **0.0089 → 0.0123 cores per MiB (+38%)**. Client CPU per MiB improves
   (0.0113 → 0.0095) because the same cycles now move more data.
 - **Aggregate capacity on a busy box.** Interleaved, four reps of two
   independent frps+frpc pairs on the same box, per-socket sender: baseline
@@ -87,15 +89,13 @@ This buys parallelism, not efficiency, and the bill is visible in three places.
   CPU, and pooling changes thread count, not work.
 - **Threads.** Pooled, the cost is bounded: workers are started lazily, one per
   core capped at four, and a socket binds to exactly one of them at construction.
-  Measured with `tcpMux = false` and eight streams (ten sockets per side, so one
-  sender each without a pool), client-side threads: **22 with no sender thread,
-  31 per-socket, 25 pooled** — ten senders become four. Ordering survives the
+  Measured with `tcpMux = false` and eight streams, client-side thread counts on
+  the same shape: **22 with no sender thread, 31 per-socket, 25 pooled** — ten
+  sender threads become four. (The totals are as sampled; the base process is a
+  thread or two different between runs, so do not subtract 22 from the others.)
+  Ordering survives the
   sharing because a socket never migrates between workers: all of its runs enter
   one FIFO.
-- **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
-  64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
-  1.56-1.65 ms**, because the queue is FIFO and interactive traffic waits behind
-  a bulk run.
 - **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
   64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
   1.56-1.65 ms**, because the queue is FIFO and interactive traffic waits behind
@@ -104,7 +104,8 @@ This buys parallelism, not efficiency, and the bill is visible in three places.
 The CPU increase is not the extra syscalls one would expect. Counting them on
 frps over 8 s at the two arms' own rates (`116.7` and `138.9` MiB/s):
 `sendmmsg` 16,402 → 15,819 — 4% fewer calls for 19% more bytes, i.e. roughly
-**+17% datagrams per call** — but `recvmmsg` 28,690 → 65,989. The driver reaches the socket sooner
+**+23% bytes (and so datagrams) per call** at a fixed MSS — but `recvmmsg`
+28,690 → 65,989, more than double. The driver reaches the socket sooner
 because it is no longer busy sending, so fewer datagrams have accumulated per
 call. Accepting a partially filled batch and looping again cut `recvmmsg` by 12%
 and changed neither throughput nor CPU, so the count is a symptom, not the cost.
@@ -119,13 +120,14 @@ the TODO item is open. The note makes no claim past the numbers.
 
 One host, loopback, 4 vCPUs, one KCP socket carrying 8 streams, FEC 10+3, default
 MTU 1400. A stalled socket now also stalls the sockets sharing its worker — the
-bound is `MAX_STALLS` per run, but a pathological peer costs its neighbours
-latency rather than only itself. With `tcpMux = false` and more than four
+bound is `STALL_BUDGET` (50 ms) per run, but a pathological peer costs its
+neighbours latency rather than only itself, and up to `SEND_QUEUE_DEPTH` (128)
+queued runs of its own can hold that worker for 128 × 50 ms in the worst case. With `tcpMux = false` and more than four
 concurrent sockets, sends queue behind each other on four workers; the pool width
 is `available_parallelism` capped at 4 (`MAX_WORKERS`). **All numbers are Linux.** Off Linux the worker has no `sendmmsg`
 (`send_udp_batch` returns 0 and each datagram takes its own `try_send_to`) and a
-`WouldBlock` waits a fixed 5 ms slice, bounded per run by `MAX_STALLS` — so a
-stalled socket costs up to 200 slices before the run is handed back to KCP. That
+`WouldBlock` waits a fixed 5 ms slice, bounded per run by `STALL_BUDGET` — so a
+stalled socket costs up to ten slices before the run is handed back to KCP. That
 path is unmeasured here and is a plausible regression for macOS/Windows KCP
 users; it needs its own A/B before this ships everywhere. The aggregate test spreads clients over separate frps processes; a
 single frps serving many clients has the same thread topology but different
@@ -133,6 +135,18 @@ shared-state pressure, and was not measured. No real NIC was available, so the
 kernel cost per datagram here (netfilter ~4.5% self on loopback) is not the
 deployed one. The comparison is against `main` at `b48ef8a7` only — Go was
 measured separately for context, not in the interleaved pairs.
+
+## The baseline gate this change does not pass
+
+`CLAUDE.md`'s perf-baseline rule says a change to one axis must not regress the
+others by more than 5%. This one regresses two: aggregate capacity on a
+saturated box **−5.3%** (184.8 → 174.9 MiB/s across two pairs) and echo **p99
++40%** (0.92-1.20 → 1.56-1.65 ms). It is merged on an explicit waiver, not
+silently: the win is +15-23% on the shape KCP is used for (one tunnel, mux on),
+the two costs are named in the CHANGELOG, and `TODO.md` carries the follow-up —
+either recover the cores per MiB or record the trade as the accepted shape for
+single-tunnel deployments. A reader who runs many KCP tunnels on one small box
+should treat this note as a warning, not a recommendation.
 
 ## Reproduce
 
