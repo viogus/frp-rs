@@ -13001,6 +13001,28 @@ kept out of the main P2 list so that adding them does not renumber every later
   statistic the notes warn about, where its own later bullet already said 1.14×.
   No code change rides on this tick.
 
+- [ ] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.**
+
+  The send path moved off the driver thread
+  (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +17.4% at eight
+  streams (119.3 → 140.0 MiB/s, 6/6 interleaved pairs) and +23.4% at one, but
+  the server goes from 1.06 to 1.72 cores — 0.0089 → 0.0122 cores per MiB — and
+  two independent frps+frpc pairs on the same four-vCPU box sum to 173.0/175.2
+  against a baseline 186.9/178.4. Tail latency moves the same way: echo p99
+  0.92-1.20 → 1.56-1.65 ms, because the run queue is FIFO behind bulk data. The
+  syscall count is a symptom, not the cost — `sendmmsg` calls *fall* (16,402 →
+  14,483 per 8 s, 43 → 60 datagrams per call) while `recvmmsg` doubles (28,690 →
+  65,082), and making the read arm loop on partial batches cut that by 12%
+  without moving throughput or CPU.
+
+  **Done-when:** either the single-pair gain survives at ≤1.1× the single-threaded
+  cores per MiB with `par-test.sh 2 8 10` back at or above baseline, or the
+  trade-off is recorded as the accepted shape for the deployments that matter
+  (a single tunnel on an otherwise idle box) with the saturated case named in
+  the perf baselines. Candidates, none measured: one sender shared by all
+  sockets on a host instead of one thread per socket, `SO_REUSEPORT` sharding of
+  the receive side, and a non-FIFO lane for non-bulk runs.
+
 - [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**
 
   The TLS-off arm's nine-pair mean is 86.4 MiB/s against the TLS-on arm's mean of
