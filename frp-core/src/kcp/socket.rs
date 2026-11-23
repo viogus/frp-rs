@@ -14,6 +14,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::{interval, Duration};
 
 use super::config::{KcpConfig, KCP_WIRE_OVERHEAD, MAX_KCP_MTU};
+use super::send_thread::{SendJob, SendThread};
 use super::session::KcpSession;
 use super::stream::KcpStream;
 
@@ -286,6 +287,10 @@ pub(crate) struct KcpSocket {
     /// driver returns consumed chunks here after segmenting them into the
     /// session's send queue.
     chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// Sender thread for this socket: the driver hands each run of datagrams
+    /// off instead of spending its own cycles in `sendmmsg`. See
+    /// [`super::send_thread`] for why that split exists and what it costs.
+    send_thread: SendThread,
     start: Instant,
     /// UDP packets that could not be sent immediately because the socket
     /// send buffer was full (try_send_to). Drained on the next tick — keeps
@@ -336,6 +341,7 @@ impl KcpSocket {
         let write_notify = Arc::new(Notify::new());
         let alive_streams = Arc::new(AtomicUsize::new(0));
         let chunk_pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
+        let send_thread = SendThread::spawn(Arc::clone(&socket), Arc::clone(&chunk_pool));
         let this = Self {
             socket,
             config,
@@ -353,6 +359,7 @@ impl KcpSocket {
             write_notify: write_notify.clone(),
             alive_streams: alive_streams.clone(),
             chunk_pool: chunk_pool.clone(),
+            send_thread,
             start: Instant::now(),
             pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
@@ -808,12 +815,13 @@ impl KcpSocket {
                         }
                         match session.update(now_ms) {
                             Ok(packets) => {
-                                Self::send_packets(
+                                Self::send_run(
+                                    &self.send_thread,
                                     &self.socket,
                                     &mut self.pending_udp,
-                                    packets,
-                                    key.1,
                                     &self.chunk_pool,
+                                    key.1,
+                                    packets,
                                 );
                             }
                             Err(e) => {
@@ -1122,12 +1130,55 @@ impl KcpSocket {
         }
     }
 
+    /// Hand a run of datagrams to the sender thread, or send them here when the
+    /// queue is full or no thread could be spawned.
+    ///
+    /// Fields are taken explicitly so this stays callable while `self.sessions`
+    /// is mutably borrowed — the tick loop sends retransmissions from inside
+    /// its `iter_mut`.
+    fn send_run(
+        send_thread: &SendThread,
+        socket: &UdpSocket,
+        pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
+        pool: &ArrayQueue<Vec<u8>>,
+        peer: SocketAddr,
+        packets: Vec<Vec<u8>>,
+    ) {
+        if packets.is_empty() {
+            return;
+        }
+        match send_thread.try_dispatch(SendJob { peer, packets }) {
+            Ok(()) => {}
+            Err(job) if !send_thread.has_thread() => {
+                // No sender thread (spawn failed at startup): keep the old
+                // inline path rather than dropping every datagram.
+                Self::send_packets(socket, pending_udp, job.packets, job.peer, pool);
+            }
+            // Queue full: the sender is a whole queue behind (~5 MiB, tens of
+            // milliseconds), i.e. the peer has stopped draining its socket.
+            // Drop the run — every datagram in it is either re-sent by KCP or
+            // a bare ACK the peer retransmits for — and never send it from the
+            // driver: two producers writing the same socket would reorder
+            // segments against the queued runs.
+            Err(job) => {
+                tracing::trace!(
+                    peer = %job.peer,
+                    packets = job.packets.len(),
+                    "KCP SEND: queue full, dropping run"
+                );
+                for pkt in job.packets {
+                    chunk_pool_push(pool, pkt);
+                }
+            }
+        }
+    }
+
     /// Send a run of datagrams aimed at one peer, batching where the platform
     /// allows it and queueing whatever the kernel did not take.
     ///
     /// Both the flush path and the tick path (ACKs, retransmits) produce runs
-    /// for a single peer, so they share this.
-    fn send_packets(
+    /// for a single peer, so they share this. The sender thread calls it too.
+    pub(crate) fn send_packets(
         socket: &UdpSocket,
         pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
         packets: Vec<Vec<u8>>,
@@ -1158,7 +1209,11 @@ impl KcpSocket {
     /// Returns how many were sent; the caller recycles those buffers into the
     /// chunk pool and queues the rest.
     #[cfg(target_os = "linux")]
-    fn send_udp_batch(socket: &UdpSocket, packets: &[Vec<u8>], peer: SocketAddr) -> usize {
+    pub(crate) fn send_udp_batch(
+        socket: &UdpSocket,
+        packets: &[Vec<u8>],
+        peer: SocketAddr,
+    ) -> usize {
         use std::os::fd::AsRawFd;
 
         if packets.len() < 2 {
@@ -1251,20 +1306,31 @@ impl KcpSocket {
 
     /// Re-send packets queued by a previous full send buffer (FIFO).
     fn drain_pending_udp(&mut self) {
+        Self::drain_pending(&self.socket, &mut self.pending_udp, &self.chunk_pool);
+    }
+
+    /// Retry a queue of datagrams the kernel refused before (FIFO), recycling
+    /// each buffer that actually goes out. The sender thread keeps its own
+    /// queue and calls this at the start of every run.
+    pub(crate) fn drain_pending(
+        socket: &UdpSocket,
+        pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
+        pool: &ArrayQueue<Vec<u8>>,
+    ) {
         let mut still_pending = VecDeque::new();
-        while let Some((pa, pkt)) = self.pending_udp.pop_front() {
-            match self.socket.try_send_to(&pkt, pa) {
-                Ok(_) => chunk_pool_push(&self.chunk_pool, pkt),
+        while let Some((pa, pkt)) = pending_udp.pop_front() {
+            match socket.try_send_to(&pkt, pa) {
+                Ok(_) => chunk_pool_push(pool, pkt),
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     still_pending.push_back((pa, pkt));
                 }
                 Err(e) => {
                     tracing::debug!(peer = %pa, error = %e, "KCP UDP pending send error");
-                    chunk_pool_push(&self.chunk_pool, pkt);
+                    chunk_pool_push(pool, pkt);
                 }
             }
         }
-        self.pending_udp = still_pending;
+        *pending_udp = still_pending;
     }
 
     /// Flush a session's pending KCP output to the wire immediately.
@@ -1289,12 +1355,13 @@ impl KcpSocket {
             Vec::new()
         };
         let n = packets.len();
-        Self::send_packets(
+        Self::send_run(
+            &self.send_thread,
             &self.socket,
             &mut self.pending_udp,
-            packets,
-            peer_addr,
             &self.chunk_pool,
+            peer_addr,
+            packets,
         );
         n
     }

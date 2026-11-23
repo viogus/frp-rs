@@ -8,6 +8,7 @@ mod config;
 mod driver_thread;
 mod listener;
 pub mod protocol;
+mod send_thread;
 pub mod session;
 mod socket;
 mod stream;
