@@ -220,8 +220,9 @@ pub async fn dial_kcp_with_driver(
     // unconditional, which made an IPv6 remote undialable — reached by an IPv6
     // literal and by any host name whose first resolved address is IPv6
     // (`localhost` on macOS). This socket is never `connect`ed: packets leave
-    // through `UdpSocket::try_send_to`, called from `KcpSocket::send_udp_packet`
-    // and `KcpSocket::drain_pending_udp` (`frp-core/src/kcp/socket.rs`), and a
+    // through `UdpSocket::try_send_to`, called from `KcpSocket::send_udp_packet`,
+    // `KcpSocket::drain_pending_udp` (`frp-core/src/kcp/socket.rs`) and
+    // `send_thread::run` (`frp-core/src/kcp/send_thread.rs`), and a
     // cross-family `sendto` is silently dropped (macOS even reports success for
     // the send; elsewhere the send errors and is only `tracing::debug!`-logged),
     // so the caller sees no error at all and the session dies later as a
