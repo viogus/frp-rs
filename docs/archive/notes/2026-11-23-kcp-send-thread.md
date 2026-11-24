@@ -98,6 +98,22 @@ This buys parallelism, not efficiency, and the bill is visible in four places.
   Ordering survives the
   sharing because a socket never migrates between workers: all of its runs enter
   one FIFO.
+- **Where those extra cycles go.** `perf stat -p <frps>` over the same shape
+  (7 s, 8 streams, `perf` overhead included in both arms) says the increase
+  is spread, not concentrated: **instructions per MiB +15%**, **cycles per MiB
+  +25%**, **IPC 0.78 → 0.71 (−8%)**, cache misses per MiB flat (−4%), and
+  **context switches 34k → 70k** (2.1×) — one extra thread, one wakeup per run.
+  The receive side also pays: the driver, no longer blocking on `sendmmsg`,
+  wakes with fewer datagrams queued, and `recvmmsg` calls more than doubled
+  (28,690 → 65,082 per 8 s). Retrying the drain with a short-batch round
+  (`got > 0`) cut that by 12.5% and moved nothing else, so the syscall count is
+  a symptom: what remains is the ordinary price of running one pipeline's work
+  on two cores — fewer cache hits per instruction, more scheduling.
+  There is no single hot spot to fix, which is why the trade is recorded rather
+  than narrowed. The way to get both shapes is a per-transport switch that keeps
+  the inline path for hosts whose cores are already busy; that is filed in
+  `TODO.md` and not built here.
+
 - **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
   64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
   1.56-1.65 ms**, because the queue is FIFO and interactive traffic waits behind
