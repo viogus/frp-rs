@@ -80,6 +80,19 @@ pub struct KcpConfig {
     /// link; `[transport.kcp] deadLink` exposes it (frp-rs extension — Go frp
     /// hard-codes 20 in `pkg/util/net/kcp.go`).
     pub dead_link: u32,
+    /// Whether the UDP send path runs on the shared `frp-kcp-send` pool instead
+    /// of inline on the driver thread.
+    ///
+    /// Default `true`: measured +15.1% at eight streams on the pooled build and
+    /// +23.4% at one (`docs/archive/notes/2026-11-23-kcp-send-thread.md`), paid
+    /// for with 0.0089 -> 0.0123 server cores per MiB. `[transport.kcp]
+    /// senderThread = false` keeps those syscalls on the driver thread. Two
+    /// independent pairs on one four-vCPU box measure 183.6 MiB/s pooled
+    /// against 182.1 inline (four interleaved reps, −0.8%, inside the host's
+    /// noise), so the switch buys footprint and core placement, not throughput.
+    /// Wire bytes and event ordering are the same either way; only where the
+    /// `sendmmsg` runs changes.
+    pub sender_thread: bool,
     /// Whether the driver probes a quiet session for liveness.
     ///
     /// A session with nothing in flight cannot reach the retransmission
@@ -110,6 +123,7 @@ impl Default for KcpConfig {
             stream: true,
             dead_link: KCP_DEAD_LINK_DEFAULT,
             liveness_probe: true,
+            sender_thread: true,
         }
     }
 }

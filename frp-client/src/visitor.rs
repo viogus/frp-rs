@@ -213,6 +213,7 @@ fn plan_visitor_dial(
         // The visitor transport section does not expose
         // `[transport.kcp] probe`, so the probe stays on.
         kcp_liveness_probe: true,
+        kcp_sender_thread: true,
         v2: transport.v2,
     };
     let yamux_keepalive_secs = if transport.tcp_mux {

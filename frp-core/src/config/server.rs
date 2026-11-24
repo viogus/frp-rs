@@ -1202,6 +1202,20 @@ pub struct KcpOptions {
     /// refreshed.
     #[serde(default = "default_kcp_probe")]
     pub probe: bool,
+    /// Run KCP's UDP sends on the shared sender pool instead of inline on the
+    /// driver thread. Default: true. frp-rs extension — Go frp always sends
+    /// inline, so a Go peer is unaffected either way.
+    ///
+    /// The pool is what makes a tunnel faster (+15.1% at eight streams) at the
+    /// cost of server CPU (0.0089 → 0.0123 cores per MiB per server). Measured
+    /// on the pooled build 2026-11-24, two independent pairs on one four-vCPU
+    /// box sum 183.6 MiB/s with the pool against 182.1 inline (four
+    /// interleaved reps, −0.8%, inside the host's ±3% noise), so this is a
+    /// footprint/topology control, not a throughput lever: the −5% aggregate
+    /// cost recorded earlier was the pre-pooling per-socket build. Wire bytes
+    /// and ordering are identical either way.
+    #[serde(default = "default_kcp_sender_thread", alias = "senderThread")]
+    pub sender_thread: bool,
 }
 
 impl Default for KcpOptions {
@@ -1209,11 +1223,16 @@ impl Default for KcpOptions {
         Self {
             dead_link: default_kcp_dead_link(),
             probe: default_kcp_probe(),
+            sender_thread: default_kcp_sender_thread(),
         }
     }
 }
 
 fn default_kcp_probe() -> bool {
+    true
+}
+
+fn default_kcp_sender_thread() -> bool {
     true
 }
 

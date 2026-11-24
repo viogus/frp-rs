@@ -13007,7 +13007,7 @@ kept out of the main P2 list so that adding them does not renumber every later
   statistic the notes warn about, where its own later bullet already said 1.14×.
   No code change rides on this tick.
 
-- [ ] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.**
+- [x] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.** — closed 2026-11-24: the attribution below leaves nothing to narrow, and `[transport.kcp] senderThread = false` now selects the inline path. Re-measured on the pooled build the same day, two pairs × eight streams sum 183.6 MiB/s pooled against 182.1 inline (−0.8%, inside noise), so the −5% above was the pre-pooling build and the switch is a core-placement control.
 
   Moving the send path off the driver thread
   (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +15.1% at eight

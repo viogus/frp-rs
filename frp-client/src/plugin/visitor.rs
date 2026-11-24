@@ -286,6 +286,7 @@ async fn handle_visitor_conn(
         // The visitor transport section does not expose
         // `[transport.kcp] probe`, so the probe stays on.
         kcp_liveness_probe: true,
+        kcp_sender_thread: true,
         v2,
     };
     let raw_stream = transport::dial_server(&opts)

@@ -191,13 +191,34 @@ fn the_listener_config_carries_the_parsed_bound() {
             .kcp_options
             .as_ref()
             .map(|options| options.probe),
+        cfg.transport
+            .kcp_options
+            .as_ref()
+            .map(|options| options.sender_thread),
     );
     assert_eq!(listener.dead_link, 7);
+    assert!(listener.sender_thread, "absent means on");
+
+    let cfg: ServerConfig =
+        load_server_config_from_str("bindPort = 7000\n[transport.kcp]\nsenderThread = false")
+            .unwrap();
+    let listener = crate::kcp::kcp_config_from_options(
+        None,
+        None,
+        cfg.transport
+            .kcp_options
+            .as_ref()
+            .map(|options| options.sender_thread),
+    );
+    assert!(
+        !listener.sender_thread,
+        "`[transport.kcp] senderThread = false` must reach the socket"
+    );
     assert!(
         listener.liveness_probe,
         "an absent `probe` key must leave the liveness probe on"
     );
-    let default = crate::kcp::kcp_config_from_options(None, None);
+    let default = crate::kcp::kcp_config_from_options(None, None, None);
     assert_eq!(default.dead_link, crate::KCP_DEAD_LINK_DEFAULT);
     assert!(default.liveness_probe);
 
@@ -208,6 +229,7 @@ fn the_listener_config_carries_the_parsed_bound() {
     let listener = crate::kcp::kcp_config_from_options(
         cfg.transport.kcp_options.as_ref().map(|o| o.dead_link),
         cfg.transport.kcp_options.as_ref().map(|o| o.probe),
+        None,
     );
     assert!(
         !listener.liveness_probe,

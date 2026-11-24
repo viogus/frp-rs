@@ -1591,6 +1591,7 @@ mod tests {
             new.transport.kcp_options = Some(crate::config::server::KcpOptions {
                 dead_link: 7,
                 probe: false,
+                sender_thread: true,
             });
         }
         let changes = old.restart_only_changes(&new);

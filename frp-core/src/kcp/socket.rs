@@ -287,10 +287,12 @@ pub(crate) struct KcpSocket {
     /// driver returns consumed chunks here after segmenting them into the
     /// session's send queue.
     chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
-    /// The pool worker this socket sends through. Bound once, at construction:
-    /// all of a socket's runs enter one FIFO, which is what keeps datagrams in
-    /// order while several sockets share a worker. See [`super::send_thread`].
-    sender: &'static Worker,
+    /// The pool worker this socket sends through, or `None` when
+    /// `[transport.kcp] senderThread = false` asked for the inline path.
+    /// Bound once, at construction: all of a socket's runs enter one FIFO,
+    /// which is what keeps datagrams in order while several sockets share a
+    /// worker. See [`super::send_thread`].
+    sender: Option<&'static Worker>,
     start: Instant,
     /// UDP packets that could not be sent immediately because the socket
     /// send buffer was full (try_send_to). Drained on the next tick — keeps
@@ -341,7 +343,10 @@ impl KcpSocket {
         let write_notify = Arc::new(Notify::new());
         let alive_streams = Arc::new(AtomicUsize::new(0));
         let chunk_pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
-        let sender = SenderPool::pick();
+        // `[transport.kcp] senderThread = false` keeps the send syscalls on
+        // the driver thread: the CPU-cheap shape for a host already saturated
+        // by several tunnels (see `KcpConfig::sender_thread`).
+        let sender = config.sender_thread.then(SenderPool::pick);
         let this = Self {
             socket,
             config,
@@ -1142,7 +1147,7 @@ impl KcpSocket {
     /// is mutably borrowed — the tick loop sends retransmissions from inside
     /// its `iter_mut`.
     fn send_run(
-        sender: &Worker,
+        sender: Option<&Worker>,
         socket: &Arc<UdpSocket>,
         pending_udp: &mut VecDeque<(SocketAddr, Vec<u8>)>,
         pool: &Arc<ArrayQueue<Vec<u8>>>,
@@ -1152,6 +1157,12 @@ impl KcpSocket {
         if packets.is_empty() {
             return;
         }
+        // Inline mode (`senderThread = false`): the driver is the only writer,
+        // exactly as it was before the sender thread existed.
+        let Some(sender) = sender else {
+            Self::send_packets(socket, pending_udp, packets, peer, pool);
+            return;
+        };
         let job = SendJob {
             socket: Arc::clone(socket),
             pool: Arc::clone(pool),
@@ -1735,6 +1746,57 @@ mod tests {
     /// is constructed at the configured cap, so a target-only comparison would
     /// leave it there forever. This is the bug the per-session compare exists
     /// to catch.
+    /// `[transport.kcp] senderThread = false` must leave the socket with no
+    /// worker and still put bytes on the wire — the inline path is the arm a
+    /// saturated host selects, so it is worth one round trip.
+    #[test]
+    fn a_socket_without_a_sender_thread_sends_inline() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            let mut config = KcpConfig {
+                sender_thread: false,
+                ..KcpConfig::default()
+            };
+            config.data_shards = 0;
+            config.parity_shards = 0;
+            let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let (driver, _handle, _accept_rx) = KcpSocket::new(Arc::clone(&local), config);
+            assert!(
+                driver.sender.is_none(),
+                "`senderThread = false` must not bind a pool worker"
+            );
+
+            let mut pending = VecDeque::new();
+            let pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
+            // Prime the readiness cache: tokio's `try_send_to` answers
+            // `WouldBlock` from a stale registration without attempting the
+            // syscall, and a freshly bound socket has never been polled for
+            // writability.
+            local.writable().await.unwrap();
+            KcpSocket::send_run(
+                driver.sender,
+                &local,
+                &mut pending,
+                &pool,
+                peer_addr,
+                vec![vec![7u8; 32]],
+            );
+            let mut buf = [0u8; 64];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+                .await
+                .expect("an inline send must reach the peer")
+                .unwrap();
+            assert_eq!(n, 32);
+            assert_eq!(from.port(), local.local_addr().unwrap().port());
+            assert!(pending.is_empty());
+        });
+    }
+
     #[test]
     fn sync_windows_corrects_sessions_created_after_the_last_change() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2056,6 +2118,7 @@ mod tests {
             },
             dead_link: super::super::config::KCP_DEAD_LINK_DEFAULT,
             liveness_probe: true,
+            sender_thread: true,
         };
         let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(16);
         let mut sender = KcpSession::new(1, "127.0.0.1:9001".parse().unwrap(), cfg.clone(), tx1);

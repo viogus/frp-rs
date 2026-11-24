@@ -80,6 +80,12 @@ User-facing release notes for frp-rs.
 
 ### Performance
 
+- KCP sends can be kept on the driver thread: `[transport.kcp] senderThread = false`
+  selects the inline path (the pool's +15% costs 0.0089 → 0.0123 server cores
+  per MiB per server). Measured on the shipped pooled build, two pairs on one
+  box sum 183.6 MiB/s pooled against 182.1 inline — inside noise, so this is a
+  core-placement control, not a throughput lever. Wire bytes and ordering are
+  identical either way.
 - **KCP tunnels move 15-23% more data once the send syscalls leave the driver
   thread** (15.1% on the pooled build at eight streams with tcpMux, 23.4% at one
   stream, 30-35% with tcpMux off). A bulk KCP stream put ~70% of the server's single driver thread

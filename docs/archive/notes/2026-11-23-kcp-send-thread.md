@@ -52,6 +52,22 @@ in the worker did not fix it (still 95.0); dropping is what made the design
 work. The worker only blocks on `WouldBlock` *within* one run, where it is still
 the sole writer.
 
+### The switch
+
+`[transport.kcp] senderThread = false` (frp-rs extension, default `true`)
+selects the path this note exists to contrast with: `KcpSocket::new` binds no
+worker and every run goes through `send_packets` on the driver thread, exactly
+as before the change. The wire bytes and the event order are the same, so it is
+a per-host CPU/throughput choice, not a compatibility knob — a Go peer is
+unaffected either way.
+
+Measured on the pooled build (2026-11-24, two independent pairs × eight
+streams × 10 s, four interleaved reps, `gc`): pooled **183.6** MiB/s summed
+against inline **182.1** — **−0.8%**, inside the host's ±3% noise. So the
+escape hatch buys core placement, not throughput, and the −5.3% aggregate row
+above belongs to the pre-pooling per-socket build rather than to what ships. `KcpConfig::sender_thread` carries it and
+`KcpSocket::new` reads it once, at construction.
+
 ## Measured
 
 Interleaved A/B pairs, MiB/s, `main` vs candidate:
