@@ -307,6 +307,9 @@ pub(crate) struct WorkConnConfig {
     /// Whether KCP sessions this work connection dials probe a quiet peer
     /// (`[transport.kcp] probe`), forwarded to the dial options.
     pub kcp_liveness_probe: bool,
+    /// Whether KCP sessions this work connection dials run their UDP sends on
+    /// the shared sender pool (`[transport.kcp] senderThread`), forwarded to the
+    /// dial options.
     pub kcp_sender_thread: bool,
     pub bind_addr: Option<String>,
     pub proxy_url: String,

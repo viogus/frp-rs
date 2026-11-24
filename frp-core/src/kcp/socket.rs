@@ -1141,7 +1141,12 @@ impl KcpSocket {
     }
 
     /// Hand a run of datagrams to the sender thread, or send them here when the
-    /// queue is full or no thread could be spawned.
+    /// socket has no sender thread at all (`senderThread = false`) or the one it
+    /// was bound to is gone (`Dispatch::NoThread`).
+    ///
+    /// A *full* queue is not a fallback: that run is dropped, because the
+    /// worker still holds the earlier runs and a second producer on the same
+    /// socket would reorder segments against them.
     ///
     /// Fields are taken explicitly so this stays callable while `self.sessions`
     /// is mutably borrowed — the tick loop sends retransmissions from inside
@@ -1206,8 +1211,9 @@ impl KcpSocket {
     /// allows it and queueing whatever the kernel did not take.
     ///
     /// Both the flush path and the tick path (ACKs, retransmits) produce runs
-    /// for a single peer, so they share this. With a sender thread this is the
-    /// fallback for a socket whose thread is missing or dead
+    /// for a single peer, so they share this. It is the only path when the
+    /// socket has no sender thread (`senderThread = false`), and with one it is
+    /// the fallback for a socket whose thread is missing or dead
     /// (`Dispatch::NoThread`); the worker calls `send_udp_batch` directly.
     fn send_packets(
         socket: &UdpSocket,
@@ -1742,13 +1748,11 @@ mod tests {
         assert_eq!(desired_window(3, 512), 1024, "the floor still applies");
     }
 
-    /// A session created *after* the last resize must still be corrected: it
-    /// is constructed at the configured cap, so a target-only comparison would
-    /// leave it there forever. This is the bug the per-session compare exists
-    /// to catch.
     /// `[transport.kcp] senderThread = false` must leave the socket with no
     /// worker and still put bytes on the wire — the inline path is the arm a
-    /// saturated host selects, so it is worth one round trip.
+    /// saturated host selects, so it is worth one round trip. The default is
+    /// checked in the same test: a mutation that always yielded `None` would
+    /// turn the feature off silently and leave every other test green.
     #[test]
     fn a_socket_without_a_sender_thread_sends_inline() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1765,6 +1769,12 @@ mod tests {
             config.data_shards = 0;
             config.parity_shards = 0;
             let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let (default_driver, _default_handle, _default_accept) =
+                KcpSocket::new(Arc::clone(&local), KcpConfig::default());
+            assert!(
+                default_driver.sender.is_some(),
+                "the default config must bind a pool worker"
+            );
             let (driver, _handle, _accept_rx) = KcpSocket::new(Arc::clone(&local), config);
             assert!(
                 driver.sender.is_none(),
@@ -1797,6 +1807,10 @@ mod tests {
         });
     }
 
+    /// A session created *after* the last resize must still be corrected: it
+    /// is constructed at the configured cap, so a target-only comparison would
+    /// leave it there forever. This is the bug the per-session compare exists
+    /// to catch.
     #[test]
     fn sync_windows_corrects_sessions_created_after_the_last_change() {
         let rt = tokio::runtime::Builder::new_current_thread()

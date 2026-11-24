@@ -83,8 +83,8 @@ pub fn default_kcp_client_config() -> KcpConfig {
 }
 
 /// The KCP listener config for a server whose `[transport.kcp]` options are
-/// `(dead_link, liveness_probe)`. Missing values keep the kcp-go default
-/// bound and the probe on.
+/// `(dead_link, liveness_probe, sender_thread)`. Missing values keep the kcp-go
+/// default bound, the probe on, and the send pool bound.
 ///
 /// Extracted from the listener so the config-to-listener hop is testable
 /// without standing up a UDP socket.
@@ -107,8 +107,8 @@ pub fn kcp_config_from_options(
 }
 
 /// The KCP client config for a dial whose `[transport.kcp]` options are
-/// `(dead_link, liveness_probe)`. Clamped like the listener's, so a
-/// hand-built `DialOptions` cannot produce a session that dies on its first
+/// `(dead_link, liveness_probe, sender_thread)`. Clamped like the listener's, so
+/// a hand-built `DialOptions` cannot produce a session that dies on its first
 /// write.
 pub fn kcp_client_config(dead_link: u32, liveness_probe: bool, sender_thread: bool) -> KcpConfig {
     let mut config = default_kcp_client_config();

@@ -44,7 +44,7 @@
 use std::fmt::Display;
 
 use super::{
-    FeatureConfig, LogConfig, ObservabilityConfig, ServerConfig, ServerTransportConfig,
+    FeatureConfig, KcpOptions, LogConfig, ObservabilityConfig, ServerConfig, ServerTransportConfig,
     SshTunnelGatewayConfig, WebServerConfig, WebServerTlsConfig,
 };
 
@@ -480,7 +480,11 @@ fn web_server_restart_changes(
 ///
 /// **What keeps it complete.** Both patterns name all eleven fields with no `..`
 /// (the `#[cfg]` on `quic_options` is this crate's own gate, so it matches the
-/// struct exactly).
+/// struct exactly). `KcpOptions` — the one nested table that is compared field
+/// by field rather than as a whole — is destructured with no `..` too, so a new
+/// `[transport.kcp]` key fails to compile here until it is classified. (It
+/// carries no `#[cfg]` of its own: the table exists in every tier, so the
+/// pattern needs no gate either.)
 ///
 /// **What it does not cover.** Two fields are compared as the **effective** value
 /// the runtime resolves, not as the raw `Option`, because the raw shapes can
@@ -606,10 +610,24 @@ fn transport_restart_changes(
     // `[transport.kcp]` (frp-rs extension) needs a restart like the QUIC
     // options do. Compared as the effective value: absent means the kcp-go
     // default, so `unset -> deadLink = 20` is not a change.
+    //
+    // Destructured with no `..` for the same reason as the outer structs: a
+    // fourth key added to the table must be classified here, not discovered by
+    // an operator whose reload answered "no changes detected".
+    let KcpOptions {
+        dead_link: old_dead_link,
+        probe: old_probe,
+        sender_thread: old_sender_thread,
+    } = old_kcp_options.clone().unwrap_or_default();
+    let KcpOptions {
+        dead_link: new_dead_link,
+        probe: new_probe,
+        sender_thread: new_sender_thread,
+    } = new_kcp_options.clone().unwrap_or_default();
     push(
         out,
-        &old_kcp_options.clone().unwrap_or_default().dead_link,
-        &new_kcp_options.clone().unwrap_or_default().dead_link,
+        &old_dead_link,
+        &new_dead_link,
         "transport.kcp.dead_link",
         ServerReader::Kcp,
     );
@@ -617,9 +635,21 @@ fn transport_restart_changes(
     // to every session it accepts, so a reload cannot change it either.
     push(
         out,
-        &old_kcp_options.clone().unwrap_or_default().probe,
-        &new_kcp_options.clone().unwrap_or_default().probe,
+        &old_probe,
+        &new_probe,
         "transport.kcp.probe",
+        ServerReader::Kcp,
+    );
+    // `senderThread` is read at the same moment, one level down: the listener's
+    // `KcpConfig` is cloned into every `KcpSocket::new`, and that reads the flag
+    // once per socket, so already-open sessions keep the value they started
+    // with. Without this entry a reload that flips only this key answers "no
+    // changes detected" while nothing changes.
+    push(
+        out,
+        &old_sender_thread,
+        &new_sender_thread,
+        "transport.kcp.sender_thread",
         ServerReader::Kcp,
     );
 }
@@ -1586,12 +1616,13 @@ mod tests {
         set_gated_ports(&mut new);
         #[cfg(feature = "kcp")]
         {
-            // Both knobs move, so both report: `probe` defaults to `true`,
-            // so flipping it to `false` is what makes the second entry appear.
+            // All three knobs move, so all three report: `probe` and
+            // `sender_thread` default to `true`, so flipping them to `false` is
+            // what makes the second and third entries appear.
             new.transport.kcp_options = Some(crate::config::server::KcpOptions {
                 dead_link: 7,
                 probe: false,
-                sender_thread: true,
+                sender_thread: false,
             });
         }
         let changes = old.restart_only_changes(&new);
@@ -1633,6 +1664,15 @@ mod tests {
                 .iter()
                 .any(|c| { c.name == "transport.kcp.probe" && c.reader == ServerReader::Kcp }),
             "the liveness probe flag must be classified as read by the kcp listener: {changes:?}"
+        );
+        // And the send-placement flag, which `KcpSocket::new` reads one level
+        // below the listener: a flip must not reload silently.
+        #[cfg(feature = "kcp")]
+        assert!(
+            changes.iter().any(|c| {
+                c.name == "transport.kcp.sender_thread" && c.reader == ServerReader::Kcp
+            }),
+            "the send-placement flag must be classified as read by the kcp listener: {changes:?}"
         );
 
         // In the micro tier none of the three fields exists, so every arm above

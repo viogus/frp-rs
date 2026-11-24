@@ -1311,6 +1311,41 @@ reconnect instead. Visitor dials and the XTCP proxy P2P plane use their built-in
 KCP configs, which do not expose this table. See
 [`docs/archive/notes/2026-11-19-kcp-liveness-probe.md`](archive/notes/2026-11-19-kcp-liveness-probe.md).
 
+**Send placement (`[transport.kcp] senderThread`):**
+
+```toml
+# frps.toml and frpc.toml
+[transport.kcp]
+sender_thread = false   # default true: keep KCP's UDP sends on the frp-kcp-send pool
+```
+
+By default the datagrams a KCP flush has produced are handed to a small pool of
+`frp-kcp-send` threads (one per core, at most four, started lazily; a socket
+binds to one of them for its lifetime, which is what keeps the ordering).
+`sender_thread = false` binds no worker for a socket and runs the same
+`send_packets` inline on the driver thread — the pre-pool behaviour. The wire
+bytes, the event order and the retransmission bound are unaffected either way,
+and a Go peer always sends inline and never sees the choice.
+
+The pool buys throughput: +15.1% at eight streams with `tcpMux` and TLS, and
++23.4% at one. It spends server CPU to do it — 0.0089 → 0.0123 cores per MiB per
+server (+38%) — because one pipeline's work now runs on two cores. On two
+independent pairs of a 4-vCPU box the pool and inline come out level (183.6
+against 182.1 MiB/s summed over four interleaved reps, −0.8%, inside the host's
+noise), so on a host already busy with several KCP tunnels this key is the way
+to get those cores back without losing aggregate capacity. It is not a latency
+lever: inline puts the sends back on the driver loop, and the echo p99 cost of
+the pool (0.92-1.20 → 1.56-1.65 ms) was not measured against it.
+
+On `frps` the listener's `KcpConfig` is cloned into every socket at bind time, so
+a changed `senderThread` is **restart-only**: `frps reload` reports
+`transport.kcp.sender_thread: old -> new (restart required)` instead of applying
+it. On `frpc` the value is read when a session is dialled, so a `frpc reload`
+takes effect on the next reconnect. Visitor dials (`[visitors]`, including the
+XTCP visitor) and the XTCP proxy's own P2P data plane build their `KcpConfig`
+from the compiled-in default and do not read this table — the same two paths
+that keep the kcp-go default for `deadLink`.
+
 **Heartbeat intervals:**
 
 ```toml

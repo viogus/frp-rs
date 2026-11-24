@@ -13007,7 +13007,7 @@ kept out of the main P2 list so that adding them does not renumber every later
   statistic the notes warn about, where its own later bullet already said 1.14×.
   No code change rides on this tick.
 
-- [x] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.** — closed 2026-11-24: the attribution below leaves nothing to narrow, and `[transport.kcp] senderThread = false` now selects the inline path. Re-measured on the pooled build the same day, two pairs × eight streams sum 183.6 MiB/s pooled against 182.1 inline (−0.8%, inside noise), so the −5% above was the pre-pooling build and the switch is a core-placement control.
+- [x] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.** — closed 2026-11-24: the attribution below leaves nothing to narrow, and `[transport.kcp] senderThread = false` now selects the inline path. Re-measured on the pooled build the same day, two pairs × eight streams sum 183.6 MiB/s pooled against 182.1 inline (−0.8%, inside noise), and inline reproduces the pre-pooling baseline — so the −5% row below is the per-socket build's, and the pooled reading that once seemed to confirm it came from two valid reps of a run whose other two lost a stream. The switch is a core-placement control, not a throughput recovery.
 
   Moving the send path off the driver thread
   (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +15.1% at eight
@@ -13015,8 +13015,10 @@ kept out of the main P2 list so that adding them does not renumber every later
   per-socket build measured +17.4% over six pairs) and +23.4% at one, but the
   server goes from 1.06 to 1.72 cores — 0.0089 → 0.0123 cores per MiB — and
   two independent frps+frpc pairs on the same four-vCPU box sum to **174.9 against
-  a baseline 184.8** (four interleaved reps: 186.1/187.1/184.6/181.2 against
-  170.7/175.9/171.8/181.3, three negative and one at parity). Sender threads are
+  a baseline 184.8** on the **per-socket** build (four interleaved reps:
+  186.1/187.1/184.6/181.2 against 170.7/175.9/171.8/181.3, three negative and
+  one at parity); the pooled build that ships measures level with inline
+  (183.6 vs 182.1). Sender threads are
   pooled — one per core capped at four, started lazily, one bound per socket for
   ordering — so the client carries four instead of ten on the `tcpMux = false`
   eight-stream shape (22 threads with no sender thread, 31 per-socket, 25
@@ -13037,10 +13039,13 @@ kept out of the main P2 list so that adding them does not renumber every later
   a symptom.
   **Done-when:** the trade-off is rounded out with the escape hatch operators
   need — a `[transport.kcp]` switch that keeps the inline send path for hosts
-  whose cores are already busy (it selects the existing
-  `Dispatch::NoThread` → `send_packets` arm), documented next to
-  `deadLink`/`probe`, and measured on `par-test.sh 2 8 10` to recover the
-  −5% — **or** an explicit decision that one default stands for every shape.
+  whose cores are already busy (the inline path is a new early return in
+  `KcpSocket::send_run`; `Dispatch::NoThread` stays the spawn-failure fallback),
+  documented next to `deadLink`/`probe`, and measured on `par-test.sh 2 8 10` to
+  recover the −5% — **or** an explicit decision that one default stands for
+  every shape. Measured: the recovery did not exist (−0.8%, inside noise), so
+  the second option is what was taken — the default stays on and the switch
+  buys core placement.
   Candidates, none measured: `SO_REUSEPORT` sharding of the receive side, and a
   non-FIFO lane for non-bulk runs.
 

@@ -85,7 +85,7 @@ pub struct KcpConfig {
     ///
     /// Default `true`: measured +15.1% at eight streams on the pooled build and
     /// +23.4% at one (`docs/archive/notes/2026-11-23-kcp-send-thread.md`), paid
-    /// for with 0.0089 -> 0.0123 server cores per MiB. `[transport.kcp]
+    /// for with 0.0089 → 0.0123 server cores per MiB. `[transport.kcp]
     /// senderThread = false` keeps those syscalls on the driver thread. Two
     /// independent pairs on one four-vCPU box measure 183.6 MiB/s pooled
     /// against 182.1 inline (four interleaved reps, −0.8%, inside the host's

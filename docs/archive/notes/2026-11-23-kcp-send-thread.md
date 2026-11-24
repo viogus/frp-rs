@@ -3,9 +3,14 @@
 2026-11-23. Measured on a 4-vCPU Linux VPS, loopback, `frp-stress` `stream`/`sink`
 shapes (one-way, 10 s, 8 streams unless noted, arms interleaved and order-flipped
 per rep). Baseline: `main` at `b48ef8a7`. Candidate: the same tree plus sender
-threads for the KCP socket's UDP writes. Every row below is labelled with the
-build that produced it — the per-socket and pooled designs differ only in how the
-threads are owned, and the pooled one is what ships.
+threads for the KCP socket's UDP writes. The per-socket and pooled designs differ
+only in how the threads are owned, and the pooled one is what ships. Every row
+that names a design was measured on that design; the rows that do not say
+`shared pool` were measured on the per-socket candidate, and the pool's numbers
+are the two rows that name it plus § "The switch".
+
+Status: shipped. Entry point: `[transport.kcp] senderThread`
+(`frp-core/src/kcp/config.rs`, `KcpSocket::new`).
 
 ## The claim, and where it came from
 
@@ -62,11 +67,24 @@ a per-host CPU/throughput choice, not a compatibility knob — a Go peer is
 unaffected either way.
 
 Measured on the pooled build (2026-11-24, two independent pairs × eight
-streams × 10 s, four interleaved reps, `gc`): pooled **183.6** MiB/s summed
-against inline **182.1** — **−0.8%**, inside the host's ±3% noise. So the
-escape hatch buys core placement, not throughput, and the −5.3% aggregate row
-above belongs to the pre-pooling per-socket build rather than to what ships. `KcpConfig::sender_thread` carries it and
-`KcpSocket::new` reads it once, at construction.
+streams × 10 s, four interleaved reps on the 4-vCPU host `gc`, the same
+`par-test.sh 2 8 10` harness as the aggregate row): pooled **193.2 / 177.4 /
+181.4 / 182.4** MiB/s summed (mean **183.6**) against inline **191.2 / 176.6 /
+179.8 / 180.7** (mean **182.1**) — **−0.8%**, inside the host's ±3% noise, all
+four pairs in the same direction and no streams lost.
+
+That run is also what settles the −5.3% above. Inline (182.1) reproduces the
+pre-pooling baseline (184.8, −1.5%) and the pool adds nothing measurable on top
+of it, so the aggregate loss in § "What it costs" belonged to the per-socket
+build the row is labelled with. The pooled reading quoted there (−2.3% and
+−6.7%) came from a run whose other two reps lost a stream; two valid reps of a
+run that could not hold its streams are not an aggregate measurement, and this
+clean four-rep run does not reproduce it.
+
+So the escape hatch buys core placement, not throughput. `KcpConfig::sender_thread`
+carries it and `KcpSocket::new` reads it once, at construction; `frps reload`
+reports a changed value as restart-only because the listener's `KcpConfig` is
+cloned into each socket at bind time.
 
 ## Measured
 
@@ -102,9 +120,11 @@ This buys parallelism, not efficiency, and the bill is visible in four places.
   independent frps+frpc pairs on the same box, per-socket sender: baseline
   186.1 / 187.1 / 184.6 / 181.2 (mean **184.8**), candidate 170.7 / 175.9 /
   171.8 / 181.3 (mean **174.9**) — **−5.3%**, three of four reps negative and one
-  at parity. The shared pool does not change that (−2.3% and −6.7% on the two
-  reps where both arms stayed valid; the other two lost a stream): the cost is
-  CPU, and pooling changes thread count, not work.
+  at parity. This is the **per-socket** build (the row says so): the pooled build
+  that ships was compared against inline directly in § "The switch" and comes
+  out level (183.6 vs 182.1, −0.8%). The pooled reading once quoted here (−2.3%
+  and −6.7%) was taken from the two reps of a run whose other two lost a stream,
+  and is superseded by that four-rep run.
 - **Threads.** Pooled, the cost is bounded: workers are started lazily, one per
   core capped at four, and a socket binds to exactly one of them at construction.
   Measured with `tcpMux = false` and eight streams, client-side thread counts on
@@ -126,9 +146,8 @@ This buys parallelism, not efficiency, and the bill is visible in four places.
   a symptom: what remains is the ordinary price of running one pipeline's work
   on two cores — fewer cache hits per instruction, more scheduling.
   There is no single hot spot to fix, which is why the trade is recorded rather
-  than narrowed. The way to get both shapes is a per-transport switch that keeps
-  the inline path for hosts whose cores are already busy; that is filed in
-  `TODO.md` and not built here.
+  than narrowed. The per-transport switch that keeps the inline path for hosts
+  whose cores are already busy is `[transport.kcp] senderThread` (§ "The switch").
 
 - **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
   64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
@@ -173,14 +192,17 @@ measured separately for context, not in the interleaved pairs.
 ## The baseline gate this change does not pass
 
 `CLAUDE.md`'s perf-baseline rule says a change to one axis must not regress the
-others by more than 5%. This one regresses two: aggregate capacity on a
-saturated box **−5.3%** (184.8 → 174.9 MiB/s across two pairs) and echo **p99
-+40%** (0.92-1.20 → 1.56-1.65 ms). It is merged on an explicit waiver, not
-silently: the win is +15-23% on the shape KCP is used for (one tunnel, mux on),
-the two costs are named in the CHANGELOG, and `TODO.md` carries the follow-up —
-either recover the cores per MiB or record the trade as the accepted shape for
-single-tunnel deployments. A reader who runs many KCP tunnels on one small box
-should treat this note as a warning, not a recommendation.
+others by more than 5%. One axis still fails: echo **p99 +40%**
+(0.92-1.20 → 1.56-1.65 ms, and the switch's A/B measured throughput only, so
+`senderThread = false` is a core-placement knob, not a latency fix). The other
+axis originally listed here — aggregate capacity, −5.3% (184.8 → 174.9 MiB/s
+across two pairs) — was the **per-socket** build's cost; the pooled build that
+ships measures level against inline (§ "The switch"), so that half of the waiver
+is withdrawn rather than repeated. The change is merged on an explicit waiver
+for p99, not silently: the win is +15-23% on the shape KCP is used for (one
+tunnel, mux on), the remaining cost is named in the CHANGELOG, and `TODO.md`
+carries the core-efficiency follow-up (0.0089 → 0.0123 cores per MiB). A reader
+who runs many KCP tunnels on one small box is buying CPU, not losing throughput.
 
 ## Reproduce
 

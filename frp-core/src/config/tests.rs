@@ -257,19 +257,30 @@ fn strict_client_mode_accepts_the_kcp_table() {
         "server_addr = '127.0.0.1'\n[transport]\nkcp = { deadLink = 6 }\n",
         "server_addr = '127.0.0.1'\nkcp = { dead_link = 6 }\n",
         "server_addr = '127.0.0.1'\n[transport.kcp]\nprobe = false\n",
+        "server_addr = '127.0.0.1'\n[transport.kcp]\nsenderThread = false\n",
+        "server_addr = '127.0.0.1'\n[transport.kcp]\nsender_thread = false\n",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("frpc.toml");
         std::fs::write(&path, body).unwrap();
         let cfg = load_client_config(path.to_str().unwrap(), true)
             .unwrap_or_else(|e| panic!("strict mode must load this:\n{e}\nbody:\n{body}"));
-        // `probe` is the only body above that does not set `deadLink`, so the
-        // two assertions are conditional rather than duplicated per body.
+        // Each body above sets exactly one key, so the assertion follows the
+        // body rather than being duplicated per case: `probe` is the only one
+        // that does not set `deadLink`, and the two `senderThread` spellings are
+        // the only ones that do not set either. The strict allow-list has to
+        // carry both alias spellings or `frpc -c` rejects the table.
         if body.contains("probe = false") {
             assert_eq!(
                 cfg.kcp_options.as_ref().map(|o| o.probe),
                 Some(false),
                 "the strict key list must accept `probe`, and it must parse: body:\n{body}"
+            );
+        } else if body.contains("sender") {
+            assert_eq!(
+                cfg.kcp_options.as_ref().map(|o| o.sender_thread),
+                Some(false),
+                "the strict key list must accept both `senderThread` and `sender_thread`: body:\n{body}"
             );
         } else {
             assert_eq!(

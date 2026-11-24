@@ -83,9 +83,11 @@ User-facing release notes for frp-rs.
 - KCP sends can be kept on the driver thread: `[transport.kcp] senderThread = false`
   selects the inline path (the pool's +15% costs 0.0089 → 0.0123 server cores
   per MiB per server). Measured on the shipped pooled build, two pairs on one
-  box sum 183.6 MiB/s pooled against 182.1 inline — inside noise, so this is a
-  core-placement control, not a throughput lever. Wire bytes and ordering are
-  identical either way.
+  box sum 183.6 MiB/s pooled against 182.1 inline (four interleaved reps,
+  −0.8%, inside noise), and inline reproduces the pre-pooling baseline, so this
+  is a core-placement control, not a throughput lever. Wire bytes and ordering
+  are identical either way, and `frps reload` reports a changed value as
+  restart-only.
 - **KCP tunnels move 15-23% more data once the send syscalls leave the driver
   thread** (15.1% on the pooled build at eight streams with tcpMux, 23.4% at one
   stream, 30-35% with tcpMux off). A bulk KCP stream put ~70% of the server's single driver thread
@@ -101,11 +103,15 @@ User-facing release notes for frp-rs.
   (+15.1%)** and **108.3 → 133.7 (+23.4%) at one**; 137.3 at eight streams is
   ~8% ahead of Go frp v0.72.0's 127.2 on the same shape.
   The gain is parallelism, not efficiency, and it is visible: server CPU goes
-  from 0.0089 to 0.0123 cores per MiB (+38%), a host already saturated by two
-  independent tunnels loses ~5% (184.8 → 174.9 MiB/s aggregate), and echo p99
-  rises from ~1.0 to ~1.6 ms because the run queue is FIFO behind bulk data. If
-  you run many KCP tunnels on one small box, this is a regression; if you run
-  one, it is the largest single win in the KCP data path so far. Measurements:
+  from 0.0089 to 0.0123 cores per MiB (+38%), and echo p99
+  rises from ~1.0 to ~1.6 ms because the run queue is FIFO behind bulk data.
+  Aggregate capacity on a saturated box was the *per-socket* build's cost, not
+  the shipped pool's: that build lost ~5% across two independent tunnels
+  (184.8 → 174.9 MiB/s), while the pooled build measures 183.6 against 182.1
+  inline (four interleaved reps, inside noise — see the `senderThread` entry
+  above). So run many KCP tunnels on one small box and you pay CPU per byte, not
+  throughput; run one and it is the largest single win in the KCP data path so
+  far. Measurements:
   [`docs/archive/notes/2026-11-23-kcp-send-thread.md`](docs/archive/notes/2026-11-23-kcp-send-thread.md).
 
 - **The client now defaults to one worker per core, like the server and Go.**
