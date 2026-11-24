@@ -180,9 +180,22 @@ concurrent sockets, sends queue behind each other on four workers; the pool widt
 is `available_parallelism` capped at 4 (`MAX_WORKERS`). **All numbers are Linux.** Off Linux the worker has no `sendmmsg`
 (`send_udp_batch` returns 0 and each datagram takes its own `try_send_to`) and a
 `WouldBlock` waits a fixed 5 ms slice, bounded per run by `STALL_BUDGET` — so a
-stalled socket costs up to ten slices before the run is handed back to KCP. That
-path is unmeasured here and is a plausible regression for macOS/Windows KCP
-users; it needs its own A/B before this ships everywhere. The aggregate test spreads clients over separate frps processes; a
+stalled socket costs up to ten slices before the run is handed back to KCP, and
+that path **was measured on macOS** (2026-11-24,
+`scripts/kcp-sender-ab-macos.sh`: one `frps` + one `frpc`, KCP + `tcpMux` + TLS,
+eight streams, unidirectional into a sink, the `frpc` flag alone toggled, six
+interleaved 256 MiB arms): the pool is no faster there and costs **+59% CPU per
+MiB** (43.55 against 27.32 ms/MiB, pooled cheaper in 0/6 paired reps), with a
+throughput point estimate of −14.8% (31.1 against 36.5 MiB/s — two earlier
+fixed-duration runs of the same shape gave −4.8% and +3.5%, so the rate sits
+inside the host's noise and the CPU cost is the finding). That is the missing
+`sendmmsg` showing up as predicted: without batched sends every datagram is its
+own `try_send_to`, and a `WouldBlock` parks the worker for a 5 ms slice it could
+have spent sending. The host was a fanless M2 Air carrying a Spotlight indexer
+at ~90% of a core with load averages of 6-8, so ±10% is the resolution on rate —
+the CPU cost is measured against that noise, not inside it. Windows is still
+unmeasured, and `senderThread` exists so an operator does not have to wait for
+it: on a Mac it is the cheaper setting, on Linux it gives up 15-23%. The aggregate test spreads clients over separate frps processes; a
 single frps serving many clients has the same thread topology but different
 shared-state pressure, and was not measured. No real NIC was available, so the
 kernel cost per datagram here (netfilter ~4.5% self on loopback) is not the

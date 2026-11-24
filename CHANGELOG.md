@@ -87,9 +87,11 @@ User-facing release notes for frp-rs.
   −0.8%, inside noise), and inline reproduces the pre-pooling baseline, so this
   is a core-placement control, not a throughput lever. Wire bytes and ordering
   are identical either way, and `frps reload` reports a changed value as
-  restart-only.
+  restart-only. The pool's win is Linux's (`sendmmsg`): on macOS the same
+  eight-stream shape costs +59% client CPU per MiB with no rate gain, so on a
+  Mac `senderThread = false` is the cheaper setting.
 - **KCP tunnels move 15-23% more data once the send syscalls leave the driver
-  thread** (15.1% on the pooled build at eight streams with tcpMux, 23.4% at one
+  thread** (Linux: 15.1% on the pooled build at eight streams with tcpMux, 23.4% at one
   stream, 30-35% with tcpMux off). A bulk KCP stream put ~70% of the server's single driver thread
   inside `sendmmsg`, so the whole tunnel was capped by one core's kernel-side
   send path. The datagrams a flush has already produced are now handed to a

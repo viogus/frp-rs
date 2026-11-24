@@ -1316,7 +1316,7 @@ KCP configs, which do not expose this table. See
 ```toml
 # frps.toml and frpc.toml
 [transport.kcp]
-sender_thread = false   # default true: keep KCP's UDP sends on the frp-kcp-send pool
+sender_thread = false   # default true; cheaper off on macOS/Windows (see below)
 ```
 
 By default the datagrams a KCP flush has produced are handed to a small pool of
@@ -1336,6 +1336,20 @@ noise), so on a host already busy with several KCP tunnels this key is the way
 to get those cores back without losing aggregate capacity. It is not a latency
 lever: inline puts the sends back on the driver loop, and the echo p99 cost of
 the pool (0.92-1.20 → 1.56-1.65 ms) was not measured against it.
+
+Every number above is **Linux**, where the worker batches with `sendmmsg` and a
+full socket buffer returns to KCP instead of parking the thread. Off Linux there
+is no batched send and a would-blocked worker waits a fixed 5 ms slice, so the
+pool costs instead of paying: on an eight-stream `tcpMux` + TLS shape on macOS
+the same comparison gives **+59% client CPU per MiB** with no throughput gain
+(43.55 against 27.32 ms/MiB, pooled cheaper in 0/6 paired reps; the rate itself
+swung −14.8%, −4.8% and +3.5% across runs on a loaded laptop, so read the CPU
+figure and not the rate). On a Mac, or on Windows where the same non-Linux path
+runs, `sender_thread = false` is the cheaper setting — and it is the behaviour
+those platforms had before the pool existed. Reproduce with
+`bash scripts/kcp-sender-ab-macos.sh`, whose header documents the shape; the
+record is
+[§ Limits](archive/notes/2026-11-23-kcp-send-thread.md#limits).
 
 On `frps` the listener's `KcpConfig` is cloned into every socket at bind time, so
 a changed `senderThread` is **restart-only**: `frps reload` reports
