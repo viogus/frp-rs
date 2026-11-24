@@ -13027,12 +13027,22 @@ kept out of the main P2 list so that adding them does not renumber every later
   (28,690 → 65,989), and making the read arm loop on partial batches cut that by
   12% without moving throughput or CPU.
 
-  **Done-when:** either the single-pair gain survives at ≤1.1× the single-threaded
-  cores per MiB with `par-test.sh 2 8 10` back at or above baseline, or the
-  trade-off is recorded as the accepted shape for the deployments that matter
-  (a single tunnel on an otherwise idle box) with the saturated case named in
-  the perf baselines. Candidates, none measured: `SO_REUSEPORT` sharding of
-  the receive side, and a non-FIFO lane for non-bulk runs.
+  Attribution (2026-11-24, `perf stat` over the same shape): instructions per
+  MiB **+15%**, cycles per MiB **+25%**, IPC 0.78 → 0.71, cache misses flat,
+  context switches 2.1×, `recvmmsg` 28,690 → 65,082 per 8 s — spread across the
+  pipeline with no single hot spot
+  (`docs/archive/notes/2026-11-23-kcp-send-thread.md` § "Where those extra
+  cycles go"). The first option below is therefore out: there is nothing to
+  narrow, and the retried short-batch drain already showed the syscall count is
+  a symptom.
+  **Done-when:** the trade-off is rounded out with the escape hatch operators
+  need — a `[transport.kcp]` switch that keeps the inline send path for hosts
+  whose cores are already busy (it selects the existing
+  `Dispatch::NoThread` → `send_packets` arm), documented next to
+  `deadLink`/`probe`, and measured on `par-test.sh 2 8 10` to recover the
+  −5% — **or** an explicit decision that one default stands for every shape.
+  Candidates, none measured: `SO_REUSEPORT` sharding of the receive side, and a
+  non-FIFO lane for non-bulk runs.
 
 - [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**
 
