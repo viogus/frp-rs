@@ -611,6 +611,11 @@ impl Service {
             .as_ref()
             .map(|opts| opts.probe)
             .unwrap_or(true);
+        let wc_kcp_sender_thread = cfg_local
+            .kcp_options
+            .as_ref()
+            .map(|opts| opts.sender_thread)
+            .unwrap_or(frp_core::KCP_SENDER_THREAD_DEFAULT);
         let wc_bind_addr = opt_if_empty!(cfg_local.connect_server_local_ip);
         let wc_proxy_url = cfg_local.proxy_url.clone();
         let wc_dial_timeout_secs = cfg_local.dial_server_timeout.max(1) as u64;
@@ -642,6 +647,7 @@ impl Service {
             cfg_local.tcp_recv_buffer_size,
             wc_kcp_dead_link,
             wc_kcp_liveness_probe,
+            wc_kcp_sender_thread,
             self.oidc_client.clone(),
             cfg_local.metas.clone(),
             cfg_local.proxy_url.clone(),
@@ -796,6 +802,7 @@ impl Service {
             wc_keepalive_secs,
             wc_kcp_dead_link,
             wc_kcp_liveness_probe,
+            wc_kcp_sender_thread,
             wc_bind_addr,
             wc_proxy_url,
             wc_dial_timeout_secs,

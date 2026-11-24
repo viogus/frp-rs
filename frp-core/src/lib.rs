@@ -247,6 +247,19 @@ pub const KCP_DEAD_LINK_DEFAULT: u32 = 20;
 /// state machine tears the session down at `xmit >= dead_link`, so 1 dies on the
 /// first write and 2 on the first retransmission — values no operator means.
 pub const KCP_DEAD_LINK_MIN: u32 = 3;
+
+/// Whether KCP's UDP sends default to the shared sender pool on this platform.
+///
+/// The pool pays only where one wake can drain a batch: Linux and Android send
+/// with `sendmmsg`, and that is worth +15.1% throughput at eight streams for
+/// +38% CPU. Everywhere else the send path issues one `try_send_to` per
+/// datagram and a would-blocked worker parks for a fixed 5 ms slice, which
+/// measured **+59% client CPU per MiB with no throughput gain** on macOS
+/// (`docs/archive/notes/2026-11-23-kcp-send-thread.md` § Limits). Declared
+/// here rather than in the `kcp` module because the config and transport layers
+/// reference it in builds without the `kcp` feature — the same reason as
+/// [`KCP_DEAD_LINK_DEFAULT`].
+pub const KCP_SENDER_THREAD_DEFAULT: bool = cfg!(any(target_os = "linux", target_os = "android"));
 pub const EXIT_AUTH: i32 = 3; // frp-rs extension: construction failure tagged InitErrorKind::Auth
 pub const EXIT_BIND: i32 = 4; // frp-rs extension: construction failure tagged InitErrorKind::Other
 

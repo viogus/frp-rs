@@ -307,6 +307,10 @@ pub(crate) struct WorkConnConfig {
     /// Whether KCP sessions this work connection dials probe a quiet peer
     /// (`[transport.kcp] probe`), forwarded to the dial options.
     pub kcp_liveness_probe: bool,
+    /// Whether KCP sessions this work connection dials run their UDP sends on
+    /// the shared sender pool (`[transport.kcp] senderThread`), forwarded to the
+    /// dial options.
+    pub kcp_sender_thread: bool,
     pub bind_addr: Option<String>,
     pub proxy_url: String,
     pub dial_timeout_secs: u64,
@@ -344,6 +348,7 @@ struct WorkConnDialConfig<'a> {
     keepalive_secs: u64,
     kcp_dead_link: u32,
     kcp_liveness_probe: bool,
+    kcp_sender_thread: bool,
     bind_addr: &'a Option<String>,
     proxy_url: &'a str,
     dial_timeout_secs: u64,
@@ -382,6 +387,7 @@ async fn connect_yamux_or_dial(cfg: &WorkConnDialConfig<'_>) -> Option<IoStream>
             keepalive_secs: cfg.keepalive_secs,
             kcp_dead_link: cfg.kcp_dead_link,
             kcp_liveness_probe: cfg.kcp_liveness_probe,
+            kcp_sender_thread: cfg.kcp_sender_thread,
             bind_addr: cfg.bind_addr.clone(),
             proxy_url: if cfg.proxy_url.is_empty() {
                 None
@@ -654,6 +660,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
             keepalive_secs,
             kcp_dead_link,
             kcp_liveness_probe,
+            kcp_sender_thread,
             bind_addr,
             proxy_url,
             dial_timeout_secs,
@@ -708,6 +715,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                 keepalive_secs,
                 kcp_dead_link,
                 kcp_liveness_probe,
+                kcp_sender_thread,
                 bind_addr: &bind_addr,
                 proxy_url: &proxy_url,
                 dial_timeout_secs,
@@ -735,6 +743,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
             keepalive_secs,
             kcp_dead_link,
             kcp_liveness_probe,
+            kcp_sender_thread,
             bind_addr: &bind_addr,
             proxy_url: &proxy_url,
             dial_timeout_secs,
@@ -1432,6 +1441,7 @@ mod tests {
             keepalive_secs: 0,
             kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
             kcp_liveness_probe: true,
+            kcp_sender_thread: true,
             bind_addr: None,
             proxy_url: String::new(),
             dial_timeout_secs: 1,

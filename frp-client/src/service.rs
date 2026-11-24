@@ -232,6 +232,7 @@ struct SessionCtx {
     /// same retransmission bound as the control connection.
     wc_kcp_dead_link: u32,
     wc_kcp_liveness_probe: bool,
+    wc_kcp_sender_thread: bool,
     wc_bind_addr: Option<String>,
     wc_proxy_url: String,
     wc_dial_timeout_secs: u64,
@@ -996,6 +997,7 @@ impl Service {
             keepalive_secs: ctx.wc_keepalive_secs,
             kcp_dead_link: ctx.wc_kcp_dead_link,
             kcp_liveness_probe: ctx.wc_kcp_liveness_probe,
+            kcp_sender_thread: ctx.wc_kcp_sender_thread,
             bind_addr: ctx.wc_bind_addr.clone(),
             proxy_url: ctx.wc_proxy_url.clone(),
             dial_timeout_secs: ctx.wc_dial_timeout_secs,

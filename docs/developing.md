@@ -199,7 +199,7 @@ Add a field only for a genuinely new knob, and then follow the house rules:
   ignored* by Go frp — the config is accepted and the setting is dropped. This is
   the single most expensive compatibility bug class in this repository.
 - The client plugin config struct is separate: `PluginConfig` at
-  `frp-core/src/config/server.rs:1493`.
+  `frp-core/src/config/server.rs:1518`.
 
 **The type name itself is validated by an allow-list, and this is the first wall.**
 `fn validate_proxy_configs` (`frp-core/src/config/loader.rs:1339`) checks

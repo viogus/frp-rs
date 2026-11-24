@@ -80,6 +80,24 @@ pub struct KcpConfig {
     /// link; `[transport.kcp] deadLink` exposes it (frp-rs extension — Go frp
     /// hard-codes 20 in `pkg/util/net/kcp.go`).
     pub dead_link: u32,
+    /// Whether the UDP send path runs on the shared `frp-kcp-send` pool instead
+    /// of inline on the driver thread.
+    ///
+    /// Default: [`default_sender_thread`] — offloaded where the platform batches
+    /// sends, inline everywhere else. On Linux (and Android) one wake drains a
+    /// batch with `sendmmsg` and a full socket buffer returns `WouldBlock` to
+    /// KCP, so the pool measured +15.1% at eight streams and +23.4% at one
+    /// (`docs/archive/notes/2026-11-23-kcp-send-thread.md`), paid for with
+    /// 0.0089 → 0.0123 server cores per MiB. Elsewhere `send_udp_batch` returns
+    /// 0 — every datagram is its own `try_send_to` — and a would-blocked worker
+    /// waits a fixed 5 ms slice, which on macOS measured **+59% client CPU per
+    /// MiB with no throughput gain**; there the pool is off by default. Two
+    /// independent pairs on one four-vCPU box measure 183.6 MiB/s pooled
+    /// against 182.1 inline (four interleaved reps, −0.8%, inside the host's
+    /// noise), so on Linux the switch buys footprint and core placement, not
+    /// throughput. Wire bytes and event ordering are the same either way; only
+    /// where the `sendmmsg` runs changes.
+    pub sender_thread: bool,
     /// Whether the driver probes a quiet session for liveness.
     ///
     /// A session with nothing in flight cannot reach the retransmission
@@ -110,8 +128,23 @@ impl Default for KcpConfig {
             stream: true,
             dead_link: KCP_DEAD_LINK_DEFAULT,
             liveness_probe: true,
+            sender_thread: default_sender_thread(),
         }
     }
+}
+
+/// Whether new sockets offload their UDP sends to the shared pool by default.
+///
+/// The pool's win is batching, and only the Linux-family targets have it: one
+/// wake drains a batch with `sendmmsg` and a full socket buffer returns
+/// `WouldBlock` to the next tick, which is what the +15-23% on Linux is made
+/// of. Everywhere else `send_udp_batch` reports 0 and each datagram costs its
+/// own `try_send_to`, while a would-blocked worker parks for a fixed 5 ms
+/// slice — measured on macOS as +59% client CPU per MiB with no throughput
+/// gain, so pooling there is pure overhead and the default keeps the pre-pool
+/// inline path. `[transport.kcp] senderThread` overrides this either way.
+pub const fn default_sender_thread() -> bool {
+    crate::KCP_SENDER_THREAD_DEFAULT
 }
 
 impl KcpConfig {

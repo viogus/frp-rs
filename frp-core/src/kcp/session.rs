@@ -1142,6 +1142,7 @@ mod tests {
             },
             dead_link: KCP_DEAD_LINK_DEFAULT,
             liveness_probe: true,
+            sender_thread: true,
         }
     }
 
@@ -1401,6 +1402,7 @@ mod tests {
             },
             dead_link: KCP_DEAD_LINK_DEFAULT,
             liveness_probe: true,
+            sender_thread: true,
         }
     }
 

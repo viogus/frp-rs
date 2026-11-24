@@ -13007,7 +13007,7 @@ kept out of the main P2 list so that adding them does not renumber every later
   statistic the notes warn about, where its own later bullet already said 1.14×.
   No code change rides on this tick.
 
-- [ ] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.**
+- [x] **The KCP sender thread buys throughput with CPU: 38% more cores per MiB, and a saturated host runs ~5% behind.** — closed 2026-11-24: the attribution below leaves nothing to narrow, and `[transport.kcp] senderThread = false` now selects the inline path. Re-measured on the pooled build the same day, two pairs × eight streams sum 183.6 MiB/s pooled against 182.1 inline (−0.8%, inside noise), and inline reproduces the pre-pooling baseline — so the −5% row below is the per-socket build's, and the pooled reading that once seemed to confirm it came from two valid reps of a run whose other two lost a stream. The switch is a core-placement control, not a throughput recovery.
 
   Moving the send path off the driver thread
   (`docs/archive/notes/2026-11-23-kcp-send-thread.md`) buys +15.1% at eight
@@ -13015,8 +13015,10 @@ kept out of the main P2 list so that adding them does not renumber every later
   per-socket build measured +17.4% over six pairs) and +23.4% at one, but the
   server goes from 1.06 to 1.72 cores — 0.0089 → 0.0123 cores per MiB — and
   two independent frps+frpc pairs on the same four-vCPU box sum to **174.9 against
-  a baseline 184.8** (four interleaved reps: 186.1/187.1/184.6/181.2 against
-  170.7/175.9/171.8/181.3, three negative and one at parity). Sender threads are
+  a baseline 184.8** on the **per-socket** build (four interleaved reps:
+  186.1/187.1/184.6/181.2 against 170.7/175.9/171.8/181.3, three negative and
+  one at parity); the pooled build that ships measures level with inline
+  (183.6 vs 182.1). Sender threads are
   pooled — one per core capped at four, started lazily, one bound per socket for
   ordering — so the client carries four instead of ten on the `tcpMux = false`
   eight-stream shape (22 threads with no sender thread, 31 per-socket, 25
@@ -13027,12 +13029,25 @@ kept out of the main P2 list so that adding them does not renumber every later
   (28,690 → 65,989), and making the read arm loop on partial batches cut that by
   12% without moving throughput or CPU.
 
-  **Done-when:** either the single-pair gain survives at ≤1.1× the single-threaded
-  cores per MiB with `par-test.sh 2 8 10` back at or above baseline, or the
-  trade-off is recorded as the accepted shape for the deployments that matter
-  (a single tunnel on an otherwise idle box) with the saturated case named in
-  the perf baselines. Candidates, none measured: `SO_REUSEPORT` sharding of
-  the receive side, and a non-FIFO lane for non-bulk runs.
+  Attribution (2026-11-24, `perf stat` over the same shape): instructions per
+  MiB **+15%**, cycles per MiB **+25%**, IPC 0.78 → 0.71, cache misses flat,
+  context switches 2.1×, `recvmmsg` 28,690 → 65,082 per 8 s — spread across the
+  pipeline with no single hot spot
+  (`docs/archive/notes/2026-11-23-kcp-send-thread.md` § "Where those extra
+  cycles go"). The first option below is therefore out: there is nothing to
+  narrow, and the retried short-batch drain already showed the syscall count is
+  a symptom.
+  **Done-when:** the trade-off is rounded out with the escape hatch operators
+  need — a `[transport.kcp]` switch that keeps the inline send path for hosts
+  whose cores are already busy (the inline path is a new early return in
+  `KcpSocket::send_run`; `Dispatch::NoThread` stays the spawn-failure fallback),
+  documented next to `deadLink`/`probe`, and measured on `par-test.sh 2 8 10` to
+  recover the −5% — **or** an explicit decision that one default stands for
+  every shape. Measured: the recovery did not exist (−0.8%, inside noise), so
+  the second option is what was taken — the default stays on and the switch
+  buys core placement.
+  Candidates, none measured: `SO_REUSEPORT` sharding of the receive side, and a
+  non-FIFO lane for non-bulk runs.
 
 - [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**
 
@@ -13051,21 +13066,20 @@ kept out of the main P2 list so that adding them does not renumber every later
   `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:99-110` does not already
   exclude is measured and ruled out.
 
-- [ ] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
-  Unmeasured hypothesis, filed from the 2026-11-23 write-batching probe. On the
-  frp-rs↔frp-rs bulk shape (`tcpMux` + TLS over KCP, 8 streams, 124 MiB/s) the
-  receiving side handled **247,477 `Flush` requests for 339 KB of writes** in a
-  14 s process life — every batch at depth 1, i.e. ~18k wakeups/s to move ~30
-  KB/s (`docs/archive/notes/2026-11-23-kcp-write-batch-deeper.md` §6).
-  `handle_flush` (`frp-core/src/kcp/socket.rs:376`) unconditionally runs
-  `flush_carry` + `flush_session_output` → `force_flush`, so a flush request with
-  nothing queued still pays a KCP send-buffer scan.
-  **Done-when:** a flush whose session has no queued data **and no pending ACK**
-  skips `force_flush`, with the ACK half kept: 2026-11-12 measured a tick-only
-  flush at 24-30 MiB/s (2.2-2.8× slower), so deferring ACKs to the tick is not an
-  option — `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. The change is
-  only worth landing with a before/after flush-request rate and a throughput row
-  on the same shape, plus a green `scripts/compat-test.sh`.
+- [x] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
+  Filed from the 2026-11-23 write-batching probe and **closed 2026-11-24 as
+  measured, not adopted**. The pathology is real: on the frp-rs↔frp-rs bulk
+  shape (`tcpMux` + TLS over KCP, 8 streams) the **client skips 12.4% of its
+  flushes** (2,696 of 21,825) once `handle_flush` consults a `would_emit`
+  predicate, and the server 0.15% — so "the flush carries nothing" is the normal
+  case, not an edge case. It buys nothing anyway: two interleaved A/B sessions
+  disagreed in sign (+5.7% 4/4 and −2.0% 1/4, pooled +1.7%, inside the host's
+  ±6%), with CPU flat within 0.7%. `force_flush` is 6.8% inclusive of CPU under
+  bulk load and the client's share is smaller; 12% of that is below resolution,
+  while the cost the kernel charges — one datagram per segment — is untouched.
+  Numbers, the predicate and the reproduction:
+  `docs/archive/notes/2026-11-24-kcp-skip-empty-flush.md`. The patch is kept in
+  the stash `kcp: skip the flush that carries nothing`; it is not on `main`.
 
 ---
 

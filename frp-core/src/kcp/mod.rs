@@ -13,7 +13,7 @@ pub mod session;
 mod socket;
 mod stream;
 
-pub use config::{KcpConfig, KcpNoDelayConfig, KCP_DEAD_LINK_DEFAULT};
+pub use config::{default_sender_thread, KcpConfig, KcpNoDelayConfig, KCP_DEAD_LINK_DEFAULT};
 pub use listener::{dial_kcp, dial_kcp_with_driver, KcpListener};
 pub use session::KcpSession;
 pub use stream::KcpStream;
@@ -52,6 +52,7 @@ pub fn default_kcp_config() -> KcpConfig {
         stream: true,
         dead_link: KCP_DEAD_LINK_DEFAULT,
         liveness_probe: true,
+        sender_thread: default_sender_thread(),
     }
 }
 
@@ -77,16 +78,22 @@ pub fn default_kcp_client_config() -> KcpConfig {
         stream: true,
         dead_link: KCP_DEAD_LINK_DEFAULT,
         liveness_probe: true,
+        sender_thread: default_sender_thread(),
     }
 }
 
 /// The KCP listener config for a server whose `[transport.kcp]` options are
-/// `(dead_link, liveness_probe)`. Missing values keep the kcp-go default
-/// bound and the probe on.
+/// `(dead_link, liveness_probe, sender_thread)`. Missing values keep the kcp-go
+/// default bound, the probe on, and the send pool where the platform batches
+/// sends ([`default_sender_thread`]).
 ///
 /// Extracted from the listener so the config-to-listener hop is testable
 /// without standing up a UDP socket.
-pub fn kcp_config_from_options(dead_link: Option<u32>, liveness_probe: Option<bool>) -> KcpConfig {
+pub fn kcp_config_from_options(
+    dead_link: Option<u32>,
+    liveness_probe: Option<bool>,
+    sender_thread: Option<bool>,
+) -> KcpConfig {
     let mut config = default_kcp_config();
     if let Some(dead_link) = dead_link {
         config.dead_link = dead_link.max(crate::KCP_DEAD_LINK_MIN);
@@ -94,17 +101,21 @@ pub fn kcp_config_from_options(dead_link: Option<u32>, liveness_probe: Option<bo
     if let Some(liveness_probe) = liveness_probe {
         config.liveness_probe = liveness_probe;
     }
+    if let Some(sender_thread) = sender_thread {
+        config.sender_thread = sender_thread;
+    }
     config
 }
 
 /// The KCP client config for a dial whose `[transport.kcp]` options are
-/// `(dead_link, liveness_probe)`. Clamped like the listener's, so a
-/// hand-built `DialOptions` cannot produce a session that dies on its first
+/// `(dead_link, liveness_probe, sender_thread)`. Clamped like the listener's, so
+/// a hand-built `DialOptions` cannot produce a session that dies on its first
 /// write.
-pub fn kcp_client_config(dead_link: u32, liveness_probe: bool) -> KcpConfig {
+pub fn kcp_client_config(dead_link: u32, liveness_probe: bool, sender_thread: bool) -> KcpConfig {
     let mut config = default_kcp_client_config();
     config.dead_link = dead_link.max(crate::KCP_DEAD_LINK_MIN);
     config.liveness_probe = liveness_probe;
+    config.sender_thread = sender_thread;
     config
 }
 
@@ -114,29 +125,41 @@ mod option_tests {
 
     #[test]
     fn the_listener_config_takes_the_configured_bound() {
-        assert_eq!(kcp_config_from_options(Some(7), None).dead_link, 7);
+        assert_eq!(kcp_config_from_options(Some(7), None, None).dead_link, 7);
         assert_eq!(
-            kcp_config_from_options(None, None).dead_link,
+            kcp_config_from_options(None, None, None).dead_link,
             crate::KCP_DEAD_LINK_DEFAULT
         );
     }
 
     #[test]
     fn the_listener_config_takes_the_probe_toggle() {
-        assert!(kcp_config_from_options(None, None).liveness_probe);
-        assert!(!kcp_config_from_options(None, Some(false)).liveness_probe);
-        assert!(kcp_config_from_options(None, Some(true)).liveness_probe);
+        assert!(kcp_config_from_options(None, None, None).liveness_probe);
+        assert!(!kcp_config_from_options(None, Some(false), None).liveness_probe);
+        assert!(kcp_config_from_options(None, Some(true), None).liveness_probe);
+    }
+
+    #[test]
+    fn the_sender_thread_default_follows_the_platform() {
+        assert_eq!(
+            kcp_config_from_options(None, None, None).sender_thread,
+            default_sender_thread()
+        );
+        assert!(kcp_config_from_options(None, None, Some(true)).sender_thread);
+        assert!(!kcp_config_from_options(None, None, Some(false)).sender_thread);
+        assert!(kcp_client_config(9, true, true).sender_thread);
+        assert!(!kcp_client_config(9, true, false).sender_thread);
     }
 
     #[test]
     fn the_dial_config_takes_the_configured_bound_and_clamps() {
-        assert_eq!(kcp_client_config(9, true).dead_link, 9);
+        assert_eq!(kcp_client_config(9, true, true).dead_link, 9);
         assert_eq!(
-            kcp_client_config(1, true).dead_link,
+            kcp_client_config(1, true, true).dead_link,
             crate::KCP_DEAD_LINK_MIN,
             "a hand-built DialOptions must not produce a session that dies on its first write"
         );
-        assert!(!kcp_client_config(9, false).liveness_probe);
+        assert!(!kcp_client_config(9, false, true).liveness_probe);
     }
 }
 

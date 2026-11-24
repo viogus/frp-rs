@@ -3,9 +3,14 @@
 2026-11-23. Measured on a 4-vCPU Linux VPS, loopback, `frp-stress` `stream`/`sink`
 shapes (one-way, 10 s, 8 streams unless noted, arms interleaved and order-flipped
 per rep). Baseline: `main` at `b48ef8a7`. Candidate: the same tree plus sender
-threads for the KCP socket's UDP writes. Every row below is labelled with the
-build that produced it — the per-socket and pooled designs differ only in how the
-threads are owned, and the pooled one is what ships.
+threads for the KCP socket's UDP writes. The per-socket and pooled designs differ
+only in how the threads are owned, and the pooled one is what ships. Every row
+that names a design was measured on that design; the rows that do not say
+`shared pool` were measured on the per-socket candidate, and the pool's numbers
+are the two rows that name it plus § "The switch".
+
+Status: shipped. Entry point: `[transport.kcp] senderThread`
+(`frp-core/src/kcp/config.rs`, `KcpSocket::new`).
 
 ## The claim, and where it came from
 
@@ -52,6 +57,35 @@ in the worker did not fix it (still 95.0); dropping is what made the design
 work. The worker only blocks on `WouldBlock` *within* one run, where it is still
 the sole writer.
 
+### The switch
+
+`[transport.kcp] senderThread = false` (frp-rs extension, default `true`)
+selects the path this note exists to contrast with: `KcpSocket::new` binds no
+worker and every run goes through `send_packets` on the driver thread, exactly
+as before the change. The wire bytes and the event order are the same, so it is
+a per-host CPU/throughput choice, not a compatibility knob — a Go peer is
+unaffected either way.
+
+Measured on the pooled build (2026-11-24, two independent pairs × eight
+streams × 10 s, four interleaved reps on the 4-vCPU host `gc`, the same
+`par-test.sh 2 8 10` harness as the aggregate row): pooled **193.2 / 177.4 /
+181.4 / 182.4** MiB/s summed (mean **183.6**) against inline **191.2 / 176.6 /
+179.8 / 180.7** (mean **182.1**) — **−0.8%**, inside the host's ±3% noise, all
+four pairs in the same direction and no streams lost.
+
+That run is also what settles the −5.3% above. Inline (182.1) reproduces the
+pre-pooling baseline (184.8, −1.5%) and the pool adds nothing measurable on top
+of it, so the aggregate loss in § "What it costs" belonged to the per-socket
+build the row is labelled with. The pooled reading quoted there (−2.3% and
+−6.7%) came from a run whose other two reps lost a stream; two valid reps of a
+run that could not hold its streams are not an aggregate measurement, and this
+clean four-rep run does not reproduce it.
+
+So the escape hatch buys core placement, not throughput. `KcpConfig::sender_thread`
+carries it and `KcpSocket::new` reads it once, at construction; `frps reload`
+reports a changed value as restart-only because the listener's `KcpConfig` is
+cloned into each socket at bind time.
+
 ## Measured
 
 Interleaved A/B pairs, MiB/s, `main` vs candidate:
@@ -86,9 +120,11 @@ This buys parallelism, not efficiency, and the bill is visible in four places.
   independent frps+frpc pairs on the same box, per-socket sender: baseline
   186.1 / 187.1 / 184.6 / 181.2 (mean **184.8**), candidate 170.7 / 175.9 /
   171.8 / 181.3 (mean **174.9**) — **−5.3%**, three of four reps negative and one
-  at parity. The shared pool does not change that (−2.3% and −6.7% on the two
-  reps where both arms stayed valid; the other two lost a stream): the cost is
-  CPU, and pooling changes thread count, not work.
+  at parity. This is the **per-socket** build (the row says so): the pooled build
+  that ships was compared against inline directly in § "The switch" and comes
+  out level (183.6 vs 182.1, −0.8%). The pooled reading once quoted here (−2.3%
+  and −6.7%) was taken from the two reps of a run whose other two lost a stream,
+  and is superseded by that four-rep run.
 - **Threads.** Pooled, the cost is bounded: workers are started lazily, one per
   core capped at four, and a socket binds to exactly one of them at construction.
   Measured with `tcpMux = false` and eight streams, client-side thread counts on
@@ -98,6 +134,21 @@ This buys parallelism, not efficiency, and the bill is visible in four places.
   Ordering survives the
   sharing because a socket never migrates between workers: all of its runs enter
   one FIFO.
+- **Where those extra cycles go.** `perf stat -p <frps>` over the same shape
+  (7 s, 8 streams, `perf` overhead included in both arms) says the increase
+  is spread, not concentrated: **instructions per MiB +15%**, **cycles per MiB
+  +25%**, **IPC 0.78 → 0.71 (−8%)**, cache misses per MiB flat (−4%), and
+  **context switches 34k → 70k** (2.1×) — one extra thread, one wakeup per run.
+  The receive side also pays: the driver, no longer blocking on `sendmmsg`,
+  wakes with fewer datagrams queued, and `recvmmsg` calls more than doubled
+  (28,690 → 65,082 per 8 s). Retrying the drain with a short-batch round
+  (`got > 0`) cut that by 12.5% and moved nothing else, so the syscall count is
+  a symptom: what remains is the ordinary price of running one pipeline's work
+  on two cores — fewer cache hits per instruction, more scheduling.
+  There is no single hot spot to fix, which is why the trade is recorded rather
+  than narrowed. The per-transport switch that keeps the inline path for hosts
+  whose cores are already busy is `[transport.kcp] senderThread` (§ "The switch").
+
 - **Tail latency.** Echo RTT through the tunnel, 4 connections, 1500 samples of
   64 B: p50 unchanged (0.40-0.46 vs 0.36-0.45 ms) but **p99 0.92-1.20 →
   1.56-1.65 ms**, because the queue is FIFO and interactive traffic waits behind
@@ -129,9 +180,30 @@ concurrent sockets, sends queue behind each other on four workers; the pool widt
 is `available_parallelism` capped at 4 (`MAX_WORKERS`). **All numbers are Linux.** Off Linux the worker has no `sendmmsg`
 (`send_udp_batch` returns 0 and each datagram takes its own `try_send_to`) and a
 `WouldBlock` waits a fixed 5 ms slice, bounded per run by `STALL_BUDGET` — so a
-stalled socket costs up to ten slices before the run is handed back to KCP. That
-path is unmeasured here and is a plausible regression for macOS/Windows KCP
-users; it needs its own A/B before this ships everywhere. The aggregate test spreads clients over separate frps processes; a
+stalled socket costs up to ten slices before the run is handed back to KCP, and
+that path **was measured on macOS** (2026-11-24,
+`scripts/kcp-sender-ab-macos.sh`: one `frps` + one `frpc`, KCP + `tcpMux` + TLS,
+eight streams, unidirectional into a sink, the `frpc` flag alone toggled, six
+interleaved 256 MiB arms): the pool is no faster there and costs **+59% CPU per
+MiB** (43.55 against 27.32 ms/MiB, pooled cheaper in 0/6 paired reps), with a
+throughput point estimate of −14.8% (31.1 against 36.5 MiB/s — two earlier
+fixed-duration runs of the same shape gave −4.8% and +3.5%, so the rate sits
+inside the host's noise and the CPU cost is the finding). That is the missing
+`sendmmsg` showing up as predicted: without batched sends every datagram is its
+own `try_send_to`, and a `WouldBlock` parks the worker for a 5 ms slice it could
+have spent sending. The host was a fanless M2 Air carrying a Spotlight indexer
+at ~90% of a core with load averages of 6-8, so ±10% is the resolution on rate —
+the CPU cost is measured against that noise, not inside it. Windows is still
+unmeasured, and `senderThread` exists so an operator does not have to wait for
+it — and since this measurement the **default follows the platform**: the pool
+stays on for Linux and Android, where batching pays, and is off for every other
+target, where it only costs. A Linux host that wants the cores back still sets
+`senderThread = false`; a Mac or Windows host can still opt in.
+
+That default was checked on the same Mac: with no `[transport.kcp]` table at
+all the client measured **29.88 ms CPU/MiB** against **43.67** for an explicit
+`senderThread = true` (0/4 paired reps, 8 streams × 256 MiB, 4 interleaved
+rounds) — level with the inline arm above (27.32), not with the pooled one. The aggregate test spreads clients over separate frps processes; a
 single frps serving many clients has the same thread topology but different
 shared-state pressure, and was not measured. No real NIC was available, so the
 kernel cost per datagram here (netfilter ~4.5% self on loopback) is not the
@@ -141,14 +213,17 @@ measured separately for context, not in the interleaved pairs.
 ## The baseline gate this change does not pass
 
 `CLAUDE.md`'s perf-baseline rule says a change to one axis must not regress the
-others by more than 5%. This one regresses two: aggregate capacity on a
-saturated box **−5.3%** (184.8 → 174.9 MiB/s across two pairs) and echo **p99
-+40%** (0.92-1.20 → 1.56-1.65 ms). It is merged on an explicit waiver, not
-silently: the win is +15-23% on the shape KCP is used for (one tunnel, mux on),
-the two costs are named in the CHANGELOG, and `TODO.md` carries the follow-up —
-either recover the cores per MiB or record the trade as the accepted shape for
-single-tunnel deployments. A reader who runs many KCP tunnels on one small box
-should treat this note as a warning, not a recommendation.
+others by more than 5%. One axis still fails: echo **p99 +40%**
+(0.92-1.20 → 1.56-1.65 ms, and the switch's A/B measured throughput only, so
+`senderThread = false` is a core-placement knob, not a latency fix). The other
+axis originally listed here — aggregate capacity, −5.3% (184.8 → 174.9 MiB/s
+across two pairs) — was the **per-socket** build's cost; the pooled build that
+ships measures level against inline (§ "The switch"), so that half of the waiver
+is withdrawn rather than repeated. The change is merged on an explicit waiver
+for p99, not silently: the win is +15-23% on the shape KCP is used for (one
+tunnel, mux on), the remaining cost is named in the CHANGELOG, and `TODO.md`
+carries the core-efficiency follow-up (0.0089 → 0.0123 cores per MiB). A reader
+who runs many KCP tunnels on one small box is buying CPU, not losing throughput.
 
 ## Reproduce
 

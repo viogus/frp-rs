@@ -677,6 +677,12 @@ pub struct DialOptions {
     /// frp-rs extension (`[transport.kcp] probe`); see
     /// [`crate::kcp::KcpConfig::liveness_probe`].
     pub kcp_liveness_probe: bool,
+    /// Whether KCP's UDP sends run on the shared `frp-kcp-send` pool instead of
+    /// inline on the driver thread. Default is
+    /// [`crate::KCP_SENDER_THREAD_DEFAULT`].
+    /// frp-rs extension (`[transport.kcp] senderThread`); see
+    /// [`crate::kcp::KcpConfig::sender_thread`].
+    pub kcp_sender_thread: bool,
     /// Upstream proxy URL. Supports http:// and socks5:// schemes.
     /// When set, the TCP connection goes through the proxy instead of
     /// connecting directly. Empty = direct connection.
@@ -709,6 +715,7 @@ impl Default for DialOptions {
             tcp_recv_buffer_size: 0,
             kcp_dead_link: crate::KCP_DEAD_LINK_DEFAULT,
             kcp_liveness_probe: true,
+            kcp_sender_thread: crate::KCP_SENDER_THREAD_DEFAULT,
             proxy_url: None,
             v2: false,
         }
@@ -1603,8 +1610,11 @@ pub async fn dial_server(opts: &DialOptions) -> Result<IoStream, crate::Error> {
             // address dialled is the one the KCP+TLS stream reports as its
             // `peer_addr`.
             let addr = udp_peer.to_string();
-            let kcp_cfg =
-                crate::kcp::kcp_client_config(opts.kcp_dead_link, opts.kcp_liveness_probe);
+            let kcp_cfg = crate::kcp::kcp_client_config(
+                opts.kcp_dead_link,
+                opts.kcp_liveness_probe,
+                opts.kcp_sender_thread,
+            );
             let stream = crate::kcp::dial_kcp(&addr, kcp_cfg)
                 .await
                 .map_err(|e| crate::Error::Transport(format!("KCP dial: {e}").into()))?;
@@ -3389,7 +3399,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2354).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2364).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

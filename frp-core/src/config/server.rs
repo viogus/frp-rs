@@ -1178,7 +1178,8 @@ pub struct QuicOptions {
 ///
 /// frp-rs extension: Go frp hard-codes these in `pkg/util/net/kcp.go`, so a
 /// config that sets them is refused by Go frp (`unknown field`), not silently
-/// ignored. Values are wire-neutral — they change timers only.
+/// ignored. Values are wire-neutral — they change timers and where the UDP
+/// sends run, never the bytes on the wire.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KcpOptions {
     /// Retransmissions of one segment before the session is declared dead.
@@ -1202,6 +1203,25 @@ pub struct KcpOptions {
     /// refreshed.
     #[serde(default = "default_kcp_probe")]
     pub probe: bool,
+    /// Run KCP's UDP sends on the shared sender pool instead of inline on the
+    /// driver thread. Default: [`crate::KCP_SENDER_THREAD_DEFAULT`] — on where
+    /// the platform batches sends (Linux/Android), off elsewhere. frp-rs
+    /// extension — Go frp always sends inline, so a Go peer is unaffected
+    /// either way.
+    ///
+    /// The pool is what makes a tunnel faster (+15.1% at eight streams) at the
+    /// cost of server CPU (0.0089 → 0.0123 cores per MiB per server). On two
+    /// independent pairs of one four-vCPU box the pooled build sums 183.6 MiB/s
+    /// against 182.1 inline (four interleaved reps, −0.8%, inside the host's
+    /// ±3% noise), and inline reproduces the pre-pooling baseline (184.8 on an
+    /// earlier run), so this is a footprint/topology control, not a throughput
+    /// lever. The −5.3% aggregate row recorded for the sender-thread change is
+    /// labelled `per-socket` in the note; the pooled reading that seemed to
+    /// confirm it rested on the two valid reps of a run whose other two lost a
+    /// stream, and a clean four-rep run does not reproduce it. Wire bytes and
+    /// ordering are identical either way.
+    #[serde(default = "default_kcp_sender_thread", alias = "senderThread")]
+    pub sender_thread: bool,
 }
 
 impl Default for KcpOptions {
@@ -1209,12 +1229,17 @@ impl Default for KcpOptions {
         Self {
             dead_link: default_kcp_dead_link(),
             probe: default_kcp_probe(),
+            sender_thread: default_kcp_sender_thread(),
         }
     }
 }
 
 fn default_kcp_probe() -> bool {
     true
+}
+
+fn default_kcp_sender_thread() -> bool {
+    crate::KCP_SENDER_THREAD_DEFAULT
 }
 
 fn default_kcp_dead_link() -> u32 {

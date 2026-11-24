@@ -343,6 +343,11 @@ impl Service {
                     .kcp_options
                     .as_ref()
                     .map(|options| options.probe),
+                self.cfg
+                    .transport
+                    .kcp_options
+                    .as_ref()
+                    .map(|options| options.sender_thread),
             );
             spawn_boxed(Box::pin(async move {
                 let mut listener =

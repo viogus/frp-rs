@@ -673,7 +673,13 @@ fn section_known_keys(section: &str) -> Option<&'static [&'static str]> {
         ],
         // frp-rs extension: `[transport.kcp]` (Go frp has no such table; its
         // kcp-go dead_link is hard-coded at 20).
-        "kcp" => &["dead_link", "deadLink", "probe"],
+        "kcp" => &[
+            "dead_link",
+            "deadLink",
+            "probe",
+            "sender_thread",
+            "senderThread",
+        ],
         "quic" => &[
             "keepalive_period",
             "keepalivePeriod",
