@@ -12967,7 +12967,13 @@ kept out of the main P2 list so that adding them does not renumber every later
   effect), and flushing when an ACK slides the window (~61-63 MiB/s, about 5%
   slower) — plus the eleven earlier pass/eliminate experiments (copies, yamux
   window, tokio-vs-blocking relay, ACK batching to the tick):
-  `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. That mixed-binary
+  `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. Deeper write batching
+  (cap 32 writes / 1 MiB, six interleaved pairs) is negative too, and for a
+  measurable reason: the cap never binds — 75% of batches are closed by a
+  `Flush` from the producer at depth 4-5, and none reaches 7 — while the flush
+  bookkeeping it would amortise is 6.8% of frps CPU against 63.7% in the
+  datagram send — `docs/archive/notes/2026-11-23-kcp-write-batch-deeper.md`.
+  That mixed-binary
   matrix was taken on the TLS-**off** shape: with Go as the client the same
   servers carry 80-83 MiB/s, with frp-rs as the client 61-66, so the client end
   was the limiter *there* — not the server, and not the KCP core. That band
@@ -13044,6 +13050,23 @@ kept out of the main P2 list so that adding them does not renumber every later
   does not count — or a named candidate that
   `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:99-110` does not already
   exclude is measured and ruled out.
+
+- [ ] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
+  Unmeasured hypothesis, filed from the 2026-11-23 write-batching probe. On the
+  frp-rs↔frp-rs bulk shape (`tcpMux` + TLS over KCP, 8 streams, 124 MiB/s) the
+  receiving side handled **247,477 `Flush` requests for 339 KB of writes** in a
+  14 s process life — every batch at depth 1, i.e. ~18k wakeups/s to move ~30
+  KB/s (`docs/archive/notes/2026-11-23-kcp-write-batch-deeper.md` §6).
+  `handle_flush` (`frp-core/src/kcp/socket.rs:376`) unconditionally runs
+  `flush_carry` + `flush_session_output` → `force_flush`, so a flush request with
+  nothing queued still pays a KCP send-buffer scan.
+  **Done-when:** a flush whose session has no queued data **and no pending ACK**
+  skips `force_flush`, with the ACK half kept: 2026-11-12 measured a tick-only
+  flush at 24-30 MiB/s (2.2-2.8× slower), so deferring ACKs to the tick is not an
+  option — `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. The change is
+  only worth landing with a before/after flush-request rate and a throughput row
+  on the same shape, plus a green `scripts/compat-test.sh`.
+
 ---
 
 ## P2 — structural (scheduling)
