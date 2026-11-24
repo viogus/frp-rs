@@ -7,20 +7,39 @@
 # `CHUNK` is the point of the harness: the naked arm's rate follows it, the TLS
 # arm's does not (rustls re-blocks to ~16 KiB records before KCP sees the bytes).
 #
-#   bash scripts/kcp-tls-ab.sh [reps] [mib]        # 64 KiB writes
-#   CHUNK=16384 bash scripts/kcp-tls-ab.sh 3 768   # 16 KiB writes
+#   bash scripts/kcp-tls-ab.sh [reps] [mib]                  # 64 KiB writes
+#   CHUNK=16384 bash scripts/kcp-tls-ab.sh 3 768             # 16 KiB writes
+#   CHUNKS="65536 16384" bash scripts/kcp-tls-ab.sh 5 768    # both, interleaved
 #
 # Needs a release build of both binaries (default: this checkout's target/release).
+# Linux only — it reads /proc/net/snmp and /proc/<pid>/stat and probes with `ss`.
+# The macOS counterpart for the sender pool is scripts/kcp-sender-ab-macos.sh.
 set -uo pipefail
 REPS=${1:-3}
 MIB=${2:-768}
-CHUNK=${CHUNK:-65536}
+CHUNKS=${CHUNKS:-${CHUNK:-65536}}
 BIND=${BIND:-17000}
 TOKEN=abc123
 PROJECT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 DIR=$(mktemp -d /tmp/kcp-tls-ab.XXXXXX)
+SHA=$(git -C "$PROJECT_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)
 FRPS=${FRPS:-$PROJECT_DIR/target/release/frps}
 FRPC=${FRPC:-$PROJECT_DIR/target/release/frpc}
+HZ=${HZ:-$(getconf CLK_TCK 2>/dev/null || echo 100)}
+
+[[ -x $FRPS && -x $FRPC ]] || {
+  echo "need frps and frpc release binaries (looked for $FRPS and $FRPC);" >&2
+  echo "build them with: cargo build --release -p frps -p frpc" >&2
+  exit 1
+}
+
+cleanup() {
+  [[ -n ${frpc_pid:-} ]] && kill "$frpc_pid" 2>/dev/null
+  [[ -n ${frps_pid:-} ]] && kill "$frps_pid" 2>/dev/null
+  [[ -n ${sink_pid:-} ]] && kill "$sink_pid" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT INT TERM
 
 cat > "$DIR/sink.py" <<'PY'
 import socket, sys, threading
@@ -62,9 +81,11 @@ PY
 
 udp_err() { awk '/^Udp:/{ if (++n == 2) { print $4, $6, $7 } }' /proc/net/snmp; }
 wait_tcp() { for _ in $(seq 1 "${2:-150}"); do (exec 3<>/dev/tcp/127.0.0.1/"$1") 2>/dev/null && return 0; sleep 0.1; done; return 1; }
-wait_udp() { for _ in $(seq 1 "${2:-100}"); do ss -lun | grep -q ":$1 " && return 0; sleep 0.1; done; return 1; }
+wait_udp() { for _ in $(seq 1 "${2:-100}"); do grep -q ":$1 " <<<"$(ss -lun)" && return 0; sleep 0.1; done; return 1; }
 
-results="$DIR/results.txt"; : > "$results"
+results="$DIR/results.txt"
+printf '# session=%s sha=%s reps=%s mib=%s chunks=%s\n' \
+  "$(basename "$DIR")" "$SHA" "$REPS" "$MIB" "$CHUNKS" > "$results"
 
 idx=0
 run_arm() {
@@ -97,13 +118,13 @@ localIP = "127.0.0.1"
 localPort = $sink
 remotePort = $remote
 EOF
-  python3 "$DIR/sink.py" "$sink" & local sink_pid=$!
-  "$FRPS" -c "$DIR/frps.toml" > "$DIR/frps-$rep-$tls-$pool.log" 2>&1 & local frps_pid=$!
+  python3 "$DIR/sink.py" "$sink" & sink_pid=$!
+  "$FRPS" -c "$DIR/frps.toml" > "$DIR/frps-$rep-$tls-$pool.log" 2>&1 & frps_pid=$!
   if ! wait_udp "$BIND" 100; then
     echo "FATAL frps never bound $BIND (tls=$tls rep=$rep)"; tail -3 "$DIR/frps-$rep-$tls-$pool.log"
     kill "$frps_pid" "$sink_pid" 2>/dev/null; exit 1
   fi
-  "$FRPC" -c "$DIR/frpc.toml" > "$DIR/frpc-$rep-$tls-$pool.log" 2>&1 & local frpc_pid=$!
+  "$FRPC" -c "$DIR/frpc.toml" > "$DIR/frpc-$rep-$tls-$pool.log" 2>&1 & frpc_pid=$!
   if ! wait_tcp "$remote" 150; then
     echo "FATAL frpc never published $remote (tls=$tls rep=$rep)"; tail -3 "$DIR/frpc-$rep-$tls-$pool.log"
     kill "$frpc_pid" "$frps_pid" "$sink_pid" 2>/dev/null; exit 1
@@ -116,7 +137,7 @@ EOF
   cpu1=$(awk '{print $14+$15}' /proc/$frpc_pid/stat 2>/dev/null || echo "$cpu0")
   e1=$(udp_err)
   rate=$(awk -v m="$MIB" -v w="$wall" 'BEGIN{printf "%.1f", m/w}')
-  cpu=$(awk -v a="$cpu0" -v b="$cpu1" -v m="$MIB" 'BEGIN{printf "%.2f", (b-a)*10/m}')
+  cpu=$(awk -v a="$cpu0" -v b="$cpu1" -v m="$MIB" -v hz="$HZ" 'BEGIN{printf "%.2f", (b-a)*1000/(hz*m)}')
   local err0 err1 rcv_err0 rcv_err1
   read -r err0 rcv_err0 _ <<<"$e0"
   read -r err1 rcv_err1 _ <<<"$e1"
@@ -128,12 +149,24 @@ EOF
   sleep 0.5
 }
 
+# Every cell gets the same number of reps, and the arms rotate order per rep so a
+# drift in host load lands on all of them. CHUNKS is a space-separated list, so
+# write sizes are compared inside one session rather than across two runs.
+ARMS=()
+for chunk in $CHUNKS; do
+  for tls in off on; do
+    for pool in true false; do
+      ARMS+=("$tls:$pool:$chunk")
+    done
+  done
+done
+n_arms=${#ARMS[@]}
 for rep in $(seq 1 "$REPS"); do
-  if (( rep % 2 == 1 )); then
-    run_arm off true "$rep"; run_arm on true "$rep"; run_arm off false "$rep"; run_arm on false "$rep"
-  else
-    run_arm on false "$rep"; run_arm off false "$rep"; run_arm on true "$rep"; run_arm off true "$rep"
-  fi
+  for i in $(seq 0 $((n_arms - 1))); do
+    idx=$(( (i + rep - 1) % n_arms ))
+    IFS=: read -r tls pool chunk <<<"${ARMS[$idx]}"
+    CHUNK=$chunk run_arm "$tls" "$pool" "$rep"
+  done
 done
 
 echo "--- summary"
@@ -148,13 +181,19 @@ for line in open(sys.argv[1]):
     rows.setdefault(k, {"rate": [], "cpu": [], "err": []})
     rows[k]["rate"].append(float(f["mibps"]))
     rows[k]["cpu"].append(float(f["frpc_cpu_ms_per_mib"]))
-    rows[k]["err"].append(int(f.get("udp_err", "0")))
+    rows[k]["err"].append(int(f.get("udp_in_err", "0")))
+    rows[k].setdefault("rcv_err", []).append(int(f.get("udp_rcvbuf_err", "0")))
 for k in sorted(rows):
     r, c, e = rows[k]["rate"], rows[k]["cpu"], rows[k]["err"]
-    print(f"{k:<20} n={len(r)} mean={statistics.mean(r):6.1f} median={statistics.median(r):6.1f} cpu_med={statistics.median(c):5.2f} udp_in_err={sum(e)} reps={r}")
-for pool in ("true", "false"):
-    a, b = rows.get(f"tls=off,pool={pool}"), rows.get(f"tls=on,pool={pool}")
-    if a and b:
-        print(f"pool={pool}: naked/tls = {statistics.mean(a['rate']) / statistics.mean(b['rate']):.3f}x")
+    rcv = sum(rows[k]["rcv_err"])
+    print(f"{k:<32} n={len(r)} mean={statistics.mean(r):6.1f} median={statistics.median(r):6.1f} cpu_med={statistics.median(c):5.2f} udp_in_err={sum(e)} udp_rcvbuf_err={rcv} reps={r}")
+chunks = sorted({k.split(",")[0].split("=")[1] for k in rows}, key=int)
+for chunk in chunks:
+    for pool in ("true", "false"):
+        a = rows.get(f"chunk={chunk},tls=off,pool={pool}")
+        b = rows.get(f"chunk={chunk},tls=on,pool={pool}")
+        if a and b:
+            print(f"chunk={chunk} pool={pool}: naked/tls = "
+                  f"{statistics.mean(a['rate']) / statistics.mean(b['rate']):.3f}x")
 PY
 echo "logs: $DIR"

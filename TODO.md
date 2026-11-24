@@ -13049,45 +13049,27 @@ kept out of the main P2 list so that adding them does not renumber every later
   Candidates, none measured: `SO_REUSEPORT` sharding of the receive side, and a
   non-FIFO lane for non-bulk runs.
 
-- [ ] **Bare KCP still trails its own TLS shape by 5-7%, and the residue is the writer's chunk size.**
+- [ ] **Bare KCP trails its own TLS shape by 6% (2-12% across sessions), and nothing measured explains it.**
 
   The 2026-11-15 figure — TLS-off nine-pair mean 86.4 against TLS-on 110.2
   (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:74,78-82,111-113`) — no
-  longer describes `4ba46c3c`: remeasured on the same host and shape (KCP,
-  `tcpMux = false`, one flow, 768 MiB, 2-4 interleaved reps) the naked arm reads
-  100-105 against 111-113 for TLS, a 5-7% gap the sender pool neither creates nor
-  removes (0.910x-0.950x pooled, 0.936x-1.040x inline, the 1.040x from the
-  two-rep run). The gap follows the
-  **client's write size**, not TLS: at 16 KiB writes the naked arm's medians
-  land on the TLS arm's (107.2-107.9 against 103.2-108.1) while the TLS arm does
-  not move at all — rustls re-blocks whatever it is handed into ~16 KiB records
-  before KCP sees it. Measurements, and the caveat that the drop hypothesis is
-  unproven: `docs/archive/notes/2026-11-25-kcp-naked-write-granularity.md`.
+  longer holds on `4ba46c3c`: the naked arm reads 99-108 against 107-112 for
+  TLS. Under a paired design (arm difference within one rep, which removes
+  session drift) the gap is +6.6 MiB/s over 108.3 at 64 KiB writes with the
+  shipping pool default (t≈4 over 12 pairs), but +4.1 over the same cell in a
+  second session (t≈1.6 over 5) — so the band is 2-12%, not a point estimate.
+  Two candidates are ruled out by measurement in
+  `docs/archive/notes/2026-11-25-kcp-naked-write-granularity.md`: the client's
+  **write chunk size** (halving it *triples* the gap: +12.2 against +4.1 MiB/s in
+  the same session — the opposite of the first draft's reading) and the **sender
+  pool** (it moves the gap by ~2-6 MiB/s with no consistent sign, and its own
+  ~4% cost is the pooling effect the send-thread note already records).
 
-  **Done-when:** decide whether the KCP bridge should cap its write to the
-  stream at one record's worth (16 KiB) instead of passing the whole read chunk
-  — measure it with the harness in the note (the 64 KiB arm should move from
-  100-105 to 107+), and either land it or record why 5-7% on one shape is not
-  worth it.
-
-- [x] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
-  Filed from the 2026-11-23 write-batching probe and **closed 2026-11-24 as
-  measured, not adopted**. The pathology is real: on the frp-rs↔frp-rs bulk
-  shape (`tcpMux` + TLS over KCP, 8 streams) the **client skips 12.4% of its
-  flushes** (2,696 of 21,825) once `handle_flush` consults a `would_emit`
-  predicate, and the server 0.15% — so "the flush carries nothing" is the normal
-  case, not an edge case. It buys nothing anyway: two interleaved A/B sessions
-  disagreed in sign (+5.7% 4/4 and −2.0% 1/4, pooled +1.7%, inside the host's
-  ±6%), with CPU flat within 0.7%. `force_flush` is 6.8% inclusive of CPU under
-  bulk load and the client's share is smaller; 12% of that is below resolution,
-  while the cost the kernel charges — one datagram per segment — is untouched.
-  Numbers, the predicate and the reproduction:
-  `docs/archive/notes/2026-11-24-kcp-skip-empty-flush.md`. The patch is kept in
-  the stash `kcp: skip the flush that carries nothing`; it is not on `main`.
-
----
-
-## P2 — structural (scheduling)
+  **Done-when:** either a paired measurement on a host whose load is flat for a
+  session (or both frpc configurations inside one process lifetime against one
+  frps) resolves the band to ≤2% and names the cause, or the item is closed with
+  the recorded conclusion that 6% of one shape is not worth an instrument this
+  host cannot support.
 
 - [ ] **One session's pipeline migrates between runtime workers** — `docs/archive/notes/2026-11-12-worker-thread-count.md`
 
