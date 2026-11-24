@@ -13049,22 +13049,26 @@ kept out of the main P2 list so that adding them does not renumber every later
   Candidates, none measured: `SO_REUSEPORT` sharding of the receive side, and a
   non-FIFO lane for non-bulk runs.
 
-- [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**
+- [ ] **Bare KCP still trails its own TLS shape by 5-7%, and the residue is the writer's chunk size.**
 
-  The TLS-off arm's nine-pair mean is 86.4 MiB/s against the TLS-on arm's mean of
-  110.2, same engine, host and shape
-  (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:74,78-82,111-113`). The
-  self-gap was 48 MiB/s before the coalescing and is 24 after it, so that change
-  removed **about half** of it, not most — and the note calls what is left
-  **unexplained**. The item above closed on the cross-stack comparison — 1.04×
-  with TLS, 1.14× without — which is a different question from why the naked row
-  trails its own TLS shape, and nothing else in this file owns it.
+  The 2026-11-15 figure — TLS-off nine-pair mean 86.4 against TLS-on 110.2
+  (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:74,78-82,111-113`) — no
+  longer describes `4ba46c3c`: remeasured on the same host and shape (KCP,
+  `tcpMux = false`, one flow, 768 MiB, 2-4 interleaved reps) the naked arm reads
+  100-105 against 111-113 for TLS, a 5-7% gap the sender pool neither creates nor
+  removes (0.910x-0.950x pooled, 0.936x-1.040x inline, the 1.040x from the
+  two-rep run). The gap follows the
+  **client's write size**, not TLS: at 16 KiB writes the naked arm's medians
+  land on the TLS arm's (107.2-107.9 against 103.2-108.1) while the TLS arm does
+  not move at all — rustls re-blocks whatever it is handed into ~16 KiB records
+  before KCP sees it. Measurements, and the caveat that the drop hypothesis is
+  unproven: `docs/archive/notes/2026-11-25-kcp-naked-write-granularity.md`.
 
-  **Done-when:** a TLS-off row whose three interleaved block medians clear the
-  TLS-on arm's mean — the naked arm's own samples span 81-99, so one lucky run
-  does not count — or a named candidate that
-  `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:99-110` does not already
-  exclude is measured and ruled out.
+  **Done-when:** decide whether the KCP bridge should cap its write to the
+  stream at one record's worth (16 KiB) instead of passing the whole read chunk
+  — measure it with the harness in the note (the 64 KiB arm should move from
+  100-105 to 107+), and either land it or record why 5-7% on one shape is not
+  worth it.
 
 - [x] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
   Filed from the 2026-11-23 write-batching probe and **closed 2026-11-24 as
