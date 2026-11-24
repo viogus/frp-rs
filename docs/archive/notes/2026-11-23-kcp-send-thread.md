@@ -21,7 +21,9 @@ A separate measurement closed the adjacent idea first: deeper write batching
 cannot help, because 75% of write batches are closed by the producer's own
 `Flush` (2,344 batches/s against 1,838 `Flush`/s), so flushes never queue.
 `docs/archive/notes/2026-11-11-kcp-write-batching.md` records the `WRITE_BATCH`
-history; this note assumes that cap is not the lever.
+history and [`2026-11-23-kcp-write-batch-deeper.md`](2026-11-23-kcp-write-batch-deeper.md)
+the measurement that closed it (depth averaged 3.8, never above 5, and the
+32-write budget fired zero times); this note assumes that cap is not the lever.
 
 ## The change
 
