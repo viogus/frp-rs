@@ -13051,21 +13051,20 @@ kept out of the main P2 list so that adding them does not renumber every later
   `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:99-110` does not already
   exclude is measured and ruled out.
 
-- [ ] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
-  Unmeasured hypothesis, filed from the 2026-11-23 write-batching probe. On the
-  frp-rs↔frp-rs bulk shape (`tcpMux` + TLS over KCP, 8 streams, 124 MiB/s) the
-  receiving side handled **247,477 `Flush` requests for 339 KB of writes** in a
-  14 s process life — every batch at depth 1, i.e. ~18k wakeups/s to move ~30
-  KB/s (`docs/archive/notes/2026-11-23-kcp-write-batch-deeper.md` §6).
-  `handle_flush` (`frp-core/src/kcp/socket.rs:376`) unconditionally runs
-  `flush_carry` + `flush_session_output` → `force_flush`, so a flush request with
-  nothing queued still pays a KCP send-buffer scan.
-  **Done-when:** a flush whose session has no queued data **and no pending ACK**
-  skips `force_flush`, with the ACK half kept: 2026-11-12 measured a tick-only
-  flush at 24-30 MiB/s (2.2-2.8× slower), so deferring ACKs to the tick is not an
-  option — `docs/archive/notes/2026-11-12-kcp-go-flush-model.md`. The change is
-  only worth landing with a before/after flush-request rate and a throughput row
-  on the same shape, plus a green `scripts/compat-test.sh`.
+- [x] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
+  Filed from the 2026-11-23 write-batching probe and **closed 2026-11-24 as
+  measured, not adopted**. The pathology is real: on the frp-rs↔frp-rs bulk
+  shape (`tcpMux` + TLS over KCP, 8 streams) the **client skips 12.4% of its
+  flushes** (2,696 of 21,825) once `handle_flush` consults a `would_emit`
+  predicate, and the server 0.15% — so "the flush carries nothing" is the normal
+  case, not an edge case. It buys nothing anyway: two interleaved A/B sessions
+  disagreed in sign (+5.7% 4/4 and −2.0% 1/4, pooled +1.7%, inside the host's
+  ±6%), with CPU flat within 0.7%. `force_flush` is 6.8% inclusive of CPU under
+  bulk load and the client's share is smaller; 12% of that is below resolution,
+  while the cost the kernel charges — one datagram per segment — is untouched.
+  Numbers, the predicate and the reproduction:
+  `docs/archive/notes/2026-11-24-kcp-skip-empty-flush.md`. The patch is kept in
+  the stash `kcp: skip the flush that carries nothing`; it is not on `main`.
 
 ---
 
