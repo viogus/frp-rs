@@ -1616,13 +1616,14 @@ mod tests {
         set_gated_ports(&mut new);
         #[cfg(feature = "kcp")]
         {
-            // All three knobs move, so all three report: `probe` and
-            // `sender_thread` default to `true`, so flipping them to `false` is
-            // what makes the second and third entries appear.
+            // All three knobs move, so all three report. `probe` defaults to
+            // `true` and `sender_thread` to the platform default, so each is
+            // flipped away from its default — otherwise the arm is a no-op on
+            // the platform whose default already matches.
             new.transport.kcp_options = Some(crate::config::server::KcpOptions {
                 dead_link: 7,
                 probe: false,
-                sender_thread: false,
+                sender_thread: !crate::kcp::default_sender_thread(),
             });
         }
         let changes = old.restart_only_changes(&new);

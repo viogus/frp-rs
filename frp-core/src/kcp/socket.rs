@@ -1751,8 +1751,10 @@ mod tests {
     /// `[transport.kcp] senderThread = false` must leave the socket with no
     /// worker and still put bytes on the wire — the inline path is the arm a
     /// saturated host selects, so it is worth one round trip. The default is
-    /// checked in the same test: a mutation that always yielded `None` would
-    /// turn the feature off silently and leave every other test green.
+    /// checked in the same test: it must agree with
+    /// [`default_sender_thread`], and an explicit `true` must bind a worker — a
+    /// mutation that always yielded `None` would turn pooling off silently and
+    /// leave every other test green.
     #[test]
     fn a_socket_without_a_sender_thread_sends_inline() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1769,11 +1771,21 @@ mod tests {
             config.data_shards = 0;
             config.parity_shards = 0;
             let local = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
-            let (default_driver, _default_handle, _default_accept) =
-                KcpSocket::new(Arc::clone(&local), KcpConfig::default());
+            assert_eq!(
+                KcpConfig::default().sender_thread,
+                crate::kcp::default_sender_thread(),
+                "the default must follow the platform's batching support"
+            );
+            let (pooled_driver, _pooled_handle, _pooled_accept) = KcpSocket::new(
+                Arc::clone(&local),
+                KcpConfig {
+                    sender_thread: true,
+                    ..KcpConfig::default()
+                },
+            );
             assert!(
-                default_driver.sender.is_some(),
-                "the default config must bind a pool worker"
+                pooled_driver.sender.is_some(),
+                "`senderThread = true` must bind a pool worker"
             );
             let (driver, _handle, _accept_rx) = KcpSocket::new(Arc::clone(&local), config);
             assert!(

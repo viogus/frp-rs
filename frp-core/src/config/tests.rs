@@ -197,7 +197,11 @@ fn the_listener_config_carries_the_parsed_bound() {
             .map(|options| options.sender_thread),
     );
     assert_eq!(listener.dead_link, 7);
-    assert!(listener.sender_thread, "absent means on");
+    assert_eq!(
+        listener.sender_thread,
+        crate::kcp::default_sender_thread(),
+        "absent means the platform default, never a hard-coded `true`"
+    );
 
     let cfg: ServerConfig =
         load_server_config_from_str("bindPort = 7000\n[transport.kcp]\nsenderThread = false")

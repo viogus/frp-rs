@@ -13,7 +13,7 @@ pub mod session;
 mod socket;
 mod stream;
 
-pub use config::{KcpConfig, KcpNoDelayConfig, KCP_DEAD_LINK_DEFAULT};
+pub use config::{default_sender_thread, KcpConfig, KcpNoDelayConfig, KCP_DEAD_LINK_DEFAULT};
 pub use listener::{dial_kcp, dial_kcp_with_driver, KcpListener};
 pub use session::KcpSession;
 pub use stream::KcpStream;
@@ -52,7 +52,7 @@ pub fn default_kcp_config() -> KcpConfig {
         stream: true,
         dead_link: KCP_DEAD_LINK_DEFAULT,
         liveness_probe: true,
-        sender_thread: true,
+        sender_thread: default_sender_thread(),
     }
 }
 
@@ -78,13 +78,14 @@ pub fn default_kcp_client_config() -> KcpConfig {
         stream: true,
         dead_link: KCP_DEAD_LINK_DEFAULT,
         liveness_probe: true,
-        sender_thread: true,
+        sender_thread: default_sender_thread(),
     }
 }
 
 /// The KCP listener config for a server whose `[transport.kcp]` options are
 /// `(dead_link, liveness_probe, sender_thread)`. Missing values keep the kcp-go
-/// default bound, the probe on, and the send pool bound.
+/// default bound, the probe on, and the send pool where the platform batches
+/// sends ([`default_sender_thread`]).
 ///
 /// Extracted from the listener so the config-to-listener hop is testable
 /// without standing up a UDP socket.
@@ -139,8 +140,11 @@ mod option_tests {
     }
 
     #[test]
-    fn the_sender_thread_is_on_unless_turned_off() {
-        assert!(kcp_config_from_options(None, None, None).sender_thread);
+    fn the_sender_thread_default_follows_the_platform() {
+        assert_eq!(
+            kcp_config_from_options(None, None, None).sender_thread,
+            default_sender_thread()
+        );
         assert!(kcp_config_from_options(None, None, Some(true)).sender_thread);
         assert!(!kcp_config_from_options(None, None, Some(false)).sender_thread);
         assert!(kcp_client_config(9, true, true).sender_thread);

@@ -284,9 +284,10 @@ async fn handle_visitor_conn(
         // does not expose `[transport.kcp]` (see docs/deployment.md).
         kcp_dead_link: frp_core::KCP_DEAD_LINK_DEFAULT,
         // The visitor transport section does not expose
-        // `[transport.kcp] probe`, so the probe stays on.
+        // `[transport.kcp] probe`, so the probe stays on. The send pool follows
+        // the platform default, like any dial with no `[transport.kcp]`.
         kcp_liveness_probe: true,
-        kcp_sender_thread: true,
+        kcp_sender_thread: frp_core::kcp::default_sender_thread(),
         v2,
     };
     let raw_stream = transport::dial_server(&opts)

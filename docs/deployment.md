@@ -1316,16 +1316,17 @@ KCP configs, which do not expose this table. See
 ```toml
 # frps.toml and frpc.toml
 [transport.kcp]
-sender_thread = false   # default true; cheaper off on macOS/Windows (see below)
+sender_thread = true    # default: on Linux/Android, off elsewhere (see below)
 ```
 
-By default the datagrams a KCP flush has produced are handed to a small pool of
-`frp-kcp-send` threads (one per core, at most four, started lazily; a socket
-binds to one of them for its lifetime, which is what keeps the ordering).
-`sender_thread = false` binds no worker for a socket and runs the same
-`send_packets` inline on the driver thread — the pre-pool behaviour. The wire
-bytes, the event order and the retransmission bound are unaffected either way,
-and a Go peer always sends inline and never sees the choice.
+On Linux and Android — the targets whose sends batch — the datagrams a KCP flush
+has produced are handed to a small pool of `frp-kcp-send` threads by default
+(one per core, at most four, started lazily; a socket binds to one of them for
+its lifetime, which is what keeps the ordering). `sender_thread = false` binds
+no worker for a socket and runs the same `send_packets` inline on the driver
+thread — the pre-pool behaviour, and the default on every other platform. The
+wire bytes, the event order and the retransmission bound are unaffected either
+way, and a Go peer always sends inline and never sees the choice.
 
 The pool buys throughput: +15.1% at eight streams with `tcpMux` and TLS, and
 +23.4% at one. It spends server CPU to do it — 0.0089 → 0.0123 cores per MiB per
@@ -1344,9 +1345,11 @@ pool costs instead of paying: on an eight-stream `tcpMux` + TLS shape on macOS
 the same comparison gives **+59% client CPU per MiB** with no throughput gain
 (43.55 against 27.32 ms/MiB, pooled cheaper in 0/6 paired reps; the rate itself
 swung −14.8%, −4.8% and +3.5% across runs on a loaded laptop, so read the CPU
-figure and not the rate). On a Mac, or on Windows where the same non-Linux path
-runs, `sender_thread = false` is the cheaper setting — and it is the behaviour
-those platforms had before the pool existed. Reproduce with
+figure and not the rate). That is why the default follows the platform rather
+than the release: on a Mac, or on Windows where the same non-Linux path runs,
+the pool is **off** unless a host opts in — which is also the behaviour those
+platforms had before the pool existed — and `sender_thread = true` there is only
+worth setting against a measurement of your own. Reproduce with
 `bash scripts/kcp-sender-ab-macos.sh`, whose header documents the shape; the
 record is
 [§ Limits](archive/notes/2026-11-23-kcp-send-thread.md#limits).

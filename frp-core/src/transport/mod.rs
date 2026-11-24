@@ -678,7 +678,8 @@ pub struct DialOptions {
     /// [`crate::kcp::KcpConfig::liveness_probe`].
     pub kcp_liveness_probe: bool,
     /// Whether KCP's UDP sends run on the shared `frp-kcp-send` pool instead of
-    /// inline on the driver thread.
+    /// inline on the driver thread. Default is
+    /// [`crate::kcp::default_sender_thread`].
     /// frp-rs extension (`[transport.kcp] senderThread`); see
     /// [`crate::kcp::KcpConfig::sender_thread`].
     pub kcp_sender_thread: bool,
@@ -714,7 +715,7 @@ impl Default for DialOptions {
             tcp_recv_buffer_size: 0,
             kcp_dead_link: crate::KCP_DEAD_LINK_DEFAULT,
             kcp_liveness_probe: true,
-            kcp_sender_thread: true,
+            kcp_sender_thread: crate::kcp::default_sender_thread(),
             proxy_url: None,
             v2: false,
         }
