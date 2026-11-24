@@ -144,7 +144,7 @@ impl Default for KcpConfig {
 /// gain, so pooling there is pure overhead and the default keeps the pre-pool
 /// inline path. `[transport.kcp] senderThread` overrides this either way.
 pub const fn default_sender_thread() -> bool {
-    cfg!(any(target_os = "linux", target_os = "android"))
+    crate::KCP_SENDER_THREAD_DEFAULT
 }
 
 impl KcpConfig {

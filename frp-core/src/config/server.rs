@@ -1204,7 +1204,7 @@ pub struct KcpOptions {
     #[serde(default = "default_kcp_probe")]
     pub probe: bool,
     /// Run KCP's UDP sends on the shared sender pool instead of inline on the
-    /// driver thread. Default: [`crate::kcp::default_sender_thread`] — on where
+    /// driver thread. Default: [`crate::KCP_SENDER_THREAD_DEFAULT`] — on where
     /// the platform batches sends (Linux/Android), off elsewhere. frp-rs
     /// extension — Go frp always sends inline, so a Go peer is unaffected
     /// either way.
@@ -1239,7 +1239,7 @@ fn default_kcp_probe() -> bool {
 }
 
 fn default_kcp_sender_thread() -> bool {
-    crate::kcp::default_sender_thread()
+    crate::KCP_SENDER_THREAD_DEFAULT
 }
 
 fn default_kcp_dead_link() -> u32 {

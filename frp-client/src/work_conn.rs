@@ -743,6 +743,7 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
             keepalive_secs,
             kcp_dead_link,
             kcp_liveness_probe,
+            kcp_sender_thread,
             bind_addr: &bind_addr,
             proxy_url: &proxy_url,
             dial_timeout_secs,
