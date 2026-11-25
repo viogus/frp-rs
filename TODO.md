@@ -12857,6 +12857,38 @@ other.
 
   **Done (2026-11-07).** Both planes now wrap their transport in the same `ActivityIo`/`WriteStall` the control/data mux uses — `frp-core/src/xtcp_p2p.rs` (P2P stream before `.compat()`) and `frp-core/src/xtcp_session.rs` (`ReadActivity`-wrapped KCP stream) — and each driver's `select!` gained a `biased` arm on the force-close channel that `write_stall_watchdog` fires at the deadline (10 s by default, `crate::mux::DEFAULT_WRITE_DEADLINE`; the tunnel driver takes it as a parameter so tests can shorten it). The watchdog and the `wait_force_close` semantics are the ones already pinned by the mux tests; the new `a_stalled_tunnel_transport_tears_the_session_down` pins the **wiring** — marked stall + 200 ms deadline ⇒ `session.is_alive()` flips false inside 2 s, red at the 2 s bound with the select arm removed.
 
+## Performance measurement programme — status (2026-11-25)
+
+A status block, not an item: it records where the throughput/scheduling work
+stands so the next reader does not re-measure a closed candidate. Each entry
+links the note that closed it.
+
+**Closed by measurement** (numbers are the note's, on the host it names):
+
+| candidate | outcome | note |
+|---|---|---|
+| KCP read coalescing | shipped, 63.0 → 86.4 MiB/s on the nine-pair mean | `docs/archive/notes/2026-11-15-kcp-read-coalescing.md` |
+| rustls deframer read size | shipped as a vendor patch, +4.2% | `docs/archive/notes/2026-11-11-tls-record-read-size.md` |
+| KCP send thread (off the driver) | shipped as a switch: +15.1% at eight streams for +38% CPU per MiB, −0.8% on a saturated host; default on where the platform batches sends | `docs/archive/notes/2026-11-23-kcp-send-thread.md` |
+| KCP deeper write batching | no gain — the producer's flush cadence is the binding constraint, not the batch cap | `docs/archive/notes/2026-11-23-kcp-write-batch-deeper.md` |
+| yamux inline write | no longer applies: the shape that motivated it is gone | `docs/archive/notes/2026-11-22-yamux-inline-write-no-longer-applies.md` |
+| capping the bridge write to 16 KiB | falsified: halving the write triples the naked row's gap | `docs/archive/notes/2026-11-25-kcp-naked-write-granularity.md` |
+
+**Still open, and instrument-bound:** the naked-KCP deficit (6%, 2-12% band —
+`TODO.md:13052`) and the per-connection bridge fan-in (`TODO.md:13088`). Neither
+can be moved by another code change until the measurement is better than the
+host: two sessions on the same box read 869.6 and 788.7 MiB/s for the same cell,
+so **between-session drift is ~10% and the gaps in question are 1-10%**. The
+minimum bar for a claim here is a paired design (both arms inside one session,
+order flipped per rep), a named n, and a note that prints the raw reps — which
+`scripts/kcp-tls-ab.sh` does and `scripts/throughput-baseline.sh` does not.
+
+Unmeasured levers that would need a new instrument, not a new patch: KCP MSS,
+which the in-tree `aggressive`/`conservative` profiles fix at 1400/1350 and
+`[transport.kcp]` does not expose (the Go-compatible value, so moving it is a
+compatibility question before it is a performance one), and anything requiring a
+second host per OS.
+
 ## P3 — measured but not adopted
 
 - **rustls `ChunkVecBuffer` per-record allocation (4th TLS lever).** Recycling
