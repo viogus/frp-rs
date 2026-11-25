@@ -13106,22 +13106,33 @@ kept out of the main P2 list so that adding them does not renumber every later
   hundreds — see `docs/archive/notes/2026-11-16-worker-thread-default.md`.
 
   **Status (2026-11-25): the driver half is shipped, the yamux half needs no
-  private thread, and the bridge-path half does not reproduce on Linux.** Every
-  KCP socket runs its driver on a private runtime; the yamux follow-up was
+  private thread, and the plain-`tcp` row shows no one-worker penalty on Linux.**
+  Every KCP socket runs its driver on a private runtime; the yamux follow-up was
   measured 2026-11-21 and needs none. What had remained open was the
-  per-connection bridge path, where one macOS worker carried 77-79% of the
-  pool's eight-connection aggregate. Re-measured on the Linux host `gc` (4
-  vCPU, `splice(2)` available) with the same harness row, 3 reps per cell: one
-  `frpc` worker carries **99%** of the default pool's aggregate (869.6 against
-  877.5 MiB/s) and is 3% *faster* on one flow (325.1 against 315.6), while eight
-  sessions at one worker reach **2.68×** the one-flow rate — above the 2.5×
-  trigger, so the item does not reopen.
+  per-connection bridge path, where one macOS worker carried 85.2% of the pool's
+  eight-connection aggregate against the **same host's four-worker arm** (77-79%
+  against its eight-worker one). Re-measured on the Linux host `gc` (4 vCPU,
+  `splice(2)`, `load ~2`) with the same harness row and 8 interleaved pairs per
+  cell: one `frpc` worker carries **98.3%** of the four-worker aggregate
+  (+13.5 ± 15.4 MiB/s for four workers, t≈0.9) and one connection is flat
+  (325.4 against 326.9). Caveats that limit the claim: the eight-connection row
+  saturates at ~790-880 MiB/s both-ways, six times under this host's raw `tcp`
+  rate, and no Linux loopback ceiling or per-arm CPU was measured; the same host
+  still shows a 20-37% one-worker penalty on the `tcpMux`/TLS shapes
+  (`docs/archive/notes/2026-11-16-worker-thread-default.md:30,42`), so this is a
+  statement about the plain, mux-free row and not about the host. The item's own
+  2.5× trigger could not be read either way — 2.42× and 2.68× in the two
+  sessions, straddling the threshold.
   `docs/archive/notes/2026-11-21-worker-fan-in-macos.md`
 
-  **Done-when:** a third host (many cores, Linux) shows one worker carrying under
-  90% of the default pool's eight-connection aggregate *and* eight sessions at
-  one worker under 2.5× the one-flow rate; otherwise this is a macOS artifact of
-  the userspace bridge copy and stays closed.
+  **Done-when:** the comparison is re-run on a host with at least 8 cores, a
+  named load, CPU figures per arm and a raw-loopback row, using a **fixed 1
+  against 4 worker** pair (not the pool default, which moves with core count);
+  it closes as "no fan-in penalty on the plain row" if one worker's share stays
+  above 90% with a 95% CI excluding 90%, and reopens as a live item if it drops
+  below it — in which case the attribution question (`splice(2)`? bridge copy?
+  core count?) becomes measurable. The 2.5× trigger is retired: it tracks the
+  host's eight-connection ceiling, not the scheduling.
 
   **Fixed 2026-11-22 (mux write path, 4-core Linux VPS):** frps emitted every
   mux frame as two segments because `PreReadStream` had no
@@ -13196,10 +13207,11 @@ kept out of the main P2 list so that adding them does not renumber every later
   **0.88×**, and that host's four-worker eight-session figure (2867) is 1.12× its
   one-flow rate
   (`docs/archive/notes/2026-11-13-splice-wrapper-peel.md:80-83`). An absolute
-  8/1 ratio measures the host and the byte counting; what holds across both hosts
-  is the worker-relative figure (0.84-0.88 here, 2266/2867 = 79% there), so re-open
-  on a change in that, or in the 1→2 step and anything beyond four — two to four
-  is flat here.
+  8/1 ratio measures the host and the byte counting; the worker-relative share is
+  the better quantity, but the 2026-11-25 Linux run reads 98% for it on the plain
+  row against macOS's 85%, so it is not host-independent either. The reopen
+  condition is the **Done-when** above, and the 2.5× figure this paragraph used to
+  carry is retired with it.
 
 ## P2 — measured: `websocket` + TLS + `tcpMux` stalls intermittently
 

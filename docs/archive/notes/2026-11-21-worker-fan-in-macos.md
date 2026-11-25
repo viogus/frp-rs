@@ -70,8 +70,10 @@ throughput` straight at the echo backend), for the ceiling comparison:
    822-836 at four, 864-935 at eight. Most of the gain arrives at two workers;
    2→4 adds nothing measurable; 4→8 is a further step. One worker carries
    **77-79%** of the default pool's eight-connection aggregate, paired rep-wise
-   (681.5/864.0, 719.7/934.9, 718.0/930.4) — **on this host**; the § re-measured
-   on Linux below reads 99% for the same quantity.
+   (681.5/864.0, 719.7/934.9, 718.0/930.4) — **on this host, against the
+   eight-worker pool**. Against this host's own four-worker arm the same cell is
+   706.4/828.8 = **85.2%**, and against two workers 89.3%; the § re-measured on
+   Linux below compares 1 against 4 and reads 98%.
 3. **The ~900 MiB/s plateau is the bridge, not the loopback**: without frp the
    same harness reaches 2295-2312 on one connection and 8508-8697 on eight. This
    host has no Linux `splice(2)`, so its bridge copy is userspace; that is
@@ -93,39 +95,69 @@ throughput` straight at the echo backend), for the ceiling comparison:
   8/1 ratio measures the host and the counting, not the scheduling. This note
   originally read the worker-relative 77-79% as the quantity that holds across
   hosts (2266/2867 = 79% on the quoting host); the Linux re-measurement below
-  falsifies that — 79% there was a single ratio, not a host-independent law.
+  weakens that — 79% there was one ratio from one host, and the Linux host reads
+  98% on the plain shape, so the quantity is neither host-independent nor
+  shape-independent.
 
 ## Re-measured on Linux (2026-11-25)
 
-Same question, same harness row, a host with `splice(2)`:
+Same question, same harness row, on a host with `splice(2)`:
 
 - Host `gc` (greencloud-tyo): 4 vCPU EPYC-Milan, loopback, load ~2 from
   unrelated daemons. Binaries `--release` at `4ba46c3c`.
 - `scripts/throughput-baseline.sh`, `plain` row only (`tcp`, `tcp_mux = false`,
-  no encryption/compression, `pool_count = 1`), 10 s, 3 reps per cell; `frps`
-  left at its default pool, `frpc` pinned with
-  `[transport] worker_threads = 1|4` appended to its generated config.
+  no encryption/compression, `pool_count = 1`), 10 s per rep; `frps` left at its
+  default pool, `frpc` pinned with `[transport] worker_threads = 1|4` appended to
+  its generated config. Arms interleaved, order flipped every rep: 8 reps per
+  cell at eight connections, 4 per cell at one.
 - Counts bytes both ways, like the macOS run, so levels are not comparable with
   one-way figures — ratios are.
+- Two sessions were run (the first before the rep count was raised) and they
+  disagree by ~10% on the level: eight connections at one worker read 869.6 in
+  the n=3 session and 788.7 in the n=8 one. Only within-session ratios are used
+  below.
 
-| frpc workers | 1 connection | 8 connections | 8/1 |
+| session | frpc workers | 1 connection | 8 connections |
 |---|---|---|---|
-| 1 | 325.1 (326.2 / 322.5 / 326.5) | 869.6 (900.5 / 849.3 / 859.0) | **2.68** |
-| 4 (default) | 315.6 (312.2 / 319.6 / 314.9) | 877.5 (915.4 / 826.0 / 891.0) | 2.78 |
+| n=3 | 1 | 325.1 | 869.6 (900.5 / 849.3 / 859.0) |
+| n=3 | 4 (default) | 315.6 | 877.5 (915.4 / 826.0 / 891.0) |
+| n=8 | 1 | 325.4 (317.0 / 322.3 / 324.2 / 338.0) | 788.7 sd 25.5 |
+| n=8 | 4 (default) | 326.9 (313.4 / 329.3 / 330.8 / 333.9) | 802.2 sd 24.4 |
 
-- **The item's trigger does not fire here.** Eight connections at one worker
-  reach 2.68× the one-flow rate, above the 2.5× threshold the item names.
-- **There is no fan-in penalty at one worker on this host.** One worker carries
-  **99%** of the four-worker eight-connection aggregate (869.6 / 877.5), against
-  77-79% on macOS.
-- **One worker is not slower at one connection either**: 325.1 against 315.6,
-  i.e. one worker is 3% *ahead*, the opposite sign to the macOS column.
+Reading the n=8 session, which is the one with enough reps to bound anything:
 
-So the migration cost this item is about is not universal: on the Linux host
-with `splice(2)` it is absent at both connection counts, and the macOS column is
-consistent with the userspace bridge copy that host has (as § 3 above says,
-without measuring it as the cause). A cross-host claim would need a third host
-before it could be made.
+- **One worker carries 98.3% of the four-worker eight-connection aggregate**,
+  paired rep-wise: +13.5 ± 15.4 MiB/s for four workers over one (t≈0.9, n=8),
+  ratio 95% CI ≈ 0.96-1.03. Against macOS's same 1-vs-4 comparison (85.2%), that
+  is not the same regime — but with one host per OS the difference cannot be
+  attributed to `splice(2)`, to 8 cores against 4, or to this host's external
+  load.
+- **The item's trigger cannot be read on this host.** Eight connections at one
+  worker are 2.42× the one-flow rate in this session and 2.68× in the n=3 one —
+  across the 2.5× threshold, on the two sides of the same threshold. Both arms
+  also sit on the same wall (~790-880 both-ways, i.e. ~400-440 one-way), which
+  is six times below this host's raw `tcp` rate (2684/2542 MiB/s one-way,
+  `docs/archive/notes/2026-11-16-worker-thread-default.md`), so the eight-connection
+  row is bounded by something other than the worker count. No Linux
+  raw-loopback ceiling was measured here to name that bound; the macOS section
+  did measure one on its host.
+- **One connection is flat**: 325.4 against 326.9 (+1.5 ± 4.8, t≈0.3, n=4) — the
+  3% one-worker lead of the n=3 session does not survive more reps. macOS reads
+  the same direction (364.5 at one worker against 347.9 at four, its "5-7%
+  one-flow cost of extra workers"), so nothing here is *opposite* in sign.
+- **This is one shape, not a host.** The same host shows a 20-37% one-worker
+  penalty on the `tcpMux` and TLS shapes
+  (`docs/archive/notes/2026-11-16-worker-thread-default.md:30,42`), which is
+  what § "What it cannot say" above predicts: `worker_threads` sizes one
+  process-wide runtime, so a plain, mux-free, TLS-free row exercises no yamux
+  task and no KCP driver thread. The plain row's ~1.0 ratio therefore says the
+  *plain* row has no fan-in penalty on this host; it does not say the bridge
+  path is free everywhere.
+
+What this measurement does not support: that the migration cost is absent on
+Linux in general, that the macOS figure is caused by the userspace bridge copy,
+or that the 2.5× trigger is meaningful — all three would need a second Linux
+host, CPU figures per arm, and a raw-loopback row on the same box.
 
 ## Reproducing
 
