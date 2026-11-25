@@ -1,6 +1,6 @@
 # Client worker count and fan-in, on a macOS host
 
-**Status (2026-11-21): measurement only.** Recorded for
+**Status (2026-11-21, re-measured on Linux 2026-11-25): measurement only.** Recorded for
 [`TODO.md`](../../../TODO.md)'s "One session's pipeline migrates between runtime
 workers" item, whose reopen trigger could not be read on this host. No code
 change.
@@ -70,7 +70,8 @@ throughput` straight at the echo backend), for the ceiling comparison:
    822-836 at four, 864-935 at eight. Most of the gain arrives at two workers;
    2→4 adds nothing measurable; 4→8 is a further step. One worker carries
    **77-79%** of the default pool's eight-connection aggregate, paired rep-wise
-   (681.5/864.0, 719.7/934.9, 718.0/930.4).
+   (681.5/864.0, 719.7/934.9, 718.0/930.4) — **on this host**; the § re-measured
+   on Linux below reads 99% for the same quantity.
 3. **The ~900 MiB/s plateau is the bridge, not the loopback**: without frp the
    same harness reaches 2295-2312 on one connection and 8508-8697 on eight. This
    host has no Linux `splice(2)`, so its bridge copy is userspace; that is
@@ -89,8 +90,42 @@ throughput` straight at the echo backend), for the ceiling comparison:
   item quotes, eight sessions at one worker carried 2266 MiB/s against 2570 on
   one flow — 0.88×, already inside the 2.5× threshold, and that host's
   four-worker eight-session figure (2867) is 1.12× its one-flow rate. An absolute
-  8/1 ratio measures the host and the counting, not the scheduling; the
-  worker-relative 77-79% is what holds across both hosts (2266/2867 = 79% there).
+  8/1 ratio measures the host and the counting, not the scheduling. This note
+  originally read the worker-relative 77-79% as the quantity that holds across
+  hosts (2266/2867 = 79% on the quoting host); the Linux re-measurement below
+  falsifies that — 79% there was a single ratio, not a host-independent law.
+
+## Re-measured on Linux (2026-11-25)
+
+Same question, same harness row, a host with `splice(2)`:
+
+- Host `gc` (greencloud-tyo): 4 vCPU EPYC-Milan, loopback, load ~2 from
+  unrelated daemons. Binaries `--release` at `4ba46c3c`.
+- `scripts/throughput-baseline.sh`, `plain` row only (`tcp`, `tcp_mux = false`,
+  no encryption/compression, `pool_count = 1`), 10 s, 3 reps per cell; `frps`
+  left at its default pool, `frpc` pinned with
+  `[transport] worker_threads = 1|4` appended to its generated config.
+- Counts bytes both ways, like the macOS run, so levels are not comparable with
+  one-way figures — ratios are.
+
+| frpc workers | 1 connection | 8 connections | 8/1 |
+|---|---|---|---|
+| 1 | 325.1 (326.2 / 322.5 / 326.5) | 869.6 (900.5 / 849.3 / 859.0) | **2.68** |
+| 4 (default) | 315.6 (312.2 / 319.6 / 314.9) | 877.5 (915.4 / 826.0 / 891.0) | 2.78 |
+
+- **The item's trigger does not fire here.** Eight connections at one worker
+  reach 2.68× the one-flow rate, above the 2.5× threshold the item names.
+- **There is no fan-in penalty at one worker on this host.** One worker carries
+  **99%** of the four-worker eight-connection aggregate (869.6 / 877.5), against
+  77-79% on macOS.
+- **One worker is not slower at one connection either**: 325.1 against 315.6,
+  i.e. one worker is 3% *ahead*, the opposite sign to the macOS column.
+
+So the migration cost this item is about is not universal: on the Linux host
+with `splice(2)` it is absent at both connection counts, and the macOS column is
+consistent with the userspace bridge copy that host has (as § 3 above says,
+without measuring it as the cause). A cross-host claim would need a third host
+before it could be made.
 
 ## Reproducing
 

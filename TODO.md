@@ -13105,14 +13105,23 @@ kept out of the main P2 list so that adding them does not renumber every later
   the process: right for one fat tunnel, wrong for a many-core server carrying
   hundreds — see `docs/archive/notes/2026-11-16-worker-thread-default.md`.
 
-  **Status (2026-11-14): the driver half is shipped** — every KCP socket runs its
-  driver on a private runtime, and `tcp`/`tcpMux` showed no worker-count penalty
-  at all. The yamux half of the follow-up question was measured 2026-11-21 (below)
-  and needs no private thread; what remains open is the per-connection bridge
-  path, where one worker still carries ~85% of the pool's aggregate without a
-  mechanism.
-  Re-open with fresh evidence if eight `tcp` sessions at one worker drop below
-  2.5× the one-flow rate (today: 2266 MiB/s at eight sessions, 2570 one flow).
+  **Status (2026-11-25): the driver half is shipped, the yamux half needs no
+  private thread, and the bridge-path half does not reproduce on Linux.** Every
+  KCP socket runs its driver on a private runtime; the yamux follow-up was
+  measured 2026-11-21 and needs none. What had remained open was the
+  per-connection bridge path, where one macOS worker carried 77-79% of the
+  pool's eight-connection aggregate. Re-measured on the Linux host `gc` (4
+  vCPU, `splice(2)` available) with the same harness row, 3 reps per cell: one
+  `frpc` worker carries **99%** of the default pool's aggregate (869.6 against
+  877.5 MiB/s) and is 3% *faster* on one flow (325.1 against 315.6), while eight
+  sessions at one worker reach **2.68×** the one-flow rate — above the 2.5×
+  trigger, so the item does not reopen.
+  `docs/archive/notes/2026-11-21-worker-fan-in-macos.md`
+
+  **Done-when:** a third host (many cores, Linux) shows one worker carrying under
+  90% of the default pool's eight-connection aggregate *and* eight sessions at
+  one worker under 2.5× the one-flow rate; otherwise this is a macOS artifact of
+  the userspace bridge copy and stays closed.
 
   **Fixed 2026-11-22 (mux write path, 4-core Linux VPS):** frps emitted every
   mux frame as two segments because `PreReadStream` had no
