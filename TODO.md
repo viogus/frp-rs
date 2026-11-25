@@ -13049,41 +13049,27 @@ kept out of the main P2 list so that adding them does not renumber every later
   Candidates, none measured: `SO_REUSEPORT` sharding of the receive side, and a
   non-FIFO lane for non-bulk runs.
 
-- [ ] **Raw KCP with TLS off runs about a fifth slower than the same KCP engine with TLS on.**
+- [ ] **Bare KCP trails its own TLS shape by 6% (2-12% across sessions), and nothing measured explains it.**
 
-  The TLS-off arm's nine-pair mean is 86.4 MiB/s against the TLS-on arm's mean of
-  110.2, same engine, host and shape
-  (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:74,78-82,111-113`). The
-  self-gap was 48 MiB/s before the coalescing and is 24 after it, so that change
-  removed **about half** of it, not most — and the note calls what is left
-  **unexplained**. The item above closed on the cross-stack comparison — 1.04×
-  with TLS, 1.14× without — which is a different question from why the naked row
-  trails its own TLS shape, and nothing else in this file owns it.
+  The 2026-11-15 figure — TLS-off nine-pair mean 86.4 against TLS-on 110.2
+  (`docs/archive/notes/2026-11-15-kcp-read-coalescing.md:74,78-82,111-113`) — no
+  longer holds on `4ba46c3c`: the naked arm reads 99-108 against 107-112 for
+  TLS. Under a paired design (arm difference within one rep, which removes
+  session drift) the gap is +6.6 MiB/s over 108.3 at 64 KiB writes with the
+  shipping pool default (t≈4 over 12 pairs), but +4.1 over the same cell in a
+  second session (t≈1.6 over 5) — so the band is 2-12%, not a point estimate.
+  Two candidates are ruled out by measurement in
+  `docs/archive/notes/2026-11-25-kcp-naked-write-granularity.md`: the client's
+  **write chunk size** (halving it *triples* the gap: +12.2 against +4.1 MiB/s in
+  the same session — the opposite of the first draft's reading) and the **sender
+  pool** (it moves the gap by ~2-6 MiB/s with no consistent sign, and its own
+  ~4% cost is the pooling effect the send-thread note already records).
 
-  **Done-when:** a TLS-off row whose three interleaved block medians clear the
-  TLS-on arm's mean — the naked arm's own samples span 81-99, so one lucky run
-  does not count — or a named candidate that
-  `docs/archive/notes/2026-11-15-kcp-read-coalescing.md:99-110` does not already
-  exclude is measured and ruled out.
-
-- [x] **Every KCP `Flush` request runs a full `update()` + `flush()`, including the ones that carry no writes.**
-  Filed from the 2026-11-23 write-batching probe and **closed 2026-11-24 as
-  measured, not adopted**. The pathology is real: on the frp-rs↔frp-rs bulk
-  shape (`tcpMux` + TLS over KCP, 8 streams) the **client skips 12.4% of its
-  flushes** (2,696 of 21,825) once `handle_flush` consults a `would_emit`
-  predicate, and the server 0.15% — so "the flush carries nothing" is the normal
-  case, not an edge case. It buys nothing anyway: two interleaved A/B sessions
-  disagreed in sign (+5.7% 4/4 and −2.0% 1/4, pooled +1.7%, inside the host's
-  ±6%), with CPU flat within 0.7%. `force_flush` is 6.8% inclusive of CPU under
-  bulk load and the client's share is smaller; 12% of that is below resolution,
-  while the cost the kernel charges — one datagram per segment — is untouched.
-  Numbers, the predicate and the reproduction:
-  `docs/archive/notes/2026-11-24-kcp-skip-empty-flush.md`. The patch is kept in
-  the stash `kcp: skip the flush that carries nothing`; it is not on `main`.
-
----
-
-## P2 — structural (scheduling)
+  **Done-when:** either a paired measurement on a host whose load is flat for a
+  session (or both frpc configurations inside one process lifetime against one
+  frps) resolves the band to ≤2% and names the cause, or the item is closed with
+  the recorded conclusion that 6% of one shape is not worth an instrument this
+  host cannot support.
 
 - [ ] **One session's pipeline migrates between runtime workers** — `docs/archive/notes/2026-11-12-worker-thread-count.md`
 
