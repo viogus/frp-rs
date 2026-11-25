@@ -13220,6 +13220,15 @@ kept out of the main P2 list so that adding them does not renumber every later
   not worth porting; its reopen trigger is a re-measurement, not this item
   (`docs/archive/notes/2026-11-22-yamux-inline-write-no-longer-applies.md`).
 
+  One cell of that table has since been resolved rather than left open: the
+  `tcpMux` wall-clock row reproduces at **0.89×** on a quiet host (eight
+  streams, arms interleaved, ~1% spread) while frp-rs spends 29% less CPU per
+  byte than Go, so the gap is serialisation, not compute
+  (`docs/archive/notes/2026-11-22-mux-wallclock-gap-reproducible.md`). That
+  makes the mux write path the one measured throughput deficit in the tree; the
+  next step is to find which task it waits on, not to port the kept
+  inline-write experiment on the strength of a 4 µs hop.
+
   What it does change is the trigger above: that trigger already sits inside its
   own threshold — 2266 MiB/s at eight sessions against 2570 on one flow is
   **0.88×**, and that host's four-worker eight-session figure (2867) is 1.12× its
