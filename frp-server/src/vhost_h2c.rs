@@ -36,12 +36,39 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
 
 use super::{resolve_vhost_request, VhostResolveError};
 use crate::service::{AppState, InternalMsg};
+
+/// Per-stream HTTP/2 receive window (1 MiB) for the public h2c vhost surface.
+/// RFC 9113's 64 KiB default caps a 50 ms RTT link at ~1.3 MB/s; 1 MiB keeps
+/// WAN streams moving while the 4 MiB connection window below bounds total
+/// inbound buffering across up to 100 concurrent streams.
+const H2C_STREAM_WINDOW_SIZE: u32 = 1024 * 1024;
+/// Connection-wide HTTP/2 receive window (4 MiB) shared across all streams.
+const H2C_CONN_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
+/// Max HTTP/2 DATA frame payload (64 KiB), aligned with frp-rs bridge/yamux
+/// chunks (4× fewer frames than RFC 9113's 16 KiB minimum).
+const H2C_MAX_FRAME_SIZE: u32 = 64 * 1024;
+/// Duplex buffer size per direction bridging each h2c stream to the internal
+/// work-conn relay (64 KiB matches `H2C_MAX_FRAME_SIZE` and bounds 100
+/// concurrent streams to 12.8 MiB total across both directions instead of
+/// 25.6 MiB).
+const H2C_DUPLEX_BUF_SIZE: usize = 64 * 1024;
+
+/// RAII guard that aborts a spawned helper task when dropped, preventing a
+/// detached `body_task` from leaking its duplex/write handle if the parent
+/// stream handler is cancelled before its explicit cleanup runs.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// HTTP/2 prior-knowledge connection preface (RFC 7540 §3.5). These binary
 /// bytes carry no text `Host:` header, so `vhost.rs` dispatches connections
@@ -94,6 +121,12 @@ impl<S: AsyncRead + Unpin> AsyncRead for PreReadStream<S> {
             let n = (self.pre_read.len() - self.pos).min(buf.remaining());
             buf.put_slice(&self.pre_read[self.pos..self.pos + n]);
             self.pos += n;
+            if self.pos == self.pre_read.len() {
+                // Release the pre-read allocation once drained so it does not
+                // linger for the lifetime of a keep-alive h2c connection.
+                self.pre_read = Vec::new();
+                self.pos = 0;
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -107,6 +140,16 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
@@ -166,6 +209,9 @@ pub(crate) async fn serve_h2c_request<S>(
                 // unauthenticated client a ~1.6 GiB per-connection memory ceiling
                 // to park on.
                 .max_header_list_size(4096)
+                .initial_window_size(H2C_STREAM_WINDOW_SIZE)
+                .initial_connection_window_size(H2C_CONN_WINDOW_SIZE)
+                .max_frame_size(H2C_MAX_FRAME_SIZE)
                 .handshake(io),
         )
         .await
@@ -286,15 +332,6 @@ async fn handle_stream(
     let has_content_length = request.headers().contains_key("content-length");
     let request_head = build_http1_request_head(&request);
 
-    // The 404 body every non-timeout backend failure answers with (FIX 2):
-    // the configured custom_404_page when non-empty, else the builtin HTML —
-    // the same selection the HTTP/1.1 surface makes in
-    // `write_not_found_response` (Go ErrorHandler → getNotFoundPageContent,
-    // pkg/util/vhost/resource.go). Computed once here because both the
-    // route-miss arm above and the backend-failure arms inside
-    // `stream_h2_response` need it.
-    let not_found_page = h2c_not_found_body(&state.custom_404_page);
-
     let forward = match resolve_vhost_request(
         &state,
         host,
@@ -354,7 +391,7 @@ async fn handle_stream(
             .await;
         }
         Err(VhostResolveError::NotFound) => {
-            return send_h2_404(&mut respond, &not_found_page).await;
+            return send_h2_404(&mut respond, &state.custom_404_page).await;
         }
     };
 
@@ -372,7 +409,7 @@ async fn handle_stream(
         // same answer the HTTP/1.1 surface gives a control-gone route
         // (Go connectHandler CreateConnection errors write NotFoundResponse,
         // not 502).
-        return send_h2_404(&mut respond, &not_found_page).await;
+        return send_h2_404(&mut respond, &state.custom_404_page).await;
     };
 
     // Bridge the h2 stream to the byte-level work-conn machinery through an
@@ -381,7 +418,7 @@ async fn handle_stream(
     // HTTP/1.1 response comes back on the same pair for parsing and h2
     // re-encoding. `IoStream::SshChannel` is a type-erased byte stream —
     // exactly what the bridge expects.
-    let (client, control) = tokio::io::duplex(128 * 1024);
+    let (client, control) = tokio::io::duplex(H2C_DUPLEX_BUF_SIZE);
     // send().await: backpressure is correct — a full control channel must
     // not silently drop a user connection (the HTTP/1.1 path uses the same
     // pattern). Bounded (frp-server/src/vhost.rs:721-727 parity): a control handler that
@@ -410,7 +447,7 @@ async fn handle_stream(
             // dispatch — the backend connection can no longer be
             // established, so the Go ErrorHandler 404 class (FIX 2).
             tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel closed", host, path);
-            return send_h2_404(&mut respond, &not_found_page).await;
+            return send_h2_404(&mut respond, &state.custom_404_page).await;
         }
         Err(_elapsed) => {
             // CTL_SEND_TIMEOUT fired: the control handler stopped draining.
@@ -420,12 +457,33 @@ async fn handle_stream(
             // backend-unreachable 404 class, like the other dispatch
             // failures (FIX 2).
             tracing::warn!(host = %host, path = %path, "h2c route for '{}' path '{}' found but control channel send timed out; answering 404", host, path);
-            return send_h2_404(&mut respond, &not_found_page).await;
+            return send_h2_404(&mut respond, &state.custom_404_page).await;
         }
     }
 
-    let (mut client_r, client_w) = tokio::io::split(client);
     let mut body = request.into_body();
+    let head_timeout = Some(std::time::Duration::from_secs(super::clamp_vhost_timeout(
+        state.vhost_http_timeout,
+    )));
+
+    // Bodyless fast path (GET/HEAD/DELETE with END_STREAM on HEADERS): skip
+    // `tokio::io::split` (`Arc<BiLock>`), `Arc<Notify>`, and spawning a
+    // body-forwarder task; half-close the write side of `DuplexStream` inline
+    // and stream the response directly from its read side.
+    if body.is_end_stream() {
+        let mut client = client;
+        let _ = client.shutdown().await;
+        return stream_h2_response(
+            &mut client,
+            &mut respond,
+            head_timeout,
+            is_head,
+            &state.custom_404_page,
+        )
+        .await;
+    }
+
+    let (mut client_r, mut client_w) = tokio::io::split(client);
 
     // RFC 7540 §8.1.2.6: the request body must not extend beyond the
     // declared Content-Length. The h2 crate (0.4.18) DOES parse and enforce
@@ -433,35 +491,10 @@ async fn handle_stream(
     // frame when the value does not parse (RST_STREAM PROTOCOL_ERROR at
     // HEADERS) and `recv.rs:707` resets the stream once the received DATA
     // total overruns the declared length — so the app-level counter below is
-    // DEFENSE IN DEPTH, not the primary defense. (The pre-round-18 comment
-    // here claimed the crate "has no notion of Content-Length" and that this
-    // gate was therefore the only thing standing between a lying client and
-    // a pipelined request; that was false, and the overrun arm is
-    // unreachable against a conforming crate.) The body task still counts
-    // against the declared length and signals `excess` on a violation; the
-    // main task answers RST_STREAM PROTOCOL_ERROR (Go's h2 server resets
-    // with PROTOCOL_ERROR on the same violation), and forwarding excess
-    // bytes raw would let them reach the provider as a pipelined request
-    // (request smuggling).
-    //
-    // Three fail-closed STRICTNESS divergences from Go's h2 server remain —
-    // all of them live in the crate, none is reachable from this file:
-    //   * a PADDED declared CL (e.g. `" 5"`) with no body → the crate RSTs
-    //     at HEADERS, where Go's server trims the value and serves 200;
-    //   * declared CL > 2^63-1 → the crate RSTs, where Go serves with a
-    //     zero-length body (the oversized value is discarded);
-    //   * a clean declared CL N with END_STREAM already on HEADERS → the
-    //     crate RSTs, where Go serves an empty body (N is never delivered).
-    // Each is a stricter-than-Go rejection of a malformed-or-unusual
-    // request, so it can only refuse traffic, never forward wrong bytes.
+    // DEFENSE IN DEPTH, not the primary defense.
     //
     // `Notify` is deliberate over `oneshot`: the signal must fire ONLY on an
-    // actual violation. A oneshot's sender is dropped when the body task
-    // finishes NORMALLY (every legitimate request), which closes the channel
-    // and resolves the receiver with `Err(Closed)` — a `biased` select would
-    // then take the reset arm on every forwarded request. `notified()` stays
-    // pending until `notify_one()` is called, no matter how the body task
-    // ends; the permit is retained if the notification beats the first poll.
+    // actual violation (see prior round-18 rationale).
     let excess = Arc::new(tokio::sync::Notify::new());
     let excess_body = excess.clone();
 
@@ -469,12 +502,21 @@ async fn handle_stream(
     // Content-Length it was emitted with `Transfer-Encoding: chunked` (Go
     // http.Transport behavior for unknown-length bodies), so body bytes are
     // framed accordingly. Releasing the h2 flow-control capacity after each
-    // write keeps backpressure end-to-end.
-    let body_task = tokio::spawn(async move {
-        let mut client_w = client_w;
-        let end_stream = body.is_end_stream();
+    // write keeps backpressure end-to-end. Guarded by `AbortOnDrop` so task
+    // cancellation cannot leave a detached task holding `client_w`.
+    let _body_guard = AbortOnDrop(tokio::spawn(async move {
         let mut remaining = content_length;
-        while let Some(Ok(data)) = body.data().await {
+        let mut chunk_buf: Vec<u8> = Vec::new();
+        while let Some(res) = body.data().await {
+            let Ok(data) = res else {
+                // Client reset/aborted the stream mid-upload: half-close the
+                // duplex write side immediately (WriteHalf has no Drop
+                // shutdown) WITHOUT emitting `0\r\n\r\n`, so the backend sees
+                // premature EOF instead of stalling or treating a truncated
+                // upload as complete.
+                let _ = client_w.shutdown().await;
+                return;
+            };
             if !data.is_empty() {
                 if let Some(rem) = remaining {
                     if data.len() as u64 > rem {
@@ -487,77 +529,62 @@ async fn handle_stream(
                     remaining = Some(rem - data.len() as u64);
                 }
                 if has_content_length {
-                    let _ = client_w.write_all(&data).await;
+                    if client_w.write_all(&data).await.is_err() {
+                        return;
+                    }
                 } else {
                     use std::io::Write;
-                    // Chunk-size line, formatted on the stack (audit §3 item
-                    // 5): `format!("{:X}\r\n")` allocated a String per DATA
-                    // frame just to be copied out. The 16-byte buffer is
-                    // ample — len is one h2 DATA frame (hex of the maximum
-                    // 2^24-1 frame is 6 digits) plus CRLF, far under 16.
-                    // `io::Write` on `&mut [u8]` advances the slice, so the
-                    // written length is what the slice lost. The discard is
-                    // safe: writing into a byte slice only fails when it is
-                    // too short.
                     const SIZE_BUF_LEN: usize = 16;
                     let mut size_buf = [0u8; SIZE_BUF_LEN];
                     let mut sink: &mut [u8] = &mut size_buf;
                     let _ = write!(sink, "{:X}\r\n", data.len());
                     let size_len = SIZE_BUF_LEN - sink.len();
-                    let _ = client_w.write_all(&size_buf[..size_len]).await;
-                    let _ = client_w.write_all(&data).await;
-                    let _ = client_w.write_all(b"\r\n").await;
+                    if data.len() <= MAX_CHUNK_SIZE {
+                        chunk_buf.clear();
+                        chunk_buf.reserve_exact(size_len + data.len() + 2);
+                        chunk_buf.extend_from_slice(&size_buf[..size_len]);
+                        chunk_buf.extend_from_slice(&data);
+                        chunk_buf.extend_from_slice(b"\r\n");
+                        if client_w.write_all(&chunk_buf).await.is_err() {
+                            return;
+                        }
+                    } else if client_w.write_all(&size_buf[..size_len]).await.is_err()
+                        || client_w.write_all(&data).await.is_err()
+                        || client_w.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
                 }
             }
             let _ = body.flow_control().release_capacity(data.len());
         }
-        if !has_content_length && !end_stream {
+        if !has_content_length {
             // Stream had an open body: terminate the chunked framing.
             let _ = client_w.write_all(b"0\r\n\r\n").await;
         }
         let _ = client_w.flush().await;
         let _ = client_w.shutdown().await;
-    });
+    }));
 
-    // Read the backend's HTTP/1.1 response and re-encode it as HTTP/2. The
-    // response-head exchange is bounded by vhost_http_timeout — the Go vhost
-    // maps the same config to `ResponseHeaderTimeout` and answers 504 via its
-    // ErrorHandler (pkg/util/vhost/http.go), and `<= 0` floors at 60s (shared
-    // clamp in vhost.rs). This leg arms its one deadline at the first
-    // response-head read; Go arms the timer once the request body is fully
-    // written (transport.go writeErrCh), which the response-read side cannot
-    // observe — the same narrow anchor divergence documented on the
-    // HTTP/1.1 ResponseHeaderInjector. The deadline is shared across the
-    // whole exchange: interim 1xx heads do not re-arm it
-    // (see stream_h2_response).
-    let head_timeout = Some(std::time::Duration::from_secs(super::clamp_vhost_timeout(
-        state.vhost_http_timeout,
-    )));
     // `biased;`: if the backend completes AND the body exceeds simultaneously,
     // the protocol error wins — a declared Content-Length is a hard contract.
-    let response_result = tokio::select! {
+    tokio::select! {
         biased;
         _ = excess.notified() => {
-            body_task.abort();
             // Go's h2 server answers RST_STREAM PROTOCOL_ERROR when a DATA
-            // frame exceeds the declared Content-Length.
+            // frame exceeds the declared Content-Length. `_body_guard` aborts
+            // `body_task` on return.
             respond.send_reset(h2::Reason::PROTOCOL_ERROR);
-            return Ok(());
+            Ok(())
         }
         r = stream_h2_response(
             &mut client_r,
             &mut respond,
             head_timeout,
             is_head,
-            &not_found_page,
+            &state.custom_404_page,
         ) => r,
-    };
-
-    // Once the response is fully relayed the bridge has served its purpose —
-    // stop the body forwarder so the h2 stream (and work conn) can wind down
-    // even if the client is still trickling request bytes.
-    body_task.abort();
-    response_result
+    }
 }
 
 /// Canonicalize an h2 `:authority` (Host equivalent) for routing — Go
@@ -896,8 +923,7 @@ async fn send_h2_error(
             .insert("content-type", http::HeaderValue::from_static("text/html"));
     }
     let mut send = respond.send_response(resp, false)?;
-    send.send_data(body, true)?;
-    Ok(())
+    send_h2_data(&mut send, body, true).await
 }
 
 /// The 404 answer Go frp's vhost ErrorHandler gives every non-timeout
@@ -907,9 +933,10 @@ async fn send_h2_error(
 /// surface's `write_not_found_response` serves.
 async fn send_h2_404(
     respond: &mut SendResponse<Bytes>,
-    not_found_page: &Bytes,
+    custom_404_page: &str,
 ) -> Result<(), h2::Error> {
-    send_h2_error(respond, 404, &[], not_found_page.clone()).await
+    let body = h2c_not_found_body(custom_404_page);
+    send_h2_error(respond, 404, &[], body).await
 }
 
 /// Body selection for the h2c 404 arms: `custom_404_page` when non-empty,
@@ -1284,118 +1311,165 @@ fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
-/// Per-slice cap for streaming chunked bodies (round 10 MEDIUM): a chunk is
-/// forwarded in bounded slices instead of one `read_exact(size)` allocation.
+/// Per-slice cap for streaming chunked and Content-Length bodies (64 KiB,
+/// aligned with `H2C_MAX_FRAME_SIZE`).
 const MAX_CHUNK_SIZE: usize = 64 * 1024;
+/// Minimum spare capacity retained in `BodyReader`'s `BytesMut` slab before
+/// reserving a fresh 64 KiB chunk.
+const BODY_MIN_RESERVE: usize = 16 * 1024;
+/// Minimum slice size eligible for zero-copy `BytesMut::split_to().freeze()`.
+/// Smaller chunks are copied out via `Bytes::copy_from_slice` + `advance()` so
+/// tiny chunked frames cannot promote `BytesMut` to `KIND_ARC` and pin 64 KiB
+/// slabs inside `h2`'s send queue.
+const ZERO_COPY_MIN_BYTES: usize = 4096;
 
-/// Incremental response-body reader that starts with the bytes that arrived
-/// together with the response head.
+/// Send `data` on an HTTP/2 `SendStream` respecting peer flow-control capacity
+/// (`reserve_capacity` + `poll_capacity`). Without this, `h2::SendStream::send_data`
+/// queues chunks unconditionally in memory even when the peer window is 0,
+/// letting a fast backend OOM the server against a slow/stalled h2c client.
+async fn send_h2_data(
+    send: &mut SendStream<Bytes>,
+    mut data: Bytes,
+    end_stream: bool,
+) -> Result<(), h2::Error> {
+    if data.is_empty() {
+        if end_stream {
+            send.send_data(Bytes::new(), true)?;
+        }
+        return Ok(());
+    }
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let cap = loop {
+            let c = send.capacity();
+            if c > 0 {
+                break c;
+            }
+            match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                Some(Ok(c)) if c > 0 => break c,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Err(h2::Error::from(h2::Reason::CANCEL)),
+            }
+        };
+        let n = cap.min(data.len());
+        let is_last = n == data.len();
+        let piece = if is_last {
+            std::mem::take(&mut data)
+        } else {
+            data.split_to(n)
+        };
+        send.send_data(piece, end_stream && is_last)?;
+    }
+    Ok(())
+}
+
+/// Incremental zero-copy response-body reader backed by `BytesMut`, seeded
+/// with any body bytes that arrived alongside the response head.
 struct BodyReader<'a, R: AsyncRead + Unpin> {
     inner: &'a mut R,
-    buf: Vec<u8>,
-    pos: usize,
+    buf: BytesMut,
 }
 
 impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
-    fn new(inner: &'a mut R, initial: Vec<u8>) -> Self {
-        Self {
-            inner,
-            buf: initial,
-            pos: 0,
-        }
+    fn new(inner: &'a mut R, initial: &[u8], capacity_hint: Option<u64>) -> Self {
+        let cap = capacity_hint
+            .map_or(MAX_CHUNK_SIZE, |cl| cl.min(MAX_CHUNK_SIZE as u64) as usize)
+            .max(initial.len());
+        let mut buf = BytesMut::with_capacity(cap);
+        buf.extend_from_slice(initial);
+        Self { inner, buf }
     }
 
-    fn available(&self) -> &[u8] {
-        &self.buf[self.pos..]
-    }
-
-    fn consume(&mut self, n: usize) {
-        self.pos += n;
-    }
-
-    /// Append more bytes from the inner stream. Returns `Ok(false)` on EOF.
+    /// Read more bytes directly into `self.buf` via `read_buf`. Returns
+    /// `Ok(false)` on EOF.
     async fn read_more(&mut self) -> std::io::Result<bool> {
-        if self.pos > 0 && self.pos == self.buf.len() {
-            self.buf.clear();
-            self.pos = 0;
+        if self.buf.capacity() - self.buf.len() < BODY_MIN_RESERVE {
+            self.buf.reserve(MAX_CHUNK_SIZE);
         }
-        let mut tmp = [0u8; 8192];
-        let n = self.inner.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(false);
-        }
-        self.buf.extend_from_slice(&tmp[..n]);
-        Ok(true)
+        let n = self.inner.read_buf(&mut self.buf).await?;
+        Ok(n > 0)
     }
 
-    /// Fill `buf` completely from the buffered reader, failing with
-    /// UnexpectedEof when the stream ends early.
-    async fn fill_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    fn take_bytes(&mut self, take: usize) -> Bytes {
+        if take >= ZERO_COPY_MIN_BYTES {
+            self.buf.split_to(take).freeze()
+        } else {
+            let out = Bytes::copy_from_slice(&self.buf[..take]);
+            self.buf.advance(take);
+            out
+        }
+    }
+
+    /// Take up to `max_len` bytes (zero-copy when `>= ZERO_COPY_MIN_BYTES`,
+    /// copied otherwise so small chunks never pin a 64 KiB slab), refilling
+    /// once if the buffer is empty. Errors with `UnexpectedEof` on clean EOF.
+    async fn take_chunk(&mut self, max_len: usize) -> std::io::Result<Bytes> {
+        if self.buf.is_empty() && !self.read_more().await? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof in response body",
+            ));
+        }
+        let take = max_len.min(self.buf.len());
+        Ok(self.take_bytes(take))
+    }
+
+    /// Take up to `max_len` bytes for EOF-delimited bodies, returning
+    /// `Ok(None)` on clean EOF.
+    async fn take_chunk_or_eof(&mut self, max_len: usize) -> std::io::Result<Option<Bytes>> {
+        if self.buf.is_empty() && !self.read_more().await? {
+            return Ok(None);
+        }
+        let take = max_len.min(self.buf.len());
+        Ok(Some(self.take_bytes(take)))
+    }
+
+    /// Fill `out` completely from the buffered reader, failing with
+    /// `UnexpectedEof` when the stream ends early.
+    async fn fill_exact(&mut self, out: &mut [u8]) -> std::io::Result<()> {
         let mut filled = 0;
-        while filled < buf.len() {
-            if self.available().is_empty() && !self.read_more().await? {
+        while filled < out.len() {
+            if self.buf.is_empty() && !self.read_more().await? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "eof in response body",
                 ));
             }
-            let take = (buf.len() - filled).min(self.available().len());
-            buf[filled..filled + take].copy_from_slice(&self.available()[..take]);
-            self.consume(take);
+            let take = (out.len() - filled).min(self.buf.len());
+            out[filled..filled + take].copy_from_slice(&self.buf[..take]);
+            self.buf.advance(take);
             filled += take;
         }
         Ok(())
     }
 
-    /// Read exactly `n` bytes into `out`. The caller owns the buffer, so its
-    /// allocation is REUSED across calls — chunked streaming no longer
-    /// allocates (and re-grows) a fresh Vec per chunk (a 64 KiB chunk used
-    /// to cost ~8 reallocations via `with_capacity(n.min(8192))` growth).
-    /// The capacity grows to exactly `n` on the first call and is kept for
-    /// subsequent calls.
-    ///
-    /// `out` keeps its LENGTH high-water mark instead of being cleared and
-    /// re-filled with zeros (audit §3 item 4): `clear()` + `resize(n, 0)`
-    /// zeroed the whole slice on every chunk even though `fill_exact`
-    /// immediately overwrites all of it — the streaming loops call this
-    /// back-to-back with the same `n`, so the zero fill was pure waste.
-    /// Only a GROWTH past the previous length zero-fills (once, on the
-    /// first call); a shrink truncates, which writes nothing. The
-    /// post-condition is unchanged: on `Ok(())` at least the first `n`
-    /// bytes are freshly filled by `fill_exact` (a short read is an
-    /// `UnexpectedEof` error, and every caller aborts on `Err`), so stale
-    /// bytes are never exposed.
-    async fn read_exact_into(&mut self, out: &mut Vec<u8>, n: usize) -> std::io::Result<()> {
-        out.try_reserve_exact(n.saturating_sub(out.len()))
-            .map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::OutOfMemory, "response body too large")
-            })?;
-        out.resize(n, 0); // no realloc: capacity already >= n
-        self.fill_exact(&mut out[..n]).await
-    }
-
-    /// Read one CRLF (or LF) terminated line including its terminator.
-    /// A line longer than 64 KiB is invalid (chunk-size lines and trailing
-    /// headers are tiny in practice) — the growth is bounded instead of
-    /// letting a misbehaving backend accumulate 8 KiB per read_more forever.
+    /// Read one CRLF (or LF) terminated line including its terminator in a
+    /// single O(n) pass. Returns an owned `Vec<u8>` + `advance()` rather than
+    /// `split_to().freeze()` so framing metadata never promotes `self.buf` to
+    /// a shared `KIND_ARC` slab. A line longer than 64 KiB errors before
+    /// refilling beyond the limit.
     async fn read_line(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut scanned = 0usize;
         loop {
-            let avail = self.available();
-            if avail.len() > MAX_CHUNK_SIZE {
+            if let Some(rel) = self.buf[scanned..].iter().position(|&b| b == b'\n') {
+                let end = scanned + rel + 1;
+                if end > MAX_CHUNK_SIZE {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "chunk line exceeds 64 KiB",
+                    ));
+                }
+                let line = self.buf[..end].to_vec();
+                self.buf.advance(end);
+                return Ok(line);
+            }
+            scanned = self.buf.len();
+            if scanned >= MAX_CHUNK_SIZE {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "chunk line exceeds 64 KiB",
                 ));
-            }
-            if let Some(rel) = avail.windows(2).position(|w| w == b"\r\n") {
-                let line = avail[..rel + 2].to_vec();
-                self.consume(rel + 2);
-                return Ok(line);
-            }
-            if let Some(rel) = avail.iter().position(|&b| b == b'\n') {
-                let line = avail[..rel + 1].to_vec();
-                self.consume(rel + 1);
-                return Ok(line);
             }
             if !self.read_more().await? {
                 return Err(std::io::Error::new(
@@ -1451,13 +1525,10 @@ async fn abort_stream(send: &mut SendStream<Bytes>) -> Result<Option<http::Heade
 /// (see [`abort_stream`]). That includes a MALFORMED chunk terminator, an
 /// explicit framing error (Go chunkedReader: "malformed chunked encoding")
 /// — the old code reset with CANCEL, which is the h2-layer fallback when a
-/// SendResponse is dropped, not Go's handlerPanicRST code. `scratch` is the
-/// caller-owned buffer reused for every chunk (see
-/// `BodyReader::read_exact_into`).
+/// SendResponse is dropped, not Go's handlerPanicRST code.
 async fn stream_chunked_body(
     reader: &mut BodyReader<'_, impl AsyncRead + Unpin>,
     send: &mut SendStream<Bytes>,
-    scratch: &mut Vec<u8>,
 ) -> Result<Option<http::HeaderMap>, h2::Error> {
     loop {
         let line = match reader.read_line().await {
@@ -1535,19 +1606,18 @@ async fn stream_chunked_body(
         // line — buffering it in one `read_exact(size)` allocates
         // attacker-influenced memory (a misbehaving backend or proxied
         // origin can emit an arbitrarily large chunk). Stream the chunk
-        // in bounded slices instead; the frame stays chunked
-        // (end_stream=false on every slice). Round 15: each slice reads
-        // into the reused `scratch` (no per-chunk Vec growth); the data is
-        // copied out because h2's `SendStream` consumes `Bytes`.
+        // in bounded slices via `BodyReader::take_chunk` (zero-copy `Bytes`
+        // for slices >= `ZERO_COPY_MIN_BYTES`, copied for small slices so
+        // tiny chunks cannot pin 64 KiB slabs).
         let mut remaining = size;
         while remaining > 0 {
             let n = remaining.min(MAX_CHUNK_SIZE);
-            match reader.read_exact_into(scratch, n).await {
-                Ok(()) => {}
+            let chunk = match reader.take_chunk(n).await {
+                Ok(c) => c,
                 Err(_) => return abort_stream(send).await, // chunk data cut short
-            }
-            send.send_data(Bytes::copy_from_slice(scratch), false)?;
-            remaining -= n;
+            };
+            remaining -= chunk.len();
+            send_h2_data(send, chunk, false).await?;
         }
         // Each chunk ends with CRLF (RFC 7230 §4.1); Go's chunkedReader
         // errors with "malformed chunked encoding" when the two bytes after
@@ -1615,85 +1685,45 @@ async fn read_backend_head<R: AsyncRead + Unpin>(
 ///
 /// `is_head` marks a HEAD request: its response never carries a body, and
 /// statuses 204/304 never do either (FIX 1 — see the tail of this fn).
-/// `not_found_page` is the pre-resolved 404 body (custom_404_page or the
-/// builtin HTML) shared by the failure arms below.
+/// `custom_404_page` is resolved lazily by [`send_h2_404`] only on error arms.
 async fn stream_h2_response<R: AsyncRead + Unpin>(
     r: &mut R,
     respond: &mut SendResponse<Bytes>,
     head_timeout: Option<std::time::Duration>,
     is_head: bool,
-    not_found_page: &Bytes,
+    custom_404_page: &str,
 ) -> Result<(), h2::Error> {
     let deadline = head_timeout.map(|d| tokio::time::Instant::now() + d);
     let mut head = match read_backend_head(r, Vec::new(), deadline).await {
         Ok(h) => h,
         Err(HeadReadError::Closed) => {
-            // Backend closed (or no work conn was ever assigned) before the
-            // response head. Go frp's vhost ErrorHandler answers every
-            // non-timeout transport error with 404 + its not-found page
-            // (pkg/util/vhost/http.go:128-138 — only a `net.Error`
-            // Timeout() maps to 504), and h2c rides the same handler on the
-            // same net/http listener, so this h2 leg mirrors that 404 class
-            // instead of inventing a 502 (FIX 2).
             tracing::debug!("h2c backend closed before response head, sending 404");
-            return send_h2_404(respond, not_found_page).await;
+            return send_h2_404(respond, custom_404_page).await;
         }
         Err(HeadReadError::TimedOut) => {
-            // The one net.Error-equivalent arm: Go maps a
-            // ResponseHeaderTimeout to a bare 504 (WriteHeader only —
-            // http.go:130-133). The h2c translation read IS clocked by
-            // vhost_http_timeout (clamp_vhost_timeout doc), so a deadline
-            // expiry here is the exact mirror of Go's response-head timer.
             tracing::debug!("h2c backend response-head timeout, sending 504");
             return send_h2_error(respond, 504, &[], Bytes::new()).await;
         }
     };
-    // Go Transport readResponse parity (round-13 review finding): non-101
-    // 1xx heads (a 100 Continue answering `Expect: 100-continue`) are
-    // consumed internally and never surface as the response — keep reading
-    // until a final head ends the exchange. Without the skip the interim
-    // head was sent to the h2 client as `:status 100` and the pipelined
-    // final head streamed as its body. Go frp serves h2c from the same
-    // net/http vhost listener as h1, and its reverse proxy consumes 1xx
-    // the same way on both transports.
     let parsed = loop {
         let Some(parsed) = parse_response_head(&head) else {
-            // Malformed backend head — a Go transport readResponse error,
-            // i.e. a non-timeout ErrorHandler class → 404 (FIX 2).
             tracing::debug!("h2c backend sent a malformed response head, sending 404");
-            return send_h2_404(respond, not_found_page).await;
+            return send_h2_404(respond, custom_404_page).await;
         };
         if (100..=199).contains(&parsed.status) {
             if parsed.status == 101 {
-                // A backend `101 Switching Protocols` cannot be represented
-                // over HTTP/2 — h2 has no protocol switch; its 1xx are
-                // informational only, and an h2 client treats a 101 head
-                // that way too. Streaming the post-switch bytes as the
-                // body would be DATA before the final response head, a
-                // connection PROTOCOL_ERROR — the h2 crate's client
-                // answers with a whole-connection GOAWAY, killing every
-                // concurrent stream on the h2 conn (round-13 review B2).
-                // Answer the non-timeout ErrorHandler 404 (like the
-                // malformed-head/status arms below) instead of leaking a
-                // conn-killing head; there is no final head to wait for
-                // (FIX 2).
                 tracing::debug!(
                     "h2c backend answered 101 Switching Protocols (unsupported over HTTP/2), sending 404"
                 );
-                return send_h2_404(respond, not_found_page).await;
+                return send_h2_404(respond, custom_404_page).await;
             }
-            // A non-101 1xx head carries no body — bytes after its blank
-            // line are the next head's start (possibly already complete).
             tracing::trace!("h2c consuming backend interim {} head", parsed.status);
             let seed = head[parsed.body_offset..].to_vec();
             head = match read_backend_head(r, seed, deadline).await {
                 Ok(h) => h,
                 Err(HeadReadError::Closed) => {
-                    // Interim head answered, then the backend closed before
-                    // a final head — a truncated-response transport error →
-                    // the 404 ErrorHandler class (FIX 2).
                     tracing::debug!("h2c backend closed between response heads, sending 404");
-                    return send_h2_404(respond, not_found_page).await;
+                    return send_h2_404(respond, custom_404_page).await;
                 }
                 Err(HeadReadError::TimedOut) => {
                     tracing::debug!("h2c backend response-head timeout, sending 504");
@@ -1714,68 +1744,22 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     let mut resp = match http::Response::builder().status(status).body(()) {
         Ok(resp) => resp,
         Err(_) => {
-            // The status comes from the backend head; a broken/malicious
-            // backend can send a value the builder rejects (e.g. 0 or >999).
-            // Degrade to the 404 ErrorHandler class like the other
-            // malformed-head cases instead of panicking the request-serving
-            // task (FIX 2).
             tracing::debug!("h2c backend sent invalid status code {status}, sending 404");
-            return send_h2_404(respond, not_found_page).await;
+            return send_h2_404(respond, custom_404_page).await;
         }
     };
-    for (n, v) in &headers {
-        // `Trailer` is in the hop set, but a backend DECLARATION is re-emitted
-        // rather than dropped: Go's Transport moves the announced keys out of
-        // `res.Header` into `res.Trailer` (fixTrailer, net/http/transfer.go)
-        // and httputil.ReverseProxy writes them back as a `Trailer` response
-        // field before WriteHeader — a Go front's client-facing response does
-        // carry the announcement. The backend's verbatim line holds exactly
-        // the names Go re-synthesizes, and the trailer SECTION is delivered as
-        // real h2 trailers below, so the round-8 G1 pin
-        // (frp-server/tests/vhost_h2c.rs, announce field + delivered
-        // trailers) keeps holding while every other hop field is dropped.
+    let chunked = header_value(&headers, "transfer-encoding").is_some_and(|v| {
+        v.as_bytes()
+            .windows(7)
+            .any(|w| w.eq_ignore_ascii_case(b"chunked"))
+    });
+    for (n, v) in headers {
         if is_hop_by_hop(n.as_str()) && !n.as_str().eq_ignore_ascii_case("trailer") {
             continue;
         }
-        // `append`, not `insert`: a backend emitting duplicate response
-        // headers (e.g. multiple Set-Cookie) must preserve ALL values —
-        // `insert` collapses duplicates and the last one wins.
-        resp.headers_mut().append(n.clone(), v.clone());
+        resp.headers_mut().append(n, v);
     }
 
-    // FIX 1: responses to HEAD requests and the no-body statuses 204/304
-    // never carry a DATA body — Go's net/http server suppress gate is
-    // server.go:1513 (`req.Method == "HEAD" || !bodyAllowedForStatus(code)`
-    // || code == StatusNoContent), with `bodyAllowedForStatus` at
-    // transfer.go:459-461 returning false for 204/304/1xx — so the h2 relay
-    // must end the stream with the response head. The body legs below would
-    // otherwise
-    // park forever on a backend that DECLARES a Content-Length on such an
-    // answer and then holds the connection open with no body bytes (a lie
-    // for these statuses — HEAD says so by definition, 204/304 by RFC) —
-    // the FIX-1 hang: `read_exact_into` waits for bytes that can never
-    // come.
-    //
-    // Content-Length: stripped for 204 ALWAYS — RFC 9110 §8.6 forbids the
-    // header on any 204, HEAD method or not (the pre-round-15 code kept it
-    // on a HEAD + 204 answer), and stripped for 304. This mirrors the h1
-    // net/http write layer every Go frp h1 vhost response passes through —
-    // chunkWriter.writeHeader deletes suppressed headers before
-    // serialization (go1.25 server.go:1483-1497): suppressedHeadersNoBody
-    // = {Content-Length, Transfer-Encoding} for 204,
-    // suppressedHeaders304 = {Content-Type, Content-Length,
-    // Transfer-Encoding} for 304 (transfer.go:459-485). frp-rs's own h1
-    // front does the same on its http non-CONNECT legs (round-16: the
-    // ResponseHeaderInjector in frp-server/src/control/bridge.rs drops
-    // Content-Length from a final 204/304 head at its splice), so the two
-    // fronts are consistent again. Go's H2 writer has no such suppression
-    // (h2_bundle.go writeChunk moves a declared CL into the response
-    // verbatim) — this strip remains a fail-closed RFC/Go-h1-parity
-    // divergence from Go's h2 pass-through, narrow like the h1 sibling:
-    // Content-Length only, Transfer-Encoding/Content-Type left alone.
-    // A HEAD answer to a body-bearing status KEEPS its
-    // Content-Length (it truthfully describes the GET the client would
-    // receive; RFC 9110 §8.6 allows it).
     if is_head || status == 204 || status == 304 {
         if status == 204 || status == 304 {
             resp.headers_mut().remove("content-length");
@@ -1783,50 +1767,25 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         respond.send_response(resp, true)?;
         return Ok(());
     }
-
-    // Content-Length framing is the head parse's VALIDATED value
-    // (`ParsedHead`), never a re-parse of the stored row: the parser is
-    // legal for all-whitespace obs-folds that append a bare ' ' (see the
-    // record walk above), so "Content-Length: 5\r\n \r\n\r\n" stores "5 "
-    // — legal per textproto.TrimString — which `parse::<usize>()` on the
-    // raw row rejects, silently degrading a length-bounded body to
-    // read-to-EOF (a backend that then holds the connection open parked
-    // the stream). The client https2http twin h2.rs consumes the same
-    // carried value.
-    let chunked = header_value(&headers, "transfer-encoding")
-        .map(|v| {
-            v.to_str()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .contains("chunked")
-        })
-        .unwrap_or(false);
+    if !chunked && content_length == Some(0) {
+        respond.send_response(resp, true)?;
+        return Ok(());
+    }
 
     let mut send = respond.send_response(resp, false)?;
-    let mut reader = BodyReader::new(r, head[body_offset..].to_vec());
-    // One scratch buffer for every body path — chunk slices and
-    // content-length slices read into it and are copied out (h2
-    // `SendStream` consumes `Bytes`), so no per-slice Vec growth.
-    let mut scratch: Vec<u8> = Vec::new();
+    let mut reader = BodyReader::new(
+        r,
+        &head[body_offset..],
+        if chunked { None } else { content_length },
+    );
 
     if chunked {
-        // `Ok(None)` = the backend body was truncated mid-stream and
-        // [`abort_stream`] already reset it — no clean END_STREAM, which
-        // would present the truncated body as complete (round-18 M3
-        // mirror).
-        match stream_chunked_body(&mut reader, &mut send, &mut scratch).await? {
+        match stream_chunked_body(&mut reader, &mut send).await? {
             None => return Ok(()),
             Some(trailers) => {
                 if trailers.is_empty() {
                     send.send_data(Bytes::new(), true)?;
                 } else {
-                    // Audit round 8 (G1): the backend sent a trailer section after
-                    // its terminating 0-chunk — deliver it as real h2 trailers.
-                    // `send_trailers` ends the stream with a HEADERS frame
-                    // (END_STREAM), replacing the bare empty-DATA end. The values
-                    // were announced to the client already via the forwarded
-                    // `Trailer:` head field (and unannounced fields arrive too —
-                    // Go delivers what arrives).
                     send.send_trailers(trailers)?;
                 }
             }
@@ -1835,52 +1794,31 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
     }
     if let Some(mut remaining) = content_length {
         while remaining > 0 {
-            // 32 KiB slices (audit §3 item 5): the old 8192-byte slice made
-            // every byte of a Content-Length body travel in four times as
-            // many read+frame iterations as the chunked path's 64 KiB cap
-            // (h2 splits DATA frames at its own negotiated max frame size
-            // regardless, so this is not a wire-shape change).
-            let n = remaining.min(32 * 1024) as usize;
-            match reader.read_exact_into(&mut scratch, n).await {
-                Ok(()) => {}
+            let n = remaining.min(MAX_CHUNK_SIZE as u64) as usize;
+            let chunk = match reader.take_chunk(n).await {
+                Ok(c) => c,
                 Err(_) => {
-                    // Truncated Content-Length-bounded body: the declared
-                    // length was never delivered — reset the stream rather
-                    // than end it cleanly (round-18 M3 mirror; the old
-                    // `break` fell to the clean END_STREAM below and the
-                    // h2 client read a complete response out of a
-                    // truncated one — Go copyResponse aborts instead).
                     tracing::debug!(
                         "h2c backend truncated a Content-Length-bounded body, resetting the stream"
                     );
                     return abort_stream(&mut send).await.map(|_| ());
                 }
-            }
-            remaining -= scratch.len() as u64;
-            send.send_data(Bytes::copy_from_slice(&scratch), false)?;
+            };
+            remaining -= chunk.len() as u64;
+            send_h2_data(&mut send, chunk, remaining == 0).await?;
         }
-    } else {
-        // No length framing: read to EOF (the work conn is closed by frpc
-        // once the provider finishes). A genuine EOF is the natural end of
-        // a close-delimited body; an io error mid-body aborts like every
-        // other truncated backend body (round-18 M3 mirror).
-        loop {
-            if reader.available().is_empty() {
-                match reader.read_more().await {
-                    Ok(true) => {}
-                    Ok(false) => break, // clean EOF: body complete
-                    Err(_) => {
-                        tracing::debug!("h2c backend body read error, resetting the stream");
-                        return abort_stream(&mut send).await.map(|_| ());
-                    }
-                }
+        return Ok(());
+    }
+    loop {
+        match reader.take_chunk_or_eof(MAX_CHUNK_SIZE).await {
+            Ok(Some(chunk)) => {
+                send_h2_data(&mut send, chunk, false).await?;
             }
-            if reader.available().is_empty() {
-                break;
+            Ok(None) => break, // clean EOF: body complete
+            Err(_) => {
+                tracing::debug!("h2c backend body read error, resetting the stream");
+                return abort_stream(&mut send).await.map(|_| ());
             }
-            let data = reader.available().to_vec();
-            reader.consume(data.len());
-            send.send_data(Bytes::from(data), false)?;
         }
     }
     send.send_data(Bytes::new(), true)?;
@@ -2830,11 +2768,21 @@ mod tests {
         // `test_h2_backend_truncated_chunked_body_resets_stream` below.
         let data: &[u8] = b"5\r\nabc";
         let mut src = data;
-        let mut reader = BodyReader::new(&mut src, Vec::new());
-        assert_eq!(reader.read_line().await.expect("chunk size line"), b"5\r\n");
-        let mut scratch = Vec::new();
+        let mut reader = BodyReader::new(&mut src, &[], None);
+        assert_eq!(
+            reader
+                .read_line()
+                .await
+                .expect("chunk size line")
+                .as_slice(),
+            b"5\r\n"
+        );
+        // Streaming `take_chunk` delivers the 3 available bytes first, then
+        // fails with UnexpectedEof when the remaining 2 bytes never arrive.
+        let got = reader.take_chunk(5).await.expect("first 3 bytes available");
+        assert_eq!(got.as_ref(), b"abc");
         let err = reader
-            .read_exact_into(&mut scratch, 5)
+            .take_chunk(5 - got.len())
             .await
             .expect_err("declared 5 bytes, only 3 arrive");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
@@ -3038,8 +2986,7 @@ mod tests {
             let mut respond = respond;
             let mut backend =
                 HeadThenPanicMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n");
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut backend, &mut respond, None, true, &page).await
+            stream_h2_response(&mut backend, &mut respond, None, true, "").await
         })
         .await;
         assert_eq!(status, 200);
@@ -3055,8 +3002,7 @@ mod tests {
             let mut respond = respond;
             let mut backend =
                 HeadThenPanicMock::new(b"HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\n");
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            stream_h2_response(&mut backend, &mut respond, None, false, "").await
         })
         .await;
         assert_eq!(status, 204);
@@ -3070,8 +3016,7 @@ mod tests {
         let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
             let mut respond = respond;
             let mut backend = HeadThenPanicMock::new(b"HTTP/1.1 304 Not Modified\r\n\r\n");
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            stream_h2_response(&mut backend, &mut respond, None, false, "").await
         })
         .await;
         assert_eq!(status, 304);
@@ -3090,8 +3035,7 @@ mod tests {
             let mut respond = respond;
             let mut backend =
                 HeadThenPanicMock::new(b"HTTP/1.1 204 No Content\r\nContent-Length: 50\r\n\r\n");
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut backend, &mut respond, None, true, &page).await
+            stream_h2_response(&mut backend, &mut respond, None, true, "").await
         })
         .await;
         assert_eq!(status, 204);
@@ -3104,21 +3048,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_backend_failures_answer_404_with_page() {
-        // FIX 2 pins: the non-timeout backend-failure arms answer Go's
-        // ErrorHandler 404 — status 404, Content-Type text/html (send_h2_error's
-        // default for the page body). The page body follows
-        // `h2c_not_found_body`: the CONFIGURED custom_404_page when
-        // non-empty (round-15 gap — every prior call passed ""), else the
-        // builtin page the HTTP/1.1 surface serves byte-identical
-        // (GO_404_NOT_FOUND_BODY). First arm pins the custom branch (:846),
-        // second arm the builtin branch.
         let custom_page = "<html><body>custom 404</body></html>";
-        let (status, headers, body) = h2c_test_roundtrip("GET", move |respond| {
-            let page = h2c_not_found_body(custom_page);
-            async move {
-                let mut respond = respond;
-                stream_h2_response(&mut EofMock, &mut respond, None, false, &page).await
-            }
+        let (status, headers, body) = h2c_test_roundtrip("GET", move |respond| async move {
+            let mut respond = respond;
+            stream_h2_response(&mut EofMock, &mut respond, None, false, custom_page).await
         })
         .await;
         assert_eq!(status, 404, "backend close before the head → Go 404 class");
@@ -3136,8 +3069,7 @@ mod tests {
         let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
             let mut respond = respond;
             let mut backend = HeadThenPanicMock::new(b"not-http\r\n\r\n");
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            stream_h2_response(&mut backend, &mut respond, None, false, "").await
         })
         .await;
         assert_eq!(status, 404, "malformed head → Go 404 class");
@@ -3150,13 +3082,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_error_render_content_type_nosniff_and_default() {
-        // FIX 3: the 401/407 arms render Go's http.Error shape — explicit
-        // Content-Type text/plain; charset=utf-8 + X-Content-Type-Options:
-        // nosniff + the StatusText body with a trailing newline. The h2
-        // error helper must NOT overwrite the caller's Content-Type with
-        // its text/html default (pre-fix: every non-empty-bodied error was
-        // text/html — the 401/407 arms answered with the wrong type and no
-        // body).
         for (expected, want_body) in [
             (401u16, "Unauthorized\n"),
             (407u16, "Proxy Authentication Required\n"),
@@ -3196,8 +3121,7 @@ mod tests {
         // Content-Type passed).
         let (status, headers, body) = h2c_test_roundtrip("GET", |respond| async move {
             let mut respond = respond;
-            let page = h2c_not_found_body("");
-            send_h2_404(&mut respond, &page).await
+            send_h2_404(&mut respond, "").await
         })
         .await;
         assert_eq!(status, 404);
@@ -3208,25 +3132,15 @@ mod tests {
         assert_eq!(body, frp_core::bridge::GO_404_NOT_FOUND_BODY.as_bytes());
     }
 
-    // --- Round-18 wave mirrors (the client plugin h2.rs M2/M3/M4 +
-    // deviation-3 fixes, applied to this server h2c twin): obs-fold heads
-    // merge and serve, dup/garbage Content-Length heads behave like Go's
-    // transport, and truncated bodies reset the stream instead of ending
-    // clean.
-
     #[tokio::test]
     async fn test_h2_backend_obs_fold_head_merges_and_forwards() {
-        // M4 mirror e2e: a legal obs-fold backend head now SERVES (200,
-        // merged value) — RED pre-fix: the fold lost its leading space,
-        // read as a colonless record, and the whole head failed → 404.
         let (status, headers, body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
                 let mut backend = SliceMock::new(
                     b"HTTP/1.1 200 OK\r\nX-A: one\r\n two\r\nContent-Length: 2\r\n\r\nok",
                 );
-                let page = h2c_not_found_body("");
-                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                stream_h2_response(&mut backend, &mut respond, None, false, "").await
             })
             .await;
         assert_eq!(status, 200, "obs-fold head must serve, not 404");
@@ -3241,16 +3155,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_backend_duplicate_rows_all_reach_the_client() {
-        // M2 mirror e2e (pin): duplicate Set-Cookie rows both survive the
-        // head→h2 copy (the append loop was already correct — this pins it
-        // against a regression to `insert`).
         let (status, headers, body, err) = h2c_test_roundtrip_body_err("GET", |respond| async move {
             let mut respond = respond;
             let mut backend = SliceMock::new(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\nok",
             );
-            let page = h2c_not_found_body("");
-            stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+            stream_h2_response(&mut backend, &mut respond, None, false, "").await
         })
         .await;
         assert_eq!(status, 200);
@@ -3270,17 +3180,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_backend_duplicate_content_length_go_fixlength_parity() {
-        // Identical dup CL rows → 200 with ONE content-length row on the
-        // h2 wire (RED pre-fix: the parse kept both rows and the copy loop
-        // forwarded both — fixLength dedupes, Go Issue 16490).
         let (status, headers, body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
                 let mut backend = SliceMock::new(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok",
                 );
-                let page = h2c_not_found_body("");
-                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                stream_h2_response(&mut backend, &mut respond, None, false, "").await
             })
             .await;
         assert_eq!(status, 200);
@@ -3291,17 +3197,13 @@ mod tests {
             1,
             "identical duplicate CL rows collapse to one on the wire"
         );
-        // Differing dup CL values fail the whole head → the Go 404 class
-        // (RED pre-fix: 200 forwarded, its body framing matching neither
-        // row).
         let (status, _headers, _body, _err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
                 let mut backend = SliceMock::new(
                     b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
                 );
-                let page = h2c_not_found_body("");
-                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                stream_h2_response(&mut backend, &mut respond, None, false, "").await
             })
             .await;
         assert_eq!(
@@ -3312,9 +3214,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_backend_garbage_content_length_go_404_class() {
-        // Deviation-3 e2e: a garbage or empty Content-Length row fails the
-        // whole head → the Go 404 class (RED pre-fix: 200 forwarded with
-        // the garbage row and the body read to EOF).
         for staged in [
             &b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nhi"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhi"[..],
@@ -3324,8 +3223,7 @@ mod tests {
                     let mut backend = SliceMock::new(staged);
                     async move {
                         let mut respond = respond;
-                        let page = h2c_not_found_body("");
-                        stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                        stream_h2_response(&mut backend, &mut respond, None, false, "").await
                     }
                 })
                 .await;
@@ -3336,25 +3234,12 @@ mod tests {
                 String::from_utf8_lossy(staged)
             );
         }
-        // A padded numeric value stays legal (TrimString, Go fixLength) and
-        // its body leg must deliver EXACTLY the declared bytes — the round-18
-        // review fix: drive the store shape the padded value actually comes
-        // from. An all-whitespace obs-fold appends a bare ' ' to the value
-        // (the record walk above), so the backend head
-        // "Content-Length: 5\r\n \r\n" stores "5 " — the parse gate accepts
-        // it (TrimString → "5") and the VALIDATED count must ride out on
-        // `ParsedHead`; re-parsing the stored row in the body leg saw "5 ",
-        // failed, and read the body to EOF. The trailing "EXTRA" bytes make
-        // that degradation visible: read-to-EOF delivers them, the
-        // length-bounded read does not (RED pre-fix: body is
-        // "helloEXTRA").
         let (status, _headers, body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
                 let mut backend =
                     SliceMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n \r\n\r\nhelloEXTRA");
-                let page = h2c_not_found_body("");
-                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                stream_h2_response(&mut backend, &mut respond, None, false, "").await
             })
             .await;
         assert_eq!(status, 200, "fold-padded Content-Length stays legal");
@@ -3368,18 +3253,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_backend_truncated_cl_body_resets_stream() {
-        // M3 mirror e2e: declared 10 body bytes, backend delivers 2 then
-        // EOFs. Go copyResponse aborts mid-body → RST_STREAM
-        // INTERNAL_ERROR; the old CL arm `Err(_) => break` fell to the
-        // clean END_STREAM and the client read the truncated body as a
-        // complete 200 (RED pre-fix: err is None).
         let (status, _headers, _body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
                 let mut backend =
                     SliceMock::new(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhi");
-                let page = h2c_not_found_body("");
-                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                stream_h2_response(&mut backend, &mut respond, None, false, "").await
             })
             .await;
         assert_eq!(status, 200, "the head itself is valid and served");
@@ -3391,18 +3270,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_h2_backend_truncated_chunked_body_resets_stream() {
-        // M3 mirror e2e — the chunked leg: declared 5 bytes, delivers 2,
-        // then EOF. The old walker returned an empty trailer map on the
-        // mid-chunk EOF and the caller ended the stream cleanly (RED
-        // pre-fix: err is None — the walker arms and the CRLF-mismatch
-        // CANCEL path all used to swallow or reset-with-wrong-code).
         let (status, _headers, _body, err) =
             h2c_test_roundtrip_body_err("GET", |respond| async move {
                 let mut respond = respond;
                 let mut backend =
                     SliceMock::new(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhe");
-                let page = h2c_not_found_body("");
-                stream_h2_response(&mut backend, &mut respond, None, false, &page).await
+                stream_h2_response(&mut backend, &mut respond, None, false, "").await
             })
             .await;
         assert_eq!(status, 200, "the head itself is valid and served");
@@ -3410,5 +3283,203 @@ mod tests {
             err.is_some(),
             "a chunked body cut mid-chunk must reset the stream, not end clean"
         );
+    }
+
+    /// Backpressure regression test: when the h2c client stops releasing
+    /// flow-control capacity, `stream_h2_response` must park in `poll_capacity`
+    /// and apply end-to-end backpressure to the backend duplex instead of
+    /// buffering the entire 1 MiB response into `h2`'s send queue.
+    #[tokio::test]
+    async fn test_h2c_response_respects_peer_flow_control_backpressure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TOTAL: usize = 1024 * 1024;
+        const SLICE: usize = 16 * 1024;
+
+        for chunked in [false, true] {
+            let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+            let (mut backend_w, mut backend_r) = tokio::io::duplex(32 * 1024);
+            let written = Arc::new(AtomicUsize::new(0));
+            let written_bg = written.clone();
+
+            let backend_task = tokio::spawn(async move {
+                let head = if chunked {
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_string()
+                } else {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {TOTAL}\r\n\r\n")
+                };
+                backend_w.write_all(head.as_bytes()).await.unwrap();
+                let mut sent = 0usize;
+                let mut block = vec![0u8; SLICE];
+                while sent < TOTAL {
+                    let n = SLICE.min(TOTAL - sent);
+                    block[..n].fill((sent / SLICE) as u8);
+                    if chunked {
+                        let hdr = format!("{n:X}\r\n");
+                        backend_w.write_all(hdr.as_bytes()).await.unwrap();
+                        backend_w.write_all(&block[..n]).await.unwrap();
+                        backend_w.write_all(b"\r\n").await.unwrap();
+                    } else {
+                        backend_w.write_all(&block[..n]).await.unwrap();
+                    }
+                    sent += n;
+                    written_bg.store(sent, Ordering::SeqCst);
+                }
+                if chunked {
+                    backend_w.write_all(b"0\r\n\r\n").await.unwrap();
+                }
+                backend_w.shutdown().await.unwrap();
+            });
+
+            let srv_task = tokio::spawn(async move {
+                let mut conn = h2::server::Builder::new()
+                    .max_frame_size(H2C_MAX_FRAME_SIZE)
+                    .handshake(server_io)
+                    .await
+                    .unwrap();
+                let (req, mut respond) = conn.accept().await.unwrap().unwrap();
+                let _ = req;
+                let driver = tokio::spawn(async move { while conn.accept().await.is_some() {} });
+                stream_h2_response(&mut backend_r, &mut respond, None, false, "")
+                    .await
+                    .unwrap();
+                let _ = driver.await;
+            });
+
+            let (mut send_req, conn) = h2::client::Builder::new()
+                .initial_window_size(65_535)
+                .initial_connection_window_size(65_535)
+                .handshake::<_, Bytes>(client_io)
+                .await
+                .unwrap();
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+
+            let req = http::Request::builder()
+                .method("GET")
+                .uri("http://example.com/large")
+                .body(())
+                .unwrap();
+            let (resp_fut, _send_body) = send_req.send_request(req, true).unwrap();
+            let resp = resp_fut.await.unwrap();
+            assert_eq!(resp.status(), http::StatusCode::OK);
+            let mut body = resp.into_body();
+
+            // Read first chunk WITHOUT calling release_capacity so the peer's
+            // 64 KiB stream window drains and stalls further writes.
+            let mut received = Vec::with_capacity(TOTAL);
+            let first = body.data().await.unwrap().unwrap();
+            received.extend_from_slice(&first);
+
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            let pushed_while_stalled = written.load(Ordering::SeqCst);
+            assert!(
+                pushed_while_stalled < TOTAL / 2,
+                "chunked={chunked}: backend must be backpressured when peer window is 0 \
+                 (pushed {pushed_while_stalled} of {TOTAL} bytes)"
+            );
+
+            // Release capacity and drain the rest of the 1 MiB response.
+            body.flow_control().release_capacity(first.len()).unwrap();
+            while let Some(chunk) = body.data().await {
+                let chunk = chunk.unwrap();
+                let len = chunk.len();
+                received.extend_from_slice(&chunk);
+                body.flow_control().release_capacity(len).unwrap();
+            }
+
+            assert_eq!(received.len(), TOTAL);
+            for (i, slice) in received.chunks(SLICE).enumerate() {
+                assert!(
+                    slice.iter().all(|&b| b == i as u8),
+                    "chunked={chunked}: byte corruption in slice {i}"
+                );
+            }
+            drop(body);
+            drop(_send_body);
+            drop(send_req);
+            tokio::time::timeout(std::time::Duration::from_secs(5), backend_task)
+                .await
+                .expect("backend task timed out")
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), srv_task)
+                .await
+                .expect("server task timed out")
+                .unwrap();
+        }
+    }
+
+    /// Regression test (Round 1 review P1): `BodyReader::read_line` must stop
+    /// at the first `\n` in wire order even when `\r\n` appears later in the
+    /// same buffer, so mixed LF/CRLF chunk-size lines and trailer fields parse
+    /// intact instead of swallowing following lines.
+    #[tokio::test]
+    async fn test_h2c_chunked_mixed_lf_crlf_lines_and_trailers() {
+        let (client_io, server_io) = tokio::io::duplex(16 * 1024);
+        let srv_task = tokio::spawn(async move {
+            let mut conn = h2::server::Builder::new()
+                .handshake(server_io)
+                .await
+                .unwrap();
+            let (_req, mut respond) = conn.accept().await.unwrap().unwrap();
+            let driver = tokio::spawn(async move { while conn.accept().await.is_some() {} });
+            let mut backend = SliceMock::new(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\nX-A: 1\nX-B: 2\r\n\r\n",
+            );
+            stream_h2_response(&mut backend, &mut respond, None, false, "")
+                .await
+                .unwrap();
+            let _ = driver.await;
+        });
+
+        let (mut send_req, conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("http://example.com/")
+            .body(())
+            .unwrap();
+        let (resp_fut, _send_body) = send_req.send_request(req, true).unwrap();
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let mut body = resp.into_body();
+        let mut data = Vec::new();
+        while let Some(chunk) = body.data().await {
+            data.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(data, b"hello");
+        let trailers = body.trailers().await.unwrap().expect("expected trailers");
+        assert_eq!(trailers.get("x-a").unwrap(), "1");
+        assert_eq!(trailers.get("x-b").unwrap(), "2");
+        drop(body);
+        drop(_send_body);
+        drop(send_req);
+        tokio::time::timeout(std::time::Duration::from_secs(5), srv_task)
+            .await
+            .expect("server task timed out")
+            .unwrap();
+    }
+
+    /// Regression test (Round 1 review P1): `read_line` must accept a line of
+    /// exactly `MAX_CHUNK_SIZE` bytes ending in `\n` and reject an unterminated
+    /// `MAX_CHUNK_SIZE`-byte prefix immediately without over-buffering.
+    #[tokio::test]
+    async fn test_h2c_body_reader_line_limit_exact_boundary() {
+        let mut exact = vec![b'a'; MAX_CHUNK_SIZE - 1];
+        exact.push(b'\n');
+        let mut mock_ok = std::io::Cursor::new(exact);
+        let mut r_ok = BodyReader::new(&mut mock_ok, &[], None);
+        let line = r_ok.read_line().await.unwrap();
+        assert_eq!(line.len(), MAX_CHUNK_SIZE);
+
+        let mut too_long = vec![b'a'; MAX_CHUNK_SIZE];
+        too_long.push(b'\n');
+        let mut mock_err = std::io::Cursor::new(too_long);
+        let mut r_err = BodyReader::new(&mut mock_err, &[], None);
+        let err = r_err.read_line().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 }

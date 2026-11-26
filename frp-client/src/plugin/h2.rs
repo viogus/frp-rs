@@ -15,8 +15,10 @@
 //! field on those options (plaintext inbound, HTTP/1.1 only).
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes, BytesMut};
 use h2::server::SendResponse;
 use h2::{RecvStream, SendStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -24,6 +26,21 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use frp_core::transport::set_nodelay;
+
+/// Per-stream HTTP/2 receive window (2 MiB), aligned with `http2connect.rs`.
+const H2_STREAM_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+/// Connection-wide HTTP/2 receive window (8 MiB) shared across all streams.
+const H2_CONN_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+/// Max HTTP/2 DATA frame payload (64 KiB, 4× fewer frames than RFC 9113's
+/// 16 KiB minimum).
+const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+/// Timeout for outbound TCP/TLS backend dials (matches `http2connect.rs`).
+const BACKEND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Threshold below which a bodyless request head is written inline instead of
+/// spawning a separate `body_task` (keeps normal GET/HEAD requests zero-spawn
+/// while preventing deadlock if an unusually huge header block exceeds the
+/// socket send buffer).
+const INLINE_HEAD_WRITE_CAP: usize = 16 * 1024;
 
 /// Backend the h2 request is forwarded to. `https2http` uses plain TCP;
 /// `https2https` wraps it in TLS (Go https2https.go connects with
@@ -41,10 +58,15 @@ pub(crate) enum Backend {
     },
 }
 
-type DynStream = Box<dyn DynIo>;
+type BoxedBackendRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxedBackendWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
-trait DynIo: AsyncRead + AsyncWrite + Unpin + Send {}
-impl<T: AsyncRead + AsyncWrite + Unpin + Send> DynIo for T {}
+struct H2ConnConfig {
+    target: String,
+    host_rewrite: String,
+    request_headers: HashMap<String, String>,
+    backend: Backend,
+}
 
 /// Serve one inbound TLS connection whose ALPN negotiated `h2`.
 pub(crate) async fn serve_h2_connection<S>(
@@ -57,65 +79,60 @@ pub(crate) async fn serve_h2_connection<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let mut connection: h2::server::Connection<S, Bytes> = match h2::server::Builder::new()
-        // Deliberate per-connection cap — NOT a Go default (Go's
-        // http.Server allows 250 concurrent streams; 100 is this plugin's
-        // own bound on per-connection memory, matching the server-side
-        // vhost h2c path).
-        .max_concurrent_streams(100)
-        // Go parity: the https2http/https2https plugins serve with net/http
-        // (x/net/http2 defaultMaxHeaderListSize = 16 MiB), so legitimately
-        // large header lists — big Cookie jars, JWTs — must not be rejected.
-        // Unlike the server-side vhost h2c path (frp-server vhost_h2c.rs),
-        // which deliberately stays at 4096 because it accepts connections
-        // from ANY client on an untrusted public surface, this listener is
-        // the operator's own: the plugin binds 127.0.0.1:local_port and
-        // serves only the local user's browser, so 16 MiB is safe here.
-        .max_header_list_size(16 * 1024 * 1024)
-        .handshake(stream)
-        .await
+    let mut connection: h2::server::Connection<S, Bytes> = match tokio::time::timeout(
+        super::PLUGIN_HANDSHAKE_TIMEOUT,
+        h2::server::Builder::new()
+            // Deliberate per-connection cap — NOT a Go default (Go's
+            // http.Server allows 250 concurrent streams; 100 is this plugin's
+            // own bound on per-connection memory, matching the server-side
+            // vhost h2c path).
+            .max_concurrent_streams(100)
+            // Go parity: the https2http/https2https plugins serve with net/http
+            // (x/net/http2 defaultMaxHeaderListSize = 16 MiB), so legitimately
+            // large header lists — big Cookie jars, JWTs — must not be rejected.
+            .max_header_list_size(16 * 1024 * 1024)
+            .initial_window_size(H2_STREAM_WINDOW_SIZE)
+            .initial_connection_window_size(H2_CONN_WINDOW_SIZE)
+            .max_frame_size(H2_MAX_FRAME_SIZE)
+            .handshake(stream),
+    )
+    .await
     {
-        Ok(c) => c,
-        Err(e) => {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             debug!(error = %e, "https plugin h2 handshake failed");
+            return;
+        }
+        Err(_elapsed) => {
+            debug!("https plugin h2 handshake timed out");
             return;
         }
     };
 
+    let cfg = Arc::new(H2ConnConfig {
+        target,
+        host_rewrite,
+        request_headers,
+        backend,
+    });
+
     // Per-stream handlers, collected so they cannot outlive this h2
-    // connection. The enclosing serve_plugin JoinSet tracks the connection
-    // handler task only — a bare spawn here would escape it, leaving an
-    // in-flight stream (holding its backend TCP connection) detached until
-    // its own I/O resolves after the connection is gone.
+    // connection. Poll `streams.join_next()` alongside `connection.accept()`
+    // so finished streams are reaped even while the keep-alive connection idles.
     let mut streams: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        match connection.accept().await {
+        let accepted = tokio::select! {
+            res = connection.accept() => res,
+            Some(_) = streams.join_next(), if !streams.is_empty() => continue,
+        };
+        match accepted {
             Some(Ok((request, respond))) => {
-                let target = target.clone();
-                let host_rewrite = host_rewrite.clone();
-                let request_headers = request_headers.clone();
-                let backend = backend.clone();
+                let cfg = cfg.clone();
                 streams.spawn(async move {
-                    if let Err(e) = handle_stream(
-                        request,
-                        respond,
-                        &target,
-                        &host_rewrite,
-                        &request_headers,
-                        backend,
-                        real_peer,
-                    )
-                    .await
-                    {
+                    if let Err(e) = handle_stream(request, respond, &cfg, real_peer).await {
                         debug!(error = %e, "https plugin h2 stream error");
                     }
                 });
-                // Reap completed stream tasks so their JoinSet nodes and
-                // outputs do not accumulate for this connection's lifetime —
-                // a keep-alive h2 connection can open hundreds of streams,
-                // but memory and scan cost must track concurrency, not
-                // cumulative stream count. Errors are already logged inside
-                // the handler, so the () output is dropped.
                 while streams.try_join_next().is_some() {}
             }
             Some(Err(e)) => {
@@ -137,23 +154,11 @@ pub(crate) async fn serve_h2_connection<S>(
 async fn handle_stream(
     request: http::Request<RecvStream>,
     respond: SendResponse<Bytes>,
-    target: &str,
-    host_rewrite: &str,
-    request_headers: &HashMap<String, String>,
-    backend: Backend,
+    cfg: &H2ConnConfig,
     real_peer: std::net::IpAddr,
 ) -> Result<(), h2::Error> {
-    // Captured before the body is consumed: a HEAD response never carries a
-    // DATA body (RFC 9113 §8.1), and the no-body statuses 204/304 never do
-    // either — `stream_h2_response` ends those streams at the response head
-    // instead of running a body leg against bytes that can never come
-    // (round-18 FIX 1, mirroring the server twin vhost_h2c's `is_head`).
     let is_head = request.method() == http::Method::HEAD;
     let has_content_length = request.headers().contains_key("content-length");
-    // Declared Content-Length for the request body. The h2 crate validates
-    // content-length per RFC 7540 §8.1.2.6 before delivering the request, so
-    // an unparseable value is unreachable in practice; a None falls back to
-    // forwarding all data frames (matches the previous behavior).
     let declared_length = request
         .headers()
         .get("content-length")
@@ -161,66 +166,98 @@ async fn handle_stream(
         .and_then(|s| s.parse::<usize>().ok());
     let head = build_http1_request_head(
         &request,
-        host_rewrite,
-        request_headers,
+        &cfg.host_rewrite,
+        &cfg.request_headers,
         real_peer,
         request.body().is_end_stream(),
     );
 
-    // A refused/unreachable backend answers 502 (Go ReverseProxy ErrorHandler).
-    let remote = match connect_backend(&backend).await {
-        Ok(r) => r,
+    // A refused/unreachable/timed-out backend answers 502 (Go ReverseProxy ErrorHandler).
+    let (mut remote_r, mut remote_w) = match connect_backend(&cfg.backend).await {
+        Ok(halves) => halves,
         Err(e) => {
-            debug!(target = %target, error = %e, "https plugin h2 backend connect failed");
+            debug!(target = %cfg.target, error = %e, "https plugin h2 backend connect failed");
             return send_h2_error(respond, 502, &[], Bytes::new()).await;
         }
     };
 
-    // Forward the h2 request body on a separate task so a slow upload cannot
-    // block reading the backend's (possibly early) response — Go ReverseProxy
-    // streams both directions concurrently (vhost_h2c uses the same pattern
-    // through a duplex pair). A head without Content-Length was emitted with
-    // `Transfer-Encoding: chunked` (Go http.Transport behavior for
-    // unknown-length bodies), so body bytes are framed accordingly.
-    let (mut remote_r, mut remote_w) = tokio::io::split(remote);
     let mut body = request.into_body();
     let end_stream = body.is_end_stream();
-    let body_task = tokio::spawn(async move {
+    let is_tls = matches!(cfg.backend, Backend::Tls { .. });
+
+    // Fast path for normal bodyless requests (GET/HEAD/DELETE with modest
+    // headers): write the head inline without spawning a task. On write error,
+    // still read from `remote_r` so early backend rejections (e.g. 431/400)
+    // reach the client instead of being masked as 502 (matching Go
+    // ReverseProxy); if the backend genuinely died without replying,
+    // `stream_h2_response` answers 502. Skip `shutdown()` on TLS backends so
+    // we do not emit a TLS `close_notify` before reading the response.
+    if end_stream && head.len() <= INLINE_HEAD_WRITE_CAP {
+        if let Err(e) = remote_w.write_all(&head).await {
+            debug!(error = %e, "https plugin h2 head write failed; reading backend response");
+        } else {
+            let _ = remote_w.flush().await;
+            if !is_tls {
+                let _ = remote_w.shutdown().await;
+            }
+        }
+        drop(remote_w);
+        return stream_h2_response(&mut remote_r, respond, is_head).await;
+    }
+
+    // Requests carrying a body (or a very large header block) run the write
+    // direction on a separate task so a slow upload cannot deadlock an early
+    // backend response. Guarded by `AbortOnDrop` so cancelling `handle_stream`
+    // (e.g. via `streams.abort_all()`) aborts `body_task` and drops `remote_w`.
+    let _body_guard = AbortOnDrop(tokio::spawn(async move {
         if remote_w.write_all(&head).await.is_err() {
             return;
         }
-        // Forward at most the declared Content-Length body bytes: surplus h2
-        // DATA frames are dropped (Go's http.Transport body reader stops at
-        // the declared length) so the backend cannot misread the surplus as
-        // a pipelined request on the HTTP/1.1 connection.
         let mut remaining = declared_length;
-        while let Some(Ok(data)) = body.data().await {
+        let mut chunk_buf: Vec<u8> = Vec::new();
+        while let Some(res) = body.data().await {
+            let Ok(data) = res else {
+                // Client reset/aborted the stream mid-upload: shut down the
+                // write half immediately (WriteHalf on TLS has no Drop
+                // shutdown) WITHOUT emitting `0\r\n\r\n`, so the backend sees
+                // premature EOF instead of stalling or treating a truncated
+                // upload as complete.
+                let _ = remote_w.shutdown().await;
+                return;
+            };
             let len = data.len();
             if !data.is_empty() {
                 let (next_remaining, n) = cap_chunk(len, remaining);
                 if remaining.is_none() {
-                    // Chunked framing for an unknown-length body (no
-                    // Content-Length): the full chunk is written framed.
-                    let frame = format!("{:X}\r\n", len);
-                    if remote_w.write_all(frame.as_bytes()).await.is_err()
+                    use std::io::Write;
+                    const SIZE_BUF_LEN: usize = 16;
+                    let mut size_buf = [0u8; SIZE_BUF_LEN];
+                    let mut sink: &mut [u8] = &mut size_buf;
+                    let _ = write!(sink, "{:X}\r\n", len);
+                    let size_len = SIZE_BUF_LEN - sink.len();
+                    if len <= MAX_CHUNK_SIZE {
+                        chunk_buf.clear();
+                        chunk_buf.reserve_exact(size_len + len + 2);
+                        chunk_buf.extend_from_slice(&size_buf[..size_len]);
+                        chunk_buf.extend_from_slice(&data);
+                        chunk_buf.extend_from_slice(b"\r\n");
+                        if remote_w.write_all(&chunk_buf).await.is_err() {
+                            return;
+                        }
+                    } else if remote_w.write_all(&size_buf[..size_len]).await.is_err()
                         || remote_w.write_all(&data).await.is_err()
                         || remote_w.write_all(b"\r\n").await.is_err()
                     {
                         return;
                     }
-                } else if n > 0 {
-                    // Content-Length bounded: forward at most the remaining
-                    // bytes; the surplus is dropped.
-                    if remote_w.write_all(&data[..n]).await.is_err() {
-                        return;
-                    }
+                } else if n > 0 && remote_w.write_all(&data[..n]).await.is_err() {
+                    return;
                 }
                 remaining = next_remaining;
             }
             let _ = body.flow_control().release_capacity(len);
         }
         if !has_content_length && !end_stream {
-            // Stream had an open body: terminate the chunked framing.
             if let Err(e) = remote_w.write_all(b"0\r\n\r\n").await {
                 tracing::debug!(error = %e, "plugin relay error: {}", e);
             }
@@ -228,40 +265,65 @@ async fn handle_stream(
         if let Err(e) = remote_w.flush().await {
             tracing::debug!(error = %e, "plugin relay error: {}", e);
         }
-        if let Err(e) = remote_w.shutdown().await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        if !is_tls {
+            if let Err(e) = remote_w.shutdown().await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
         }
-    });
+    }));
 
-    // Read the backend's HTTP/1.1 response and re-encode it as h2. Once the
-    // response is fully relayed the body forwarder has served its purpose —
-    // stop it so the h2 stream can wind down even if the client is still
-    // trickling request bytes (same as vhost_h2c).
-    let result = stream_h2_response(&mut remote_r, respond, is_head).await;
-    body_task.abort();
-    result
+    stream_h2_response(&mut remote_r, respond, is_head).await
 }
 
-async fn connect_backend(backend: &Backend) -> std::io::Result<DynStream> {
+async fn connect_backend(
+    backend: &Backend,
+) -> std::io::Result<(BoxedBackendRead, BoxedBackendWrite)> {
     match backend {
         Backend::Plain { host, port } => {
-            let s = TcpStream::connect((host.as_str(), *port)).await?;
+            let s = tokio::time::timeout(
+                BACKEND_CONNECT_TIMEOUT,
+                TcpStream::connect((host.as_str(), *port)),
+            )
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "backend TCP connect timed out",
+                )
+            })??;
             set_nodelay(&s);
-            Ok(Box::new(s))
+            let (r, w) = s.into_split();
+            Ok((Box::new(r), Box::new(w)))
         }
         Backend::Tls {
             connector,
             host,
             port,
         } => {
-            let tcp = TcpStream::connect((host.as_str(), *port)).await?;
+            let deadline = tokio::time::Instant::now() + BACKEND_CONNECT_TIMEOUT;
+            let tcp = tokio::time::timeout_at(deadline, TcpStream::connect((host.as_str(), *port)))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend TCP connect timed out",
+                    )
+                })??;
             set_nodelay(&tcp);
             let server_name =
                 rustls::pki_types::ServerName::try_from(host.clone()).map_err(|_| {
                     std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad backend hostname")
                 })?;
-            let tls = connector.connect(server_name, tcp).await?;
-            Ok(Box::new(tls))
+            let tls = tokio::time::timeout_at(deadline, connector.connect(server_name, tcp))
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "backend TLS handshake timed out",
+                    )
+                })??;
+            let (r, w) = tokio::io::split(tls);
+            Ok((Box::new(r), Box::new(w)))
         }
     }
 }
@@ -515,8 +577,7 @@ async fn send_h2_error(
     resp.headers_mut()
         .insert("content-type", http::HeaderValue::from_static("text/html"));
     let mut send = respond.send_response(resp, false)?;
-    send.send_data(body, true)?;
-    Ok(())
+    send_h2_data(&mut send, body, true).await
 }
 
 /// Read bytes until the end of the HTTP/1.1 response head, returning head +
@@ -898,114 +959,174 @@ fn parse_hex(b: &[u8]) -> std::io::Result<usize> {
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad chunk size"))
 }
 
-/// Per-slice cap for streaming chunked bodies (round 10 MEDIUM): a chunk is
-/// forwarded in bounded slices instead of one `read_exact(size)` allocation.
+/// Per-slice cap for streaming chunked and Content-Length bodies (64 KiB,
+/// aligned with `H2_MAX_FRAME_SIZE`).
 const MAX_CHUNK_SIZE: usize = 64 * 1024;
+/// Minimum spare capacity retained in `BodyReader`'s `BytesMut` slab before
+/// reserving a fresh 64 KiB chunk.
+const BODY_MIN_RESERVE: usize = 16 * 1024;
+/// Minimum slice size eligible for zero-copy `BytesMut::split_to().freeze()`.
+/// Smaller chunks are copied out via `Bytes::copy_from_slice` + `advance()` so
+/// tiny chunked frames cannot promote `BytesMut` to `KIND_ARC` and pin 64 KiB
+/// slabs inside `h2`'s send queue.
+const ZERO_COPY_MIN_BYTES: usize = 4096;
 
-/// Incremental response-body reader that starts with the bytes that arrived
-/// together with the response head.
+/// RAII guard that aborts a spawned helper task when dropped, preventing a
+/// detached `body_task` from leaking backend TCP/TLS sockets if `handle_stream`
+/// is cancelled (e.g. via `streams.abort_all()`).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Send `data` on an HTTP/2 `SendStream` respecting peer flow-control capacity
+/// (`reserve_capacity` + `poll_capacity`). Prevents unbounded buffering in
+/// `h2`'s internal send queue when a fast local backend streams to a slow or
+/// stalled remote HTTP/2 client.
+async fn send_h2_data(
+    send: &mut SendStream<Bytes>,
+    mut data: Bytes,
+    end_stream: bool,
+) -> Result<(), h2::Error> {
+    if data.is_empty() {
+        if end_stream {
+            send.send_data(Bytes::new(), true)?;
+        }
+        return Ok(());
+    }
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let cap = loop {
+            let c = send.capacity();
+            if c > 0 {
+                break c;
+            }
+            match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                Some(Ok(c)) if c > 0 => break c,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Err(h2::Error::from(h2::Reason::CANCEL)),
+            }
+        };
+        let n = cap.min(data.len());
+        let is_last = n == data.len();
+        let piece = if is_last {
+            std::mem::take(&mut data)
+        } else {
+            data.split_to(n)
+        };
+        send.send_data(piece, end_stream && is_last)?;
+    }
+    Ok(())
+}
+
+/// Incremental zero-copy response-body reader backed by `BytesMut`, seeded
+/// with any body bytes that arrived alongside the response head.
 struct BodyReader<'a, R: AsyncRead + Unpin> {
     inner: &'a mut R,
-    buf: Vec<u8>,
-    pos: usize,
+    buf: BytesMut,
 }
 
 impl<'a, R: AsyncRead + Unpin> BodyReader<'a, R> {
-    fn new(inner: &'a mut R, initial: Vec<u8>) -> Self {
-        Self {
-            inner,
-            buf: initial,
-            pos: 0,
-        }
+    fn new(inner: &'a mut R, initial: &[u8], capacity_hint: Option<u64>) -> Self {
+        let cap = capacity_hint
+            .map_or(MAX_CHUNK_SIZE, |cl| cl.min(MAX_CHUNK_SIZE as u64) as usize)
+            .max(initial.len());
+        let mut buf = BytesMut::with_capacity(cap);
+        buf.extend_from_slice(initial);
+        Self { inner, buf }
     }
 
-    fn available(&self) -> &[u8] {
-        &self.buf[self.pos..]
-    }
-
-    fn consume(&mut self, n: usize) {
-        self.pos += n;
-    }
-
-    /// Append more bytes from the inner stream. Returns `Ok(false)` on EOF.
-    /// The consumed prefix is dropped before refilling, so `self.buf` never
-    /// holds more than the unconsumed portion plus one refill — the
-    /// `CHUNK_LINE_MAX` check in `read_line` on `available()` is therefore
-    /// the true memory bound (a `buf.len()` check would double-count bytes
-    /// already consumed, and without the drain the consumed prefix could
-    /// accumulate when lines are split across reads with a tail left over).
+    /// Read more bytes directly into `self.buf` via `read_buf`. Returns
+    /// `Ok(false)` on EOF.
     async fn read_more(&mut self) -> std::io::Result<bool> {
-        if self.pos > 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
+        if self.buf.capacity() - self.buf.len() < BODY_MIN_RESERVE {
+            self.buf.reserve(MAX_CHUNK_SIZE);
         }
-        let mut tmp = [0u8; 8192];
-        let n = self.inner.read(&mut tmp).await?;
-        if n == 0 {
-            return Ok(false);
-        }
-        self.buf.extend_from_slice(&tmp[..n]);
-        Ok(true)
+        let n = self.inner.read_buf(&mut self.buf).await?;
+        Ok(n > 0)
     }
 
-    async fn read_exact(&mut self, n: usize) -> std::io::Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(n.min(8192));
-        while out.len() < n {
-            if self.available().is_empty() && !self.read_more().await? {
+    fn take_bytes(&mut self, take: usize) -> Bytes {
+        if take >= ZERO_COPY_MIN_BYTES {
+            self.buf.split_to(take).freeze()
+        } else {
+            let out = Bytes::copy_from_slice(&self.buf[..take]);
+            self.buf.advance(take);
+            out
+        }
+    }
+
+    /// Take up to `max_len` bytes (zero-copy when `>= ZERO_COPY_MIN_BYTES`,
+    /// copied otherwise so small chunks never pin a 64 KiB slab), refilling
+    /// once if empty. Errors with `UnexpectedEof` on clean EOF.
+    async fn take_chunk(&mut self, max_len: usize) -> std::io::Result<Bytes> {
+        if self.buf.is_empty() && !self.read_more().await? {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "eof in response body",
+            ));
+        }
+        let take = max_len.min(self.buf.len());
+        Ok(self.take_bytes(take))
+    }
+
+    /// Take up to `max_len` bytes for EOF-delimited bodies, returning
+    /// `Ok(None)` on clean EOF.
+    async fn take_chunk_or_eof(&mut self, max_len: usize) -> std::io::Result<Option<Bytes>> {
+        if self.buf.is_empty() && !self.read_more().await? {
+            return Ok(None);
+        }
+        let take = max_len.min(self.buf.len());
+        Ok(Some(self.take_bytes(take)))
+    }
+
+    /// Fill `out` completely from the buffered reader, failing with
+    /// `UnexpectedEof` when the stream ends early.
+    async fn fill_exact(&mut self, out: &mut [u8]) -> std::io::Result<()> {
+        let mut filled = 0;
+        while filled < out.len() {
+            if self.buf.is_empty() && !self.read_more().await? {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
                     "eof in response body",
                 ));
             }
-            let take = (n - out.len()).min(self.available().len());
-            out.extend_from_slice(&self.available()[..take]);
-            self.consume(take);
+            let take = (out.len() - filled).min(self.buf.len());
+            out[filled..filled + take].copy_from_slice(&self.buf[..take]);
+            self.buf.advance(take);
+            filled += take;
         }
-        Ok(out)
+        Ok(())
     }
 
-    /// Read one CRLF (or LF) terminated line including its terminator.
+    /// Read one CRLF (or LF) terminated line including its terminator in a
+    /// single O(n) pass. Returns an owned `Vec<u8>` + `advance()` rather than
+    /// `split_to().freeze()` so framing metadata never promotes `self.buf` to
+    /// a shared `KIND_ARC` slab.
     ///
-    /// A line exceeding [`super::CHUNK_LINE_MAX`] errors instead of growing
-    /// `self.buf` without bound (a backend that never terminates its chunk
-    /// line would otherwise balloon memory). Same cap semantics as the
-    /// mod.rs body reader: the check runs on the terminator-found paths too,
-    /// so an over-long line is never returned.
+    /// A line exceeding [`super::CHUNK_LINE_MAX`] errors before refilling
+    /// beyond the limit.
     async fn read_line(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut scanned = 0usize;
         loop {
-            let avail = self.available();
-            if let Some(rel) = avail.windows(2).position(|w| w == b"\r\n") {
-                let line = avail[..rel + 2].to_vec();
-                if line.len() > super::CHUNK_LINE_MAX {
+            if let Some(rel) = self.buf[scanned..].iter().position(|&b| b == b'\n') {
+                let end = scanned + rel + 1;
+                if end > super::CHUNK_LINE_MAX {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "chunk line too long",
                     ));
                 }
-                self.consume(rel + 2);
+                let line = self.buf[..end].to_vec();
+                self.buf.advance(end);
                 return Ok(line);
             }
-            if let Some(rel) = avail.iter().position(|&b| b == b'\n') {
-                let line = avail[..rel + 1].to_vec();
-                if line.len() > super::CHUNK_LINE_MAX {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "chunk line too long",
-                    ));
-                }
-                self.consume(rel + 1);
-                return Ok(line);
-            }
-            // No terminator in the buffer: the available portion is one
-            // (partial) line — bound it before extending. Checking
-            // `available()` (not `buf.len()`) keeps consumed bytes out of
-            // the accounting when `pos > 0`; `read_more` drains the consumed
-            // prefix on refill, so this is also the true memory bound. A
-            // line exactly at the cap whose terminator is split across reads
-            // is still served (the scan above finds it once the extension
-            // lands; the line-length check on the terminator paths then
-            // applies).
-            if self.available().len() > super::CHUNK_LINE_MAX {
+            scanned = self.buf.len();
+            if scanned >= super::CHUNK_LINE_MAX {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "chunk line too long",
@@ -1025,18 +1146,6 @@ fn is_blank_line(b: &[u8]) -> bool {
     b.iter().all(|&c| matches!(c, b'\r' | b'\n' | b' ' | b'\t'))
 }
 
-/// Decode a chunked response body and stream it as HTTP/2 DATA frames.
-///
-/// Returns `Ok(true)` if the backend truncated or corrupted the chunked
-/// stream mid-body (the h2 stream has been reset and MUST NOT end clean),
-/// `Ok(false)` after a clean 0-chunk end. Go ReverseProxy parity
-/// (httputil/reverseproxy.go:537-543): copyResponse panics
-/// http.ErrAbortHandler on ANY mid-body read error, and the net/http h2
-/// server answers that panic with RST_STREAM + ErrCodeInternal
-/// (h2_bundle.go handlerPanicRST) — a truncated backend body must never
-/// surface as a clean, complete response (round-18 M3). The old "Read
-/// errors truncate the body (Go treats an aborted backend body as EOF)"
-/// comment was a false citation: Go aborts the whole exchange.
 async fn stream_chunked_body(
     reader: &mut BodyReader<'_, impl AsyncRead + Unpin>,
     send: &mut SendStream<Bytes>,
@@ -1063,9 +1172,6 @@ async fn stream_chunked_body(
             Err(_) => return abort_stream(send).await,
         };
         if size == 0 {
-            // Trailing headers until the final blank line (RFC 7230 §4.1.2).
-            // An EOF before the terminator truncates the trailer — abort,
-            // like Go's chunkedReader readTrailer (ErrUnexpectedEOF).
             loop {
                 match reader.read_line().await {
                     Ok(t) if !is_blank_line(&t) => continue,
@@ -1074,24 +1180,20 @@ async fn stream_chunked_body(
                 }
             }
         }
-        // Round 10 (MEDIUM): `size` comes from the backend's chunk-size
-        // line — buffering it in one `read_exact(size)` allocates
-        // attacker-influenced memory (a misbehaving backend or proxied
-        // origin can emit an arbitrarily large chunk). Stream the chunk
-        // in bounded slices instead; the frame stays chunked
-        // (end_stream=false on every slice).
         let mut remaining = size;
         while remaining > 0 {
             let n = remaining.min(MAX_CHUNK_SIZE);
-            let data = match reader.read_exact(n).await {
-                Ok(d) => d,
+            let chunk = match reader.take_chunk(n).await {
+                Ok(c) => c,
                 Err(_) => return abort_stream(send).await, // chunk cut short
             };
-            send.send_data(Bytes::from(data), false)?;
-            remaining -= n;
+            remaining -= chunk.len();
+            send_h2_data(send, chunk, false).await?;
         }
-        if reader.read_exact(2).await.is_err() {
-            return abort_stream(send).await; // missing trailing CRLF
+        let mut terminator = [0u8; 2];
+        match reader.fill_exact(&mut terminator).await {
+            Ok(()) if terminator == *b"\r\n" => {}
+            _ => return abort_stream(send).await, // missing/malformed trailing CRLF
         }
     }
 }
@@ -1245,36 +1347,13 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
             );
             h2::Error::from(h2::Reason::INTERNAL_ERROR)
         })?;
-    for (n, v) in &headers {
+    for (n, v) in headers {
         if is_hop_by_hop(n.as_str()) {
             continue;
         }
-        // Go copyHeader parity (httputil/reverseproxy.go): dst.Add per row —
-        // duplicate rows (Set-Cookie, Warning, ...) accumulate as separate
-        // h2 header lines instead of the last row silently replacing the
-        // earlier ones (round-18 M2).
-        resp.headers_mut().append(n.clone(), v.clone());
+        resp.headers_mut().append(n, v);
     }
 
-    // Round-18 FIX 1: responses to HEAD requests and the no-body statuses
-    // 204/304 never carry a DATA body — Go's net/http suppress gate is
-    // server.go:1513 (`req.Method == "HEAD" || !bodyAllowedForStatus(code)`
-    // || code == StatusNoContent) with `bodyAllowedForStatus`
-    // (transfer.go:459-461) false for 204/304/1xx, and `fixLength` returns 0
-    // for those shapes (transfer.go:250-252, 700-703). The h2 relay must
-    // therefore end the stream with the response head: the body legs below
-    // would otherwise wait on a backend that DECLARES a body length (or
-    // holds the connection open with no framing at all) and never sends
-    // bytes that, for these responses, can never come — the pre-fix hang,
-    // and behind it the round-18 M3 CL-arm RST on the backend's clean EOF
-    // (a truthful HEAD Content-Length read as a truncated body).
-    //
-    // Content-Length is stripped for 204/304 (mirror of the server twin
-    // vhost_h2c and of the h1 net/http write layer: suppressedHeadersNoBody
-    // = {Content-Length, TE} for 204, suppressedHeaders304 = {Content-Type,
-    // Content-Length, TE} for 304 — go1.25 server.go:1483-1497); a HEAD
-    // answer to a body-bearing status KEEPS it (it truthfully describes the
-    // GET the client would receive — RFC 9110 §8.6).
     if is_head || status == 204 || status == 304 {
         if status == 204 || status == 304 {
             resp.headers_mut().remove("content-length");
@@ -1282,37 +1361,30 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
         respond.send_response(resp, true)?;
         return Ok(());
     }
-    // A chunked response must not forward the backend's Content-Length row
-    // (RFC 9113 §8.1.1: a declared length need not equal the decoded DATA
-    // length, and an h2 peer may fail the stream on the mismatch) — Go
-    // deletes it once Transfer-Encoding: chunked wins the framing
-    // (net/http/transfer.go). Round-18 FIX 3; the row is still validated
-    // above (a garbage value under chunked fails the whole head).
     if chunked {
         resp.headers_mut().remove("content-length");
+    } else if content_length == Some(0) {
+        respond.send_response(resp, true)?;
+        return Ok(());
     }
 
     let mut send = respond.send_response(resp, false)?;
-    let mut reader = BodyReader::new(r, head[body_offset..].to_vec());
+    let mut reader = BodyReader::new(
+        r,
+        &head[body_offset..],
+        if chunked { None } else { content_length },
+    );
 
-    // Every body leg ends the stream exactly two ways: a clean, fully
-    // delivered body falls through to the single END_STREAM below, and a
-    // backend that dies mid-body returns here with the stream already
-    // reset (abort_stream) — truncation is NEVER a clean end (round-18 M3,
-    // Go copyResponse abort parity).
     if chunked {
         if stream_chunked_body(&mut reader, &mut send).await? {
             return Ok(()); // truncated: stream reset, no clean end
         }
     } else if let Some(mut remaining) = content_length {
         while remaining > 0 {
-            let n = remaining.min(8192) as usize;
-            let data = match reader.read_exact(n).await {
-                Ok(d) => d,
+            let n = remaining.min(MAX_CHUNK_SIZE as u64) as usize;
+            let chunk = match reader.take_chunk(n).await {
+                Ok(c) => c,
                 Err(_) => {
-                    // Truncated CL-bounded body: the declared length was
-                    // never delivered — RST, never a clean END_STREAM that
-                    // reads like the full response.
                     debug!(
                         "https plugin backend truncated a Content-Length-bounded body, \
                          resetting the stream"
@@ -1320,30 +1392,22 @@ async fn stream_h2_response<R: AsyncRead + Unpin>(
                     return abort_stream(&mut send).await.map(|_| ());
                 }
             };
-            remaining -= data.len() as u64;
-            send.send_data(Bytes::from(data), false)?;
+            remaining -= chunk.len() as u64;
+            send_h2_data(&mut send, chunk, remaining == 0).await?;
         }
+        return Ok(());
     } else {
-        // No length framing: read to EOF (the backend closes the connection).
-        // A genuine EOF is the natural end; an io error mid-body aborts like
-        // every other truncated backend body (Go copyResponse).
         loop {
-            if reader.available().is_empty() {
-                match reader.read_more().await {
-                    Ok(true) => {}
-                    Ok(false) => break,
-                    Err(_) => {
-                        debug!("https plugin backend body read error, resetting the stream");
-                        return abort_stream(&mut send).await.map(|_| ());
-                    }
+            match reader.take_chunk_or_eof(MAX_CHUNK_SIZE).await {
+                Ok(Some(chunk)) => {
+                    send_h2_data(&mut send, chunk, false).await?;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    debug!("https plugin backend body read error, resetting the stream");
+                    return abort_stream(&mut send).await.map(|_| ());
                 }
             }
-            if reader.available().is_empty() {
-                break;
-            }
-            let data = reader.available().to_vec();
-            reader.consume(data.len());
-            send.send_data(Bytes::from(data), false)?;
         }
     }
     send.send_data(Bytes::new(), true)?;
