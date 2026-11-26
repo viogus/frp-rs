@@ -360,6 +360,14 @@ impl AsyncRead for Stream {
             buf[n..n + k].copy_from_slice(&chunk.as_ref()[..k]);
             n += k;
             chunk.advance(k);
+            if chunk.is_empty() {
+                if let Some(chunk) = shared.buffer.pop() {
+                    let buf = chunk.into_vec();
+                    if !buf.is_empty() && buf.capacity() <= self.config.split_send_size {
+                        let _ = self.body_pool.push(buf);
+                    }
+                }
+            }
             if n == buf.len() {
                 break;
             }

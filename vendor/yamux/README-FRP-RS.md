@@ -303,41 +303,34 @@ When bumping yamux upstream: re-apply the `body_pool` field threading
 (`poll_write`, `WriteState::Body` completion, `ReadState::Body` init,
 `poll_read` consumed-chunk return), or carry the patch upstream.
 
-## Patch: write path split into read half + shared writer (inline stream writes)
+## Patch: write path split into read half + driver-owned writer (burst flush)
 
-Why: on the frp data plane every data frame was written by the
-connection driver, so `Stream::poll_write` handed each frame to the
-driver task through an mpsc channel and the driver had to be woken —
-measured at 29.1 µs per frame, the bulk of the 83 µs per-packet mux tax.
-The frame must instead reach the socket from the task that produced it.
+Why: upstream's `frame::Io` couples the read and write halves of the socket
+in one type and flushes after every frame. On the frp data plane that is one
+`write` + one `flush` per frame, and the socket halves cannot carry separate
+transport-level bookkeeping (frp wraps both halves of a `tokio::io::split`
+in an activity/stall tracker).
 
 ### What changed
 
 - `frame::Io` (`src/frame/io.rs`) is split into `Reader<R>` (read state
-  machine) and `Writer<W>` (write state machine). `Writer` additionally
-  owns the frame queues: a control queue (ping/pong/goaway/reset/window
-  update, written first) and a data queue, plus `poll_drain`, which
-  writes queued frames one at a time — a frame's header and body must
-  reach the socket contiguously — and flushes when the queues are empty.
+  machine) and `Writer<W>` (write state machine). `Writer` holds a single
+  in-flight frame (`WriteState`) — a frame's header and body must reach the
+  socket contiguously, written as one vectored write (`writev`) — plus a FIFO
+  `queue` used only by `Closing` (`poll_drain`) to drain remaining frames.
+  `poll_finish_current`, `poll_send_frame` and `poll_flush_io` let the driver
+  write each frame immediately (returning pooled bodies at once) and flush
+  at most once per burst of up to 16 frames (never when idle).
 - `Connection::new(socket)` splits the socket
   (`futures::AsyncReadExt::split`) and delegates to
   `Connection::new_split(read, write, cfg, mode)`. `Connection<T>`'s
   type parameter is the read half; the write half is type-erased
-  (`Box<dyn AsyncWrite + Unpin + Send>`) so `Stream` and `Closing` need
-  no socket type parameter and frp's `YamuxStream = Compat<Stream>`
-  stays as it is.
-- The writer is shared as an `Arc<ConnWriter>` between the driver and
-  every stream. `ConnWriter` is a `tokio::sync::Mutex<frame::Writer>`
-  plus the owner-wake handshake: the driver registers its waker on every
-  poll and sets `owner_wants_lock` when it fails to take the lock; the
-  lock holder releases *then* wakes it (waking while still holding would
-  be answered by another failed `try_lock`, i.e. a lost wakeup).
-- New dependency: `tokio = { version = "1", default-features = false,
-  features = ["sync"] }` (`Cargo.toml`) — `tokio::sync::Mutex` only. No
-  runtime, no `net`, no `time`; tokio is already in the frp dependency
-  graph, so no crate enters the build.
-- `Connection`'s driver and `Closing` both write through that lock, so
-  there is exactly one writer on the wire.
+  (`Box<dyn AsyncWrite + Unpin + Send>`) wrapped directly in
+  `frame::Writer`, owned by `Active` (and transferred to `Closing` on
+  close), so there is only ever one writer on the wire, with no mutex,
+  `Arc` or `AtomicWaker`. `Stream`s send frames to the driver through the
+  bounded channel.
+- No extra `tokio` dependency.
 
 ### Upgrade note
 
@@ -406,10 +399,11 @@ So a `Ready`-forever terminal state has no caller that can keep polling it.
 
 ### Blocked write: enforced **above** the port, not inside it
 
-`Active::poll` drives writes through `poll_ready_unpin` / `start_send_unpin` /
-`poll_flush_unpin` (`vendor/yamux/src/connection.rs:630-639`) and, when the
-transport is not writable, falls through to `return Poll::Pending`
-(`:720`) after the socket registered its waker. The crate itself still has **no
+`Active::poll` drives writes through `Active::poll_writes`
+(`vendor/yamux/src/connection.rs:617`) using `Writer::poll_finish_current` /
+`poll_send_frame` / `poll_flush_io` (`vendor/yamux/src/frame/io.rs:125-141`)
+and, when the transport is not writable, falls through to `return Poll::Pending`
+after the socket registered its waker. The crate itself still has **no
 write deadline** — `grep -rn "write_timeout\|WriteTimeout\|write deadline"
 vendor/yamux/src/` is empty and `Config` (`vendor/yamux/src/lib.rs:100-116`) has
 no timeout field — and it is deliberately runtime-agnostic, so a timer cannot
@@ -500,13 +494,13 @@ difference, by file:
 
 | File | Changed lines | What |
 |------|---------------|------|
-| `Cargo.toml` | 20 | `crossbeam-queue = "0.3"` (body-pool patch); restored `[dev-dependencies.quickcheck]` + empty `[workspace]` (vendoring repair) — 20 non-blank changed lines, 23 with blanks |
-| `src/connection.rs` | 245 | per-stream RST on inbound cap; exact outbound-ACK counter; threads the body pool into `Active`/`frame::Io` |
+| `Cargo.toml` | — | `crossbeam-queue = "0.3"` (body-pool patch); restored `[dev-dependencies.quickcheck]` + empty `[workspace]` (vendoring repair); the unused `[dependencies.tokio]` is removed (write-path split no longer needs it) |
+| `src/connection.rs` | — | per-stream RST on inbound cap; exact outbound-ACK counter; threads the body pool into `Active`/`frame::Writer`; `new_split` + driver-owned `Writer` with burst flush (`poll_writes`, `writer_needs_flush`, `reply_in_flight`) |
 | `src/connection/stream/flow_control.rs` | 210 | receive-window cap clamp; seed-RTT growth gate (`window_growth_gate_open`) |
 | `src/lib.rs` | 101 | `max_stream_receive_window` + setter; `window_growth_seed_rtt` + accessors, `WINDOW_GROWTH_SEED_RTT`, `Config::default()` seed; `web_time::Duration` import; clause additions inside upstream's `#[cfg(test)] impl Arbitrary for Config` (repair #3 above) |
-| `src/frame/io.rs` | 67 | pooled read/write bodies, `split_send_size` field, body return at `WriteState::Body` completion, pooled `ReadState::Body` init |
-| `src/connection/stream.rs` | 39 | body-pool field + `poll_write` reuse + `poll_read` return; test call site gains the pool (repair #2 above) |
-| `src/connection/closing.rs` | 8 | `#[cfg(test)]` only: its `frame::Io::new(...)` call gains the body-pool argument forced by the `Io::new` signature change — no behaviour change, not a separate patch |
+| `src/frame/io.rs` | — | `Io` split into `Reader`/`Writer`; pooled read/write bodies (`vec![0u8; len]` + `ZERO_CHUNK` slab fill under `opt-level = "z"`), `split_send_size` field, body return at `WriteState::Body` completion; `poll_finish_current`/`poll_send_frame`/`poll_flush_io` |
+| `src/connection/stream.rs` | — | body-pool field + `poll_write` reuse + immediate `poll_read` consumed-chunk return; test call site gains the pool (repair #2 above) |
+| `src/connection/closing.rs` | — | takes ownership of the `frame::Writer` transferred from `Active` and drains it (`poll_drain`) |
 | `src/frame/header.rs` | 4 | `#[allow(dead_code)]` on `internal_error()` |
 | `src/frame.rs` | 4 | same, on `Frame::internal_error()` |
 | `Cargo.lock` | — | present in the tarball, not vendored (regenerated by the standalone check) |

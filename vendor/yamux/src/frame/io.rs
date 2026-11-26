@@ -34,9 +34,9 @@ const MAX_FRAME_BODY_LEN: usize = crate::MIB;
 /// The read half of a connection's I/O: frame decoding plus the read-side
 /// body-pool bookkeeping.
 ///
-/// frp-rs patch: the read and write halves are separate types so the write
-/// half can be moved behind a lock and driven by whoever owns a stream (see
-/// `frame::Writer`). Reads stay with the connection driver.
+/// frp-rs patch: the read and write halves are separate types so the I/O
+/// halves can come from a `tokio::io::split`. Reads stay with the connection
+/// driver (see `frame::Writer` for the write side).
 #[derive(Debug)]
 pub(crate) struct Reader<R> {
     id: Id,
@@ -65,22 +65,18 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 /// The write half of a connection's I/O: frame encoding, the body-pool
 /// return path, and the outbound frame queues.
 ///
-/// frp-rs patch: frames are queued in two priorities and written by whoever
-/// holds the connection's write lock — inline by the `Stream` that produced a
-/// data frame, otherwise by the connection driver. Control frames (pong,
-/// GoAway, stream resets, window updates) always precede queued data frames.
-/// Only one frame is ever in flight (`WriteState`): a frame's header and body
-/// must reach the socket contiguously, so a new frame is only started once the
-/// previous one is fully written. Header and body are written as one vectored
-/// write (`writev`) — one syscall per frame.
+/// frp-rs patch: the connection driver owns the `Writer` and writes frames
+/// directly. Only one frame is ever in flight (`WriteState`): a frame's header
+/// and body must reach the socket contiguously, so a new frame is only started
+/// once the previous one is fully written. Header and body are written as one
+/// vectored write (`writev`) — one syscall per frame. `queue` is used only by
+/// `Closing` to drain remaining frames in FIFO order.
 #[derive(Debug)]
 pub(crate) struct Writer<W> {
     id: Id,
     io: W,
     write_state: WriteState,
-    /// Control frames, drained before `queue`.
-    control: VecDeque<Frame<()>>,
-    /// Data (and stream-close) frames, in submission order.
+    /// Pending frames queued during graceful close ([`Closing`]).
     queue: VecDeque<Frame<()>>,
     /// frp-rs patch: connection-scoped body-buffer pool (send + read side).
     /// A fully written data-frame body is returned here (WriteState::Body
@@ -108,20 +104,13 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             id,
             io,
             write_state: WriteState::Init,
-            control: VecDeque::new(),
             queue: VecDeque::new(),
             body_pool,
             split_send_size,
         }
     }
 
-    /// Queue a control frame (pong, GoAway, stream reset, window update).
-    /// Control frames are written before any queued data frame.
-    pub(crate) fn push_control(&mut self, frame: Frame<()>) {
-        self.control.push_back(frame);
-    }
-
-    /// Queue a data or stream-close frame, after any control frame.
+    /// Queue a frame for draining by [`Closing`].
     pub(crate) fn push_data(&mut self, frame: Frame<()>) {
         self.queue.push_back(frame);
     }
@@ -129,9 +118,28 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     /// Whether a new frame can be started right away: nothing is in flight
     /// and nothing is queued.
     pub(crate) fn is_idle(&self) -> bool {
-        matches!(self.write_state, WriteState::Init)
-            && self.control.is_empty()
-            && self.queue.is_empty()
+        matches!(self.write_state, WriteState::Init) && self.queue.is_empty()
+    }
+
+    /// Drive any in-flight frame to completion without flushing `io`.
+    pub(crate) fn poll_finish_current(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self).poll_ready(cx)
+    }
+
+    /// Start sending `frame` (caller must ensure `is_idle()`) and immediately
+    /// drive its vectored write without calling `io.poll_flush`.
+    pub(crate) fn poll_send_frame(
+        &mut self,
+        cx: &mut Context<'_>,
+        frame: Frame<()>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut *self).start_send(frame)?;
+        Pin::new(self).poll_ready(cx)
+    }
+
+    /// Flush the underlying writer once a burst finishes.
+    pub(crate) fn poll_flush_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(self).poll_flush(cx)
     }
 
     /// Write every queued frame, control queue first, then flush.
@@ -147,7 +155,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             // starting a frame while another one is in flight would splice
             // the two frames' bytes together on the wire.
             if matches!(self.write_state, WriteState::Init) {
-                match self.control.pop_front().or_else(|| self.queue.pop_front()) {
+                match self.queue.pop_front() {
                     Some(frame) => Pin::new(&mut *self).start_send(frame)?,
                     // Nothing queued: write whatever is in flight and flush.
                     None => {
@@ -385,9 +393,29 @@ impl<R: AsyncRead + Unpin> Stream for Reader<R> {
                         let buffer = if body_len == 0 {
                             Vec::new()
                         } else {
-                            let mut buf = this.body_pool.pop().unwrap_or_default();
-                            buf.resize(body_len, 0);
-                            buf
+                            // Under `opt-level = "z"`, `Vec::resize(n, 0)`
+                            // compiles `Vec::extend_with` as a byte-by-byte
+                            // loop (~20-30% of frpc CPU on tcp-mux). Use
+                            // `vec![0u8; body_len]` (`alloc_zeroed`/`calloc`)
+                            // on pool miss and copy from a static zero slab
+                            // (`memcpy`) when growing a shorter pooled buffer.
+                            static ZERO_CHUNK: [u8; 4096] = [0u8; 4096];
+                            match this.body_pool.pop() {
+                                Some(mut buf) if buf.capacity() >= body_len => {
+                                    if buf.len() >= body_len {
+                                        buf.truncate(body_len);
+                                    } else {
+                                        let mut need = body_len - buf.len();
+                                        while need > 0 {
+                                            let step = need.min(ZERO_CHUNK.len());
+                                            buf.extend_from_slice(&ZERO_CHUNK[..step]);
+                                            need -= step;
+                                        }
+                                    }
+                                    buf
+                                }
+                                _ => vec![0u8; body_len],
+                            }
                         };
                         this.read_state = ReadState::Body {
                             header,

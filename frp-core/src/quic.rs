@@ -292,11 +292,46 @@ impl QuicConnection {
     }
 }
 
+/// QUIC UDP socket buffer target ladder (bytes). Matches Go `quic-go` (7 MiB)
+/// at the top and falls back smoothly when an OS sysctl (e.g. macOS
+/// `kern.ipc.maxsockbuf`) rejects larger values. Linux silently clamps to
+/// `net.core.{rmem,wmem}_max`.
+const QUIC_UDP_BUF_CANDIDATES: [usize; 4] = [
+    7 * 1024 * 1024,
+    4 * 1024 * 1024,
+    2 * 1024 * 1024,
+    1024 * 1024,
+];
+
+/// Enlarge `SO_RCVBUF` and `SO_SNDBUF` on a QUIC UDP socket when below the
+/// 7 MiB target so high-rate bursts do not overflow the 212 KiB kernel default.
+fn configure_quic_udp_socket(socket: &std::net::UdpSocket) {
+    let sock_ref = socket2::SockRef::from(socket);
+    let cur_recv = sock_ref.recv_buffer_size().unwrap_or(0);
+    for &sz in &QUIC_UDP_BUF_CANDIDATES {
+        if sz <= cur_recv {
+            break;
+        }
+        if sock_ref.set_recv_buffer_size(sz).is_ok() {
+            break;
+        }
+    }
+    let cur_send = sock_ref.send_buffer_size().unwrap_or(0);
+    for &sz in &QUIC_UDP_BUF_CANDIDATES {
+        if sz <= cur_send {
+            break;
+        }
+        if sock_ref.set_send_buffer_size(sz).is_ok() {
+            break;
+        }
+    }
+}
+
 /// Build a quinn `TransportConfig` from Go-frp-compatible parameters.
 ///
 /// Shared by the listener, dial, and on-socket (XTCP P2P) code paths:
-/// max_idle_timeout, keep_alive_interval, max_concurrent_bidi_streams and
-/// stream_receive_window all come from the same `QuicTransportParams`.
+/// max_idle_timeout, keep_alive_interval, max_concurrent_bidi_streams,
+/// stream_receive_window, and send_window all derive from `QuicTransportParams`.
 fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     // Round 10 (LOW): a hostile/legacy config value (negative or near
@@ -317,7 +352,12 @@ fn build_quic_transport_config(params: &QuicTransportParams) -> quinn::Transport
     // single frp stream is hard-capped at window/RTT — ~100 Mbit/s on a
     // 100 ms path, however fat the link is. Defaults to
     // `DEFAULT_STREAM_RECEIVE_WINDOW` (6 MiB, Go parity).
-    transport.stream_receive_window(params.effective_stream_receive_window().into());
+    // Also scale `send_window` proportionally (`2 * stream_rwnd` = 12 MiB at the
+    // default 6 MiB window) so the sender scales cleanly with configured windows
+    // without buffering tens of MiB per multi-stream session.
+    let stream_rwnd = params.effective_stream_receive_window();
+    transport.stream_receive_window(stream_rwnd.into());
+    transport.send_window(2 * u64::from(stream_rwnd));
     // Connection-level receive window (`initial_max_data`): left at quinn's
     // default (VarInt::MAX) here for the DIAL paths and for the XTCP
     // hole-punched accept path (`quic_accept_on_socket`) — the frps LISTENER
@@ -378,7 +418,7 @@ impl QuicListener {
         let key = PrivateKeyDer::from_pem_slice(key_pem.as_bytes())
             .map_err(|e| io::Error::other(format!("parse key: {e}")))?;
 
-        let tls_config = rustls::ServerConfig::builder()
+        let tls_config = crate::transport::tls::server_config_builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)
             .map_err(|e| io::Error::other(format!("TLS config: {e}")))?;
@@ -417,6 +457,7 @@ impl QuicListener {
         server_config.transport_config(Arc::new(transport));
 
         let socket = std::net::UdpSocket::bind(addr)?;
+        configure_quic_udp_socket(&socket);
         let endpoint = quinn::Endpoint::new(
             quinn::EndpointConfig::default(),
             Some(server_config),
@@ -551,14 +592,14 @@ pub async fn dial_quic_connection_with_params(
             "QUIC TLS certificate verification is DISABLED (InsecureSkipVerify=true). \
              All control and data-plane traffic is vulnerable to MITM attacks."
         );
-        rustls::ClientConfig::builder()
+        crate::transport::tls::client_config_builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth()
     } else if use_system_ca {
         let verifier = crate::transport::tls::build_verifier(roots, true)
             .map_err(|e| io::Error::other(format!("QUIC TLS verifier: {e}")))?;
-        let builder = rustls::ClientConfig::builder()
+        let builder = crate::transport::tls::client_config_builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier);
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
@@ -578,8 +619,8 @@ pub async fn dial_quic_connection_with_params(
             builder.with_no_client_auth()
         }
     } else if let Some(store) = roots {
-        let builder =
-            rustls::ClientConfig::builder().with_root_certificates(std::sync::Arc::new(store));
+        let builder = crate::transport::tls::client_config_builder()
+            .with_root_certificates(std::sync::Arc::new(store));
 
         if let (Some(cert_path), Some(key_path)) = (cert_file, key_file) {
             let cert_pem = std::fs::read_to_string(cert_path)
@@ -611,7 +652,7 @@ pub async fn dial_quic_connection_with_params(
              All control and data-plane traffic is vulnerable to MITM attacks. \
              Set tls.trusted_ca_file in config to enable verification."
         );
-        rustls::ClientConfig::builder()
+        crate::transport::tls::client_config_builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth()
@@ -632,6 +673,7 @@ pub async fn dial_quic_connection_with_params(
         "0.0.0.0:0"
     };
     let socket = std::net::UdpSocket::bind(bind_addr)?;
+    configure_quic_udp_socket(&socket);
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
@@ -683,7 +725,7 @@ pub async fn quic_dial_conn_on_socket(
     // No CA on a hole-punched peer socket: skip certificate verification
     // (InsecureSkipVerify=true), matching Go frp's auto-generated certs.
     let verifier = std::sync::Arc::new(crate::transport::InsecureSkipVerify);
-    let mut tls_config = rustls::ClientConfig::builder()
+    let mut tls_config = crate::transport::tls::client_config_builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -696,6 +738,7 @@ pub async fn quic_dial_conn_on_socket(
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_tls));
     client_config.transport_config(Arc::new(build_quic_transport_config(&params)));
 
+    configure_quic_udp_socket(&socket);
     let mut endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         None,
@@ -749,6 +792,7 @@ pub async fn quic_accept_on_socket(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_tls));
     server_config.transport_config(Arc::new(build_quic_transport_config(&params)));
 
+    configure_quic_udp_socket(&socket);
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
@@ -877,8 +921,27 @@ mod tests {
             dbg.contains("stream_receive_window: 6291456"),
             "built transport must carry the 6 MiB window: {dbg}"
         );
+        assert!(
+            dbg.contains("send_window: 12582912"),
+            "built transport must scale send_window with stream_receive_window (12 MiB): {dbg}"
+        );
         // Sanity: the default really did move off quinn's own 1,250,000 B.
         assert!(!dbg.contains("stream_receive_window: 1250000"));
+    }
+
+    #[test]
+    fn configure_quic_udp_socket_enlarges_buffers_without_failing() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind udp");
+        configure_quic_udp_socket(&sock);
+        let sock_ref = socket2::SockRef::from(&sock);
+        assert!(
+            sock_ref.recv_buffer_size().unwrap() >= 256 * 1024,
+            "SO_RCVBUF should be enlarged when permitted"
+        );
+        assert!(
+            sock_ref.send_buffer_size().unwrap() >= 256 * 1024,
+            "SO_SNDBUF should be enlarged when permitted"
+        );
     }
 
     /// A hostile or fat-fingered value must not produce a useless 1-byte

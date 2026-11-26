@@ -582,6 +582,10 @@ impl AsyncWrite for IoStream {
         Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
     }
 
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
@@ -2584,6 +2588,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
