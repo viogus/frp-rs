@@ -531,3 +531,81 @@ async fn udp_disabled_keeps_connect_only_behaviour() {
     s.read_exact(&mut reply).await.unwrap();
     assert_eq!(reply[1], 0x07, "UDP disabled -> REP_CMD_NOT_SUPPORTED");
 }
+
+#[tokio::test]
+async fn udp_associate_domain_cache_hit_and_burst_round_trip() {
+    // Exercises:
+    // 1. ATYP_DOMAIN non-IP hostname ("localhost") cache miss -> async resolve;
+    // 2. Subsequent 24-packet burst of 1,400-byte datagrams hitting the
+    //    synchronous DNS cache fast path + opportunistic try_recv_from drain +
+    //    in-place zero-copy reply framing.
+    let mut echo_sock = None;
+    for addr in tokio::net::lookup_host(("localhost", 0))
+        .await
+        .expect("resolve localhost")
+    {
+        if let Ok(sock) = UdpSocket::bind(SocketAddr::new(addr.ip(), 0)).await {
+            echo_sock = Some(sock);
+            break;
+        }
+    }
+    let echo_sock = echo_sock.expect("bind localhost echo socket");
+    let backend = echo_sock.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 2048];
+        while let Ok((n, from)) = echo_sock.recv_from(&mut buf).await {
+            let _ = echo_sock.send_to(&buf[..n], from).await;
+        }
+    });
+    let handle = frp_client::plugin::start_socks5_proxy(&plugin_cfg())
+        .await
+        .expect("start socks5 plugin");
+    let (_control, relay) = udp_associate(handle.local_addr, None).await;
+    let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    // First packet warms the DNS cache via the slow path (mixed case tests
+    // stack lowercase normalization).
+    client
+        .send_to(
+            &framed_domain("LocalHost", backend.port(), b"warm-dns"),
+            relay,
+        )
+        .await
+        .unwrap();
+    let first = recv_with_timeout(&client)
+        .await
+        .expect("DNS warm-up reply timed out");
+    assert_eq!(unframe(&first).1, b"warm-dns");
+
+    // Burst 24 distinct 1,400-byte packets over the cached domain fast path.
+    let count = 24usize;
+    for i in 0..count {
+        let mut payload = vec![(i as u8).wrapping_mul(13); 1400];
+        payload[0] = i as u8;
+        client
+            .send_to(&framed_domain("LOCALHOST", backend.port(), &payload), relay)
+            .await
+            .unwrap();
+    }
+    let mut seen = vec![false; count];
+    for _ in 0..count {
+        let reply = recv_with_timeout(&client)
+            .await
+            .expect("burst reply timed out");
+        let (_, payload) = unframe(&reply);
+        assert_eq!(payload.len(), 1400);
+        let idx = payload[0] as usize;
+        assert!(idx < count, "unexpected packet index {idx}");
+        assert!(
+            payload[1..]
+                .iter()
+                .all(|&b| b == (idx as u8).wrapping_mul(13)),
+            "corrupted payload for packet {idx}"
+        );
+        seen[idx] = true;
+    }
+    assert!(
+        seen.into_iter().all(|ok| ok),
+        "every burst packet must echo"
+    );
+}
