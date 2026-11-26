@@ -54,12 +54,9 @@ pub(super) fn now_epoch_ms() -> u64 {
 /// with the session's reader task (`run_udp_session`). The reader task
 /// refreshes it per inbound packet (local replies) with one lock-free
 /// Relaxed store — that side of the per-packet path takes no shard lock.
-/// The work-conn reader refreshes it per remote datagram too, but it must
-/// reach the entry through the shard to find the `Arc`: it clones the Arc
-/// under the shard lock and performs the store AFTER the guard drops (the
-/// store itself has no ordering dependency on the shard — both writers use
-/// Relaxed). The shard lock therefore guards only map access (lookup,
-/// insert/remove, the reap sweep), never a liveness write.
+/// The work-conn reader refreshes it per remote datagram in place under the
+/// shard lock (one Relaxed store with pre-sampled epoch ms — avoiding an
+/// `Arc<AtomicU64>` clone/drop pair per packet).
 pub(super) struct UdpSession {
     pub(super) socket: Arc<UdpSocket>,
     pub(super) last_active: Arc<AtomicU64>,
@@ -144,6 +141,35 @@ impl UdpSessionTable {
 /// working until their 30s idle reap frees a slot (Go removes nothing
 /// early either — a session Go would still serve, frp-rs still serves).
 pub(super) const UDP_SESSION_CAP: usize = 1024;
+
+/// Read one client-side UDP work-conn frame into `read_scratch`.
+///
+/// Stack-pinned via `tokio::pin!` inside `run_udp_work_conn`'s reader loop so
+/// a 5s `housekeep.tick()` or benign `false -> false` `reader_cancel` wakeup
+/// never cancels an in-flight `read_exact` and desynchronizes the wire framing.
+async fn read_one_client_udp_frame(
+    w_r: &mut tokio::io::BufReader<BoxedReadHalf>,
+    read_scratch: &mut Vec<u8>,
+    v2: bool,
+    udp_codec: &str,
+) -> Result<UdpBinaryRead, frp_core::Error> {
+    if v2 && !udp_codec.is_empty() {
+        // Binary UDP codec negotiated (Go v0.71.0): type-19 frames decode to
+        // native SocketAddr form, skipping the per-packet String alloc +
+        // reparse the message path performs.
+        read_msg_v2_udp_binary_socket(w_r, read_scratch).await
+    } else if v2 {
+        read_msg_v2_with_udp_codec(w_r, None, read_scratch)
+            .await
+            .map(UdpBinaryRead::Message)
+    } else {
+        read_msg_v1(w_r).await.map(UdpBinaryRead::Message)
+    }
+}
+
+/// Maximum consecutive ready reply datagrams written before issuing a single
+/// `flush()` on buffered transports (yamux, TLS, KCP, `CipherWriter`).
+const UDP_FLUSH_BATCH_MAX: usize = 16;
 
 /// Bounded wait for the writer to return the buffer of the packet it is
 /// still encoding (P1). Under a reply burst the session recv loop can outrun
@@ -257,15 +283,11 @@ async fn run_udp_session(
                 }
             }
             _ = idle.tick() => {
-                // Reap only when BOTH directions have been idle: the entry's
-                // last_active is refreshed by the reader on inbound remote
-                // packets and by us on local replies.
-                let idle_for = {
-                    let map = sessions.shard(&remote);
-                    map.get(&remote)
-                        .map(|e| now_epoch_ms().saturating_sub(e.last_active.load(Ordering::Relaxed)))
-                        .unwrap_or(UDP_SESSION_IDLE_TIMEOUT_MS)
-                };
+                // Reap only when BOTH directions have been idle: the shared
+                // `last_active` AtomicU64 is refreshed by the reader on inbound
+                // remote packets and by us on local replies — read it directly
+                // without locking the shard every second.
+                let idle_for = now_epoch_ms().saturating_sub(last_active.load(Ordering::Relaxed));
                 if idle_for > UDP_SESSION_IDLE_TIMEOUT_MS {
                     debug!(remote = %remote, "UDP session idle for >30s, closing");
                     break;
@@ -410,6 +432,9 @@ pub(super) async fn run_udp_work_conn(
     // Shared-limiter model (F1): one bucket for both directions, already
     // created at registration when mode == ""/"client"/"both" (the client
     // side owns the limiting); None in "server" mode. rate 0 → None.
+    // Skip trailing flush on raw unencrypted TcpStream (TCP_NODELAY already
+    // pushes immediately; buffered transports and CipherWriter still flush).
+    let no_flush = work.try_tcp().is_some() && !use_enc;
     let (w_r, w_w) = match split_work_conn_halves(work) {
         Ok(pair) => pair,
         Err(e) => {
@@ -487,335 +512,323 @@ pub(super) async fn run_udp_work_conn(
         // Reusable payload buffer for the V2 UDP read path (avoids a heap
         // alloc per UDP packet).
         let mut read_scratch: Vec<u8> = Vec::new();
-        loop {
-            tokio::select! {
-                biased;
-                changed = reader_cancel.changed() => {
-                    if changed.is_err() || *reader_cancel.borrow() { break; }
-                }
-                result = async {
-                    if v2 && !reader_udp_codec.is_empty() {
-                        // Binary UDP codec negotiated (Go v0.71.0): type-19
-                        // frames decode to native SocketAddr form, skipping
-                        // the per-packet String alloc + reparse the message
-                        // path performs (audit LOW: decode formats then
-                        // re-parses).
-                        read_msg_v2_udp_binary_socket(&mut w_r, &mut read_scratch).await
-                    } else if v2 {
-                        read_msg_v2_with_udp_codec(&mut w_r, None, &mut read_scratch)
-                            .await
-                            .map(UdpBinaryRead::Message)
-                    } else {
-                        read_msg_v1(&mut w_r).await.map(UdpBinaryRead::Message)
+        // Persistent 5s housekeeping interval (replaces per-iteration
+        // `tokio::time::sleep(5s)` which churned the timer wheel on every
+        // packet AND never fired under continuous traffic, leaking stale
+        // `reader_socks` FDs/ports).
+        let mut housekeep = tokio::time::interval(Duration::from_secs(5));
+        housekeep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        housekeep.tick().await;
+        'frames: loop {
+            // Stack-pin the frame read (mirroring server bridge/udp.rs M1) so
+            // `housekeep.tick()` and benign `reader_cancel.changed()` wakeups
+            // never cancel a partially-read frame. Listing `housekeep.tick()`
+            // BEFORE `&mut read_fut` also ensures 5s housekeeping cannot be
+            // starved under saturated inbound traffic.
+            let result = {
+                let read_fut =
+                    read_one_client_udp_frame(&mut w_r, &mut read_scratch, v2, &reader_udp_codec);
+                tokio::pin!(read_fut);
+                loop {
+                    tokio::select! {
+                        biased;
+                        changed = reader_cancel.changed() => {
+                            if changed.is_err() || *reader_cancel.borrow() {
+                                break 'frames;
+                            }
+                            continue;
+                        }
+                        _ = housekeep.tick() => {
+                            if !session_alive_r.load(Ordering::Acquire) {
+                                debug!(proxy_name = %pn_r, "UDP reader '{}': session dead, stopping", pn_r);
+                                break 'frames;
+                            }
+                            // Sweep stale mirror entries for sessions reaped by
+                            // the idle timeout in O(1) per entry (locking only
+                            // each key's shard instead of all 8 shards in an
+                            // O(N^2) scan).
+                            reader_socks.retain(|k, v| {
+                                sessions
+                                    .shard(k)
+                                    .get(k)
+                                    .is_some_and(|e| Arc::ptr_eq(&e.socket, v))
+                            });
+                            continue;
+                        }
+                        res = &mut read_fut => break res,
                     }
-                } => {
-                    match result {
-                        Ok(rd) => {
-                            // Normalize both read forms to a (remote, payload)
-                            // pair; the session machinery below is form-agnostic.
-                            let (remote, mut payload) = match rd {
-                                // Native-address form: destination is already a
-                                // SocketAddr, no text round trip.
-                                UdpBinaryRead::Socket(pkt) => {
-                                    (pkt.remote_addr, pkt.content)
-                                }
-                                UdpBinaryRead::Message(FrpMessage::UDPPacket(up)) => {
-                                    let remote = match up.remote_addr {
-                                        Some(ref ra) => match ra.ip.parse::<IpAddr>() {
-                                            Ok(ip) => SocketAddr::new(ip, ra.port),
-                                            // The `%zone` scope suffix can never
-                                            // appear here: the wire format carries
-                                            // the zone in the SEPARATE `Zone` field
-                                            // (msg.rs UdpAddr mirrors Go
-                                            // net.UDPAddr marshal), so `ra.ip` is
-                                            // always zone-free and this arm is
-                                            // dead code — kept as defense-in-depth
-                                            // (round-13 audit note: the real
-                                            // zoned-v6 loss is the `Zone` field
-                                            // being dropped below — Rust std
-                                            // SocketAddr cannot carry a scope id,
-                                            // and Go's own V2 binary codec drops
-                                            // zones in Go↔Go too, so this is
-                                            // parity, not a regression).
-                                            Err(_) => {
-                                                warn!(ip = %ra.ip, port = ra.port,
+                }
+            };
+            match result {
+                Ok(rd) => {
+                    // Normalize both read forms to a (remote, payload)
+                    // pair; the session machinery below is form-agnostic.
+                    let (remote, mut payload) = match rd {
+                        // Native-address form: destination is already a
+                        // SocketAddr, no text round trip.
+                        UdpBinaryRead::Socket(pkt) => (pkt.remote_addr, pkt.content),
+                        UdpBinaryRead::Message(FrpMessage::UDPPacket(up)) => {
+                            let remote = match up.remote_addr {
+                                Some(ref ra) => match ra.ip.parse::<IpAddr>() {
+                                    Ok(ip) => SocketAddr::new(ip, ra.port),
+                                    // The `%zone` scope suffix can never
+                                    // appear here: the wire format carries
+                                    // the zone in the SEPARATE `Zone` field
+                                    // (msg.rs UdpAddr mirrors Go
+                                    // net.UDPAddr marshal), so `ra.ip` is
+                                    // always zone-free and this arm is
+                                    // dead code — kept as defense-in-depth
+                                    // (round-13 audit note: the real
+                                    // zoned-v6 loss is the `Zone` field
+                                    // being dropped below — Rust std
+                                    // SocketAddr cannot carry a scope id,
+                                    // and Go's own V2 binary codec drops
+                                    // zones in Go↔Go too, so this is
+                                    // parity, not a regression).
+                                    Err(_) => {
+                                        warn!(ip = %ra.ip, port = ra.port,
                                                     "UDP packet: unparseable remote IP, dropping");
-                                                continue;
-                                            }
-                                        },
-                                        None => {
-                                            debug!(proxy_name = %pn_r, "UDP packet without remote_addr; dropping");
-                                            continue;
-                                        }
-                                    };
-                                    (remote, up.content)
-                                }
-                                UdpBinaryRead::Message(FrpMessage::Ping(_))
-                                | UdpBinaryRead::Message(FrpMessage::Pong(_)) => continue,
-                                UdpBinaryRead::Message(other) => {
-                                    debug!(proxy_name = %pn_r, v1_type = ?other.v1_type_byte(),
-                                        "UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    debug!(proxy_name = %pn_r, "UDP packet without remote_addr; dropping");
                                     continue;
                                 }
                             };
-                            // Per-packet decompression only (compression stays
-                            // per-packet for UDP; stream-level encryption was
-                            // already applied by the CipherReader above).
-                            if use_comp
-                                && encryption::decompress_into(&payload, &mut scratch_b).is_ok()
-                            {
-                                std::mem::swap(&mut payload, &mut scratch_b);
+                            (remote, up.content)
+                        }
+                        UdpBinaryRead::Message(FrpMessage::Ping(_))
+                        | UdpBinaryRead::Message(FrpMessage::Pong(_)) => continue,
+                        UdpBinaryRead::Message(other) => {
+                            debug!(proxy_name = %pn_r, v1_type = ?other.v1_type_byte(),
+                                        "UDP work conn '{}': unexpected msg 0x{:02x}", pn_r, other.v1_type_byte());
+                            continue;
+                        }
+                    };
+                    // Per-packet decompression only (compression stays
+                    // per-packet for UDP; stream-level encryption was
+                    // already applied by the CipherReader above).
+                    if use_comp && encryption::decompress_into(&payload, &mut scratch_b).is_ok() {
+                        std::mem::swap(&mut payload, &mut scratch_b);
+                    }
+                    // Session lookup / create. The std Mutex guard is
+                    // never held across an await: if the session is
+                    // missing we drop the lock, bind outside, then
+                    // re-lock and insert. On the steady-state hit path
+                    // we stamp `last_active` in place (one Relaxed
+                    // store, no Arc clone/drop) and borrow `&UdpSocket`
+                    // directly from `reader_socks` (zero Arc clone/drop
+                    // on the socket as well).
+                    let now_ms = now_epoch_ms();
+                    let hit = {
+                        let map = sessions.shard(&remote);
+                        match map.get(&remote) {
+                            Some(entry) => {
+                                entry.last_active.store(now_ms, Ordering::Relaxed);
+                                let need_mirror_sync = reader_socks
+                                    .get(&remote)
+                                    .is_none_or(|m| !Arc::ptr_eq(m, &entry.socket));
+                                let sync_sock = if need_mirror_sync {
+                                    Some(entry.socket.clone())
+                                } else {
+                                    None
+                                };
+                                Some((sync_sock, entry.first_packet))
                             }
-                            // Session lookup / create. The std Mutex guard is
-                            // never held across an await: if the session is
-                            // missing we drop the lock, bind outside, then
-                            // re-lock and insert (the only concurrent actor is
-                            // a session task's self-removal, which the
-                            // Arc::ptr_eq guard in run_udp_session protects
-                            // against clobbering a live replacement).
-                            // The send socket comes back by reference from the
-                            // reader-owned mirror instead of an Arc clone per
-                            // packet (mirror invariant: shared-map hit implies
-                            // mirror hit).
-                            let mut liveness: Option<Arc<AtomicU64>> = None;
-                            let entry = {
-                                let mut map = sessions.shard(&remote);
-                                match map.get_mut(&remote) {
-                                    Some(entry) => {
-                                        // Clone the shared liveness timestamp
-                                        // and store into it AFTER the guard
-                                        // drops below: the store has no
-                                        // ordering dependency on the shard
-                                        // lock (both writers use Relaxed), so
-                                        // the lock need not be held for it.
-                                        liveness = Some(entry.last_active.clone());
-                                        let mirror = reader_socks
-                                            .get(&remote)
-                                            .cloned()
-                                            .unwrap_or_else(|| entry.socket.clone());
-                                        (Some(mirror), entry.first_packet)
-                                    }
-                                    None => (None, false),
-                                }
-                            };
-                            // Liveness refresh outside the shard lock.
-                            if let Some(la) = liveness {
-                                la.store(now_epoch_ms(), Ordering::Relaxed);
+                            None => None,
+                        }
+                    };
+                    let first_packet = match hit {
+                        Some((sync_sock, first_packet)) => {
+                            if let Some(s) = sync_sock {
+                                reader_socks.insert(remote, s);
                             }
-                            let (sock, first_packet) = match entry {
-                                (Some(sock), first_packet) => (sock, first_packet),
-                                (None, _) => {
-                                    // F6: refuse NEW remotes once the
-                                    // per-work-conn session cap is reached.
-                                    // Unknown remotes drop their datagram
-                                    // (warn throttled to one per 5s); known
-                                    // remotes never reach this arm. A reaped
-                                    // session's slot is freed by the next
-                                    // create. See UDP_SESSION_CAP.
-                                    if sessions.at_session_cap() {
-                                        let now = tokio::time::Instant::now();
-                                        if last_cap_warn
-                                            .is_none_or(|t| now.duration_since(t) > Duration::from_secs(5))
-                                        {
-                                            warn!(proxy_name = %pn_r, cap = %UDP_SESSION_CAP, remote = %remote,
+                            first_packet
+                        }
+                        None => {
+                            // F6: refuse NEW remotes once the
+                            // per-work-conn session cap is reached.
+                            // Unknown remotes drop their datagram
+                            // (warn throttled to one per 5s); known
+                            // remotes never reach this arm. A reaped
+                            // session's slot is freed by the next
+                            // create. See UDP_SESSION_CAP.
+                            if sessions.at_session_cap() {
+                                let now = tokio::time::Instant::now();
+                                if last_cap_warn
+                                    .is_none_or(|t| now.duration_since(t) > Duration::from_secs(5))
+                                {
+                                    warn!(proxy_name = %pn_r, cap = %UDP_SESSION_CAP, remote = %remote,
                                                 "UDP '{}': session cap {} reached; dropping datagram from new remote {}",
                                                 pn_r, UDP_SESSION_CAP, remote);
-                                            last_cap_warn = Some(now);
-                                        }
-                                        continue;
-                                    }
-                                    let bind = SocketAddr::new(local_addr.ip(), 0);
-                                    let sock = match UdpSocket::bind(bind).await {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            warn!(proxy_name = %pn_r, remote = %remote, error = %e,
+                                    last_cap_warn = Some(now);
+                                }
+                                continue;
+                            }
+                            let bind = SocketAddr::new(local_addr.ip(), 0);
+                            let sock = match UdpSocket::bind(bind).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(proxy_name = %pn_r, remote = %remote, error = %e,
                                                 "UDP: failed to bind per-remote socket");
-                                            continue;
-                                        }
-                                    };
-                                    // Connect to the local service so replies
-                                    // can only arrive from it (source
-                                    // filtering — a local process can no
-                                    // longer inject datagrams tagged as this
-                                    // remote). Requests still go out via
-                                    // send_to(local_addr), the connect addr.
-                                    if let Err(e) = sock.connect(local_addr).await {
-                                        warn!(proxy_name = %pn_r, remote = %remote, error = %e,
-                                            "UDP: failed to connect per-remote socket to local service");
-                                        continue;
-                                    }
-                                    let sock = Arc::new(sock);
-                                    let mut map = sessions.shard(&remote);
-                                    match map.get(&remote) {
-                                        // Defensive: unreachable today (the
-                                        // reader is the sole sessions inserter
-                                        // and held the lock across the bind
-                                        // gap), but if a future concurrent
-                                        // inserter is added, reuse its socket
-                                        // rather than silently re-create.
-                                        Some(entry) => {
-                                            // Defensive: unreachable today (the
-                                            // reader is the sole sessions
-                                            // inserter and held the lock across
-                                            // the bind gap), but degrade
-                                            // gracefully instead of panicking
-                                            // on the UDP hot path if a future
-                                            // concurrent inserter appears — the
-                                            // session itself carries the socket.
-                                            let mirror = reader_socks
-                                                .get(&remote)
-                                                .cloned()
-                                                .unwrap_or_else(|| entry.socket.clone());
-                                            (mirror, entry.first_packet)
-                                        }
-                                        None => {
-                                            let stx = write_tx.clone();
-                                            let s_alive = session_alive_r.clone();
-                                            let sessions_for_task = sessions.clone();
-                                            // Shared liveness timestamp: the
-                                            // reader task refreshes it per
-                                            // packet without taking the shard
-                                            // lock (one Relaxed store).
-                                            let last_active =
-                                                Arc::new(AtomicU64::new(now_epoch_ms()));
-                                            // P1: per-session buffer-return
-                                            // channel (cap 8 — the writer's
-                                            // try_send drops a full channel;
-                                            // the spare is an optimization).
-                                            let (ret_tx, ret_rx) =
-                                                mpsc::channel::<Vec<u8>>(8);
-                                            tokio::spawn(run_udp_session(
-                                                sock.clone(),
-                                                remote,
-                                                stx,
-                                                s_alive,
-                                                udp_packet_size,
-                                                sessions_for_task,
-                                                last_active.clone(),
-                                                reader_cancel.clone(),
-                                                ret_tx,
-                                                ret_rx,
-                                            ));
-                                            map.insert(
-                                                remote,
-                                                UdpSession {
-                                                    socket: sock.clone(),
-                                                    last_active,
-                                                    first_packet: true,
-                                                },
-                                            );
-                                            reader_socks.insert(remote, sock.clone());
-                                            (sock, true)
-                                        }
-                                    }
+                                    continue;
                                 }
                             };
-                            // PROXY header on the first packet of each remote
-                            // session (Go: first packet of each remote conn).
-                            // Go parity (pkg/proto/udp/udp.go Forwarder +
-                            // go-proxyproto v0.15.0): the ONLY gate is the
-                            // remote address being present
-                            // (`!ok && proxyProtocolVersion != "" &&
-                            // udpMsg.RemoteAddr != nil`) — there is NO
-                            // source-port-0 skip on the UDP path (the TCP
-                            // `m.SrcAddr != "" && m.SrcPort != 0` gate of
-                            // client/proxy/proxy.go does not apply here).
-                            // `remote` is always a parsed SocketAddr, so the
-                            // header is emitted for every new remote session
-                            // when a version is configured — a port-0 source
-                            // (legal on the wire) rides in the header block
-                            // exactly as Go would write it. The transport kind
-                            // threads into the builder so UDP sessions are
-                            // never mislabeled as TCP: v1 collapses to the
-                            // literal `PROXY UNKNOWN\r\n` (the v1 grammar has
-                            // no UDP address line) and v2 emits the
-                            // UDP-DATAGRAM frame (transport 0x12/0x22).
-                            let mut final_payload = payload;
-                            if first_packet && !proxy_protocol_version.is_empty() {
-                                if let Ok(header) =
-                                    frp_core::proxy_protocol::build_proxy_protocol_header(
-                                        &remote.ip().to_string(),
-                                        // Local service address as an IP string.
-                                        // The old `split(':').next()` on the raw
-                                        // config string mis-split hostnames and
-                                        // IPv6 (F2): the resolved socket addr is
-                                        // always canonical.
-                                        &local_addr.ip().to_string(),
-                                        remote.port(),
-                                        local_addr.port(),
-                                        &proxy_protocol_version,
-                                        frp_core::proxy_protocol::ProxyTransport::Udp,
-                                    )
-                                {
-                                    let mut buf =
-                                        Vec::with_capacity(header.len() + final_payload.len());
-                                    buf.extend_from_slice(&header);
-                                    buf.extend_from_slice(&final_payload);
-                                    final_payload = buf;
+                            // Connect to the local service so replies
+                            // can only arrive from it (source
+                            // filtering — a local process can no
+                            // longer inject datagrams tagged as this
+                            // remote). Requests still go out via
+                            // send(), the connect addr.
+                            if let Err(e) = sock.connect(local_addr).await {
+                                warn!(proxy_name = %pn_r, remote = %remote, error = %e,
+                                            "UDP: failed to connect per-remote socket to local service");
+                                continue;
+                            }
+                            let sock = Arc::new(sock);
+                            let mut map = sessions.shard(&remote);
+                            match map.get(&remote) {
+                                // Defensive: unreachable today (the
+                                // reader is the sole sessions inserter),
+                                // but if a future concurrent inserter
+                                // is added, reuse its socket rather
+                                // than silently re-create.
+                                Some(entry) => {
+                                    if reader_socks
+                                        .get(&remote)
+                                        .is_none_or(|m| !Arc::ptr_eq(m, &entry.socket))
+                                    {
+                                        reader_socks.insert(remote, entry.socket.clone());
+                                    }
+                                    entry.first_packet
+                                }
+                                None => {
+                                    let stx = write_tx.clone();
+                                    let s_alive = session_alive_r.clone();
+                                    let sessions_for_task = sessions.clone();
+                                    // Shared liveness timestamp: the
+                                    // reader task refreshes it per
+                                    // packet without taking the shard
+                                    // lock (one Relaxed store).
+                                    let last_active = Arc::new(AtomicU64::new(now_epoch_ms()));
+                                    // P1: per-session buffer-return
+                                    // channel (cap 8 — the writer's
+                                    // try_send drops a full channel;
+                                    // the spare is an optimization).
+                                    let (ret_tx, ret_rx) = mpsc::channel::<Vec<u8>>(8);
+                                    tokio::spawn(run_udp_session(
+                                        sock.clone(),
+                                        remote,
+                                        stx,
+                                        s_alive,
+                                        udp_packet_size,
+                                        sessions_for_task,
+                                        last_active.clone(),
+                                        reader_cancel.clone(),
+                                        ret_tx,
+                                        ret_rx,
+                                    ));
+                                    map.insert(
+                                        remote,
+                                        UdpSession {
+                                            socket: sock.clone(),
+                                            last_active,
+                                            first_packet: true,
+                                        },
+                                    );
+                                    reader_socks.insert(remote, sock);
+                                    true
                                 }
                             }
-                            // Clear `first_packet` only when THIS datagram was
-                            // the session's first (create arm). Mirror-arm
-                            // hits carry `first_packet == false` — the flag is
-                            // true only between the create arm's insert and
-                            // this clear, with no await in between, and the
-                            // session reader task never writes it — so gating
-                            // the clear on the observed flag turns the old
-                            // unconditional second shard-lock + hash lookup
-                            // per packet into a no-op on the steady-state
-                            // path.
-                            if first_packet {
-                                if let Some(entry) = sessions.shard(&remote).get_mut(&remote) {
-                                    entry.first_packet = false;
-                                }
-                            }
-                            debug!(proxy_name = %pn_r, byte_count = final_payload.len(),
+                        }
+                    };
+                    let Some(sock) = reader_socks.get(&remote) else {
+                        continue;
+                    };
+                    // PROXY header on the first packet of each remote
+                    // session (Go: first packet of each remote conn).
+                    // Go parity (pkg/proto/udp/udp.go Forwarder +
+                    // go-proxyproto v0.15.0): the ONLY gate is the
+                    // remote address being present
+                    // (`!ok && proxyProtocolVersion != "" &&
+                    // udpMsg.RemoteAddr != nil`) — there is NO
+                    // source-port-0 skip on the UDP path (the TCP
+                    // `m.SrcAddr != "" && m.SrcPort != 0` gate of
+                    // client/proxy/proxy.go does not apply here).
+                    // `remote` is always a parsed SocketAddr, so the
+                    // header is emitted for every new remote session
+                    // when a version is configured — a port-0 source
+                    // (legal on the wire) rides in the header block
+                    // exactly as Go would write it. The transport kind
+                    // threads into the builder so UDP sessions are
+                    // never mislabeled as TCP: v1 collapses to the
+                    // literal `PROXY UNKNOWN\r\n` (the v1 grammar has
+                    // no UDP address line) and v2 emits the
+                    // UDP-DATAGRAM frame (transport 0x12/0x22).
+                    let mut final_payload = payload;
+                    if first_packet && !proxy_protocol_version.is_empty() {
+                        if let Ok(header) = frp_core::proxy_protocol::build_proxy_protocol_header(
+                            &remote.ip().to_string(),
+                            // Local service address as an IP string.
+                            // The old `split(':').next()` on the raw
+                            // config string mis-split hostnames and
+                            // IPv6 (F2): the resolved socket addr is
+                            // always canonical.
+                            &local_addr.ip().to_string(),
+                            remote.port(),
+                            local_addr.port(),
+                            &proxy_protocol_version,
+                            frp_core::proxy_protocol::ProxyTransport::Udp,
+                        ) {
+                            let mut buf = Vec::with_capacity(header.len() + final_payload.len());
+                            buf.extend_from_slice(&header);
+                            buf.extend_from_slice(&final_payload);
+                            final_payload = buf;
+                        }
+                    }
+                    // Clear `first_packet` only when THIS datagram was
+                    // the session's first (create arm). Mirror-arm
+                    // hits carry `first_packet == false` — the flag is
+                    // true only between the create arm's insert and
+                    // this clear, with no await in between, and the
+                    // session reader task never writes it — so gating
+                    // the clear on the observed flag turns the old
+                    // unconditional second shard-lock + hash lookup
+                    // per packet into a no-op on the steady-state
+                    // path.
+                    if first_packet {
+                        if let Some(entry) = sessions.shard(&remote).get_mut(&remote) {
+                            entry.first_packet = false;
+                        }
+                    }
+                    debug!(proxy_name = %pn_r, byte_count = final_payload.len(),
                                 "UDP reader '{}': forwarding {} bytes to local", pn_r, final_payload.len());
-                            // The session socket is connect()ed to local_addr,
-                            // so use send() — send_to() on a connected socket
-                            // returns EISCONN on macOS/BSD after the first
-                            // packet (platform divergence; Linux allows it).
-                            // A failure here (e.g. ECONNREFUSED while the
-                            // local service restarts) drops the packet but
-                            // must NOT tear down the whole work conn —
-                            // Go frp logs and skips (per-remote model means
-                            // other remotes and future packets still work).
-                            if let Some(lim) = reader_lim.as_ref() {
-                                frp_core::bandwidth::BandwidthLimiter::consume_shared(
-                                    lim,
-                                    final_payload.len(),
-                                )
-                                .await;
-                            }
-                            if let Err(e) = sock.send(&final_payload).await {
-                                debug!(proxy_name = %pn_r, error = %e, local = %local_addr,
+                    // The session socket is connect()ed to local_addr,
+                    // so use send() — send_to() on a connected socket
+                    // returns EISCONN on macOS/BSD after the first
+                    // packet (platform divergence; Linux allows it).
+                    // A failure here (e.g. ECONNREFUSED while the
+                    // local service restarts) drops the packet but
+                    // must NOT tear down the whole work conn —
+                    // Go frp logs and skips (per-remote model means
+                    // other remotes and future packets still work).
+                    if let Some(lim) = reader_lim.as_ref() {
+                        frp_core::bandwidth::BandwidthLimiter::consume_shared(
+                            lim,
+                            final_payload.len(),
+                        )
+                        .await;
+                    }
+                    if let Err(e) = sock.send(&final_payload).await {
+                        debug!(proxy_name = %pn_r, error = %e, local = %local_addr,
                                     "UDP '{}' send to local failed, dropping packet: {}", pn_r, e);
-                            }
-                        }
-                        Err(e) => {
-                            debug!(proxy_name = %pn_r, error = %e,
-                                "UDP work conn '{}' read closed: {}", pn_r, e);
-                            break;
-                        }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    if !session_alive_r.load(Ordering::Acquire) {
-                        debug!(proxy_name = %pn_r, "UDP reader '{}': session dead, stopping", pn_r);
-                        break;
-                    }
-                    // Sweep stale mirror entries for sessions reaped by the
-                    // idle timeout. Without this, the per-remote connected UDP
-                    // sockets accumulate FDs and ephemeral ports for the work
-                    // conn's lifetime — bounded only by distinct remotes seen.
-                    {
-                        let maps = sessions.lock_all();
-                        reader_socks.retain(|_k, v| {
-                            // retain by value: keep only entries whose Arc
-                            // still matches a live session entry in ANY shard.
-                            maps.iter().any(|m| m.values().any(|e| Arc::ptr_eq(&e.socket, v)))
-                        });
-                    }
+                Err(e) => {
+                    debug!(proxy_name = %pn_r, error = %e,
+                                "UDP work conn '{}' read closed: {}", pn_r, e);
+                    break;
                 }
             }
         }
@@ -869,168 +882,33 @@ pub(super) async fn run_udp_work_conn(
         // the socket-level TCP keepalive for the dial phase only.
         let mut keepalive = tokio::time::interval(UDP_WORK_CONN_PING_INTERVAL);
         keepalive.tick().await;
-        loop {
+        // Persistent 5s liveness check (replaces per-iteration
+        // `tokio::time::sleep(5s)` which churned the timer wheel on every
+        // reply datagram and never fired under continuous traffic).
+        let mut liveness_tick = tokio::time::interval(Duration::from_secs(5));
+        liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        liveness_tick.tick().await;
+        let binary_codec = v2 && udp_packet_codec == frp_core::udp_binary::UDP_PACKET_CODEC_BINARY;
+        let codec_opt = if udp_packet_codec.is_empty() {
+            None
+        } else {
+            Some(udp_packet_codec.as_str())
+        };
+        // Only coalesce bursts on unthrottled buffered/encrypted V2 transports:
+        // when `writer_lim` is active, flushing per packet prevents already-
+        // written packets from stalling behind the next packet's limiter sleep
+        // and keeps cancellation/keepalive responsive; V1 does not flush.
+        let batch_flush = !no_flush && v2 && writer_lim.is_none();
+        'writer: loop {
             tokio::select! {
                 biased;
                 changed = writer_cancel.changed() => {
                     if changed.is_err() || *writer_cancel.borrow() { break; }
                 }
-                Some((remote, data, ret_tx)) = write_rx.recv() => {
-                    // Round-17 audit B: take the received Vec by move — it
-                    // crossed the async channel already owned, so the old
-                    // clear + extend_from_slice was a second full datagram
-                    // copy per packet. Compression (when enabled) compresses
-                    // out of the moved-in payload and swaps the scratch in,
-                    // preserving the reused-buffer path exactly.
-                    payload = data;
-                    if use_comp && encryption::compress_into(&payload, &mut scratch_c).is_ok()
-                    {
-                        std::mem::swap(&mut payload, &mut scratch_c);
-                    }
-                    // Stream-level encryption is applied by the CipherWriter
-                    // that wraps w_w (Go frp three-stage model); the frame
-                    // below is written over the encrypted stream.
-                    // Each reply is tagged with its own remote — no shared
-                    // last_remote, so concurrent remotes never cross wires.
-                    let pkt_len = payload.len();
-                    // Audit B1: on the V2 binary-codec path the remote is a
-                    // parsed SocketAddr here while the codec wants family /
-                    // port / zone bytes — the msg::UdpAddr String form exists
-                    // only for the V1 JSON codec. Direct-encode from the
-                    // SocketAddr via the frp-core shared helper (byte-identical
-                    // to the String round trip: same To4() mapped-v4
-                    // normalization, same empty zone) instead of building the
-                    // message struct — the per-packet ip_cache clone and the
-                    // re-parse inside the String round trip are gone on this path.
-                    let binary_codec =
-                        v2 && udp_packet_codec == frp_core::udp_binary::UDP_PACKET_CODEC_BINARY;
-                    if let Some(lim) = writer_lim.as_ref() {
-                        // Limiter counts the (compressed) payload the tunnel
-                        // actually carries.
-                        frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, pkt_len).await;
-                    }
-                    let result = if binary_codec {
-                        // Mirrors the binary arm of
-                        // write_msg_v2_with_udp_codec: type ID + codec body
-                        // share one scratch buffer, then one frame write and
-                        // a flush (CipherWriter must flush to emit its IV).
-                        wire_scratch.clear();
-                        wire_scratch
-                            .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
-                        let result =
-                            match frp_core::udp_binary::encode_udp_packet_binary_socket_addr_local(
-                                &payload,
-                                // Audit item 6: `local_addr` is the resolved
-                                // loop-invariant SocketAddr; encode it
-                                // straight from its octets — the per-datagram
-                                // ip String re-parse of the UdpAddr form is
-                                // gone (that form stays only for the JSON
-                                // arm below). Byte-identical output.
-                                Some(&local_addr),
-                                &remote,
-                                &mut wire_scratch,
-                            ) {
-                                Err(e) => Err(frp_core::Error::Protocol(format!(
-                                    "encode binary UDP packet: {e}"
-                                )
-                                .into())),
-                                Ok(()) => {
-                                    match write_v2_frame_raw(
-                                        &mut w_w,
-                                        V2_FRAME_TYPE_MESSAGE,
-                                        0,
-                                        &wire_scratch,
-                                    )
-                                    .await
-                                    {
-                                        Err(e) => Err(e),
-                                        Ok(()) => w_w.flush().await.map_err(|e| {
-                                            frp_core::Error::Protocol(format!(
-                                                "flush after binary UDP packet: {e}"
-                                            )
-                                            .into())
-                                        }),
-                                    }
-                                }
-                            };
-                        // Hand the content buffer back to the session (P1) —
-                        // see the JSON arm's comment below. local_udp_addr is
-                        // never taken on this path, so it stays invariant.
-                        let _ = ret_tx.try_send(payload);
-                        result
-                    } else {
-                        // V1 JSON frame, or V2 without the binary codec
-                        // negotiated (JSON fallback): the message needs the
-                        // msg::UdpAddr String form of the remote.
-                        let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                            content: std::mem::take(&mut payload),
-                            local_addr: local_udp_addr.take().or_else(|| {
-                                // Unreachable after the first packet (returned
-                                // below); defensive fallback.
-                                Some(udp_addr_of(&local_addr))
-                            }),
-                            remote_addr: Some(msg::UdpAddr {
-                                ip: match ip_cache.get(&remote) {
-                                    Some(s) => s.clone(),
-                                    None => {
-                                        let s = remote.ip().to_string();
-                                        if ip_cache.len() >= 256 {
-                                            ip_cache.clear();
-                                        }
-                                        ip_cache.insert(remote, s.clone());
-                                        s
-                                    }
-                                },
-                                port: remote.port(),
-                                zone: String::new(),
-                            }),
-                        });
-                        let result = if v2 {
-                            // The codec cannot be binary-v1 here (that arm is
-                            // above); any other negotiated codec name — or
-                            // none — falls through to the JSON writer.
-                            let codec_opt = if udp_packet_codec.is_empty() {
-                                None
-                            } else {
-                                Some(udp_packet_codec.as_str())
-                            };
-                            write_msg_v2_with_udp_codec(
-                                &mut w_w,
-                                &pkt,
-                                codec_opt,
-                                false,
-                                &mut wire_scratch,
-                            )
-                            .await
-                        } else {
-                            // V1 JSON: serialize into the loop's shared
-                            // scratch (`wire_scratch`) instead of letting the
-                            // writer allocate a fresh Vec per datagram.
-                            write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
-                        };
-                        // Return the invariant UdpAddr for the next packet and
-                        // hand the content buffer back to the session (P1) —
-                        // it becomes the next payload buffer. try_send:
-                        // a closed/full return channel just drops the buffer
-                        // (the spare is an optimization, and the session
-                        // already re-allocated if no spare arrived). Note the
-                        // returned Vec may be the writer's compress scratch
-                        // after a swap — either way it is a live allocation
-                        // the session can recv into, so no allocation is
-                        // lost.
-                        if let FrpMessage::UDPPacket(p) = pkt {
-                            local_udp_addr = p.local_addr;
-                            let _ = ret_tx.try_send(p.content);
-                        }
-                        result
-                    };
-                    if let Err(e) = result {
-                        debug!(proxy_name = %pn_w, error = %e,
-                            "UDP '{}' send to work conn failed: {}", pn_w, e);
-                        break;
-                    }
-                }
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                // Check liveness and 30s keepalive Ping BEFORE `write_rx.recv()`
+                // (`write_rx.recv()` is cancel-safe), so saturated local reply
+                // traffic cannot starve session-dead detection or heartbeats.
+                _ = liveness_tick.tick() => {
                     if !session_alive_w.load(Ordering::Acquire) {
                         debug!(proxy_name = %pn_w, "UDP writer '{}': session dead, stopping", pn_w);
                         break;
@@ -1047,6 +925,120 @@ pub(super) async fn run_udp_work_conn(
                         debug!(proxy_name = %pn_w, error = %e,
                             "UDP work conn '{}' keepalive ping failed: {}", pn_w, e);
                         break;
+                    }
+                }
+                Some((mut remote, mut data, mut ret_tx)) = write_rx.recv() => {
+                    // Drain up to `UDP_FLUSH_BATCH_MAX` immediately-ready
+                    // reply datagrams and flush `w_w` once at the end of the
+                    // burst (zero extra latency for single packets).
+                    let mut written_in_burst = 0usize;
+                    loop {
+                        payload = data;
+                        if use_comp && encryption::compress_into(&payload, &mut scratch_c).is_ok()
+                        {
+                            std::mem::swap(&mut payload, &mut scratch_c);
+                        }
+                        let pkt_len = payload.len();
+                        if let Some(lim) = writer_lim.as_ref() {
+                            // Limiter counts the (compressed) payload the tunnel
+                            // actually carries.
+                            frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, pkt_len).await;
+                        }
+                        let result = if binary_codec {
+                            // Reserve 8B V2 frame header headroom so
+                            // `write_v2_frame_in_place` patches in place and
+                            // emits one contiguous write (zero alloc, zero
+                            // merge copy).
+                            wire_scratch.clear();
+                            wire_scratch.resize(V2_FRAME_HEADER_LEN, 0);
+                            wire_scratch
+                                .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+                            let result = match frp_core::udp_binary::encode_udp_packet_binary_socket_addr_local(
+                                &payload,
+                                Some(&local_addr),
+                                &remote,
+                                &mut wire_scratch,
+                            ) {
+                                Err(e) => Err(frp_core::Error::Protocol(format!(
+                                    "encode binary UDP packet: {e}"
+                                )
+                                .into())),
+                                Ok(()) => {
+                                    write_v2_frame_in_place(
+                                        &mut w_w,
+                                        V2_FRAME_TYPE_MESSAGE,
+                                        0,
+                                        &mut wire_scratch,
+                                    )
+                                    .await
+                                }
+                            };
+                            let _ = ret_tx.try_send(payload);
+                            result
+                        } else {
+                            let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                                content: std::mem::take(&mut payload),
+                                local_addr: local_udp_addr.take().or_else(|| {
+                                    Some(udp_addr_of(&local_addr))
+                                }),
+                                remote_addr: Some(msg::UdpAddr {
+                                    ip: match ip_cache.get(&remote) {
+                                        Some(s) => s.clone(),
+                                        None => {
+                                            let s = remote.ip().to_string();
+                                            if ip_cache.len() >= 256 {
+                                                ip_cache.clear();
+                                            }
+                                            ip_cache.insert(remote, s.clone());
+                                            s
+                                        }
+                                    },
+                                    port: remote.port(),
+                                    zone: String::new(),
+                                }),
+                            });
+                            let result = if v2 {
+                                write_msg_v2_with_udp_codec(
+                                    &mut w_w,
+                                    &pkt,
+                                    codec_opt,
+                                    true, // flushed once at burst end below
+                                    &mut wire_scratch,
+                                )
+                                .await
+                            } else {
+                                write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
+                            };
+                            if let FrpMessage::UDPPacket(p) = pkt {
+                                local_udp_addr = p.local_addr;
+                                let _ = ret_tx.try_send(p.content);
+                            }
+                            result
+                        };
+                        if let Err(e) = result {
+                            debug!(proxy_name = %pn_w, error = %e,
+                                "UDP '{}' send to work conn failed: {}", pn_w, e);
+                            break 'writer;
+                        }
+                        written_in_burst += 1;
+                        if !batch_flush || written_in_burst >= UDP_FLUSH_BATCH_MAX {
+                            break;
+                        }
+                        match write_rx.try_recv() {
+                            Ok((r, d, tx)) => {
+                                remote = r;
+                                data = d;
+                                ret_tx = tx;
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !no_flush && v2 {
+                        if let Err(e) = w_w.flush().await {
+                            debug!(proxy_name = %pn_w, error = %e,
+                                "UDP '{}' flush after write burst failed: {}", pn_w, e);
+                            break;
+                        }
                     }
                 }
             }

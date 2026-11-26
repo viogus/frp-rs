@@ -1855,4 +1855,42 @@ mod proptest_fuzz {
             .unwrap_err();
         assert!(err.to_string().contains("JSON UDP packet after binary"));
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_v2_frame_in_place_matches_raw_and_validates_bounds() {
+        let payload = vec![0xABu8; 512];
+        let mut raw_wire = Vec::new();
+        write_v2_frame_raw(&mut raw_wire, V2_FRAME_TYPE_MESSAGE, 0, &payload)
+            .await
+            .unwrap();
+
+        let mut in_place_buf = vec![0u8; V2_FRAME_HEADER_LEN];
+        in_place_buf.extend_from_slice(&payload);
+        let mut in_place_wire = Vec::new();
+        write_v2_frame_in_place(
+            &mut in_place_wire,
+            V2_FRAME_TYPE_MESSAGE,
+            0,
+            &mut in_place_buf,
+        )
+        .await
+        .unwrap();
+        assert_eq!(in_place_wire, raw_wire);
+
+        // Buffer shorter than V2_FRAME_HEADER_LEN must error.
+        let mut short = vec![0u8; V2_FRAME_HEADER_LEN - 1];
+        assert!(
+            write_v2_frame_in_place(&mut Vec::new(), V2_FRAME_TYPE_MESSAGE, 0, &mut short)
+                .await
+                .is_err()
+        );
+
+        // Payload exceeding V2_MAX_FRAME_PAYLOAD must error.
+        let mut huge = vec![0u8; V2_FRAME_HEADER_LEN + V2_MAX_FRAME_PAYLOAD as usize + 1];
+        assert!(
+            write_v2_frame_in_place(&mut Vec::new(), V2_FRAME_TYPE_MESSAGE, 0, &mut huge)
+                .await
+                .is_err()
+        );
+    }
 }

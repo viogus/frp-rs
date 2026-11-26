@@ -61,10 +61,17 @@ pub(crate) fn chunk_pool_pop(pool: &ArrayQueue<Vec<u8>>, min_capacity: usize) ->
         .unwrap_or_else(|| Vec::with_capacity(min_capacity))
 }
 
+/// Max buffer capacity retained in `chunk_pool` (128 KiB). Oversized buffers
+/// are dropped instead of pinned in the pool.
+const CHUNK_POOL_MAX_BUF_CAP: usize = 128 * 1024;
+
 /// Return a consumed write chunk to the pool. Clears the payload (keeping
 /// the allocation so the next writer reuses it) and drops the chunk when
-/// the pool is at its cap (`push` returns it as `Err`).
+/// oversized or when the pool is at its cap (`push` returns it as `Err`).
 pub(crate) fn chunk_pool_push(pool: &ArrayQueue<Vec<u8>>, mut chunk: Vec<u8>) {
+    if chunk.capacity() > CHUNK_POOL_MAX_BUF_CAP {
+        return;
+    }
     chunk.clear();
     let _ = pool.push(chunk);
 }
@@ -311,6 +318,10 @@ pub(crate) struct KcpSocket {
     to_remove: Vec<(u32, SocketAddr)>,
     /// Pre-allocated Vec for expired unaccepted sessions cleanup during tick.
     expired: Vec<(u32, SocketAddr)>,
+    /// Reusable per-burst session tracking Vecs for `handle_data_burst`
+    /// (eliminates 2 heap allocations per write burst).
+    burst_touched: Vec<(u32, SocketAddr)>,
+    burst_full: Vec<(u32, SocketAddr)>,
     /// Reverse index from SocketAddr -> conv for O(1) FEC fallback lookup.
     /// Avoids O(n) iter().find(|(_, a)| *a == src) on every FEC non-matching packet.
     peer_addr_index: HashMap<SocketAddr, u32>,
@@ -379,6 +390,8 @@ impl KcpSocket {
             pending_udp: VecDeque::new(),
             to_remove: Vec::with_capacity(16),
             expired: Vec::with_capacity(16),
+            burst_touched: Vec::with_capacity(16),
+            burst_full: Vec::with_capacity(16),
             peer_addr_index: HashMap::new(),
         };
         let handle = KcpSocketHandle {
@@ -438,8 +451,8 @@ impl KcpSocket {
 
     /// Queue a batch of bridge writes and issue one flush per touched session.
     async fn handle_data_burst(&mut self, queue: &mut Vec<(u32, Vec<u8>)>) {
-        let mut touched: Vec<(u32, SocketAddr)> = Vec::new();
-        let mut full: Vec<(u32, SocketAddr)> = Vec::new();
+        self.burst_touched.clear();
+        self.burst_full.clear();
         for (c, data) in queue.drain(..) {
             let len = data.len();
             let addr = self.conv_index.get(&c).copied();
@@ -454,7 +467,13 @@ impl KcpSocket {
                 Ok(queued) => {
                     tracing::trace!(conv = c, len, "KCP SOCKET: write queued {len} bytes");
                     if let Some(addr) = addr {
-                        Self::record_touched(&mut touched, &mut full, c, addr, queued);
+                        Self::record_touched(
+                            &mut self.burst_touched,
+                            &mut self.burst_full,
+                            c,
+                            addr,
+                            queued,
+                        );
                     }
                 }
                 Err(e) => {
@@ -469,7 +488,8 @@ impl KcpSocket {
         // ending mid-segment would otherwise sit until the 10 ms tick (a 10x
         // ping-pong regression, measured on #611).
         let burst_end = self.write_rx.is_empty();
-        for (conv, addr) in touched {
+        for idx in 0..self.burst_touched.len() {
+            let (conv, addr) = self.burst_touched[idx];
             if burst_end {
                 if let Some(session) = self.sessions.get_mut(&(conv, addr)) {
                     if let Err(e) = session.flush_carry() {
@@ -477,7 +497,7 @@ impl KcpSocket {
                     }
                 }
             }
-            if burst_end || full.contains(&(conv, addr)) {
+            if burst_end || self.burst_full.contains(&(conv, addr)) {
                 self.flush_session_output(conv, addr).await;
             }
         }
@@ -558,9 +578,6 @@ impl KcpSocket {
             // wasn't found in sessions are routed by peer_addr.
             // With 6-byte FEC header (Go kcp-go format), conv is only
             // available in data shards at offset 8.
-            let is_fec = data.len() >= 6
-                && (u16::from_le_bytes([data[4], data[5]]) == 0xf1
-                    || u16::from_le_bytes([data[4], data[5]]) == 0xf2);
             let fec_key = if is_fec {
                 // O(1) reverse index lookup instead of O(n) sessions scan.
                 self.peer_addr_index.get(&src).map(|conv| (*conv, src))
@@ -619,7 +636,7 @@ impl KcpSocket {
                 // queue (or churn the session table) in
                 // one burst. Limits: 256 new sessions per
                 // 10 s globally, 32 per IP per 10 s.
-                let now_ms = self.start.elapsed().as_millis() as u32;
+                // Reuse the batch-sampled `now_ms`.
                 // Trim global log outside the window.
                 while let Some(&t) = self.session_create_log.front() {
                     if now_ms.wrapping_sub(t) > SESSION_CREATE_WINDOW_MS {
@@ -712,7 +729,6 @@ impl KcpSocket {
                 self.conv_index.insert(key.0, key.1);
                 self.peer_addr_index.insert(key.1, key.0);
                 self.sessions.insert(key, session);
-                let now_ms = self.start.elapsed().as_millis() as u32;
                 // Seed the newcomer at the load-appropriate window instead of
                 // letting it run the configured cap until the next tick (which
                 // would briefly advertise and buffer 4x the old bound).
@@ -804,6 +820,7 @@ impl KcpSocket {
         };
         let mut recv_slots: Vec<Vec<u8>> = (0..slot_count).map(|_| vec![0u8; slot_size]).collect();
         let mut recv_batch = RecvBatch::new(gro_enabled);
+        let mut write_queue: Vec<(u32, Vec<u8>)> = Vec::with_capacity(WRITE_BATCH);
 
         loop {
             tokio::select! {
@@ -985,19 +1002,20 @@ impl KcpSocket {
                             // one flush: a bridge write is ~16 KiB (12-13
                             // segments), so batching turns one sendmmsg and
                             // one KCP update per write into one per batch.
-                            let mut queue: Vec<(u32, Vec<u8>)> = vec![(conv, data)];
+                            write_queue.clear();
+                            write_queue.push((conv, data));
                             let mut taken = 1;
                             while taken < WRITE_BATCH {
                                 match self.write_rx.try_recv() {
                                     Ok((c, WriteRequest::Data(d))) => {
-                                        queue.push((c, d));
+                                        write_queue.push((c, d));
                                         taken += 1;
                                     }
                                     // A flush is ordered after the writes that
                                     // preceded it, so drain them first and let
                                     // the flush run once the batch is done.
                                     Ok((c, WriteRequest::Flush(tx))) => {
-                                        self.handle_data_burst(&mut queue).await;
+                                        self.handle_data_burst(&mut write_queue).await;
                                         self.handle_flush(c, tx).await;
                                         // A flush is ordered after the writes
                                         // that preceded it; returning to the
@@ -1008,7 +1026,7 @@ impl KcpSocket {
                                     Err(_) => break,
                                 }
                             }
-                            self.handle_data_burst(&mut queue).await;
+                            self.handle_data_burst(&mut write_queue).await;
                         }
                         WriteRequest::Flush(tx) => {
                             // Force immediate KCP flush: update → drain output →

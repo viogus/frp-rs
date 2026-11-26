@@ -2,49 +2,39 @@
 
 use super::*;
 
-/// Reader half of a UDP work conn plus the reusable payload buffer the V2 read
-/// decoders fill (one heap alloc per UDP packet saved). The pair moves into
-/// [`UdpFrameFut`] while a frame is in flight and comes back with the frame, so
-/// exactly one of the two places holds it at any moment.
-struct UdpFrameReader {
-    r: tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>,
-    scratch: Vec<u8>,
-}
+/// Maximum consecutive ready UDP datagrams written before issuing a single
+/// `flush()` on buffered transports (yamux, TLS, KCP, `CipherWriter`).
+/// Single datagrams still flush immediately (`try_recv_from` returns
+/// `WouldBlock`); bursts amortize per-packet flush syscalls / cipher blocks.
+const UDP_FLUSH_BATCH_MAX: usize = 16;
 
-/// Persistent read future for ONE UDP frame (audit M1 / §4 示例 A).
+/// Read one UDP work-conn frame into the caller-owned `scratch` buffer.
 ///
-/// Created once per frame and kept across `select!` wakeups that turn out not
-/// to be a frame (cancel-token tick, idle-deadline slide), so a partially-read
-/// frame survives instead of being dropped and restarted. It takes the reader
-/// and payload buffer by value rather than borrowing them: a loop-outer
-/// `Pin<Box<dyn Future + '_>>` holding `&mut w_r` / `&mut scratch` would freeze
-/// both for the whole loop (E0502).
-type UdpFrameFut<'a> = Pin<
-    Box<dyn Future<Output = (UdpFrameReader, Result<UdpBinaryRead, frp_core::Error>)> + Send + 'a>,
->;
-
-/// Arm [`UdpFrameFut`] for the current round. `codec` borrows the bridge's
-/// negotiated-codec string, which outlives the reader task.
-fn udp_frame_fut<'a>(state: UdpFrameReader, v2: bool, codec: Option<&'a str>) -> UdpFrameFut<'a> {
-    Box::pin(async move {
-        let UdpFrameReader { mut r, mut scratch } = state;
-        let result = if v2 {
-            if codec.is_some() {
-                // Binary UDP codec negotiated (Go v0.71.0): type-19 frames
-                // decode to native SocketAddr form, skipping the per-packet
-                // String alloc + reparse that the message path performs
-                // (audit LOW: decode formats then re-parses).
-                read_msg_v2_udp_binary_socket(&mut r, &mut scratch).await
-            } else {
-                read_msg_v2_with_udp_codec(&mut r, codec, &mut scratch)
-                    .await
-                    .map(UdpBinaryRead::Message)
-            }
+/// Stack-pinned inside `run_udp_work_conn`'s reader loop (zero `Box::pin`
+/// heap allocation per packet) and kept alive across benign
+/// `reader_cancel.changed()` (`false -> false`) wakeups and lazy-watchdog
+/// re-arms so a partially-read frame is never dropped or restarted (M1).
+async fn read_one_udp_frame(
+    r: &mut tokio::io::BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    scratch: &mut Vec<u8>,
+    v2: bool,
+    codec: Option<&str>,
+) -> Result<UdpBinaryRead, frp_core::Error> {
+    if v2 {
+        if codec.is_some() {
+            // Binary UDP codec negotiated (Go v0.71.0): type-19 frames
+            // decode to native SocketAddr form, skipping the per-packet
+            // String alloc + reparse that the message path performs
+            // (audit LOW: decode formats then re-parses).
+            read_msg_v2_udp_binary_socket(r, scratch).await
         } else {
-            read_msg_v1(&mut r).await.map(UdpBinaryRead::Message)
-        };
-        (UdpFrameReader { r, scratch }, result)
-    })
+            read_msg_v2_with_udp_codec(r, codec, scratch)
+                .await
+                .map(UdpBinaryRead::Message)
+        }
+    } else {
+        read_msg_v1(r).await.map(UdpBinaryRead::Message)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -125,7 +115,7 @@ pub(super) async fn run_udp_work_conn(
     // syscall per packet — and one syscall for several small packets. The
     // write half is untouched (separate object), so no flush semantics
     // change.
-    let w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
+    let mut w_r = tokio::io::BufReader::with_capacity(16 * 1024, w_r);
     let (cancel_tx, cancel_rx) = match reader_cancel_override {
         // Subscribe to the injected channel so the reader's cancel watch
         // observes the same sender the test fires (and the writer below
@@ -150,69 +140,58 @@ pub(super) async fn run_udp_work_conn(
     let reader_lim = bw_limiter.clone();
     let reader = async move {
         debug!(proxy_name = %reader_name, "UDP work conn reader task started for '{}'", reader_name);
-        // Reader half + payload buffer for the V2 UDP read path travel
-        // together inside `UdpFrameReader`: parked here between frames, owned
-        // by `read_fut` while a frame is in flight.
-        let mut frame_state: Option<UdpFrameReader> = Some(UdpFrameReader {
-            r: w_r,
-            scratch: Vec::new(),
-        });
-        // M1 (audit §4 示例 A): the frame read is ONE persistent future rather
-        // than a per-iteration `tokio::time::timeout(read_timeout, ..)` wrapper,
-        // so a select wakeup that is not a frame (cancel tick, deadline slide)
-        // no longer drops a partially-read frame or rebuilds the read future
-        // and its timer entry. `idle` is the single watchdog for the same 60s
-        // deadline, slid only when a frame actually lands.
-        let mut read_fut: Option<UdpFrameFut<'_>> = None;
+        let mut scratch: Vec<u8> = Vec::new();
+        // M1 (audit §4 示例 A): each frame read is stack-pinned via
+        // `tokio::pin!` (zero `Box::pin` heap allocation per packet) and polled
+        // inside an inner loop so benign `reader_cancel.changed()` wakeups
+        // (`false -> false`) or lazy-watchdog re-arms never drop or restart a
+        // partially-read frame. `idle` uses lazy deadline re-arming: frames
+        // only stamp `last_activity` (zero timer-wheel resets on the hot path);
+        // when `idle` fires, it re-arms once to `last_activity + read_timeout`
+        // if activity occurred since the previous arm, otherwise expires.
         let mut last_activity = tokio::time::Instant::now();
-        let mut idle = Box::pin(tokio::time::sleep_until(last_activity + read_timeout));
-        loop {
-            let result = tokio::select! {
-                biased;
-                _ = cancel_reader.cancelled() => break,
-                changed = reader_cancel.changed() => {
-                    if changed.is_err() || *reader_cancel.borrow() { break; }
-                    continue;
-                }
-                (state, frame) = async {
-                    if read_fut.is_none() {
-                        // Arm on first use; the reader + payload buffer are
-                        // parked in `frame_state` while no frame is in flight.
-                        if let Some(state) = frame_state.take() {
-                            read_fut = Some(udp_frame_fut(state, v2, udp_codec_opt));
+        let idle = tokio::time::sleep_until(last_activity + read_timeout);
+        tokio::pin!(idle);
+        'frames: loop {
+            let result = {
+                let read_fut = read_one_udp_frame(&mut w_r, &mut scratch, v2, udp_codec_opt);
+                tokio::pin!(read_fut);
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_reader.cancelled() => break 'frames,
+                        changed = reader_cancel.changed() => {
+                            if changed.is_err() || *reader_cancel.borrow() {
+                                break 'frames;
+                            }
+                            continue;
+                        }
+                        frame = &mut read_fut => {
+                            // A real frame (Ping/Pong included) refreshes
+                            // `last_activity`; `idle` is only re-armed lazily
+                            // when it fires (zero timer-wheel churn per packet).
+                            last_activity = tokio::time::Instant::now();
+                            break frame;
+                        }
+                        // M1: 60s of frame silence (Go udp.go read-deadline
+                        // parity) = dead/half-open peer. Listed AFTER the read
+                        // arm (biased select) so a frame ready at deadline
+                        // expiry is still delivered.
+                        _ = &mut idle => {
+                            let deadline = last_activity + read_timeout;
+                            if tokio::time::Instant::now() < deadline {
+                                idle.as_mut().reset(deadline);
+                                continue;
+                            }
+                            break Err(frp_core::Error::Protocol(
+                                format!(
+                                    "UDP work conn read deadline ({read_timeout:?}) expired with no frame from the client"
+                                )
+                                .into(),
+                            ));
                         }
                     }
-                    match read_fut.as_mut() {
-                        Some(fut) => fut.await,
-                        // Unreachable — the two Options are never both None.
-                        // `pending` keeps a future armed without a panic path,
-                        // and the idle arm still bounds the wait.
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    // A real frame (Ping/Pong included) — the only event that
-                    // slides the deadline, mirroring the Go SetReadDeadline
-                    // issued after every completed read.
-                    read_fut = None;
-                    frame_state = Some(state);
-                    last_activity = tokio::time::Instant::now();
-                    idle.as_mut().reset(last_activity + read_timeout);
-                    frame
                 }
-                // M1: 60s of frame silence (Go udp.go read-deadline parity) =
-                // dead/half-open peer. Same error shape as the per-read
-                // deadline it replaces — the Err arm below logs + breaks, and
-                // the supervisor re-requests a replacement work conn.
-                // Listed AFTER the read arm (biased select): the old
-                // `tokio::time::timeout` polled the inner read future first,
-                // so a frame ready exactly at deadline expiry was DELIVERED;
-                // polling this arm first would drop it and reap a live conn.
-                _ = &mut idle => Err(frp_core::Error::Protocol(
-                    format!(
-                        "UDP work conn read deadline ({read_timeout:?}) expired with no frame from the client"
-                    )
-                    .into(),
-                )),
             };
             match result {
                 // Native-address form (binary codec): the destination is
@@ -312,15 +291,22 @@ pub(super) async fn run_udp_work_conn(
                 return;
             }
         };
-        // Spare Vec for the packet content: the wire format base64-encodes
-        // UDPPacket.content, and the memcpy of `buf[..n]` is inherent — but
-        // the per-packet Vec *allocation* is not. take/return keeps the
-        // capacity across packets (audit D1-4).
-        let mut spare: Vec<u8> = Vec::with_capacity(udp_packet_size);
-        // Reused wire buffer for the V2 binary codec (type ID + encoded
-        // packet) and for the V1 frame serializer of the JSON path.
-        let mut wire_scratch: Vec<u8> = Vec::with_capacity(udp_packet_size + 48);
-        loop {
+        // Spare Vec for the packet content on the JSON path (V2 binary encodes
+        // straight from `&buf[..n]` without touching `spare`).
+        let mut spare: Vec<u8> = if v2 && udp_codec_opt.is_some() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(udp_packet_size)
+        };
+        // Reused wire buffer for the V2 binary codec (8B header + 2B type ID +
+        // encoded packet) and for the V1/V2 JSON serializer.
+        let mut wire_scratch: Vec<u8> = Vec::with_capacity(udp_packet_size + 64);
+        // Only coalesce bursts on unthrottled buffered/encrypted V2 transports:
+        // when `writer_lim` is active, flushing per packet prevents already-
+        // written packets from stalling behind the next packet's limiter sleep
+        // and keeps cancellation responsive; V1 does not flush per packet.
+        let batch_flush = !no_flush && v2 && writer_lim.is_none();
+        'writer: loop {
             let received = tokio::select! {
                 biased;
                 _ = cancel_writer.cancelled() => break,
@@ -330,109 +316,136 @@ pub(super) async fn run_udp_work_conn(
                 }
                 result = sock.recv_from(&mut buf) => result,
             };
-            match received {
-                Ok((n, src)) => {
-                    spare.clear();
-                    spare.extend_from_slice(&buf[..n]);
-                    let content = std::mem::take(&mut spare);
-                    if let Some(lim) = writer_lim.as_ref() {
-                        frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, n).await;
-                    }
-                    let result = if v2 && udp_codec_opt.is_some() {
-                        // V2 binary codec path: encode the remote `SocketAddr`
-                        // straight into the wire body — the per-packet
-                        // `ip.to_string()` String alloc + reparse is only
-                        // needed for the V1 JSON path, where the address is
-                        // serialized as text (audit: LOW). Output bytes are
-                        // identical to the string round trip
-                        // (`encode_udp_packet_binary_socket_addr`). `content`
-                        // is borrowed here and returned to `spare` below;
-                        // `local_enc` is the bridge-invariant pre-encoded
-                        // local (audit item 6 — no per-datagram parse).
-                        let encode = async {
-                            wire_scratch.clear();
-                            wire_scratch
-                                .extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
-                            frp_core::udp_binary::encode_udp_packet_binary_local_pre(
-                                &content,
-                                local_enc.as_ref(),
-                                &src,
-                                &mut wire_scratch,
-                            )
-                            .map_err(|e| {
-                                frp_core::Error::Protocol(
-                                    format!("encode binary UDP packet: {e}").into(),
-                                )
-                            })?;
-                            write_v2_frame_raw(&mut w_w, V2_FRAME_TYPE_MESSAGE, 0, &wire_scratch)
-                                .await?;
-                            if !no_flush {
-                                w_w.flush().await.map_err(|e| {
-                                    frp_core::Error::Protocol(
-                                        format!("flush after binary UDP packet: {e}").into(),
-                                    )
-                                })?;
-                            }
-                            Ok(())
-                        };
-                        let r = encode.await;
-                        spare = content;
-                        r
-                    } else {
-                        let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
-                            content,
-                            local_addr: local_addr.take(),
-                            remote_addr: Some(msg::UdpAddr {
-                                // Go net.IP.String() collapses IPv4-mapped
-                                // IPv6 to the dotted-quad form; mirror that
-                                // on the V1 JSON path too (same normalization
-                                // as the V2 binary codec, review finding C1).
-                                ip: match src.ip() {
-                                    std::net::IpAddr::V6(v6) => v6
-                                        .to_ipv4_mapped()
-                                        .map(|v4| v4.to_string())
-                                        .unwrap_or_else(|| src.ip().to_string()),
-                                    _ => src.ip().to_string(),
-                                },
-                                port: src.port(),
-                                zone: String::new(),
-                            }),
-                        });
-                        let r = if v2 {
-                            write_msg_v2_with_udp_codec(
-                                &mut w_w,
-                                &pkt,
-                                udp_codec_opt,
-                                no_flush,
-                                &mut wire_scratch,
-                            )
-                            .await
-                        } else {
-                            // Same scratch on the V1 path: `write_v1_frame`
-                            // allocates one Vec per frame, this reuses the
-                            // loop's buffer (wire bytes identical — the
-                            // scratch is cleared per call; audit §3 item 1).
-                            write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
-                        };
-                        // Return the invariant values to their locals for the
-                        // next packet before checking the write result.
-                        if let FrpMessage::UDPPacket(p) = pkt {
-                            local_addr = p.local_addr;
-                            spare = p.content;
-                        }
-                        r
-                    };
-                    if let Err(e) = result {
-                        debug!(proxy_name = %writer_name, error = %e,
-                            "UDP work conn write failed for '{}': {}", writer_name, e);
-                        break;
-                    }
-                }
+            let (mut n, mut src) = match received {
+                Ok(pair) => pair,
                 Err(e) => {
                     debug!(proxy_name = %writer_name, error = %e,
                         "UDP recv_from error for '{}': {}", writer_name, e);
                     break;
                 }
+            };
+            // Write this datagram plus up to `UDP_FLUSH_BATCH_MAX - 1`
+            // immediately-queued datagrams, then flush `w_w` ONCE at the end
+            // of the burst (when `!no_flush`).
+            let mut written_in_burst = 0usize;
+            let mut fatal_recv_err: Option<std::io::Error> = None;
+            loop {
+                if let Some(lim) = writer_lim.as_ref() {
+                    frp_core::bandwidth::BandwidthLimiter::consume_shared(lim, n).await;
+                }
+                let result = if v2 && udp_codec_opt.is_some() {
+                    // V2 binary codec fast path: encode directly from `&buf[..n]`
+                    // into `wire_scratch` with 8B V2 frame header headroom —
+                    // zero intermediate `spare` copy and zero `write_v2_frame_raw`
+                    // merge alloc/copy.
+                    wire_scratch.clear();
+                    wire_scratch.resize(V2_FRAME_HEADER_LEN, 0);
+                    wire_scratch.extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
+                    match frp_core::udp_binary::encode_udp_packet_binary_local_pre(
+                        &buf[..n],
+                        local_enc.as_ref(),
+                        &src,
+                        &mut wire_scratch,
+                    ) {
+                        Err(e) => Err(frp_core::Error::Protocol(
+                            format!("encode binary UDP packet: {e}").into(),
+                        )),
+                        Ok(()) => {
+                            write_v2_frame_in_place(
+                                &mut w_w,
+                                V2_FRAME_TYPE_MESSAGE,
+                                0,
+                                &mut wire_scratch,
+                            )
+                            .await
+                        }
+                    }
+                } else {
+                    spare.clear();
+                    spare.extend_from_slice(&buf[..n]);
+                    let content = std::mem::take(&mut spare);
+                    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+                        content,
+                        local_addr: local_addr.take(),
+                        remote_addr: Some(msg::UdpAddr {
+                            // Go net.IP.String() collapses IPv4-mapped
+                            // IPv6 to the dotted-quad form; mirror that
+                            // on the V1 JSON path too (same normalization
+                            // as the V2 binary codec, review finding C1).
+                            ip: match src.ip() {
+                                std::net::IpAddr::V6(v6) => v6
+                                    .to_ipv4_mapped()
+                                    .map(|v4| v4.to_string())
+                                    .unwrap_or_else(|| src.ip().to_string()),
+                                _ => src.ip().to_string(),
+                            },
+                            port: src.port(),
+                            zone: String::new(),
+                        }),
+                    });
+                    let r = if v2 {
+                        write_msg_v2_with_udp_codec(
+                            &mut w_w,
+                            &pkt,
+                            udp_codec_opt,
+                            true, // flushed once at burst end below
+                            &mut wire_scratch,
+                        )
+                        .await
+                    } else {
+                        // Same scratch on the V1 path: `write_v1_frame`
+                        // allocates one Vec per frame, this reuses the
+                        // loop's buffer (wire bytes identical — the
+                        // scratch is cleared per call; audit §3 item 1).
+                        write_v1_frame_scratch(&mut w_w, &pkt, &mut wire_scratch).await
+                    };
+                    // Return the invariant values to their locals for the
+                    // next packet before checking the write result.
+                    if let FrpMessage::UDPPacket(p) = pkt {
+                        local_addr = p.local_addr;
+                        spare = p.content;
+                    }
+                    r
+                };
+                if let Err(e) = result {
+                    debug!(proxy_name = %writer_name, error = %e,
+                        "UDP work conn write failed for '{}': {}", writer_name, e);
+                    break 'writer;
+                }
+                written_in_burst += 1;
+                if !batch_flush || written_in_burst >= UDP_FLUSH_BATCH_MAX {
+                    break;
+                }
+                match sock.try_recv_from(&mut buf) {
+                    Ok(pair) => {
+                        n = pair.0;
+                        src = pair.1;
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(e) => {
+                        fatal_recv_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if !no_flush && v2 {
+                if let Err(e) = w_w.flush().await {
+                    debug!(proxy_name = %writer_name, error = %e,
+                        "UDP work conn flush failed for '{}': {}", writer_name, e);
+                    break;
+                }
+            }
+            if let Some(e) = fatal_recv_err {
+                debug!(proxy_name = %writer_name, error = %e,
+                    "UDP recv_from error for '{}': {}", writer_name, e);
+                break;
             }
         }
     };
