@@ -126,8 +126,8 @@ pub struct ProxyManager {
     /// Keyed by proxy name (same as `proxies` keys).
     group_health: RwLock<HashMap<String, GroupMemberHealth>>,
     /// Fast-path guard: true when `group_health` has ≥1 entries.
-    /// Avoids acquiring the `group_health` RwLock on every
-    /// `select_group_backend` call when no health tracking is active.
+    /// Avoids acquiring the `group_health` RwLock on `select_group_backend`
+    /// and `report_backend_success` when no health tracking is active.
     health_tracking_active: AtomicBool,
 }
 
@@ -531,6 +531,9 @@ impl ProxyManager {
 
     /// Report a successful connection to a backend, resetting its health.
     pub async fn report_backend_success(&self, name: &str) {
+        if !self.health_tracking_active.load(Ordering::Acquire) {
+            return;
+        }
         let mut health = self.group_health.write().await;
         if let Some(entry) = health.get_mut(name) {
             entry.consecutive_failures = 0;
@@ -539,12 +542,11 @@ impl ProxyManager {
         }
     }
 
-    /// Report a connection failure to a backend. After `MAX_CONSECUTIVE_FAILURES`
-    /// (3), the backend is marked `Unhealthy`. It recovers after `HEALTH_COOLDOWN`
-    /// (30s) or on the next successful connection via `report_backend_success`.
+    /// Report a connection failure to a backend (`MAX_CONSECUTIVE_FAILURES` →
+    /// `Unhealthy`; recovers after `HEALTH_COOLDOWN` or `report_backend_success`).
     pub async fn report_backend_failure(&self, name: &str) {
-        self.health_tracking_active.store(true, Ordering::Release);
         let mut health = self.group_health.write().await;
+        self.health_tracking_active.store(true, Ordering::Release);
         let entry = health
             .entry(name.to_string())
             .or_insert_with(GroupMemberHealth::healthy);
@@ -1341,5 +1343,51 @@ mod tests {
             mgr.select_group_backend("g", "").await.as_deref(),
             Some("b")
         );
+    }
+
+    /// When `health_tracking_active` is false (no failures recorded),
+    /// `report_backend_success` must return via the lock-free fast path
+    /// without acquiring `group_health.write()`. Holding the write lock on
+    /// the same task would deadlock if the fast path were missing.
+    #[tokio::test]
+    async fn report_backend_success_fast_path_skips_write_lock_when_inactive() {
+        let mgr = ProxyManager::new();
+        let _write_guard = mgr.group_health.write().await;
+        mgr.report_backend_success("any-proxy").await;
+    }
+
+    /// `report_backend_failure` must arm `health_tracking_active` only after
+    /// acquiring `group_health.write()`, preventing a concurrent remover that
+    /// empties `group_health` from overwriting `true` with `false` before the
+    /// failure inserts its entry.
+    #[tokio::test]
+    async fn report_backend_failure_sets_flag_inside_write_lock() {
+        let mgr = Arc::new(ProxyManager::new());
+        let write_guard = mgr.group_health.write().await;
+
+        let mgr2 = mgr.clone();
+        let fail_task = tokio::spawn(async move {
+            mgr2.report_backend_failure("backend-a").await;
+        });
+
+        // Give fail_task a chance to block on `group_health.write()`.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !mgr.health_tracking_active
+                .load(std::sync::atomic::Ordering::Acquire),
+            "flag must not flip to true before acquiring group_health write lock"
+        );
+
+        drop(write_guard);
+        fail_task.await.unwrap();
+
+        assert!(
+            mgr.health_tracking_active
+                .load(std::sync::atomic::Ordering::Acquire),
+            "flag must be true once report_backend_failure completes"
+        );
+        assert!(mgr.group_health.read().await.contains_key("backend-a"));
     }
 }

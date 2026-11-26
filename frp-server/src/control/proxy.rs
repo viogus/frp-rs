@@ -272,32 +272,31 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
                 run_id: ctx.run_id.clone(),
             });
     }
-    // Server plugin: close_proxy hook (fire-and-forget — Go closeProxy
-    // spawns a goroutine for the notify, and Go discards the returned
-    // content here too: manager.go CloseProxy is notify-only). Payload is
-    // Go's CloseProxyContent: `user` object + proxy_name; `run_id` stays
-    // as a frp-rs extra (additive).
-    let plugin_state = ctx.state.clone();
-    let pn = cp.proxy_name.clone();
-    let rid = ctx.run_id.clone();
-    let user_info = ctx
-        .state
-        .plugin_manager
-        .user_info(&ctx.run_id)
-        .unwrap_or_default();
-    tokio::spawn(async move {
-        let _ = plugin_state
+    // Server plugin: close_proxy hook (fire-and-forget notify; Go CloseProxyContent
+    // `user` + `proxy_name`, plus additive `run_id`). Skip spawn when no plugins.
+    if !ctx.state.plugin_manager.is_empty() {
+        let plugin_state = ctx.state.clone();
+        let pn = cp.proxy_name.clone();
+        let rid = ctx.run_id.clone();
+        let user_info = ctx
+            .state
             .plugin_manager
-            .notify(
-                "close_proxy",
-                serde_json::json!({
-                    "user": user_info,
-                    "proxy_name": pn,
-                    "run_id": rid,
-                }),
-            )
-            .await;
-    });
+            .user_info(&ctx.run_id)
+            .unwrap_or_default();
+        tokio::spawn(async move {
+            let _ = plugin_state
+                .plugin_manager
+                .notify(
+                    "close_proxy",
+                    serde_json::json!({
+                        "user": user_info,
+                        "proxy_name": pn,
+                        "run_id": rid,
+                    }),
+                )
+                .await;
+        });
+    }
     // Note: Go frp does not send CloseProxyResp (type 7/19 is
     // Rust-only). frp-rs client handles both CloseProxy
     // and CloseProxyResp identically and already cleans up

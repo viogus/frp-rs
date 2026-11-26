@@ -32,9 +32,9 @@ used by both `frp-server` and `frp-client`.
 **Error type**: `frp_core::Error` is a `thiserror` enum covering Protocol,
 Transport, Auth, Config, Io, and Serde. Used across all crates.
 
-**Crypto**: `ring` for SHA256, AES-256-GCM, HKDF, HMAC. Go-compat ciphers
-(AES-128-CFB, MD5, PBKDF2-SHA1) use dedicated crates (`aes`+`cfb-mode`,
-`md-5`, `pbkdf2`+`sha1`). See [`encryption.rs`](src/encryption.rs) for
+**Crypto**: `ring` for SHA256, SHA-1 (WebSocket accept key), PBKDF2-HMAC-SHA1,
+AES-256-GCM, HKDF, HMAC. Go-compat ciphers (AES-128-CFB, MD5) use dedicated
+crates (`aes`+`cfb-mode`, `md-5`). See [`encryption.rs`](src/encryption.rs) for
 key derivation details.
 
 **Encryption key**: Derived from auth token via `PBKDF2-SHA1(token, salt="frp",

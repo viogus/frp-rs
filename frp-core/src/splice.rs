@@ -41,19 +41,23 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize)>
     let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     // SAFETY: as above — pipe2 returned 0, so fds[1] is a valid open fd.
     let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    // Grow both ends to PIPE_CAPACITY. F_SETPIPE_SZ fails with EPERM when the
-    // requested size exceeds the kernel's pipe-max-size (or the process's
-    // pipe-pages soft rlimit — a non-root `User=frp` deployment with dozens
-    // of concurrent bridges can hit the 16k-page default and silently lose
-    // the size on every pipe after a few dozen). On failure the kernel
-    // default stays and splice simply moves up to the smaller pipe, so the
-    // fallback is safe (never EAGAIN early — a full pipe still reports
-    // partial progress, not an error).
-    let mut capacity = PIPE_CAPACITY;
-    for fd in [fds[0], fds[1]] {
-        // SAFETY: fds[0]/fds[1] are valid fds from pipe2 above; fcntl does
-        // not take ownership.
-        let ret = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PIPE_CAPACITY as libc::c_int) };
+    // Grow the pipe to PIPE_CAPACITY (both fds reference the same kernel
+    // pipe buffer, so a single fcntl on fds[0] resizes the pair).
+    // F_SETPIPE_SZ fails with EPERM when the requested size exceeds the
+    // kernel's pipe-max-size (or the process's pipe-pages soft rlimit — a
+    // non-root `User=frp` deployment with dozens of concurrent bridges can
+    // hit the 16k-page default and silently lose the size on every pipe
+    // after a few dozen). On failure the kernel default stays and splice
+    // simply moves up to the smaller pipe, so the fallback is safe (never
+    // EAGAIN early — a full pipe still reports partial progress, not an
+    // error).
+    // SAFETY: fds[0] is a valid fd from pipe2 above; fcntl does not take
+    // ownership.
+    let ret = unsafe { libc::fcntl(fds[0], libc::F_SETPIPE_SZ, PIPE_CAPACITY as libc::c_int) };
+    let capacity = if ret > 0 {
+        // Linux F_SETPIPE_SZ returns the new pipe capacity in bytes on success.
+        ret as usize
+    } else {
         // The resize is a throughput hint, not a correctness requirement —
         // but when it fails how we learn the real size matters: log the
         // outcome so a bounds-regressed deployment (EPERM under the pipe
@@ -70,14 +74,15 @@ fn create_pipe_pair() -> io::Result<(AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize)>
             }
         }
         // Read back the true capacity so the splice length argument matches
-        // reality (a gracefully-resized pipe may still sit below 1 MiB if
-        // pipe-max-size is lower, and an EPERM pipe is back at 64 KiB).
-        // SAFETY: fd is a pipe end from pipe2; F_GETPIPE_SZ takes any pipe fd.
-        let actual = unsafe { libc::fcntl(fd, libc::F_GETPIPE_SZ) };
+        // reality (an EPERM pipe stays at the kernel default, e.g. 64 KiB).
+        // SAFETY: fds[0] is a pipe end from pipe2; F_GETPIPE_SZ takes any pipe fd.
+        let actual = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
         if actual > 0 {
-            capacity = actual as usize;
+            actual as usize
+        } else {
+            PIPE_CAPACITY
         }
-    }
+    };
     // SAFETY: `read` is the pipe end's sole owner and stays open for the
     // `AsyncFd`'s lifetime, so `AsyncFd::register`'s I/O-safety contract holds.
     let read_async = unsafe { AsyncFd::register(read) }?;

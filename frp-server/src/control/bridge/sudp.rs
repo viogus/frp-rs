@@ -20,19 +20,17 @@ use super::*;
 /// `Pong` is ignored on both sides (frp-rs UDP data planes treat
 /// Ping/Pong as keepalive and never forward them); any other message type
 /// is a protocol violation and closes the pair.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_sudp_message_bridge(
     work_conn: IoStream,
     req: PendingRequest,
     proxy_info: Option<Arc<crate::proxy::ProxyInfo>>,
     encryption_key: [u8; 16],
     metrics: Arc<frp_core::metrics::ProxyMetrics>,
-    state: Arc<AppState>,
     provider_v2: bool,
     provider_codec: &str,
 ) {
-    let _guard = ConnGuard::new(metrics.clone());
-    let _drain = ActiveGuard::new(&state);
+    // Caller (`run_work_bridge`) already holds `ConnGuard` and `ActiveGuard`
+    // for the full duration of this bridge; do not construct a second pair.
     let visitor_v2 = req.visitor_v2;
     let visitor_codec = req.visitor_udp_packet_codec.as_str();
 

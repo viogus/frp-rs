@@ -9,7 +9,6 @@ pub mod buffer_pool;
 pub mod cipher_stream;
 pub mod cli;
 pub mod config;
-pub mod config_store;
 pub mod control_sink;
 /// CRC-32C (Castagnoli) checksum used by the Snappy frame format.
 #[cfg(feature = "compression")]

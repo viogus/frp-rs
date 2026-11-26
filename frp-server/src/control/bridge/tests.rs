@@ -2150,3 +2150,157 @@ fn plain_path_priorities_put_the_fallback_and_the_limit_first() {
         PlainPath::RateLimited
     );
 }
+
+/// Mixed-encoding SUDP bridges delegate from `run_work_bridge` to
+/// `run_sudp_message_bridge`. The caller already holds `ConnGuard` and
+/// `ActiveGuard`; constructing a second pair inside `run_sudp_message_bridge`
+/// would double-count `active_connections`, `current_conns`, and `total_conns`.
+#[tokio::test]
+async fn mixed_sudp_bridge_counts_connection_and_active_guard_once() {
+    let (mut visitor_peer, visitor_server) = tcp_pair().await;
+    let (mut provider_peer, provider_server) = tcp_pair().await;
+
+    let cfg = frp_core::config::ServerConfig::default();
+    let state = Arc::new(AppState::new(
+        frp_core::auth::AuthConfig::with_token("test-token"),
+        "127.0.0.1".into(),
+        frp_core::encryption::derive_key("test-token"),
+        vec![frp_core::config::PortsRange {
+            start: 1,
+            end: u16::MAX,
+            single: 0,
+        }],
+        String::new(),
+        true,
+        30,
+        None,
+        7200,
+        0,
+        0,
+        90,
+        1500,
+        false,
+        None,
+        0,
+        60,
+        10,
+        false,
+        String::new(),
+        Arc::new(crate::plugin::HttpPluginManager::new(Vec::new())),
+        0,
+        0,
+        0,
+        168,
+        true,
+        0,
+        0,
+        frp_core::config::ServerConfigSnapshot::from_config(&cfg),
+    ));
+    let metrics = Arc::new(frp_core::metrics::ProxyMetrics::new("sudp-mixed".into()));
+    let proxy_info = Arc::new(crate::proxy::ProxyInfo {
+        name: "sudp-mixed".into(),
+        proxy_type: "sudp".into(),
+        run_id: "run-1".into(),
+        control_id: 1,
+        remote_port: None,
+        sk: Some("secret".into()),
+        group: None,
+        group_key: None,
+        local_addr: None,
+        use_encryption: false,
+        use_compression: false,
+        virtual_net: None,
+        allow_users: Vec::new(),
+        proxy_protocol_version: String::new(),
+        response_headers: std::collections::HashMap::new(),
+        custom_domains: Vec::new(),
+        route_by_http_user: String::new(),
+        multiplexer: String::new(),
+        bandwidth_limit: String::new(),
+        bandwidth_limit_mode: String::new(),
+        bandwidth_limiter: None,
+        udp_packet_codec: frp_core::udp_binary::UDP_PACKET_CODEC_BINARY.into(),
+        user: String::new(),
+        user_conn_sem: None,
+    });
+    let req = PendingRequest {
+        proxy_name: "sudp-mixed".into(),
+        user_conn: IoStream::Tcp(visitor_server),
+        pre_read: Vec::new(),
+        use_encryption: false,
+        use_compression: false,
+        visitor_use_encryption: false,
+        visitor_use_compression: false,
+        // V1/JSON visitor vs V2/binary-v1 provider triggers run_sudp_message_bridge.
+        visitor_v2: false,
+        visitor_udp_packet_codec: String::new(),
+        created_at: tokio::time::Instant::now(),
+        user_conn_permit: None,
+        proxy_info: Some(proxy_info.clone()),
+        request_is_connect: false,
+    };
+
+    let bridge = tokio::spawn(run_work_bridge(
+        IoStream::Tcp(provider_server),
+        req,
+        Some(proxy_info),
+        [0u8; 16],
+        metrics.clone(),
+        None,
+        state.clone(),
+        true,
+    ));
+
+    // Send one V1 UDPPacket from visitor and wait for the re-encoded V2 packet
+    // on provider so we assert while run_sudp_message_bridge is actively running.
+    let pkt = FrpMessage::UDPPacket(msg::UDPPacket {
+        content: b"ping-sudp".to_vec(),
+        local_addr: None,
+        remote_addr: Some(msg::UdpAddr {
+            ip: "127.0.0.1".into(),
+            port: 12345,
+            zone: String::new(),
+        }),
+    });
+    write_msg_v1(&mut visitor_peer, &pkt).await.unwrap();
+    let mut scratch = Vec::new();
+    let forwarded = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_msg_v2_with_udp_codec(
+            &mut provider_peer,
+            Some(frp_core::udp_binary::UDP_PACKET_CODEC_BINARY),
+            &mut scratch,
+        ),
+    )
+    .await
+    .expect("timed out waiting for forwarded mixed SUDP packet")
+    .expect("provider read");
+    assert!(matches!(forwarded, FrpMessage::UDPPacket(p) if p.content == b"ping-sudp"));
+
+    assert_eq!(
+        state.active_connections.load(Ordering::Relaxed),
+        1,
+        "mixed SUDP bridge must increment active_connections once, not twice"
+    );
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.current_conns, 1,
+        "mixed SUDP bridge must increment current_conns once, not twice"
+    );
+    assert_eq!(
+        snap.total_conns, 1,
+        "mixed SUDP bridge must increment total_conns once, not twice"
+    );
+
+    drop(visitor_peer);
+    drop(provider_peer);
+    tokio::time::timeout(std::time::Duration::from_secs(2), bridge)
+        .await
+        .expect("bridge must exit after peers close")
+        .unwrap();
+
+    assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+    let after = metrics.snapshot();
+    assert_eq!(after.current_conns, 0);
+    assert_eq!(after.total_conns, 1);
+}

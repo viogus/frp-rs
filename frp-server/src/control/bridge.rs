@@ -429,7 +429,6 @@ async fn run_work_bridge(
                 proxy_info,
                 encryption_key,
                 metrics,
-                state,
                 v2,
                 &provider_codec,
             )

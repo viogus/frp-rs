@@ -29,14 +29,11 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry", "json"] }
 tracing-appender.workspace = true
 thiserror.workspace = true
-async-trait.workspace = true
 axum = { workspace = true, optional = true }
 uuid.workspace = true
-sha1.workspace = true
 md-5.workspace = true
 aes.workspace = true
 cfb-mode.workspace = true
-pbkdf2.workspace = true
 snap = { workspace = true, optional = true }
 rand.workspace = true
 futures-util.workspace = true
@@ -53,7 +50,7 @@ socket2.workspace = true
 hyper = { workspace = true, optional = true }
 hyper-util = { workspace = true, optional = true }
 tower-service = { workspace = true, optional = true }
-http-body-util = { workspace = true, optional = true, features = ["full"] }
+http-body-util = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 http = { workspace = true, optional = true }

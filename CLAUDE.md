@@ -240,8 +240,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Serialization | `serde` + `serde_json` | derive feature |
 | Config | `toml` | 1.1 (`toml` 1.1.8+spec-1.1.0); `.yaml`/`.yml`/`.json`/`.ini` via `yaml-rust2` 0.13 (`default-features = false`, Go-compatible YAML 1.1 scalar resolution) / `serde_json` — auto-detected by extension |
 | Cert generation | `rcgen` | optional under the default `tls` feature — not dev-only: `frp-core/src/transport/tls.rs` generates the frps certificate at runtime when no cert files are configured |
-| Crypto (general) | `ring` | 0.17 — SHA256, AES-256-GCM, HKDF, HMAC |
-| Crypto (Go compat) | `aes` + `cfb-mode`, `pbkdf2` + `sha1`, `md-5` | AES-128-CFB, PBKDF2-SHA1, MD5 — ring lacks these |
+| Crypto (general) | `ring` | 0.17 — SHA256, SHA-1 (WebSocket), PBKDF2-HMAC-SHA1, AES-256-GCM, HKDF, HMAC |
+| Crypto (Go compat) | `aes` + `cfb-mode`, `md-5` | AES-128-CFB, MD5 — ring lacks these |
 | Crypto (V2 XChaCha20) | `chacha20poly1305` | ring only has ChaCha20 (96-bit nonce), V2 needs XChaCha20 (192-bit) |
 | TLS | `rustls` + `tokio-rustls` + `rustls-platform-verifier` | ring backend, tls12, native cert verifier. **Vendored** at `vendor/rustls` 0.23.46 with two patches: a one-line SNI patch (`ServerNamePayload::Invalid` → treat as no-SNI) for Go XTCP QUIC visitor compat, and `READ_SIZE` = a whole record instead of 4 KiB in the deframer (+4.2% throughput on TLS); delete the vendored copy when upgrading to rustls ≥0.24 (native `invalid_sni_policy`) and keep tracking 0.23.x security updates manually (0.23.46 is the RUSTSEC-2026-0346/-0347/-0348/-0349 fix) |
 | SSH | `russh` | ring backend (NOT aws-lc-rs), features: ring+rsa only |
@@ -264,6 +264,8 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `base64` — replaced by inline `frp_core::base64`
 - `data-encoding` — replaced by inline `frp_core::base64` (2026-08-06; was ~47KB .text in frps)
 - `sha2` — replaced by ring
+- `sha1` / `pbkdf2` — replaced by ring (`SHA1_FOR_LEGACY_USE_ONLY`, `PBKDF2_HMAC_SHA1`)
+- `async-trait` — removed (only used by dead `config_store` trait)
 - `aes-gcm` — replaced by ring (AES-256-GCM)
 - `hkdf` — replaced by ring (HKDF-SHA256)
 - `hickory-resolver` — replaced by custom DNS-over-UDP client

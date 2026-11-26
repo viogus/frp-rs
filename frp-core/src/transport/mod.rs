@@ -2144,12 +2144,11 @@ pub async fn accept_websocket(stream: IoStream) -> Result<IoStream, crate::Error
     }
 
     // Compute accept key: base64(sha1(key + magic GUID))
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let hash = hasher.finalize();
-    let accept = base64_encode(&hash);
+    let hash = hasher.finish();
+    let accept = base64_encode(hash.as_ref());
 
     // Send HTTP 101 Switching Protocols.
     // Capture any bytes BufReader may have read-ahead past headers
@@ -2325,12 +2324,11 @@ pub async fn accept_websocket_from_peeked(
     }
 
     // Compute accept key: base64(sha1(key + magic GUID))
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
     hasher.update(key.as_bytes());
     hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let hash = hasher.finalize();
-    let accept = base64_encode(&hash);
+    let hash = hasher.finish();
+    let accept = base64_encode(hash.as_ref());
 
     // Send 101 Switching Protocols
     let resp = format!(
@@ -2477,11 +2475,10 @@ where
         // control stream to it would leak the stream to an arbitrary HTTP
         // endpoint (or fail cryptically downstream).
         let expected_accept = {
-            use sha1::{Digest, Sha1};
-            let mut hasher = Sha1::new();
+            let mut hasher = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
             hasher.update(key.as_bytes());
             hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-            base64_encode(&hasher.finalize())
+            base64_encode(hasher.finish().as_ref())
         };
         match accept_header {
             Some(actual) if actual == expected_accept => {}
@@ -3312,13 +3309,15 @@ mod tests {
     #[cfg(feature = "websocket")]
     #[tokio::test]
     async fn accept_websocket_from_peeked_accepts_lf_only_head() {
-        use sha1::{Digest, Sha1};
-
         let key = "dGhlIHNhbXBsZSBub25jZQ=="; // RFC 6455 §1.3 sample key
-        let mut hasher = Sha1::new();
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
         hasher.update(key.as_bytes());
         hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        let accept = base64_encode(&hasher.finalize());
+        let accept = base64_encode(hasher.finish().as_ref());
+        assert_eq!(
+            accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+            "RFC 6455 §1.3 Sec-WebSocket-Accept KAT"
+        );
         let expected_resp = format!(
             "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
              Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -3407,7 +3406,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2368).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2366).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

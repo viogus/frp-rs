@@ -1156,7 +1156,6 @@ version = "0.72.0"
 dependencies = [
  "aes",
  "anyhow",
- "async-trait",
  "axum",
  "bpaf",
  "bytes",
@@ -1174,7 +1173,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "pbkdf2",
  "pprof",
  "proptest",
  "quinn",
@@ -1185,7 +1183,6 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
- "sha1 0.11.0",
  "snap",
  "socket2",
  "tempfile",
@@ -1249,7 +1246,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1262,7 +1258,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1381,7 +1376,6 @@ version = "1.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "337d46834ee672ab3e48caca2cb0c78cc174fb12b3a68d0d88f99a0519a5e36e"
 dependencies = [
- "generic-array 0.14.7",
  "rustversion",
  "typenum",
 ]
@@ -1567,7 +1561,6 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
- "tokio",
 ]
 
 [[package]]
@@ -2013,12 +2006,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "md5"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ebb8d8732c6a6df3d8f032a82911cfc747e00efb95cc46e8d0acd5b5b88570c"
-
-[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2407,16 +2394,6 @@ dependencies = [
  "redox_syscall",
  "smallvec",
  "windows-link",
-]
-
-[[package]]
-name = "pbkdf2"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
-dependencies = [
- "digest 0.11.3",
- "hmac",
 ]
 
 [[package]]
@@ -3033,13 +3010,11 @@ dependencies = [
  "futures",
  "generic-array 1.4.5",
  "getrandom 0.4.3",
- "ghash",
  "hex-literal",
  "hmac",
  "inout",
  "keccak",
  "log",
- "md5",
  "ml-kem",
  "module-lattice",
  "num-bigint 0.5.1",
@@ -3047,10 +3022,8 @@ dependencies = [
  "p384",
  "p521",
  "pageant",
- "pbkdf2",
  "pkcs1",
  "pkcs8",
- "polyval",
  "rand 0.10.3",
  "rand_core 0.10.1",
  "ring",
@@ -4454,15 +4427,6 @@ name = "windows-sys"
 version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
-dependencies = [
- "windows-targets",
-]
-
-[[package]]
-name = "windows-sys"
-version = "0.59.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
 dependencies = [
  "windows-targets",
 ]

@@ -315,7 +315,7 @@ exactly why a happy-path test will not tell you.
 
 A caution from this section's own history: the text it replaces said
 "`register_proxy_entry` allocates via `allocate_port_multi()`". Open
-`allocate_port_multi` (`frp-server/src/proxy.rs:821`) and you will find it
+`allocate_port_multi` (`frp-server/src/proxy.rs:823`) and you will find it
 referenced only by its own unit tests at `612f7df1` — it reads like the allocator
 from its name and is not one. Open every citation.
 
@@ -1079,7 +1079,7 @@ RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features
 
 They deliberately omit `--all-targets`. On a `--workspace` invocation every
 member is a root, so the dev-dependency edges enter the graph, and
-`frp-server`'s dev-dependency on `frp-client` (`frp-server/Cargo.toml:69`,
+`frp-server`'s dev-dependency on `frp-client` (`frp-server/Cargo.toml:67`,
 default features) plus `frp-client`'s on `frp-server` re-enable both crates'
 `default` sets — measured, the micro graph flips from `frp-client = []` to
 `frp-client = [chacha20, compression, default, http2http, kcp, oidc, quic,
@@ -4065,10 +4065,10 @@ scope.
 | **Freeze** — bug-fix only | No new Go-parity work, no Go-parity-only tests, no refactor. Not removed. | SUDP; h2c; Windows TUN; the non-default XTCP data plane (KCP+yamux). |
 
 Three build-tier facts the tier names alone would hide. The dashboard is
-**Keep** even though it is an opt-in Cargo feature (`frp-server/Cargo.toml:47`)
+**Keep** even though it is an opt-in Cargo feature (`frp-server/Cargo.toml:45`)
 — it is part of the product, just not of every binary — while the SSH gateway
-is default-on (`frp-server/Cargo.toml:46`). The `http-proxy` feature is
-**default-on** (`frp-server/Cargo.toml:45`), so the server-side
+is default-on (`frp-server/Cargo.toml:44`). The `http-proxy` feature is
+**default-on** (`frp-server/Cargo.toml:43`), so the server-side
 `[[httpPlugins]]` manager is Keep; that same feature gates the frozen h2c module
 (`frp-server/src/vhost.rs:28`), so h2c's freeze is a code-review rule rather
 than a build gate — the frozen code still compiles into the default and tiny
