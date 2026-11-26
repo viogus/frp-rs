@@ -381,15 +381,15 @@ this audit records that gap rather than closing over it.
 ### Busy loop after shutdown: no reachable path
 
 The port's one terminal state, `ConnectionState::Closed`, returns
-`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:243`) or
-`Poll::Ready(Err(ConnectionError::Closed))` (`:186`) — a caller that keeps
+`Poll::Ready(None)` (`vendor/yamux/src/connection.rs:240`) or
+`Poll::Ready(Err(ConnectionError::Closed))` (`:183`) — a caller that keeps
 polling a closed connection would indeed spin. There are **four** live poll
 sites under `tcp-mux`, and all four treat that as terminal:
 
-- the server acceptor (`frp-core/src/mux.rs:873` is its `select!`; terminal at
-  `:908`/`:912`) — `break` on `Some(Err(e))`/`None`, and the poll is wrapped in
-  `timeout(keepalive, ..)`;
-- the client driver (`frp-core/src/mux.rs:1144`/`:1208`) — same, inside a
+- the server acceptor (`frp-core/src/mux.rs:919` is its `select!`; terminal at
+  `:996`/`:1001`) — `break` on `Some(Err(e))`/`None`, with a persistent
+  `keepalive_timer.tick()` branch;
+- the client driver (`frp-core/src/mux.rs:1232`/`:1237`) — same, inside a
   `select!` whose other branch is a synchronous single poll (never parks);
 - the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1126`/`:1132`) — tick-bounded;
 - the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:804`/`:957`, terminal at
@@ -400,10 +400,10 @@ So a `Ready`-forever terminal state has no caller that can keep polling it.
 ### Blocked write: enforced **above** the port, not inside it
 
 `Active::poll` drives writes through `Active::poll_writes`
-(`vendor/yamux/src/connection.rs:617`) using `Writer::poll_finish_current` /
+(`vendor/yamux/src/connection.rs:612`) using `Writer::poll_finish_current` /
 `poll_send_frame` / `poll_flush_io` (`vendor/yamux/src/frame/io.rs:125-141`)
 and, when the transport is not writable, falls through to `return Poll::Pending`
-after the socket registered its waker. The crate itself still has **no
+(`vendor/yamux/src/connection.rs:606`) after the socket registered its waker. The crate itself still has **no
 write deadline** — `grep -rn "write_timeout\|WriteTimeout\|write deadline"
 vendor/yamux/src/` is empty and `Config` (`vendor/yamux/src/lib.rs:100-116`) has
 no timeout field — and it is deliberately runtime-agnostic, so a timer cannot

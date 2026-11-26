@@ -525,7 +525,7 @@ pub(crate) fn write_stall_watchdog(
 ///
 /// The WebSocket transport rejects, on read, any frame whose payload exceeds
 /// `MAX_WS_FRAME_PAYLOAD` — the 64 KiB V2 message cap plus 128 bytes of AEAD
-/// slack (`frp-core/src/transport/websocket.rs:27`). A yamux data frame is
+/// slack (`frp-core/src/transport/websocket.rs:25`). A yamux data frame is
 /// `split_send_size` body bytes plus its 12-byte header (65548 of the 65664
 /// allowed), so 64 KiB fits and anything larger does not. The cap matters
 /// because one oversized frame is refused by the *peer's* transport, which
@@ -599,7 +599,7 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // state: `split_send_size` is the bridge's copy buffer
     // (64 KiB default; knob overrides) - not padded, not split
     // further unless the send window is short (a partly consumed window
-    // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:408-409`)
+    // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:416-417`)
     // or the chunk is short (compression shrinks it, encryption writes the
     // IV first). Frame count is what costs here — each extra frame is
     // another 12-byte header, another window-credit check and another waker
