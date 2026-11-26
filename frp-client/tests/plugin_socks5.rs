@@ -163,3 +163,95 @@ async fn test_socks5_plugin_rejects_wrong_password() {
     assert_eq!(status[0], USERPASS_VERSION);
     assert_ne!(status[1], 0, "wrong password must be rejected");
 }
+
+#[tokio::test]
+async fn test_socks5_pipelined_handshake_preserves_first_payload() {
+    // Regression guard for buffered handshake reading: if the client pipelines
+    // the CONNECT request and its first application bytes in the same TCP
+    // segment, those bytes must be flushed to the target before relay_tcp_fast
+    // takes ownership of the raw TcpStreams.
+    let backend = start_echo_backend().await;
+    let cfg = PluginConfig {
+        plugin_type: "socks5".into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_socks5_proxy(&cfg)
+        .await
+        .expect("start socks5 plugin");
+
+    let mut s = TcpStream::connect(handle.local_addr).await.unwrap();
+    let _ = s.set_nodelay(true);
+    let std::net::IpAddr::V4(ipv4) = backend.ip() else {
+        unreachable!()
+    };
+    // Send greeting + CONNECT + pipelined payload in one write.
+    let mut combined = vec![
+        SOCKS5_VERSION,
+        1,
+        AUTH_NO_AUTH,
+        SOCKS5_VERSION,
+        CMD_CONNECT,
+        0,
+        ATYP_IPV4,
+    ];
+    combined.extend_from_slice(&ipv4.octets());
+    combined.extend_from_slice(&backend.port().to_be_bytes());
+    combined.extend_from_slice(b"pipelined-first-bytes!");
+    s.write_all(&combined).await.unwrap();
+
+    // Expect 2-byte method reply + 10-byte CONNECT reply + echoed payload.
+    let mut method_reply = [0u8; 2];
+    tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut method_reply))
+        .await
+        .expect("method reply timeout")
+        .expect("method reply");
+    assert_eq!(method_reply, [SOCKS5_VERSION, AUTH_NO_AUTH]);
+
+    let mut connect_reply = [0u8; 10];
+    tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut connect_reply))
+        .await
+        .expect("connect reply timeout")
+        .expect("connect reply");
+    assert_eq!(connect_reply[0], SOCKS5_VERSION);
+    assert_eq!(connect_reply[1], 0);
+
+    let mut echoed = vec![0u8; b"pipelined-first-bytes!".len()];
+    tokio::time::timeout(Duration::from_secs(2), s.read_exact(&mut echoed))
+        .await
+        .expect("pipelined echo timeout")
+        .expect("pipelined echo");
+    assert_eq!(echoed, b"pipelined-first-bytes!");
+}
+
+#[tokio::test]
+async fn test_socks5_bulk_bidirectional_relay() {
+    // Stresses relay_tcp_fast (Linux zero-copy splice / non-Linux lock-free
+    // into_split pooled relay) + clean half-close FIN propagation across 2 MiB.
+    let backend = start_echo_backend().await;
+    let cfg = PluginConfig {
+        plugin_type: "socks5".into(),
+        ..Default::default()
+    };
+    let handle = frp_client::plugin::start_socks5_proxy(&cfg)
+        .await
+        .expect("start socks5 plugin");
+
+    let s = socks5_connect(handle.local_addr, backend, None).await;
+    let total = 2 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 29) % 251) as u8).collect();
+    let expected = payload.clone();
+
+    let (mut r, mut w) = s.into_split();
+    let writer = tokio::spawn(async move {
+        w.write_all(&payload).await.unwrap();
+        w.shutdown().await.unwrap();
+    });
+
+    let mut got = Vec::with_capacity(total);
+    tokio::time::timeout(Duration::from_secs(5), r.read_to_end(&mut got))
+        .await
+        .expect("bulk echo timeout")
+        .expect("bulk echo read");
+    writer.await.unwrap();
+    assert_eq!(got, expected);
+}

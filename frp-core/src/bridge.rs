@@ -1163,6 +1163,59 @@ where
     relay_plain_pooled_with_linger(a, b, HALF_CLOSE_LINGER_TIMEOUT).await
 }
 
+/// Bidirectional relay between two raw `TcpStream`s.
+///
+/// - On Linux: uses kernel-space zero-copy [`crate::splice::bridge_splice`]
+///   with identical half-close linger semantics.
+/// - On non-Linux (macOS / Windows): uses lock-free `TcpStream::into_split()`
+///   with pooled 64 KiB buffers, avoiding `tokio::io::split`'s per-socket
+///   `BiLock` contention on full-duplex traffic.
+pub async fn relay_tcp_fast(
+    a: tokio::net::TcpStream,
+    b: tokio::net::TcpStream,
+) -> io::Result<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::splice::bridge_splice(a, b).await
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        relay_tcp_pooled_with_linger(a, b, HALF_CLOSE_LINGER_TIMEOUT).await
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+async fn relay_tcp_pooled_with_linger(
+    a: tokio::net::TcpStream,
+    b: tokio::net::TcpStream,
+    linger: Duration,
+) -> io::Result<(u64, u64)> {
+    let (mut a_r, mut a_w) = a.into_split();
+    let (mut b_r, mut b_w) = b.into_split();
+    let (half_closed_tx, half_closed_rx) = tokio::sync::watch::channel(false);
+    let a_to_b = {
+        let rx = half_closed_rx.clone();
+        let tx = half_closed_tx.clone();
+        async move {
+            let n = copy_pooled(&mut a_r, &mut b_w, rx, linger).await?;
+            let _ = tx.send(true);
+            b_w.shutdown().await?;
+            Ok::<u64, io::Error>(n)
+        }
+    };
+    let b_to_a = {
+        let tx = half_closed_tx;
+        async move {
+            let n = copy_pooled(&mut b_r, &mut a_w, half_closed_rx, linger).await?;
+            let _ = tx.send(true);
+            a_w.shutdown().await?;
+            Ok::<u64, io::Error>(n)
+        }
+    };
+    let (x, y) = tokio::try_join!(a_to_b, b_to_a)?;
+    Ok((x, y))
+}
+
 /// [`relay_plain_pooled`] with an injectable half-close linger, so tests can
 /// pin both the abandon-a-stalled-peer and the do-not-truncate-a-slow-peer
 /// behaviours without depending on the wall clock.

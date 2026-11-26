@@ -1,3 +1,7 @@
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
@@ -44,6 +48,160 @@ const USERPASS_VERSION: u8 = 0x01;
 const USERPASS_OK: u8 = 0x00;
 const USERPASS_FAIL: u8 = 0x01;
 
+const REPLY_SUCCEEDED_ZERO: [u8; 10] = [
+    SOCKS5_VERSION,
+    REP_SUCCEEDED,
+    0x00,
+    ATYP_IPV4,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+const REPLY_GENERAL_FAILURE: [u8; 10] = [
+    SOCKS5_VERSION,
+    REP_GENERAL_FAILURE,
+    0x00,
+    ATYP_IPV4,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+const REPLY_HOST_UNREACHABLE: [u8; 10] = [
+    SOCKS5_VERSION,
+    REP_HOST_UNREACHABLE,
+    0x00,
+    ATYP_IPV4,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+const REPLY_CMD_NOT_SUPPORTED: [u8; 10] = [
+    SOCKS5_VERSION,
+    REP_CMD_NOT_SUPPORTED,
+    0x00,
+    ATYP_IPV4,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+const REPLY_ADDR_NOT_SUPPORTED: [u8; 10] = [
+    SOCKS5_VERSION,
+    REP_ADDR_NOT_SUPPORTED,
+    0x00,
+    ATYP_IPV4,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Shared per-plugin state; cloned by `Arc` per accepted TCP connection
+/// instead of cloning `String` credentials on every connect.
+struct Socks5State {
+    user: Option<String>,
+    pass: Option<String>,
+    udp: Option<UdpAssociateHandle>,
+}
+
+/// Stack-buffered reader for the SOCKS5 handshake. Large enough (520 B) to
+/// hold the maximum RFC 1929 user/pass packet (`2 + 255 + 1 + 255 = 513 B`)
+/// contiguously so auth slices need zero heap allocation and normal handshakes
+/// drop from 7–10 `read()` syscalls to 2–3.
+struct HandshakeBuf {
+    buf: [u8; 520],
+    pos: usize,
+    len: usize,
+}
+
+impl HandshakeBuf {
+    fn new() -> Self {
+        Self {
+            buf: [0u8; 520],
+            pos: 0,
+            len: 0,
+        }
+    }
+
+    fn compact(&mut self) {
+        if self.pos == self.len {
+            self.pos = 0;
+            self.len = 0;
+        } else if self.pos > 0 {
+            self.buf.copy_within(self.pos..self.len, 0);
+            self.len -= self.pos;
+            self.pos = 0;
+        }
+    }
+
+    async fn ensure(&mut self, stream: &mut TcpStream, need: usize) -> std::io::Result<()> {
+        if self.len - self.pos >= need {
+            return Ok(());
+        }
+        if self.buf.len() - self.pos < need {
+            self.compact();
+        }
+        while self.len - self.pos < need {
+            let n = stream.read(&mut self.buf[self.len..]).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early eof",
+                ));
+            }
+            self.len += n;
+        }
+        Ok(())
+    }
+
+    async fn take_range(
+        &mut self,
+        stream: &mut TcpStream,
+        n: usize,
+    ) -> std::io::Result<std::ops::Range<usize>> {
+        self.ensure(stream, n).await?;
+        let start = self.pos;
+        self.pos += n;
+        Ok(start..start + n)
+    }
+
+    fn remaining(&self) -> &[u8] {
+        &self.buf[self.pos..self.len]
+    }
+}
+
+enum SocksTarget {
+    Addr(SocketAddr),
+    Domain(String, u16),
+}
+
+impl fmt::Display for SocksTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SocksTarget::Addr(addr) => write!(f, "{addr}"),
+            SocksTarget::Domain(host, port) => write!(f, "{host}:{port}"),
+        }
+    }
+}
+
+enum HandshakeAction {
+    Connect(SocksTarget),
+    UdpAssociate,
+}
+
 /// Start a SOCKS5 proxy plugin server.
 ///
 /// Supports CONNECT and, when `plugin.udp_enable` is set, UDP ASSOCIATE
@@ -56,54 +214,157 @@ pub async fn start_socks5_proxy(cfg: &PluginConfig) -> Result<PluginHandle, frp_
     // lazily on the first UDP ASSOCIATE and watches this token.
     let cancel = tokio_util::sync::CancellationToken::new();
     let udp = super::socks5_udp::UdpRelay::from_config(cfg, cancel.clone()).await?;
-    let mut handle = serve_plugin(
-        "socks5",
-        (user, pass, udp),
-        |stream, peer, (u, p, udp)| async move {
-            if let Err(e) = handle_socks5_conn(stream, u, p, udp).await {
-                debug!(%peer, error = %e, "socks5: {peer} error: {e}");
-            }
-        },
-    )
+    let state = Arc::new(Socks5State { user, pass, udp });
+    let mut handle = serve_plugin("socks5", state, |stream, peer, state| async move {
+        if let Err(e) = handle_socks5_conn_state(stream, &state).await {
+            debug!(%peer, error = %e, "socks5: {peer} error: {e}");
+        }
+    })
     .await?;
     handle.cancel = cancel;
     Ok(handle)
 }
 
+#[cfg(test)]
 async fn handle_socks5_conn(
-    mut client: TcpStream,
+    client: TcpStream,
     user: Option<String>,
     pass: Option<String>,
     udp: Option<UdpAssociateHandle>,
 ) -> Result<(), String> {
-    let mut buf = [0u8; 512];
+    let state = Socks5State { user, pass, udp };
+    handle_socks5_conn_state(client, &state).await
+}
 
-    // One absolute deadline anchors the whole handshake — greeting, auth
-    // methods, user/pass, CONNECT request. A peer that connects but stalls
-    // mid-handshake would otherwise pin the handler task + fd (and the
-    // work-conn bridge) forever. The relay phase after CONNECT stays
-    // unbounded: the bridge copies for as long as the tunnel lives.
-    let deadline = tokio::time::Instant::now() + SOCKS5_HANDSHAKE_TIMEOUT;
+async fn handle_socks5_conn_state(
+    mut client: TcpStream,
+    state: &Socks5State,
+) -> Result<(), String> {
+    let mut hs = HandshakeBuf::new();
 
-    // Step 1: Auth method negotiation.
-    match tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2])).await {
-        Ok(Ok(_n)) => {}
-        Ok(Err(e)) => return Err(format!("read greeting: {e}")),
-        Err(_elapsed) => return Err("socks5 greeting timed out".into()),
+    // One single timeout anchors the whole handshake — greeting, auth methods,
+    // user/pass, and request — replacing 7–10 per-read timer registrations with
+    // one timer entry. The relay phase after CONNECT stays unbounded.
+    let action = tokio::time::timeout(
+        SOCKS5_HANDSHAKE_TIMEOUT,
+        run_handshake(&mut client, &mut hs, state),
+    )
+    .await
+    .map_err(|_| "socks5 handshake timed out".to_string())??;
+
+    match action {
+        HandshakeAction::UdpAssociate => {
+            let Some(udp) = state.udp.as_ref() else {
+                client
+                    .write_all(&REPLY_CMD_NOT_SUPPORTED)
+                    .await
+                    .map_err(|e| format!("write reply: {e}"))?;
+                return Err("UDP ASSOCIATE requested but plugin.udp_enable is false".into());
+            };
+            // The relay binds lazily here (so a reload of a fixed udp_bind_addr
+            // does not collide with the previous plugin instance, which is still
+            // serving until the reload commits). The association is counted before
+            // the reply is written, so the first datagram cannot race the gate.
+            let (_guard, advertise) = match udp.enter().await {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = client.write_all(&REPLY_GENERAL_FAILURE).await;
+                    return Err(e);
+                }
+            };
+            let (reply, reply_len) = encode_reply_for_addr(REP_SUCCEEDED, advertise);
+            client
+                .write_all(&reply[..reply_len])
+                .await
+                .map_err(|e| format!("write udp associate reply: {e}"))?;
+
+            // RFC 1928: the association lives as long as this TCP connection. It
+            // carries no further protocol data; read until EOF (or an error) so a
+            // half-closed control connection still terminates the association. The
+            // absolute cap is a safety valve for a silently dead peer that never
+            // produces EOF (see UDP_ASSOCIATION_MAX_LIFETIME).
+            let mut sink = [0u8; 256];
+            let deadline = tokio::time::Instant::now() + UDP_ASSOCIATION_MAX_LIFETIME;
+            loop {
+                match tokio::time::timeout_at(deadline, client.read(&mut sink)).await {
+                    Err(_) => {
+                        debug!("socks5 UDP association reached its maximum lifetime; closing");
+                        break;
+                    }
+                    Ok(Ok(0)) | Ok(Err(_)) => break,
+                    Ok(Ok(_)) => {}
+                }
+            }
+            Ok(())
+        }
+        HandshakeAction::Connect(target) => {
+            // Step 4: Connect to target without formatting/parsing IP literals.
+            let connect_res = match &target {
+                SocksTarget::Addr(addr) => TcpStream::connect(*addr).await,
+                SocksTarget::Domain(host, port) => TcpStream::connect((host.as_str(), *port)).await,
+            };
+            let mut remote = match connect_res {
+                Ok(remote) => remote,
+                Err(_) => {
+                    if let Err(e) = client.write_all(&REPLY_HOST_UNREACHABLE).await {
+                        tracing::debug!(error = %e, "plugin relay error: {}", e);
+                    }
+                    return Err(format!("connect to {target}: failed"));
+                }
+            };
+            frp_core::transport::set_nodelay(&remote);
+
+            // Send success reply.
+            client
+                .write_all(&REPLY_SUCCEEDED_ZERO)
+                .await
+                .map_err(|e| format!("write reply: {e}"))?;
+
+            // Flush any client application bytes that arrived pipelined in the
+            // same TCP segment as the CONNECT request before handing the raw
+            // TcpStreams to zero-copy splice / pooled relay.
+            let pipelined = hs.remaining();
+            if !pipelined.is_empty() {
+                remote
+                    .write_all(pipelined)
+                    .await
+                    .map_err(|e| format!("flush pipelined data: {e}"))?;
+            }
+
+            // Step 5: Bidirectional relay — Linux uses kernel-space zero-copy
+            // `splice(2)` (`bridge_splice`); non-Linux uses lock-free
+            // `TcpStream::into_split()` pooled buffers.
+            if let Err(e) = frp_core::bridge::relay_tcp_fast(client, remote).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
+            Ok(())
+        }
     }
-    let ver = buf[0];
-    let nmethods = buf[1] as usize;
+}
+
+async fn run_handshake(
+    client: &mut TcpStream,
+    hs: &mut HandshakeBuf,
+    state: &Socks5State,
+) -> Result<HandshakeAction, String> {
+    // Step 1: Auth method negotiation.
+    let hdr = hs
+        .take_range(client, 2)
+        .await
+        .map_err(|e| format!("read greeting: {e}"))?;
+    let ver = hs.buf[hdr.start];
+    let nmethods = hs.buf[hdr.start + 1] as usize;
     if ver != SOCKS5_VERSION {
         return Err(format!("bad socks version: {ver}"));
     }
     if nmethods == 0 {
         return Err("no auth methods offered".into());
     }
-    tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..nmethods]))
+    let methods_range = hs
+        .take_range(client, nmethods)
         .await
-        .map_err(|_| "socks5 handshake timed out".to_string())?
         .map_err(|e| format!("read methods: {e}"))?;
-    let methods = &buf[..nmethods];
+    let methods = &hs.buf[methods_range];
 
     // Go parity (pkg/plugin/client/socks5.go:44-46): auth is armed by
     // OR — `Username != "" || Password != ""` — so a PARTIAL config
@@ -112,7 +373,7 @@ async fn handle_socks5_conn(
     // finding M8: AND here made the tunnel fail open). The empty half is
     // enforced as the literal empty string, matching Go's
     // StaticCredentials(map[string]string{user: pass}).
-    let use_auth = user.is_some() || pass.is_some();
+    let use_auth = state.user.is_some() || state.pass.is_some();
 
     let chosen_method = if use_auth && methods.contains(&AUTH_USER_PASS) {
         AUTH_USER_PASS
@@ -131,51 +392,46 @@ async fn handle_socks5_conn(
         .await
         .map_err(|e| format!("write auth reply: {e}"))?;
 
-    // Step 2: Username/password auth (if selected)
+    // Step 2: Username/password auth (if selected).
     if chosen_method == AUTH_USER_PASS {
         // Partial config reaches here with one empty half (OR-arm, Go
         // parity) — compare against the literal empty string.
-        let u = user.as_deref().unwrap_or("");
-        let p = pass.as_deref().unwrap_or("");
+        let u = state.user.as_deref().unwrap_or("");
+        let p = state.pass.as_deref().unwrap_or("");
 
-        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2]))
+        // Compact so the entire RFC 1929 packet (<= 513 B) fits in `hs.buf`
+        // without reallocating or copying credentials to the heap.
+        hs.compact();
+        let up_hdr = hs
+            .take_range(client, 2)
             .await
-            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read user/pass ver: {e}"))?;
-        if buf[0] != USERPASS_VERSION {
+        if hs.buf[up_hdr.start] != USERPASS_VERSION {
             client
                 .write_all(&[USERPASS_VERSION, USERPASS_FAIL])
                 .await
                 .map_err(|e| format!("write auth fail: {e}"))?;
-            return Err(format!("bad user/pass version: {}", buf[0]));
+            return Err(format!("bad user/pass version: {}", hs.buf[up_hdr.start]));
         }
-        let ulen = buf[1] as usize;
-        if ulen > 255 {
-            return Err("username too long".into());
-        }
-        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..ulen]))
+        let ulen = hs.buf[up_hdr.start + 1] as usize;
+        let user_range = hs
+            .take_range(client, ulen)
             .await
-            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read username: {e}"))?;
-        let client_user = std::str::from_utf8(&buf[..ulen])
-            .map_err(|e| format!("username utf8: {e}"))?
-            .to_string();
-
-        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..1]))
+        let plen_range = hs
+            .take_range(client, 1)
             .await
-            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read plen: {e}"))?;
-        let plen = buf[0] as usize;
-        if plen > 255 {
-            return Err("password too long".into());
-        }
-        tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..plen]))
+        let plen = hs.buf[plen_range.start] as usize;
+        let pass_range = hs
+            .take_range(client, plen)
             .await
-            .map_err(|_| "socks5 handshake timed out".to_string())?
             .map_err(|e| format!("read password: {e}"))?;
-        let client_pass = std::str::from_utf8(&buf[..plen])
-            .map_err(|e| format!("password utf8: {e}"))?
-            .to_string();
+
+        let client_user =
+            std::str::from_utf8(&hs.buf[user_range]).map_err(|e| format!("username utf8: {e}"))?;
+        let client_pass =
+            std::str::from_utf8(&hs.buf[pass_range]).map_err(|e| format!("password utf8: {e}"))?;
 
         // Both comparisons must run — bitwise `&` (not `&&`) so a mismatched
         // username cannot skip the password comparison (timing oracle; parity
@@ -196,110 +452,39 @@ async fn handle_socks5_conn(
         }
     }
 
-    // Step 3: Read request
-    tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..4]))
+    // Step 3: Read request.
+    let req_hdr = hs
+        .take_range(client, 4)
         .await
-        .map_err(|_| "socks5 handshake timed out".to_string())?
         .map_err(|e| format!("read request hdr: {e}"))?;
-    if buf[0] != SOCKS5_VERSION {
-        return Err(format!("bad request version: {}", buf[0]));
+    if hs.buf[req_hdr.start] != SOCKS5_VERSION {
+        return Err(format!("bad request version: {}", hs.buf[req_hdr.start]));
     }
-    let cmd = buf[1];
-    let atyp = buf[3];
+    let cmd = hs.buf[req_hdr.start + 1];
+    let atyp = hs.buf[req_hdr.start + 3];
 
     if cmd == CMD_UDP_ASSOCIATE {
-        let Some(udp) = udp.as_ref() else {
-            let reply = make_socks5_reply(REP_CMD_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
-            client
-                .write_all(&reply)
-                .await
-                .map_err(|e| format!("write reply: {e}"))?;
-            return Err("UDP ASSOCIATE requested but plugin.udp_enable is false".into());
-        };
+        if state.udp.is_none() {
+            return Ok(HandshakeAction::UdpAssociate);
+        }
         // The client's declared UDP endpoint is advisory (RFC 1928 §7: it may
         // be all-zero when the source port is not known yet). Parse it to
         // consume the request, but bind no per-client state: the shared relay
         // learns datagram sources when they arrive.
-        let _ = parse_socks5_target(deadline, &mut client, atyp, &mut buf).await?;
-
-        // The relay binds lazily here (so a reload of a fixed udp_bind_addr
-        // does not collide with the previous plugin instance, which is still
-        // serving until the reload commits). The association is counted before
-        // the reply is written, so the first datagram cannot race the gate.
-        let (_guard, advertise) = match udp.enter().await {
-            Ok(v) => v,
-            Err(e) => {
-                let reply = make_socks5_reply(REP_GENERAL_FAILURE, ATYP_IPV4, &[0, 0, 0, 0], 0);
-                let _ = client.write_all(&reply).await;
-                return Err(e);
-            }
-        };
-        let reply = make_socks5_reply_for_addr(REP_SUCCEEDED, advertise);
-        client
-            .write_all(&reply)
-            .await
-            .map_err(|e| format!("write udp associate reply: {e}"))?;
-
-        // RFC 1928: the association lives as long as this TCP connection. It
-        // carries no further protocol data; read until EOF (or an error) so a
-        // half-closed control connection still terminates the association. The
-        // absolute cap is a safety valve for a silently dead peer that never
-        // produces EOF (see UDP_ASSOCIATION_MAX_LIFETIME).
-        let mut sink = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + UDP_ASSOCIATION_MAX_LIFETIME;
-        loop {
-            match tokio::time::timeout_at(deadline, client.read(&mut sink)).await {
-                Err(_) => {
-                    debug!("socks5 UDP association reached its maximum lifetime; closing");
-                    break;
-                }
-                Ok(Ok(0)) | Ok(Err(_)) => break,
-                Ok(Ok(_)) => {}
-            }
-        }
-        return Ok(());
+        let _ = parse_socks5_target(client, hs, atyp).await?;
+        return Ok(HandshakeAction::UdpAssociate);
     }
 
     if cmd != CMD_CONNECT {
-        let reply = make_socks5_reply(REP_CMD_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
         client
-            .write_all(&reply)
+            .write_all(&REPLY_CMD_NOT_SUPPORTED)
             .await
             .map_err(|e| format!("write reply: {e}"))?;
         return Err(format!("unsupported cmd: {cmd}"));
     }
 
-    // Parse target address
-    let (host, port) = parse_socks5_target(deadline, &mut client, atyp, &mut buf).await?;
-
-    // Step 4: Connect to target
-    let target = format!("{host}:{port}");
-    let remote = match TcpStream::connect(&target).await {
-        Ok(remote) => remote,
-        Err(_) => {
-            let reply = make_socks5_reply(REP_HOST_UNREACHABLE, ATYP_IPV4, &[0, 0, 0, 0], 0);
-            if let Err(e) = client.write_all(&reply).await {
-                tracing::debug!(error = %e, "plugin relay error: {}", e);
-            }
-            return Err(format!("connect to {target}: failed"));
-        }
-    };
-    frp_core::transport::set_nodelay(&remote);
-
-    // Send success reply
-    let reply = make_socks5_reply(REP_SUCCEEDED, ATYP_IPV4, &[0, 0, 0, 0], 0);
-    client
-        .write_all(&reply)
-        .await
-        .map_err(|e| format!("write reply: {e}"))?;
-
-    // Step 5: Bidirectional relay through pooled buffers (audit round-8 P1:
-    // relay_plain_pooled keeps copy_bidirectional semantics — FIN
-    // propagation both ways — without the per-conn buffer pair).
-    if let Err(e) = frp_core::bridge::relay_plain_pooled(client, remote).await {
-        tracing::debug!(error = %e, "plugin relay error: {}", e);
-    }
-    Ok(())
+    let target = parse_socks5_target(client, hs, atyp).await?;
+    Ok(HandshakeAction::Connect(target))
 }
 
 /// Pure parser: decode a SOCKS5 address (ATYP + addr + port) from bytes.
@@ -358,70 +543,58 @@ fn parse_socks5_addr(buf: &[u8]) -> Result<(String, u16, usize), String> {
     }
 }
 
-/// Parse target address from SOCKS5 request (ATYP + addr + port) over TCP.
-/// Reads run under the shared handshake deadline.
+/// Parse target address from SOCKS5 request (ATYP + addr + port) via `hs`.
 async fn parse_socks5_target(
-    deadline: tokio::time::Instant,
     client: &mut TcpStream,
+    hs: &mut HandshakeBuf,
     atyp: u8,
-    buf: &mut [u8; 512],
-) -> Result<(String, u16), String> {
+) -> Result<SocksTarget, String> {
     match atyp {
         ATYP_IPV4 => {
-            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..6]))
+            let r = hs
+                .take_range(client, 6)
                 .await
-                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read ipv4: {e}"))?;
-            let host = format!("{}.{}.{}.{}", buf[0], buf[1], buf[2], buf[3]);
-            let port = u16::from_be_bytes([buf[4], buf[5]]);
-            Ok((host, port))
+            let b = &hs.buf[r];
+            let ip = Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+            let port = u16::from_be_bytes([b[4], b[5]]);
+            Ok(SocksTarget::Addr(SocketAddr::new(IpAddr::V4(ip), port)))
         }
         ATYP_DOMAIN => {
-            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..1]))
+            let len_r = hs
+                .take_range(client, 1)
                 .await
-                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read domain len: {e}"))?;
-            let dlen = buf[0] as usize;
-            if dlen > 255 {
-                return Err("domain name too long".into());
-            }
-            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..dlen]))
+            let dlen = hs.buf[len_r.start] as usize;
+            let body_r = hs
+                .take_range(client, dlen + 2)
                 .await
-                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read domain: {e}"))?;
-            let domain = std::str::from_utf8(&buf[..dlen])
-                .map_err(|e| format!("domain utf8: {e}"))?
-                .to_string();
-            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..2]))
-                .await
-                .map_err(|_| "socks5 handshake timed out".to_string())?
-                .map_err(|e| format!("read port: {e}"))?;
-            let port = u16::from_be_bytes([buf[0], buf[1]]);
-            Ok((domain, port))
+            let b = &hs.buf[body_r];
+            let domain =
+                std::str::from_utf8(&b[..dlen]).map_err(|e| format!("domain utf8: {e}"))?;
+            let port = u16::from_be_bytes([b[dlen], b[dlen + 1]]);
+            if let Ok(ip) = domain.parse::<IpAddr>() {
+                Ok(SocksTarget::Addr(SocketAddr::new(ip, port)))
+            } else {
+                Ok(SocksTarget::Domain(domain.to_string(), port))
+            }
         }
         ATYP_IPV6 => {
-            tokio::time::timeout_at(deadline, client.read_exact(&mut buf[..18]))
+            let r = hs
+                .take_range(client, 18)
                 .await
-                .map_err(|_| "socks5 handshake timed out".to_string())?
                 .map_err(|e| format!("read ipv6: {e}"))?;
-            let host = format!(
-                "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
-                u16::from_be_bytes([buf[0], buf[1]]),
-                u16::from_be_bytes([buf[2], buf[3]]),
-                u16::from_be_bytes([buf[4], buf[5]]),
-                u16::from_be_bytes([buf[6], buf[7]]),
-                u16::from_be_bytes([buf[8], buf[9]]),
-                u16::from_be_bytes([buf[10], buf[11]]),
-                u16::from_be_bytes([buf[12], buf[13]]),
-                u16::from_be_bytes([buf[14], buf[15]]),
-            );
-            let port = u16::from_be_bytes([buf[16], buf[17]]);
-            Ok((host, port))
+            let b = &hs.buf[r];
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&b[..16]);
+            let ip = Ipv6Addr::from(octets);
+            let port = u16::from_be_bytes([b[16], b[17]]);
+            Ok(SocksTarget::Addr(SocketAddr::new(IpAddr::V6(ip), port)))
         }
         _ => {
-            let reply = make_socks5_reply(REP_ADDR_NOT_SUPPORTED, ATYP_IPV4, &[0, 0, 0, 0], 0);
             client
-                .write_all(&reply)
+                .write_all(&REPLY_ADDR_NOT_SUPPORTED)
                 .await
                 .map_err(|e| format!("write reply: {e}"))?;
             Err(format!("unsupported atyp: {atyp}"))
@@ -429,15 +602,31 @@ async fn parse_socks5_target(
     }
 }
 
-/// Build a SOCKS5 reply for a concrete bound address (UDP ASSOCIATE BND.ADDR).
-fn make_socks5_reply_for_addr(rep: u8, addr: std::net::SocketAddr) -> Vec<u8> {
+/// Encode a SOCKS5 reply for a concrete bound address (UDP ASSOCIATE BND.ADDR)
+/// into a stack buffer with zero heap allocation.
+fn encode_reply_for_addr(rep: u8, addr: SocketAddr) -> ([u8; 22], usize) {
+    let mut out = [0u8; 22];
+    out[0] = SOCKS5_VERSION;
+    out[1] = rep;
+    out[2] = 0x00; // RSV
     match addr.ip() {
-        std::net::IpAddr::V4(ip) => make_socks5_reply(rep, ATYP_IPV4, &ip.octets(), addr.port()),
-        std::net::IpAddr::V6(ip) => make_socks5_reply(rep, ATYP_IPV6, &ip.octets(), addr.port()),
+        IpAddr::V4(ip) => {
+            out[3] = ATYP_IPV4;
+            out[4..8].copy_from_slice(&ip.octets());
+            out[8..10].copy_from_slice(&addr.port().to_be_bytes());
+            (out, 10)
+        }
+        IpAddr::V6(ip) => {
+            out[3] = ATYP_IPV6;
+            out[4..20].copy_from_slice(&ip.octets());
+            out[20..22].copy_from_slice(&addr.port().to_be_bytes());
+            (out, 22)
+        }
     }
 }
 
-/// Build a SOCKS5 reply packet.
+/// Build a SOCKS5 reply packet (kept for unit-test coverage).
+#[cfg(test)]
 fn make_socks5_reply(rep: u8, atyp: u8, addr: &[u8], port: u16) -> Vec<u8> {
     let mut reply = Vec::with_capacity(6 + addr.len());
     reply.push(SOCKS5_VERSION);

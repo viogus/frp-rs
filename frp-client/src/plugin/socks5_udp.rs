@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +32,16 @@ const ATYP_IPV6: u8 = 0x04;
 /// and sees only the datagram source, so this is a coalescing window, not an
 /// authentication lifetime.
 const CLIENT_TTL: Duration = Duration::from_secs(600);
+const CLIENT_TTL_MS: u64 = CLIENT_TTL.as_millis() as u64;
+/// Minimum interval between atomic timestamp writes for an active client (1 s
+/// granularity for a 600 s TTL avoids cross-core cache-line bouncing on hot
+/// bidirectional UDP flows).
+const LAST_TOUCH_GRANULARITY_MS: u64 = 1_000;
+/// Maximum SOCKS5 UDP header size: `RSV(2) + FRAG(1) + ATYP(1) + IPv6(16) + PORT(2)`.
+const MAX_UDP_HDR: usize = 22;
+/// Opportunistic non-blocking drain cap per reactor wakeup (adds zero wait for
+/// isolated packets; amortizes `select!` overhead across bursts).
+const UDP_BATCH_MAX: usize = 32;
 /// DNS answer cache lifetime.
 const DNS_TTL: Duration = Duration::from_secs(60);
 /// Negative DNS cache lifetime (a name that failed resolution must not be
@@ -242,7 +252,7 @@ async fn run_relay(
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut last_recv_warn: Option<Instant> = None;
     // Idle clients are otherwise only reaped on the next request; an
-    // association whose client disappears would pin a task + socket + 64 KiB
+    // association whose client disappears would pin a task + socket + 16 KiB
     // buffer forever on an otherwise quiet relay.
     let mut sweep = tokio::time::interval(Duration::from_secs(60));
     sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -253,10 +263,26 @@ async fn run_relay(
             _ = sweep.tick() => state.sweep(Instant::now()),
             result = socket.recv_from(&mut buf) => match result {
                 Ok((n, from)) => {
-                    if n == 0 || active.load(Ordering::Acquire) == 0 {
-                        continue;
+                    let now = Instant::now();
+                    let now_ms = state.elapsed_ms(now);
+                    if n > 0 && active.load(Ordering::Acquire) > 0 {
+                        state.handle_at(&socket, &buf[..n], from, now, now_ms).await;
                     }
-                    state.handle(&socket, &buf[..n], from).await;
+                    // Opportunistically drain already-queued datagrams from the
+                    // kernel receive buffer to amortize `select!` wakeups across
+                    // bursts; isolated packets hit `WouldBlock` immediately.
+                    for _ in 1..UDP_BATCH_MAX {
+                        match socket.try_recv_from(&mut buf) {
+                            Ok((m, src)) => {
+                                if m > 0 && active.load(Ordering::Acquire) > 0 {
+                                    state.handle_at(&socket, &buf[..m], src, now, now_ms).await;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
                 }
                 Err(e) => {
                     // A persistent recv error must not spin. Transient errors
@@ -405,6 +431,62 @@ impl<'a> UdpRequest<'a> {
 // Relay state / forwarding
 // ---------------------------------------------------------------
 
+/// Non-blocking UDP send fast path; falls back to async `send_to` only if the
+/// kernel send buffer returns `WouldBlock`.
+#[inline]
+async fn try_send_to_udp(
+    socket: &UdpSocket,
+    buf: &[u8],
+    target: SocketAddr,
+) -> std::io::Result<usize> {
+    loop {
+        match socket.try_send_to(buf, target) {
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                return socket.send_to(buf, target).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[inline]
+fn touch_last_ms(last_ms: &AtomicU64, now_ms: u64) {
+    let prev = last_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(prev) >= LAST_TOUCH_GRANULARITY_MS {
+        last_ms.store(now_ms, Ordering::Relaxed);
+    }
+}
+
+/// Prepend `RSV(2) + FRAG(1) + ATYP + SRV.ADDR + SRV.PORT` directly before
+/// `buf[MAX_UDP_HDR..]` (in-place, zero heap allocation, zero payload copy).
+/// Returns the start offset in `buf` (`12` for IPv4, `0` for IPv6).
+#[inline]
+fn encode_reply_header(buf: &mut [u8], target: SocketAddr) -> usize {
+    match target.ip() {
+        IpAddr::V4(ip) => {
+            let start = MAX_UDP_HDR - 10;
+            buf[start] = 0;
+            buf[start + 1] = 0;
+            buf[start + 2] = 0;
+            buf[start + 3] = ATYP_IPV4;
+            buf[start + 4..start + 8].copy_from_slice(&ip.octets());
+            buf[start + 8..start + 10].copy_from_slice(&target.port().to_be_bytes());
+            start
+        }
+        IpAddr::V6(ip) => {
+            buf[0] = 0;
+            buf[1] = 0;
+            buf[2] = 0;
+            buf[3] = ATYP_IPV6;
+            buf[4..20].copy_from_slice(&ip.octets());
+            buf[20..22].copy_from_slice(&target.port().to_be_bytes());
+            0
+        }
+    }
+}
+
 /// Per-client relay: dedicated outbound sockets so replies from N clients that
 /// target the same server stay separable (one shared socket would conflate
 /// `target -> client` routes). A socket is created per address family on
@@ -414,7 +496,8 @@ impl<'a> UdpRequest<'a> {
 struct ClientRelay {
     v4: Option<FamilyRelay>,
     v6: Option<FamilyRelay>,
-    last: Arc<Mutex<Instant>>,
+    /// Last activity timestamp in milliseconds since `RelayState::epoch`.
+    last_ms: Arc<AtomicU64>,
 }
 
 /// Bounded set of target addresses a client has asked for, used both as the
@@ -428,17 +511,21 @@ struct RouteSet {
 }
 
 impl RouteSet {
-    fn insert(&mut self, target: SocketAddr) {
+    /// Insert `target`, returning `true` if any oldest entry was evicted.
+    fn insert(&mut self, target: SocketAddr) -> bool {
         if !self.set.insert(target) {
-            return;
+            return false;
         }
         self.order.push_back(target);
+        let mut evicted = false;
         while self.set.len() > MAX_ROUTES_PER_CLIENT {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
             self.set.remove(&oldest);
+            evicted = true;
         }
+        evicted
     }
 
     fn contains(&self, target: &SocketAddr) -> bool {
@@ -446,15 +533,67 @@ impl RouteSet {
     }
 }
 
+/// Shared route allow-list with a monotonic eviction generation counter so
+/// steady-state single-target flows skip mutex acquisition on both uplink and
+/// downlink while preserving exact eviction semantics.
+#[derive(Default)]
+struct RouteTable {
+    set: Mutex<RouteSet>,
+    evict_gen: AtomicU64,
+}
+
+impl RouteTable {
+    fn insert(&self, target: SocketAddr) {
+        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.insert(target) {
+            self.evict_gen.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn insert_many(&self, targets: impl Iterator<Item = SocketAddr>) {
+        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        let mut evicted = false;
+        for target in targets {
+            evicted |= guard.insert(target);
+        }
+        if evicted {
+            self.evict_gen.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn contains(&self, target: &SocketAddr) -> bool {
+        self.set
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(target)
+    }
+}
+
 /// Outbound socket for one address family plus the targets requested through it.
-type FamilySocket = (Arc<UdpSocket>, Arc<Mutex<RouteSet>>);
+type FamilySocket = (Arc<UdpSocket>, Arc<RouteTable>);
 
 struct FamilyRelay {
     socket: Arc<UdpSocket>,
     /// Resolved target addresses this client has asked for. The reply header
-    /// is a pure function of the key, so storing it would allocate per packet.
-    routes: Arc<Mutex<RouteSet>>,
+    /// is encoded in-place from the source address without allocation.
+    routes: Arc<RouteTable>,
+    /// Lock-free uplink hint: when `target == last_target` and `evict_gen` is
+    /// unchanged, `target` is guaranteed to remain present in `routes`.
+    last_target: Option<SocketAddr>,
+    last_evict_gen: u64,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl FamilyRelay {
+    #[inline]
+    fn record_route(&mut self, target: SocketAddr) {
+        let cur_gen = self.routes.evict_gen.load(Ordering::Acquire);
+        if self.last_target != Some(target) || self.last_evict_gen != cur_gen {
+            self.routes.insert(target);
+            self.last_target = Some(target);
+            self.last_evict_gen = self.routes.evict_gen.load(Ordering::Acquire);
+        }
+    }
 }
 
 impl ClientRelay {
@@ -477,7 +616,8 @@ async fn spawn_family(
     main: Arc<UdpSocket>,
     client: SocketAddr,
     cancel: tokio_util::sync::CancellationToken,
-    last: Arc<Mutex<Instant>>,
+    last_ms: Arc<AtomicU64>,
+    epoch: Instant,
     v6: bool,
 ) -> std::io::Result<FamilyRelay> {
     // Unspecified on purpose: the kernel picks the source address for each
@@ -492,40 +632,60 @@ async fn spawn_family(
             .expect("constant literal socket addr always parses")
     };
     let socket = Arc::new(UdpSocket::bind(bind).await?);
-    let routes: Arc<Mutex<RouteSet>> = Arc::new(Mutex::new(RouteSet::default()));
+    let routes: Arc<RouteTable> = Arc::new(RouteTable::default());
 
     let task_socket = socket.clone();
     let task_routes = routes.clone();
-    let task_last = last;
+    let task_last = last_ms;
     let task = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_DATAGRAM];
+        // Reserve MAX_UDP_HDR (22 B) headroom so replies are framed in-place
+        // with zero per-packet heap allocation and zero payload copy.
+        let mut buf = vec![0u8; MAX_UDP_HDR + MAX_DATAGRAM];
         let mut last_warn: Option<Instant> = None;
+        let mut last_ok: Option<SocketAddr> = None;
+        let mut seen_gen = 0u64;
         loop {
             let result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = task_socket.recv_from(&mut buf) => result,
+                result = task_socket.recv_from(&mut buf[MAX_UDP_HDR..]) => result,
             };
             match result {
-                Ok((n, target)) => {
-                    *task_last.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-                    let requested = task_routes
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .contains(&target);
-                    if !requested {
-                        debug!(target = %target, client = %client,
-                            "socks5 UDP relay: reply from an unrequested address dropped");
-                        continue;
-                    }
-                    let header = reply_header(target);
-                    let mut out = Vec::with_capacity(3 + header.len() + n);
-                    out.extend_from_slice(&[0, 0, 0]); // RSV RSV FRAG
-                    out.extend_from_slice(&header);
-                    out.extend_from_slice(&buf[..n]);
-                    if let Err(e) = main.send_to(&out, client).await {
-                        debug!(client = %client, error = %e,
-                            "socks5 UDP relay: reply send failed: {e}");
+                Ok((first_n, first_target)) => {
+                    let now_ms = Instant::now().saturating_duration_since(epoch).as_millis() as u64;
+                    touch_last_ms(&task_last, now_ms);
+                    forward_reply(
+                        &main,
+                        client,
+                        &task_routes,
+                        &mut last_ok,
+                        &mut seen_gen,
+                        &mut buf,
+                        first_n,
+                        first_target,
+                    )
+                    .await;
+                    // Opportunistically drain already-queued replies without
+                    // waiting on isolated packets.
+                    for _ in 1..UDP_BATCH_MAX {
+                        match task_socket.try_recv_from(&mut buf[MAX_UDP_HDR..]) {
+                            Ok((n, target)) => {
+                                forward_reply(
+                                    &main,
+                                    client,
+                                    &task_routes,
+                                    &mut last_ok,
+                                    &mut seen_gen,
+                                    &mut buf,
+                                    n,
+                                    target,
+                                )
+                                .await;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
                     }
                 }
                 Err(e) => {
@@ -546,42 +706,90 @@ async fn spawn_family(
     Ok(FamilyRelay {
         socket,
         routes,
+        last_target: None,
+        last_evict_gen: 0,
         task,
     })
 }
 
-/// `ATYP + SRV.ADDR + SRV.PORT` for a reply datagram.
-fn reply_header(target: SocketAddr) -> Vec<u8> {
-    match target.ip() {
-        IpAddr::V4(ip) => {
-            let mut h = Vec::with_capacity(7);
-            h.push(ATYP_IPV4);
-            h.extend_from_slice(&ip.octets());
-            h.extend_from_slice(&target.port().to_be_bytes());
-            h
+#[allow(clippy::too_many_arguments)]
+#[inline]
+async fn forward_reply(
+    main: &UdpSocket,
+    client: SocketAddr,
+    routes: &RouteTable,
+    last_ok: &mut Option<SocketAddr>,
+    seen_gen: &mut u64,
+    buf: &mut [u8],
+    n: usize,
+    target: SocketAddr,
+) {
+    let cur_gen = routes.evict_gen.load(Ordering::Acquire);
+    let requested = if *last_ok == Some(target) && cur_gen == *seen_gen {
+        true
+    } else {
+        let ok = routes.contains(&target);
+        if ok {
+            *last_ok = Some(target);
+            *seen_gen = cur_gen;
         }
-        IpAddr::V6(ip) => {
-            let mut h = Vec::with_capacity(19);
-            h.push(ATYP_IPV6);
-            h.extend_from_slice(&ip.octets());
-            h.extend_from_slice(&target.port().to_be_bytes());
-            h
-        }
+        ok
+    };
+    if !requested {
+        debug!(target = %target, client = %client,
+            "socks5 UDP relay: reply from an unrequested address dropped");
+        return;
+    }
+    let start = encode_reply_header(buf, target);
+    if let Err(e) = try_send_to_udp(main, &buf[start..MAX_UDP_HDR + n], client).await {
+        debug!(client = %client, error = %e,
+            "socks5 UDP relay: reply send failed: {e}");
     }
 }
 
 struct DnsEntry {
-    addrs: Vec<SocketAddr>,
+    ips: Arc<[IpAddr]>,
     at: Instant,
+}
+
+type DnsCache = Arc<Mutex<HashMap<Box<str>, DnsEntry>>>;
+
+/// Zero-allocation lowercase lookup into the shared DNS cache (RFC 1928 domain
+/// length is at most 255 bytes). Returns `Some(ips)` on both positive and
+/// negative cache hits, or `None` on cache miss / expiration.
+fn lookup_dns_cache(dns: &DnsCache, host: &str, now: Instant) -> Option<Arc<[IpAddr]>> {
+    if host.len() > 255 {
+        return None;
+    }
+    let mut lower = [0u8; 255];
+    for (dst, src) in lower.iter_mut().zip(host.as_bytes()) {
+        *dst = src.to_ascii_lowercase();
+    }
+    // SAFETY-free: lowercasing ASCII bytes preserves valid UTF-8.
+    let key = std::str::from_utf8(&lower[..host.len()]).ok()?;
+    let cache = dns.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = cache.get(key)?;
+    let ttl = if entry.ips.is_empty() {
+        DNS_NEGATIVE_TTL
+    } else {
+        DNS_TTL
+    };
+    if now.duration_since(entry.at) < ttl {
+        Some(Arc::clone(&entry.ips))
+    } else {
+        None
+    }
 }
 
 struct RelayState {
     clients: HashMap<SocketAddr, ClientRelay>,
-    /// Shared with spawned DNS tasks; std Mutex (short critical sections, no
-    /// await while held).
-    dns: Arc<Mutex<HashMap<(String, u16), DnsEntry>>>,
+    /// Shared with spawned DNS tasks; keyed by lowercase hostname (port-free)
+    /// so lookups borrow `&str` with zero heap allocation and share entries
+    /// across ports.
+    dns: DnsCache,
     pending_dns: Arc<AtomicUsize>,
     cancel: tokio_util::sync::CancellationToken,
+    epoch: Instant,
     last_spawn_warn: Option<Instant>,
 }
 
@@ -592,19 +800,37 @@ impl RelayState {
             dns: Arc::new(Mutex::new(HashMap::new())),
             pending_dns: Arc::new(AtomicUsize::new(0)),
             cancel,
+            epoch: Instant::now(),
             last_spawn_warn: None,
         }
     }
 
+    #[inline]
+    fn elapsed_ms(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.epoch).as_millis() as u64
+    }
+
+    #[cfg(test)]
     async fn handle(&mut self, main: &Arc<UdpSocket>, data: &[u8], from: SocketAddr) {
+        let now = Instant::now();
+        let now_ms = self.elapsed_ms(now);
+        self.handle_at(main, data, from, now, now_ms).await;
+    }
+
+    async fn handle_at(
+        &mut self,
+        main: &Arc<UdpSocket>,
+        data: &[u8],
+        from: SocketAddr,
+        now: Instant,
+        now_ms: u64,
+    ) {
         let Some(request) = UdpRequest::parse(data) else {
             debug!(from = %from, bytes = data.len(),
                 "socks5 UDP relay: malformed request dropped");
             return;
         };
-        let now = Instant::now();
-        // Do NOT sweep here: the run loop already ticks every 60s, and a
-        // per-datagram O(#clients) pass would sit on the hot path.
+        // Fast path: existing client gets a single HashMap lookup.
         if !self.clients.contains_key(&from) {
             // Enforce the fd bound at insertion, not only on the 60s sweep:
             // an unauthenticated source-address spray must not grow the map
@@ -615,38 +841,152 @@ impl RelayState {
                 ClientRelay {
                     v4: None,
                     v6: None,
-                    last: Arc::new(Mutex::new(now)),
+                    last_ms: Arc::new(AtomicU64::new(now_ms)),
                 },
             );
         }
-        if let Some(client) = self.clients.get(&from) {
-            *client.last.lock().unwrap_or_else(|e| e.into_inner()) = now;
-        }
 
-        match request.target {
+        // Normalize IP literals sent inside ATYP_DOMAIN straight to Addr.
+        let target = match request.target {
+            UdpTarget::Addr(addr) => UdpTarget::Addr(addr),
+            UdpTarget::Domain(host, port) => match host.parse::<IpAddr>() {
+                Ok(ip) => UdpTarget::Addr(SocketAddr::new(ip, port)),
+                Err(_) => UdpTarget::Domain(host, port),
+            },
+        };
+
+        match target {
             UdpTarget::Addr(target) => {
-                let Some((socket, routes)) = self
-                    .ensure_client_family(main, from, target.is_ipv6())
-                    .await
+                let Some(client) = self.clients.get_mut(&from) else {
+                    return;
+                };
+                touch_last_ms(&client.last_ms, now_ms);
+                let Some(family) = ensure_family_on_client(
+                    client,
+                    main,
+                    from,
+                    &self.cancel,
+                    self.epoch,
+                    &mut self.last_spawn_warn,
+                    target.is_ipv6(),
+                )
+                .await
                 else {
                     return;
                 };
-                routes
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(target);
-                if let Err(e) = socket.send_to(request.payload, target).await {
+                family.record_route(target);
+                if let Err(e) = try_send_to_udp(&family.socket, request.payload, target).await {
                     debug!(target = %target, error = %e,
                         "socks5 UDP relay: forward failed: {e}");
                 }
             }
             UdpTarget::Domain(host, port) => {
-                // Bind both families now (IPv4/IPv6) so the spawned resolver
-                // can deliver whichever address the name resolves to. The
-                // lookup itself runs off the receive loop: one slow resolver
-                // must not stall every other client's datagrams.
-                let v4 = self.ensure_client_family(main, from, false).await;
-                let v6 = self.ensure_client_family(main, from, true).await;
+                // Fast path: check DNS cache synchronously with zero heap
+                // allocation and zero task spawn on cache hit (99.9% of domain
+                // UDP traffic). Only cache misses spawn an async resolver task.
+                if let Some(ips) = lookup_dns_cache(&self.dns, host, now) {
+                    let Some(client) = self.clients.get_mut(&from) else {
+                        return;
+                    };
+                    touch_last_ms(&client.last_ms, now_ms);
+                    if ips.is_empty() {
+                        return;
+                    }
+                    let prefer_v6 = ips[0].is_ipv6();
+                    let chosen_v6 = if ensure_family_on_client(
+                        client,
+                        main,
+                        from,
+                        &self.cancel,
+                        self.epoch,
+                        &mut self.last_spawn_warn,
+                        prefer_v6,
+                    )
+                    .await
+                    .is_some()
+                    {
+                        prefer_v6
+                    } else if ips.iter().any(|ip| ip.is_ipv6() != prefer_v6)
+                        && ensure_family_on_client(
+                            client,
+                            main,
+                            from,
+                            &self.cancel,
+                            self.epoch,
+                            &mut self.last_spawn_warn,
+                            !prefer_v6,
+                        )
+                        .await
+                        .is_some()
+                    {
+                        !prefer_v6
+                    } else {
+                        return;
+                    };
+                    let Some(family) = client.family_mut(chosen_v6).as_mut() else {
+                        return;
+                    };
+                    let mut matching = ips
+                        .iter()
+                        .copied()
+                        .filter(|ip| ip.is_ipv6() == chosen_v6)
+                        .map(|ip| SocketAddr::new(ip, port));
+                    let Some(first) = matching.next() else {
+                        return;
+                    };
+                    if let Some(second) = matching.next() {
+                        family.routes.insert_many(
+                            std::iter::once(first)
+                                .chain(std::iter::once(second))
+                                .chain(matching),
+                        );
+                    } else {
+                        family.record_route(first);
+                    }
+                    for ip in ips.iter().copied().filter(|ip| ip.is_ipv6() == chosen_v6) {
+                        if try_send_to_udp(
+                            &family.socket,
+                            request.payload,
+                            SocketAddr::new(ip, port),
+                        )
+                        .await
+                        .is_ok()
+                        {
+                            return;
+                        }
+                    }
+                    return;
+                }
+
+                // Slow path (DNS cache miss / expired): bind both families so
+                // the spawned resolver can deliver whichever address family
+                // answers without stalling the main receive loop.
+                let Some(client) = self.clients.get_mut(&from) else {
+                    return;
+                };
+                touch_last_ms(&client.last_ms, now_ms);
+                let v4 = ensure_family_on_client(
+                    client,
+                    main,
+                    from,
+                    &self.cancel,
+                    self.epoch,
+                    &mut self.last_spawn_warn,
+                    false,
+                )
+                .await
+                .map(|f| (f.socket.clone(), f.routes.clone()));
+                let v6 = ensure_family_on_client(
+                    client,
+                    main,
+                    from,
+                    &self.cancel,
+                    self.epoch,
+                    &mut self.last_spawn_warn,
+                    true,
+                )
+                .await
+                .map(|f| (f.socket.clone(), f.routes.clone()));
                 if v4.is_none() && v6.is_none() {
                     return;
                 }
@@ -656,10 +996,10 @@ impl RelayState {
                 let pending = self.pending_dns.clone();
                 let cancel = self.cancel.clone();
                 tokio::spawn(async move {
-                    let Some(addrs) = resolve_cached(&dns, &pending, &host, port).await else {
+                    let Some(ips) = resolve_cached(&dns, &pending, &host, port).await else {
                         return;
                     };
-                    deliver_resolved(addrs, payload, v4, v6, cancel).await;
+                    deliver_resolved(ips, port, payload, v4, v6, cancel).await;
                 });
             }
         }
@@ -673,7 +1013,7 @@ impl RelayState {
             let oldest = self
                 .clients
                 .iter()
-                .min_by_key(|(_, c)| *c.last.lock().unwrap_or_else(|e| e.into_inner()))
+                .min_by_key(|(_, c)| c.last_ms.load(Ordering::Relaxed))
                 .map(|(addr, _)| *addr);
             match oldest {
                 Some(addr) => {
@@ -686,55 +1026,15 @@ impl RelayState {
         }
     }
 
-    /// Ensure the client has an outbound socket for `v6`, returning it plus
-    /// its route set. Bind failures (e.g. no IPv6 on the host) are throttled
-    /// and yield `None`.
-    async fn ensure_client_family(
-        &mut self,
-        main: &Arc<UdpSocket>,
-        from: SocketAddr,
-        v6: bool,
-    ) -> Option<FamilySocket> {
-        let client = self.clients.get_mut(&from)?;
-        if client.family_mut(v6).is_none() {
-            match spawn_family(
-                main.clone(),
-                from,
-                self.cancel.clone(),
-                client.last.clone(),
-                v6,
-            )
-            .await
-            {
-                Ok(family) => *client.family_mut(v6) = Some(family),
-                Err(e) => {
-                    if self
-                        .last_spawn_warn
-                        .map(|t| t.elapsed() >= Duration::from_secs(1))
-                        .unwrap_or(true)
-                    {
-                        warn!(client = %from, error = %e,
-                            "socks5 UDP relay: could not create client socket: {e}");
-                        self.last_spawn_warn = Some(Instant::now());
-                    }
-                    return None;
-                }
-            }
-        }
-        let family = client.family_mut(v6).as_ref()?;
-        Some((family.socket.clone(), family.routes.clone()))
-    }
-
     fn sweep(&mut self, now: Instant) {
+        let now_ms = self.elapsed_ms(now);
         self.clients.retain(|_, client| {
-            let idle = {
-                let last = client.last.lock().unwrap_or_else(|e| e.into_inner());
-                now.duration_since(*last) < CLIENT_TTL
-            };
-            if !idle {
+            let last_ms = client.last_ms.load(Ordering::Relaxed);
+            let alive = now_ms.saturating_sub(last_ms) < CLIENT_TTL_MS;
+            if !alive {
                 client.abort();
             }
-            idle
+            alive
         });
         // The insertion path (`make_room_for_client`) is the only place that
         // adds entries and it enforces MAX_CLIENTS, so the map is never over
@@ -742,29 +1042,57 @@ impl RelayState {
     }
 }
 
+/// Ensure `client` has an outbound socket for `v6`, returning a mutable
+/// reference to it without a second `HashMap` lookup.
+async fn ensure_family_on_client<'a>(
+    client: &'a mut ClientRelay,
+    main: &Arc<UdpSocket>,
+    from: SocketAddr,
+    cancel: &tokio_util::sync::CancellationToken,
+    epoch: Instant,
+    last_spawn_warn: &mut Option<Instant>,
+    v6: bool,
+) -> Option<&'a mut FamilyRelay> {
+    if client.family_mut(v6).is_none() {
+        match spawn_family(
+            main.clone(),
+            from,
+            cancel.clone(),
+            client.last_ms.clone(),
+            epoch,
+            v6,
+        )
+        .await
+        {
+            Ok(family) => *client.family_mut(v6) = Some(family),
+            Err(e) => {
+                if last_spawn_warn
+                    .map(|t| t.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true)
+                {
+                    warn!(client = %from, error = %e,
+                        "socks5 UDP relay: could not create client socket: {e}");
+                    *last_spawn_warn = Some(Instant::now());
+                }
+                return None;
+            }
+        }
+    }
+    client.family_mut(v6).as_mut()
+}
+
 /// Resolve a domain off the relay receive path. Returns a (possibly empty,
-/// negatively cached) address list, or `None` when the lookup budget is
-/// exhausted. The shared cache is capped and evicts the oldest entry.
+/// negatively cached) IP list, or `None` when the lookup budget is exhausted.
+/// The shared cache is capped and evicts the oldest entry.
 async fn resolve_cached(
-    dns: &Arc<Mutex<HashMap<(String, u16), DnsEntry>>>,
+    dns: &DnsCache,
     pending: &Arc<AtomicUsize>,
     host: &str,
     port: u16,
-) -> Option<Vec<SocketAddr>> {
-    let key = (host.to_ascii_lowercase(), port);
+) -> Option<Arc<[IpAddr]>> {
     let now = Instant::now();
-    {
-        let cache = dns.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = cache.get(&key) {
-            let ttl = if entry.addrs.is_empty() {
-                DNS_NEGATIVE_TTL
-            } else {
-                DNS_TTL
-            };
-            if now.duration_since(entry.at) < ttl {
-                return Some(entry.addrs.clone());
-            }
-        }
+    if let Some(ips) = lookup_dns_cache(dns, host, now) {
+        return Some(ips);
     }
 
     if pending.fetch_add(1, Ordering::AcqRel) >= MAX_PENDING_DNS {
@@ -777,26 +1105,27 @@ async fn resolve_cached(
         tokio::time::timeout(DNS_LOOKUP_TIMEOUT, tokio::net::lookup_host((host, port))).await;
     pending.fetch_sub(1, Ordering::AcqRel);
 
-    let addrs: Vec<SocketAddr> = match result {
-        Ok(Ok(iter)) => iter.collect(),
+    let ips: Arc<[IpAddr]> = match result {
+        Ok(Ok(iter)) => iter.map(|a| a.ip()).collect::<Vec<_>>().into(),
         Ok(Err(e)) => {
             debug!(host = %host, port = %port, error = %e,
                 "socks5 UDP relay: resolve failed: {e}");
-            Vec::new()
+            Arc::from([])
         }
         Err(_) => {
             debug!(host = %host, port = %port,
                 "socks5 UDP relay: resolve timed out");
-            Vec::new()
+            Arc::from([])
         }
     };
 
+    let key: Box<str> = host.to_ascii_lowercase().into_boxed_str();
     {
         let mut cache = dns.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= MAX_DNS_ENTRIES {
             let now = Instant::now();
             cache.retain(|_, entry| {
-                let ttl = if entry.addrs.is_empty() {
+                let ttl = if entry.ips.is_empty() {
                     DNS_NEGATIVE_TTL
                 } else {
                     DNS_TTL
@@ -816,41 +1145,45 @@ async fn resolve_cached(
         cache.insert(
             key,
             DnsEntry {
-                addrs: addrs.clone(),
+                ips: Arc::clone(&ips),
                 at: now,
             },
         );
     }
-    Some(addrs)
+    Some(ips)
 }
 
 /// Deliver a resolved datagram, choosing the first address whose family has a
 /// usable outbound socket. All addresses of that family are recorded as
 /// requested so their replies are accepted.
 async fn deliver_resolved(
-    addrs: Vec<SocketAddr>,
+    ips: Arc<[IpAddr]>,
+    port: u16,
     payload: Vec<u8>,
     v4: Option<FamilySocket>,
     v6: Option<FamilySocket>,
     cancel: tokio_util::sync::CancellationToken,
 ) {
-    if addrs.is_empty() || cancel.is_cancelled() {
+    if ips.is_empty() || cancel.is_cancelled() {
         return;
     }
     let (socket, routes, chosen_v4) = match (v4, v6) {
-        (Some((s, r)), _) if addrs[0].is_ipv4() => (s, r, true),
+        (Some((s, r)), _) if ips[0].is_ipv4() => (s, r, true),
         (Some((s, r)), None) => (s, r, true),
         (_, Some((s, r))) => (s, r, false),
         (None, None) => return,
     };
-    {
-        let mut routes = routes.lock().unwrap_or_else(|e| e.into_inner());
-        for target in addrs.iter().filter(|t| t.is_ipv6() == !chosen_v4) {
-            routes.insert(*target);
-        }
-    }
-    for target in addrs.iter().filter(|t| t.is_ipv6() == !chosen_v4) {
-        if socket.send_to(&payload, *target).await.is_ok() {
+    routes.insert_many(
+        ips.iter()
+            .copied()
+            .filter(|ip| ip.is_ipv6() == !chosen_v4)
+            .map(|ip| SocketAddr::new(ip, port)),
+    );
+    for ip in ips.iter().copied().filter(|ip| ip.is_ipv6() == !chosen_v4) {
+        if try_send_to_udp(&socket, &payload, SocketAddr::new(ip, port))
+            .await
+            .is_ok()
+        {
             return;
         }
     }
@@ -980,16 +1313,14 @@ mod tests {
     async fn client_map_cap_holds_at_insertion() {
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut state = RelayState::new(cancel);
-        let base = Instant::now();
         for i in 0..MAX_CLIENTS {
             // Insertion order is the eviction order: client 1 is oldest.
-            let last = base + Duration::from_secs(i as u64);
             state.clients.insert(
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), i as u16 + 1),
                 ClientRelay {
                     v4: None,
                     v6: None,
-                    last: Arc::new(Mutex::new(last)),
+                    last_ms: Arc::new(AtomicU64::new(i as u64 * 1_000)),
                 },
             );
         }
@@ -1001,6 +1332,31 @@ mod tests {
                 .contains_key(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1)),
             "oldest client must be evicted first"
         );
+    }
+
+    #[test]
+    fn route_table_evict_gen_bumps_on_eviction() {
+        let table = RouteTable::default();
+        assert_eq!(table.evict_gen.load(Ordering::Acquire), 0);
+        let first = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+        for port in 1..=(MAX_ROUTES_PER_CLIENT as u16) {
+            table.insert(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        }
+        assert_eq!(
+            table.evict_gen.load(Ordering::Acquire),
+            0,
+            "filling up to cap must not bump evict_gen"
+        );
+        table.insert(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            MAX_ROUTES_PER_CLIENT as u16 + 1,
+        ));
+        assert_eq!(
+            table.evict_gen.load(Ordering::Acquire),
+            1,
+            "evicting oldest route must bump evict_gen so downlink cache invalidates"
+        );
+        assert!(!table.contains(&first));
     }
 
     #[tokio::test]
