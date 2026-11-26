@@ -108,11 +108,10 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     Some((value, len))
 }
 
-/// Pull one DATAGRAM capsule out of a possibly split h2 DATA stream.
-async fn recv_datagram(recv: &mut h2::RecvStream) -> Vec<u8> {
-    let mut pending = Vec::new();
+/// Pull one DATAGRAM capsule out of a possibly split or coalesced h2 DATA stream.
+async fn recv_datagram_buf(recv: &mut h2::RecvStream, pending: &mut Vec<u8>) -> Vec<u8> {
     loop {
-        while let Some((kind, type_len)) = decode_varint(&pending) {
+        while let Some((kind, type_len)) = decode_varint(pending) {
             let Some((len, len_len)) = decode_varint(&pending[type_len..]) else {
                 break;
             };
@@ -136,6 +135,11 @@ async fn recv_datagram(recv: &mut h2::RecvStream) -> Vec<u8> {
         recv.flow_control().release_capacity(chunk.len()).unwrap();
         pending.extend_from_slice(&chunk);
     }
+}
+
+async fn recv_datagram(recv: &mut h2::RecvStream) -> Vec<u8> {
+    let mut pending = Vec::new();
+    recv_datagram_buf(recv, &mut pending).await
 }
 
 #[tokio::test]
@@ -432,5 +436,221 @@ async fn http2_connect_bad_udp_path_is_rejected() {
     let (response, _) = send.send_request(request, false).unwrap();
     let response = response.await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    conn.abort();
+}
+
+fn encode_varint_test(value: u64, out: &mut Vec<u8>) {
+    if value < 64 {
+        out.push(value as u8);
+    } else if value < 16_384 {
+        out.push(0x40 | (value >> 8) as u8);
+        out.push(value as u8);
+    } else {
+        out.push(0x80 | (value >> 24) as u8);
+        out.push((value >> 16) as u8);
+        out.push((value >> 8) as u8);
+        out.push(value as u8);
+    }
+}
+
+fn datagram_capsule_any(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 6);
+    out.push(0); // DATAGRAM capsule type 0
+    encode_varint_test((1 + payload.len()) as u64, &mut out);
+    out.push(0); // Context ID 0
+    out.extend_from_slice(payload);
+    out
+}
+
+#[tokio::test]
+async fn http2_connect_tcp_streams_across_small_client_window() {
+    // Regression guard: server reads up to 64 KiB chunks, while this client
+    // advertises only a 16 KiB stream window. Streaming `send_h2` must split
+    // slices to fit available capacity without stalling or losing bytes.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend = listener.local_addr().unwrap();
+    let total = 256 * 1024usize;
+    let expected: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+    let send_copy = expected.clone();
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let _ = s.write_all(&send_copy).await;
+        let _ = s.shutdown().await;
+    });
+
+    let handle = start_plugin(None).await;
+    let tcp = TcpStream::connect(handle.local_addr).await.unwrap();
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(16 * 1024)
+        .initial_connection_window_size(32 * 1024);
+    let (mut send, connection) = builder.handshake::<_, Bytes>(tcp).await.unwrap();
+    let conn = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("127.0.0.1:{}", backend.port()))
+        .body(())
+        .unwrap();
+    let (response, mut stream) = send.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    // Half-close the request stream; target still streams all 256 KiB cleanly.
+    stream.send_data(Bytes::new(), true).unwrap();
+    let mut recv = response.into_body();
+
+    let mut got = Vec::with_capacity(total);
+    while got.len() < total {
+        let chunk = tokio::time::timeout(TIMEOUT, recv.data())
+            .await
+            .expect("small-window download timed out (send_h2 stalled?)")
+            .expect("stream ended early")
+            .expect("h2 read");
+        got.extend_from_slice(&chunk);
+        recv.flow_control().release_capacity(chunk.len()).unwrap();
+    }
+    assert_eq!(got, expected);
+    // Drain optional empty END_STREAM DATA frame and confirm clean EOF.
+    loop {
+        match tokio::time::timeout(TIMEOUT, recv.data())
+            .await
+            .expect("eof timeout")
+        {
+            Some(Ok(chunk)) if chunk.is_empty() => continue,
+            None => break,
+            other => panic!("expected clean EOF after payload, got {other:?}"),
+        }
+    }
+    conn.abort();
+}
+
+#[tokio::test]
+async fn http2_connect_tcp_bulk_bidirectional_echo() {
+    // Stresses 64 KiB read/frame chunks, BytesMut slab reuse, 2 MiB windowing,
+    // and try_write fast path + backpressure slow path end-to-end.
+    let backend = start_tcp_echo().await;
+    let handle = start_plugin(None).await;
+    let tcp = TcpStream::connect(handle.local_addr).await.unwrap();
+    let mut builder = h2::client::Builder::new();
+    builder
+        .initial_window_size(2 * 1024 * 1024)
+        .initial_connection_window_size(4 * 1024 * 1024)
+        .max_frame_size(64 * 1024);
+    let (mut send, connection) = builder.handshake::<_, Bytes>(tcp).await.unwrap();
+    let conn = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    let request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!("127.0.0.1:{}", backend.port()))
+        .body(())
+        .unwrap();
+    let (response, mut stream) = send.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut recv = response.into_body();
+
+    let total = 2 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..total).map(|i| ((i * 31) % 251) as u8).collect();
+    let expected = payload.clone();
+
+    let writer = tokio::spawn(async move {
+        let mut rem = Bytes::from(payload);
+        while !rem.is_empty() {
+            stream.reserve_capacity(rem.len());
+            let cap = loop {
+                let c = stream.capacity();
+                if c > 0 {
+                    break c;
+                }
+                match std::future::poll_fn(|cx| stream.poll_capacity(cx)).await {
+                    Some(Ok(c)) if c > 0 => break c,
+                    Some(Ok(_)) => {}
+                    other => panic!("unexpected poll_capacity: {other:?}"),
+                }
+            };
+            let n = cap.min(rem.len()).min(64 * 1024);
+            let piece = rem.split_to(n);
+            stream.send_data(piece, rem.is_empty()).unwrap();
+        }
+    });
+
+    let mut got = Vec::with_capacity(total);
+    while got.len() < total {
+        let chunk = tokio::time::timeout(TIMEOUT, recv.data())
+            .await
+            .expect("bulk echo timeout")
+            .expect("stream ended early")
+            .expect("h2 read");
+        got.extend_from_slice(&chunk);
+        recv.flow_control().release_capacity(chunk.len()).unwrap();
+    }
+    writer.await.unwrap();
+    assert_eq!(got, expected);
+    conn.abort();
+}
+
+#[tokio::test]
+async fn http2_connect_udp_handles_multi_capsule_split_and_large_datagrams() {
+    let backend = start_udp_echo().await;
+    let handle = start_plugin(None).await;
+    let (mut send, conn) = h2_client(handle.local_addr).await;
+
+    let mut request = Request::builder()
+        .method(Method::CONNECT)
+        .uri(format!(
+            "http://h2connect/.well-known/masque/udp/127.0.0.1/{}/",
+            backend.port()
+        ))
+        .header("capsule-protocol", "?1")
+        .body(())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(h2::ext::Protocol::from_static("connect-udp"));
+    let (response, mut stream) = send.send_request(request, false).unwrap();
+    let response = response.await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut recv = response.into_body();
+
+    // 1. Two capsules coalesced in a single H2 DATA chunk (zero-copy fast path)
+    //    plus a trailing split half of a 1,400-byte capsule.
+    let p1 = b"first-fast-path".to_vec();
+    let p2 = vec![0xA5u8; 1200];
+    let p3 = vec![0x5Au8; 1400];
+    let c1 = datagram_capsule_any(&p1);
+    let c2 = datagram_capsule_any(&p2);
+    let c3 = datagram_capsule_any(&p3);
+
+    let mut first_chunk = Vec::new();
+    first_chunk.extend_from_slice(&c1);
+    first_chunk.extend_from_slice(&c2);
+    first_chunk.extend_from_slice(&c3[..500]);
+    stream.send_data(Bytes::from(first_chunk), false).unwrap();
+    // Send the rest of c3 in a second chunk (exercises pending reassembly + clear).
+    stream
+        .send_data(Bytes::from(c3[500..].to_vec()), false)
+        .unwrap();
+
+    let mut recv_pending = Vec::new();
+    let mut received = vec![
+        recv_datagram_buf(&mut recv, &mut recv_pending).await,
+        recv_datagram_buf(&mut recv, &mut recv_pending).await,
+        recv_datagram_buf(&mut recv, &mut recv_pending).await,
+    ];
+    received.sort();
+    let mut expected = vec![p1, p2, p3];
+    expected.sort();
+    assert_eq!(received, expected);
+
+    // 2. Clean half-close still allows a final reply after client sends END_STREAM.
+    let p4 = vec![0x3Cu8; 4096];
+    stream
+        .send_data(Bytes::from(datagram_capsule_any(&p4)), true)
+        .unwrap();
+    assert_eq!(recv_datagram_buf(&mut recv, &mut recv_pending).await, p4);
     conn.abort();
 }

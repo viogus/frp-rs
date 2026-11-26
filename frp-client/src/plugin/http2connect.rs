@@ -16,14 +16,16 @@
 //! `crt_file` and `key_file` are set, in which case TLS with ALPN `h2` is used.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use h2::server::{Builder, SendResponse};
 use h2::{RecvStream, SendStream};
 use http::{HeaderValue, Method, Request, Response, StatusCode};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::watch;
 use tracing::debug;
@@ -33,6 +35,20 @@ use frp_core::config::PluginConfig;
 use super::http::{AuthVerdict, HttpProxyAuth};
 use super::{serve_plugin, split_host_port, urlencoding_decode, PluginHandle};
 
+/// Per-stream HTTP/2 receive window (2 MiB). RFC 9113's 64 KiB default caps a
+/// 50 ms RTT link at ~1.3 MB/s; 2 MiB keeps high-BDP streams moving while the
+/// connection window bounds total buffered bytes across concurrent streams.
+const H2_STREAM_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+/// Connection-wide HTTP/2 receive window (8 MiB) shared across all streams.
+const H2_CONN_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+/// Max HTTP/2 DATA frame payload (64 KiB), aligned with frp-rs bridge/yamux
+/// chunks (4× fewer frames than RFC 9113's 16 KiB minimum).
+const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
+/// Target TCP read chunk size for CONNECT streams (matches `H2_MAX_FRAME_SIZE`).
+const TCP_READ_CHUNK: usize = 64 * 1024;
+/// Minimum spare capacity retained in a `BytesMut` slab before reserving a
+/// fresh chunk (avoids tiny fragmented reads when `h2` still holds a slice).
+const MIN_READ_RESERVE: usize = 16 * 1024;
 /// Cap on one capsule's declared length. CONNECT-UDP datagrams are bounded by
 /// the path MTU in practice; this is a memory guard, not a protocol limit.
 const MAX_CAPSULE: usize = 64 * 1024;
@@ -41,6 +57,13 @@ const MAX_CAPSULE_BUFFER: usize = MAX_CAPSULE + 16;
 const CAPSULE_DATAGRAM: u64 = 0x00;
 /// Bound on a single target UDP reply read.
 const MAX_UDP_DATAGRAM: usize = 64 * 1024;
+/// Reusable `BytesMut` slab size for encoded outbound CONNECT-UDP capsules.
+const UDP_CAPSULE_SLAB: usize = 16 * 1024;
+/// Opportunistic non-blocking drain caps when coalescing already-queued UDP
+/// replies into a single H2 DATA frame (RFC 9297 §3). Zero wait is added for
+/// isolated packets; only datagrams already ready in the kernel buffer batch.
+const UDP_BATCH_MAX_BYTES: usize = 16 * 1024;
+const UDP_BATCH_MAX_PKTS: usize = 32;
 const TARGET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// After the client half-closes the CONNECT request stream, how long the
 /// target may keep the response half open while silent. Without this a silent
@@ -99,7 +122,10 @@ where
         // gets a small bound (16 KiB; vhost_h2c uses 4 KiB), not the local
         // https2http 16 MiB allowance. CONNECT needs only the pseudo-headers
         // plus proxy-authorization.
-        .max_header_list_size(16 * 1024);
+        .max_header_list_size(16 * 1024)
+        .initial_window_size(H2_STREAM_WINDOW_SIZE)
+        .initial_connection_window_size(H2_CONN_WINDOW_SIZE)
+        .max_frame_size(H2_MAX_FRAME_SIZE);
     // RFC 8441: advertise SETTINGS_ENABLE_CONNECT_PROTOCOL so clients may use
     // extended CONNECT (`:protocol`). Without this the client's
     // `:protocol = connect-udp` request is rejected by the h2 layer.
@@ -126,21 +152,26 @@ where
 
     let mut streams: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
     loop {
-        match connection.accept().await {
-            Some(Ok((request, respond))) => {
-                let auth = auth.clone();
-                streams.spawn(async move {
-                    if let Err(e) = handle_request(request, respond, auth).await {
-                        debug!(error = %e, "http2connect: stream error: {e}");
-                    }
-                });
-                while streams.try_join_next().is_some() {}
-            }
-            Some(Err(e)) => {
-                debug!(error = %e, "http2connect: connection error: {e}");
-                break;
-            }
-            None => break,
+        tokio::select! {
+            accepted = connection.accept() => match accepted {
+                Some(Ok((request, respond))) => {
+                    let auth = auth.clone();
+                    streams.spawn(async move {
+                        if let Err(e) = handle_request(request, respond, auth).await {
+                            debug!(error = %e, "http2connect: stream error: {e}");
+                        }
+                    });
+                    while streams.try_join_next().is_some() {}
+                }
+                Some(Err(e)) => {
+                    debug!(error = %e, "http2connect: connection error: {e}");
+                    break;
+                }
+                None => break,
+            },
+            // Reap finished stream tasks promptly even while the H2 connection
+            // sits idle between bursts.
+            Some(_) = streams.join_next(), if !streams.is_empty() => {}
         }
     }
     streams.abort_all();
@@ -174,28 +205,42 @@ async fn handle_request(
         }
     }
 
-    let protocol = request
+    enum ConnectKind {
+        Tcp(String),
+        Udp(String, u16),
+        BadRequest,
+        Unsupported(String),
+    }
+
+    let kind = match request
         .extensions()
         .get::<h2::ext::Protocol>()
-        .map(|p| p.as_str().to_string());
-    match protocol.as_deref() {
-        None => {
-            let Some(authority) = request.uri().authority().map(|a| a.as_str().to_string()) else {
-                return send_status(respond, StatusCode::BAD_REQUEST).await;
-            };
-            tcp_connect(request.into_body(), respond, &authority).await
-        }
+        .map(h2::ext::Protocol::as_str)
+    {
+        None => match request.uri().authority() {
+            Some(authority) => ConnectKind::Tcp(authority.as_str().to_string()),
+            None => ConnectKind::BadRequest,
+        },
         Some("connect-udp") => {
             // RFC 9297 §3.4 makes `Capsule-Protocol: ?1` a SHOULD on the
             // request; the response already advertises it and `:protocol =
             // connect-udp` makes the capsule dialect unambiguous, so a client
             // that omits the request header is accepted.
-            let Some((host, port)) = udp_target_from_path(request.uri().path()) else {
-                return send_status(respond, StatusCode::BAD_REQUEST).await;
-            };
+            match udp_target_from_path(request.uri().path()) {
+                Some((host, port)) => ConnectKind::Udp(host, port),
+                None => ConnectKind::BadRequest,
+            }
+        }
+        Some(other) => ConnectKind::Unsupported(other.to_string()),
+    };
+
+    match kind {
+        ConnectKind::Tcp(authority) => tcp_connect(request.into_body(), respond, &authority).await,
+        ConnectKind::Udp(host, port) => {
             udp_connect(request.into_body(), respond, &host, port).await
         }
-        Some(other) => {
+        ConnectKind::BadRequest => send_status(respond, StatusCode::BAD_REQUEST).await,
+        ConnectKind::Unsupported(other) => {
             debug!(protocol = %other, "http2connect: unsupported :protocol");
             send_status(respond, StatusCode::NOT_IMPLEMENTED).await
         }
@@ -207,6 +252,98 @@ enum ClientState {
     Open,
     HalfClosed,
     Gone,
+}
+
+/// Write `data` to `tcp_w` without touching the Tokio timer wheel on the
+/// non-blocking fast path; only arm/reset the reusable `write_sleep` timer if
+/// the kernel send buffer actually returns `WouldBlock`.
+async fn write_all_with_timeout(
+    tcp_w: &mut OwnedWriteHalf,
+    data: &[u8],
+    write_sleep: &mut Option<Pin<Box<tokio::time::Sleep>>>,
+) -> Result<(), ()> {
+    let mut offset = 0;
+    while offset < data.len() {
+        match tcp_w.try_write(&data[offset..]) {
+            Ok(0) => return Err(()),
+            Ok(n) => {
+                offset += n;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Slow path: arm (or lazily allocate) the reusable timer once
+                // for the remainder of this chunk.
+                let deadline = tokio::time::Instant::now() + TARGET_WRITE_TIMEOUT;
+                let sleep = match write_sleep {
+                    Some(s) => {
+                        s.as_mut().reset(deadline);
+                        s
+                    }
+                    None => write_sleep.insert(Box::pin(tokio::time::sleep_until(deadline))),
+                };
+                while offset < data.len() {
+                    tokio::select! {
+                        biased;
+                        res = tcp_w.write(&data[offset..]) => match res {
+                            Ok(0) => return Err(()),
+                            Ok(n) => offset += n,
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(_) => return Err(()),
+                        },
+                        _ = sleep.as_mut() => return Err(()),
+                    }
+                }
+                return Ok(());
+            }
+            Err(_) => return Err(()),
+        }
+    }
+    Ok(())
+}
+
+/// Reusable lazy half-close tail timers. On normal (open) streams neither timer
+/// is ever allocated or registered with the Tokio timer wheel.
+struct TailTimers {
+    idle: Option<Pin<Box<tokio::time::Sleep>>>,
+    max: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl TailTimers {
+    fn new() -> Self {
+        Self {
+            idle: None,
+            max: None,
+        }
+    }
+
+    fn arm_or_reset_idle(&mut self) {
+        let now = tokio::time::Instant::now();
+        let idle_at = now + TARGET_TAIL_TIMEOUT;
+        match &mut self.idle {
+            Some(s) => s.as_mut().reset(idle_at),
+            None => self.idle = Some(Box::pin(tokio::time::sleep_until(idle_at))),
+        }
+        if self.max.is_none() {
+            self.max = Some(Box::pin(tokio::time::sleep_until(
+                now + TARGET_TAIL_MAX_LIFETIME,
+            )));
+        }
+    }
+
+    fn is_armed(&self) -> bool {
+        self.idle.is_some()
+    }
+
+    async fn wait_expired(&mut self) {
+        let (Some(idle), Some(max)) = (&mut self.idle, &mut self.max) else {
+            std::future::pending::<()>().await;
+            return;
+        };
+        tokio::select! {
+            _ = idle.as_mut() => {}
+            _ = max.as_mut() => {}
+        }
+    }
 }
 
 async fn tcp_connect(
@@ -248,35 +385,28 @@ async fn tcp_connect(
     // (the plugin/h2.rs rule), and a single `select!` would block the target
     // ->client direction behind a congested `tcp_w.write_all`. Parent abort
     // drops both futures, closing the target halves.
-    let mut buf = [0u8; 16 * 1024];
     let (client_tx, mut client_rx) = watch::channel(ClientState::Open);
     let (target_tx, mut target_rx) = watch::channel(false);
 
     let up = async {
+        let mut write_sleep: Option<Pin<Box<tokio::time::Sleep>>> = None;
         loop {
             tokio::select! {
                 chunk = recv.data() => match chunk {
                     Some(Ok(chunk)) => {
-                        if recv.flow_control().release_capacity(chunk.len()).is_err() {
+                        if write_all_with_timeout(&mut tcp_w, &chunk, &mut write_sleep)
+                            .await
+                            .is_err()
+                        {
                             let _ = client_tx.send(ClientState::Gone);
                             break;
                         }
-                        let write = async {
-                            let mut offset = 0;
-                            while offset < chunk.len() {
-                                match tcp_w.write(&chunk[offset..]).await {
-                                    Ok(0) | Err(_) => return Err(()),
-                                    Ok(n) => offset += n,
-                                }
-                            }
-                            Ok(())
-                        };
-                        match tokio::time::timeout(TARGET_WRITE_TIMEOUT, write).await {
-                            Ok(Ok(())) => {}
-                            _ => {
-                                let _ = client_tx.send(ClientState::Gone);
-                                break;
-                            }
+                        // Release H2 receive window only after the target socket
+                        // accepted the bytes so slow targets apply end-to-end
+                        // flow-control backpressure to the H2 peer.
+                        if recv.flow_control().release_capacity(chunk.len()).is_err() {
+                            let _ = client_tx.send(ClientState::Gone);
+                            break;
                         }
                     }
                     Some(Err(_)) => {
@@ -303,60 +433,72 @@ async fn tcp_connect(
     };
 
     let down = async {
-        let mut idle: Option<tokio::time::Instant> = None;
-        let mut tail_started: Option<tokio::time::Instant> = None;
-        loop {
-            let deadline = idle;
-            let max_deadline = tail_started.map(|t| t + TARGET_TAIL_MAX_LIFETIME);
+        let mut buf = BytesMut::with_capacity(TCP_READ_CHUNK);
+        let mut timers = TailTimers::new();
+        let mut clean_close = true;
+        'down: loop {
+            if buf.capacity() < MIN_READ_RESERVE {
+                buf.reserve(TCP_READ_CHUNK);
+            }
             tokio::select! {
-                read = tcp_r.read(&mut buf) => match read {
+                read = tcp_r.read_buf(&mut buf) => match read {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if send_h2(&mut send, Bytes::copy_from_slice(&buf[..n]))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                    Ok(_) => {
+                        let mut data = buf.split().freeze();
+                        while !data.is_empty() {
+                            tokio::select! {
+                                biased;
+                                res = send_h2(&mut send, &mut data) => {
+                                    if res.is_err() {
+                                        clean_close = false;
+                                        break 'down;
+                                    }
+                                }
+                                changed = client_rx.changed() => {
+                                    if changed.is_err() || matches!(*client_rx.borrow(), ClientState::Gone) {
+                                        clean_close = false;
+                                        break 'down;
+                                    }
+                                    if matches!(*client_rx.borrow(), ClientState::HalfClosed) {
+                                        timers.arm_or_reset_idle();
+                                    }
+                                }
+                                _ = timers.wait_expired(), if timers.is_armed() => {
+                                    clean_close = false;
+                                    break 'down;
+                                }
+                            }
                         }
                         // Idle, not absolute: a slow response keeps resetting
                         // the tail window and is never silently truncated.
-                        if matches!(*client_rx.borrow(), ClientState::HalfClosed) {
-                            let now = tokio::time::Instant::now();
-                            idle = Some(now + TARGET_TAIL_TIMEOUT);
-                            tail_started.get_or_insert(now);
+                        if timers.is_armed() {
+                            timers.arm_or_reset_idle();
                         }
                     }
                 },
                 changed = client_rx.changed() => {
                     if changed.is_err() {
+                        clean_close = false;
                         break;
                     }
                     match *client_rx.borrow() {
-                        ClientState::Gone => break,
+                        ClientState::Gone => {
+                            clean_close = false;
+                            break;
+                        }
                         ClientState::HalfClosed => {
-                            let now = tokio::time::Instant::now();
-                            idle = Some(now + TARGET_TAIL_TIMEOUT);
-                            tail_started.get_or_insert(now);
+                            timers.arm_or_reset_idle();
                         }
                         ClientState::Open => {}
                     }
                 }
-                _ = async {
-                    match deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if deadline.is_some() => break,
-                _ = async {
-                    match max_deadline {
-                        Some(deadline) => tokio::time::sleep_until(deadline).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                }, if max_deadline.is_some() => break,
+                _ = timers.wait_expired(), if timers.is_armed() => break,
             }
         }
         let _ = target_tx.send(true);
-        let _ = send.send_data(Bytes::new(), true);
+        if clean_close {
+            let _ = send.send_data(Bytes::new(), true);
+        }
     };
 
     tokio::join!(up, down);
@@ -418,128 +560,244 @@ async fn udp_connect(
         Err(e) => return Err(e.to_string()),
     };
 
-    // Single task for both directions: abort/drop closes the target socket.
-    let mut pending: Vec<u8> = Vec::new();
-    let mut pos = 0usize;
-    let mut buf = vec![0u8; MAX_UDP_DATAGRAM];
-    let mut client_open = true;
-    let mut clean_close = true;
-    let mut idle: Option<tokio::time::Instant> = None;
-    let mut tail_started: Option<tokio::time::Instant> = None;
-    'stream: loop {
-        let deadline = idle;
-        let max_deadline = tail_started.map(|t| t + TARGET_TAIL_MAX_LIFETIME);
-        tokio::select! {
-            chunk = recv.data(), if client_open => match chunk {
-                Some(Ok(chunk)) => {
-                    if recv.flow_control().release_capacity(chunk.len()).is_err() {
-                        break 'stream;
-                    }
-                    pending.extend_from_slice(&chunk);
-                    loop {
-                        match take_capsule_at(&pending, &mut pos) {
-                            Ok(Some(value)) => {
-                                // RFC 9298 §4: the DATAGRAM capsule value is
-                                // Context ID (varint) + UDP Proxying Payload.
-                                // Context 0 is the UDP payload; unregistered
-                                // contexts are dropped (RFC 9298 §5).
-                                let Some((context, ctx_len)) = decode_varint(&value) else {
-                                    debug!("http2connect: capsule without a Context ID");
-                                    clean_close = false;
-                                    break 'stream;
-                                };
-                                if context != 0 {
-                                    continue;
-                                }
-                                if socket.send(&value[ctx_len..]).await.is_err() {
-                                    break 'stream;
-                                }
+    // Both directions run concurrently inside THIS task via `join!` so H2
+    // downlink flow-control stalls cannot head-of-line block uplink datagrams.
+    // Parent abort drops both futures, closing the target socket.
+    let (client_tx, mut client_rx) = watch::channel(ClientState::Open);
+    let (target_tx, mut target_rx) = watch::channel(false);
+    let socket_up = Arc::clone(&socket);
+    let socket_down = socket;
+
+    let up = async {
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            tokio::select! {
+                chunk = recv.data() => match chunk {
+                    Some(Ok(chunk)) => {
+                        let chunk_len = chunk.len();
+                        let send_ok = if pending.is_empty() {
+                            // Fast path: parse complete capsules directly out
+                            // of the H2 `Bytes` buffer with zero copies.
+                            let mut cpos = 0usize;
+                            let ok = dispatch_udp_capsules(&chunk, &mut cpos, &socket_up).await;
+                            if ok && cpos < chunk.len() {
+                                pending.extend_from_slice(&chunk[cpos..]);
                             }
-                            Ok(None) => break,
-                            Err(e) => {
-                                debug!(error = %e, "http2connect: malformed capsule");
-                                clean_close = false;
-                                break 'stream;
+                            ok
+                        } else {
+                            pending.extend_from_slice(&chunk);
+                            let mut ppos = 0usize;
+                            let ok = dispatch_udp_capsules(&pending, &mut ppos, &socket_up).await;
+                            if ppos == pending.len() {
+                                pending.clear();
+                            } else if ppos > 0 {
+                                pending.drain(..ppos);
                             }
+                            ok
+                        };
+                        if !send_ok {
+                            let _ = client_tx.send(ClientState::Gone);
+                            break;
+                        }
+                        if recv.flow_control().release_capacity(chunk_len).is_err() {
+                            let _ = client_tx.send(ClientState::Gone);
+                            break;
                         }
                     }
-                    if pos > 0 {
-                        pending.drain(..pos);
-                        pos = 0;
+                    Some(Err(_)) => {
+                        let _ = client_tx.send(ClientState::Gone);
+                        break;
+                    }
+                    None => {
+                        // Clean half-close: the client sends no more datagrams,
+                        // but may still read replies. Give the target an idle
+                        // window, reset by every reply.
+                        let _ = client_tx.send(ClientState::HalfClosed);
+                        break;
+                    }
+                },
+                changed = target_rx.changed() => {
+                    if changed.is_err() || *target_rx.borrow() {
+                        break;
                     }
                 }
-                Some(Err(_)) => {
-                    clean_close = false;
-                    break 'stream;
-                }
-                None => {
-                    // Clean half-close: the client sends no more datagrams,
-                    // but may still read replies. Give the target an idle
-                    // window, reset by every reply.
-                    client_open = false;
-                    let now = tokio::time::Instant::now();
-                    idle = Some(now + TARGET_TAIL_TIMEOUT);
-                    tail_started.get_or_insert(now);
-                }
-            },
-            result = socket.recv(&mut buf) => match result {
-                Ok(n) => {
-                    // RFC 9298 §4: Context ID 0 precedes every UDP payload.
-                    let mut value = Vec::with_capacity(n + 1);
-                    encode_varint(0, &mut value);
-                    value.extend_from_slice(&buf[..n]);
-                    let mut capsule = Vec::with_capacity(value.len() + 10);
-                    encode_varint(CAPSULE_DATAGRAM, &mut capsule);
-                    encode_varint(value.len() as u64, &mut capsule);
-                    capsule.extend_from_slice(&value);
-                    if send_h2(&mut send, Bytes::from(capsule)).await.is_err() {
-                        break 'stream;
+            }
+        }
+    };
+
+    let down = async {
+        // Uninitialized spare capacity — no upfront 64 KiB zero-fill on stream
+        // creation; `recv_buf` writes straight into the spare slice.
+        let mut recv_buf = BytesMut::with_capacity(MAX_UDP_DATAGRAM);
+        let mut out = BytesMut::with_capacity(UDP_CAPSULE_SLAB);
+        let mut timers = TailTimers::new();
+        let mut clean_close = true;
+        'down: loop {
+            recv_buf.clear();
+            tokio::select! {
+                result = socket_down.recv_buf(&mut recv_buf) => match result {
+                    Ok(n) => {
+                        push_udp_capsule(&mut out, &recv_buf[..n]);
+                        // Opportunistically coalesce any datagrams already
+                        // queued in the kernel socket buffer into the same H2
+                        // DATA frame (RFC 9297 §3). Adds zero latency for
+                        // isolated packets because `try_recv_buf` returns
+                        // `WouldBlock` immediately when no second packet is ready.
+                        let mut batched = 1usize;
+                        while batched < UDP_BATCH_MAX_PKTS && out.len() < UDP_BATCH_MAX_BYTES {
+                            recv_buf.clear();
+                            match socket_down.try_recv_buf(&mut recv_buf) {
+                                Ok(m) => {
+                                    push_udp_capsule(&mut out, &recv_buf[..m]);
+                                    batched += 1;
+                                }
+                                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::ConnectionRefused
+                                            | std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::HostUnreachable
+                                            | std::io::ErrorKind::NetworkUnreachable
+                                    ) =>
+                                {
+                                    debug!(target = %target, error = %e, "http2connect: UDP recv transient error");
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let mut frame = out.split().freeze();
+                        while !frame.is_empty() {
+                            tokio::select! {
+                                biased;
+                                res = send_h2(&mut send, &mut frame) => {
+                                    if res.is_err() {
+                                        clean_close = false;
+                                        break 'down;
+                                    }
+                                }
+                                changed = client_rx.changed() => {
+                                    if changed.is_err() || matches!(*client_rx.borrow(), ClientState::Gone) {
+                                        clean_close = false;
+                                        break 'down;
+                                    }
+                                    if matches!(*client_rx.borrow(), ClientState::HalfClosed) {
+                                        timers.arm_or_reset_idle();
+                                    }
+                                }
+                                _ = timers.wait_expired(), if timers.is_armed() => {
+                                    clean_close = false;
+                                    break 'down;
+                                }
+                            }
+                        }
+                        if timers.is_armed() {
+                            timers.arm_or_reset_idle();
+                        }
                     }
-                    if !client_open {
-                        let now = tokio::time::Instant::now();
-                        idle = Some(now + TARGET_TAIL_TIMEOUT);
-                        tail_started.get_or_insert(now);
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::HostUnreachable
+                                | std::io::ErrorKind::NetworkUnreachable
+                        ) =>
+                    {
+                        // A connected UDP socket surfaces ICMP errors as these
+                        // kinds on Linux; one unreachable target must not kill an
+                        // otherwise live association. Pause so a persistently
+                        // erroring socket cannot hot-spin the loop.
+                        debug!(target = %target, error = %e, "http2connect: UDP recv transient error");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(e) => {
+                        debug!(target = %target, error = %e, "http2connect: UDP recv failed");
+                        break;
+                    }
+                },
+                changed = client_rx.changed() => {
+                    if changed.is_err() {
+                        clean_close = false;
+                        break;
+                    }
+                    match *client_rx.borrow() {
+                        ClientState::Gone => {
+                            clean_close = false;
+                            break;
+                        }
+                        ClientState::HalfClosed => {
+                            timers.arm_or_reset_idle();
+                        }
+                        ClientState::Open => {}
                     }
                 }
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::ConnectionReset
-                            | std::io::ErrorKind::HostUnreachable
-                            | std::io::ErrorKind::NetworkUnreachable
-                    ) =>
-                {
-                    // A connected UDP socket surfaces ICMP errors as these
-                    // kinds on Linux; one unreachable target must not kill an
-                    // otherwise live association. Pause so a persistently
-                    // erroring socket cannot hot-spin the loop.
-                    debug!(target = %target, error = %e, "http2connect: UDP recv transient error");
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                _ = timers.wait_expired(), if timers.is_armed() => break,
+            }
+        }
+        let _ = target_tx.send(true);
+        if clean_close {
+            let _ = send.send_data(Bytes::new(), true);
+        }
+    };
+
+    tokio::join!(up, down);
+    Ok(())
+}
+
+/// Encode one RFC 9298 §4 DATAGRAM capsule (`type(0x00) + varint(1 + len) +
+/// context_id(0x00) + payload`) into `out`.
+#[inline]
+fn push_udp_capsule(out: &mut BytesMut, payload: &[u8]) {
+    let value_len = 1 + payload.len();
+    let needed = 1 + varint_len(value_len as u64) + 1 + payload.len();
+    if out.capacity() - out.len() < needed {
+        out.reserve(needed.max(UDP_CAPSULE_SLAB));
+    }
+    out.put_u8(CAPSULE_DATAGRAM as u8);
+    encode_varint_mut(value_len as u64, out);
+    out.put_u8(0);
+    out.extend_from_slice(payload);
+}
+
+async fn dispatch_udp_capsules(buf: &[u8], pos: &mut usize, socket: &UdpSocket) -> bool {
+    loop {
+        match take_capsule_at(buf, pos) {
+            Ok(Some(value)) => {
+                // RFC 9298 §4: the DATAGRAM capsule value is Context ID
+                // (varint) + UDP Proxying Payload. Context 0 is the UDP
+                // payload; unregistered contexts are dropped (RFC 9298 §5).
+                let Some((context, ctx_len)) = decode_varint(value) else {
+                    debug!("http2connect: capsule without a Context ID");
+                    return false;
+                };
+                if context != 0 {
+                    continue;
                 }
-                Err(e) => {
-                    debug!(target = %target, error = %e, "http2connect: UDP recv failed");
-                    break 'stream;
+                let payload = &value[ctx_len..];
+                loop {
+                    match socket.try_send(payload) {
+                        Ok(_) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if socket.send(payload).await.is_err() {
+                                return false;
+                            }
+                            break;
+                        }
+                        Err(_) => return false,
+                    }
                 }
-            },
-            _ = async {
-                match deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if deadline.is_some() => break 'stream,
-            _ = async {
-                match max_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if max_deadline.is_some() => break 'stream,
+            }
+            Ok(None) => return true,
+            Err(e) => {
+                debug!(error = %e, "http2connect: malformed capsule");
+                return false;
+            }
         }
     }
-    if clean_close {
-        let _ = send.send_data(Bytes::new(), true);
-    }
-    Ok(())
 }
 
 async fn send_auth_required(mut respond: SendResponse<Bytes>) -> Result<(), String> {
@@ -565,20 +823,34 @@ async fn send_status(mut respond: SendResponse<Bytes>, status: StatusCode) -> Re
     Ok(())
 }
 
-/// Send one DATA frame respecting h2 flow control.
-async fn send_h2(send: &mut SendStream<Bytes>, data: Bytes) -> Result<(), String> {
-    if data.is_empty() {
-        return Ok(());
+/// Send DATA respecting h2 flow control, streaming slices as soon as any
+/// window capacity is available so a small peer window never stalls or
+/// deadlocks a larger read chunk. Cancel-safe: `data` is mutated only once
+/// `send_data` accepts the slice.
+async fn send_h2(send: &mut SendStream<Bytes>, data: &mut Bytes) -> Result<(), String> {
+    while !data.is_empty() {
+        send.reserve_capacity(data.len());
+        let cap = loop {
+            let c = send.capacity();
+            if c > 0 {
+                break c;
+            }
+            match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
+                Some(Ok(c)) if c > 0 => break c,
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(e.to_string()),
+                None => return Err("h2 stream closed".into()),
+            }
+        };
+        let n = cap.min(data.len());
+        let piece = if n == data.len() {
+            std::mem::take(data)
+        } else {
+            data.split_to(n)
+        };
+        send.send_data(piece, false).map_err(|e| e.to_string())?;
     }
-    send.reserve_capacity(data.len());
-    while send.capacity() < data.len() {
-        match std::future::poll_fn(|cx| send.poll_capacity(cx)).await {
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(e.to_string()),
-            None => return Err("h2 stream closed".into()),
-        }
-    }
-    send.send_data(data, false).map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// True when a CONNECT authority carries an explicit numeric port. IPv6
@@ -618,24 +890,37 @@ fn udp_target_from_path(path: &str) -> Option<(String, u16)> {
 // RFC 9297 capsule framing
 // ---------------------------------------------------------------
 
-/// Append one QUIC-style variable-length integer (RFC 9000 §16).
-fn encode_varint(value: u64, out: &mut Vec<u8>) {
+/// Encoded byte length of a QUIC-style variable-length integer (RFC 9000 §16).
+#[inline]
+fn varint_len(value: u64) -> usize {
     if value < 64 {
-        out.push(value as u8);
+        1
     } else if value < 16_384 {
-        out.push(0x40 | (value >> 8) as u8);
-        out.push(value as u8);
+        2
     } else if value < (1 << 30) {
-        out.push(0x80 | (value >> 24) as u8);
-        out.push((value >> 16) as u8);
-        out.push((value >> 8) as u8);
-        out.push(value as u8);
+        4
     } else {
-        out.push(0xC0 | ((value >> 56) & 0x3f) as u8);
-        for shift in [48, 40, 32, 24, 16, 8, 0] {
-            out.push((value >> shift) as u8);
-        }
+        8
     }
+}
+
+/// Append one QUIC-style variable-length integer (RFC 9000 §16) to a `BufMut`.
+#[inline]
+fn encode_varint_mut(value: u64, out: &mut impl BufMut) {
+    if value < 64 {
+        out.put_u8(value as u8);
+    } else if value < 16_384 {
+        out.put_u16(0x4000 | value as u16);
+    } else if value < (1 << 30) {
+        out.put_u32(0x8000_0000 | value as u32);
+    } else {
+        out.put_u64(0xC000_0000_0000_0000 | (value & 0x3fff_ffff_ffff_ffff));
+    }
+}
+
+#[cfg(test)]
+fn encode_varint(value: u64, out: &mut Vec<u8>) {
+    encode_varint_mut(value, out);
 }
 
 fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
@@ -651,10 +936,10 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
     Some((value, len))
 }
 
-/// Take one DATAGRAM capsule value starting at `*pos`. Returns `Ok(None)` when
-/// more data is needed; the cursor avoids the O(n²) `Vec::drain` per capsule.
-/// Other capsule types are skipped (RFC 9297 §3.3).
-fn take_capsule_at(buf: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, String> {
+/// Borrow one DATAGRAM capsule value starting at `*pos` without allocating.
+/// Returns `Ok(None)` when more data is needed; other capsule types are
+/// skipped (RFC 9297 §3.3).
+fn take_capsule_at<'a>(buf: &'a [u8], pos: &mut usize) -> Result<Option<&'a [u8]>, String> {
     loop {
         let data = &buf[*pos..];
         let Some((kind, type_len)) = decode_varint(data) else {
@@ -681,7 +966,7 @@ fn take_capsule_at(buf: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, Strin
         }
         *pos += total;
         if kind == CAPSULE_DATAGRAM {
-            return Ok(Some(data[type_len + len_len..total].to_vec()));
+            return Ok(Some(&data[type_len + len_len..total]));
         }
     }
 }
@@ -689,7 +974,7 @@ fn take_capsule_at(buf: &[u8], pos: &mut usize) -> Result<Option<Vec<u8>>, Strin
 #[cfg(test)]
 fn take_capsule(buf: &mut Vec<u8>) -> Result<Option<Vec<u8>>, String> {
     let mut pos = 0;
-    let result = take_capsule_at(buf, &mut pos)?;
+    let result = take_capsule_at(buf, &mut pos)?.map(|s| s.to_vec());
     buf.drain(..pos);
     Ok(result)
 }
