@@ -122,11 +122,10 @@ async fn ws_client_parses_pipelined_frame_after_upgrade() {
             }
         }
         let client_key = client_key.expect("client Sec-WebSocket-Key header");
-        use sha1::{Digest, Sha1};
-        let mut hasher = Sha1::new();
+        let mut hasher = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
         hasher.update(client_key.as_bytes());
         hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-        let accept = super::super::base64_encode(&hasher.finalize());
+        let accept = super::super::base64_encode(hasher.finish().as_ref());
         // 101 response + first WS frame in a single segment.
         let resp = format!(
             "HTTP/1.1 101 Switching Protocols\r\n\

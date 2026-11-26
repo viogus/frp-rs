@@ -54,16 +54,19 @@ const MAX_SNAPPY_PENDING: usize = 16 * 1024 * 1024;
 #[cfg(feature = "compression")]
 const MAX_FRAMES_PER_CALL: usize = 1024;
 
-/// Derive an AES-128 key from a token using PBKDF2-SHA1.
-/// Matches Go frp v0.69.1 binary: pbkdf2.Key(token, "frp", 64, 16, sha1.New)
-///
-/// SECURITY NOTE: V1 uses PBKDF2-SHA1 with 64 iterations and salt="frp" for
-/// Go frp wire compatibility. This provides minimal brute-force protection.
-/// Prefer V2 protocol (AEAD with HKDF-SHA256) for stronger key derivation.
-/// Do not increase iterations: it breaks Go frp interop.
+/// Derive an AES-128 key from a token using PBKDF2-SHA1 (Go frp v0.69.1 wire
+/// compat: pbkdf2.Key(token, "frp", 64, 16, sha1.New)). Prefer V2 AEAD for new
+/// deployments; do not increase iterations or Go interop breaks.
 pub fn derive_key(token: &str) -> [u8; 16] {
     let mut key = [0u8; 16];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token.as_bytes(), b"frp", 64, &mut key);
+    const ITERS: std::num::NonZeroU32 = std::num::NonZeroU32::new(64).unwrap();
+    ring::pbkdf2::derive(
+        ring::pbkdf2::PBKDF2_HMAC_SHA1,
+        ITERS,
+        b"frp",
+        token.as_bytes(),
+        &mut key,
+    );
     key
 }
 
@@ -706,6 +709,24 @@ impl SnappyDecompressor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_key_matches_go_frp_pbkdf2_sha1_vectors() {
+        // Known-answer vectors for PBKDF2-HMAC-SHA1(token, b"frp", 64, 16)
+        // matching Go frp v0.69.1 `pbkdf2.Key(token, "frp", 64, 16, sha1.New)`.
+        assert_eq!(
+            derive_key(""),
+            [205, 201, 220, 76, 71, 44, 55, 51, 18, 129, 223, 76, 35, 42, 132, 7]
+        );
+        assert_eq!(
+            derive_key("token"),
+            [193, 106, 143, 99, 131, 41, 38, 206, 225, 35, 238, 162, 159, 149, 214, 112]
+        );
+        assert_eq!(
+            derive_key("my-secret-token"),
+            [215, 59, 188, 111, 98, 62, 117, 105, 43, 65, 254, 177, 92, 220, 130, 64]
+        );
+    }
 
     #[test]
     fn test_encrypt_decrypt() {

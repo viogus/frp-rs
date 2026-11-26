@@ -45,8 +45,10 @@ frp-core = { path = "../frp-core", default-features = false }
 frp-server = { path = "../frp-server", default-features = false }
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 mimalloc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
 
 [[bin]]
 name = "frps"

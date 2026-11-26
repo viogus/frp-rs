@@ -1384,7 +1384,7 @@ mod dir_registry_tests {
     use std::sync::{Arc, Mutex};
 
     /// An in-memory `tracing` writer: the recovery log has to be asserted, and
-    /// `tracing_subscriber` is already a bin dependency (`init_logging`).
+    /// `tracing_subscriber` is a dev-dependency (linked via `frp-core`).
     #[derive(Clone, Default)]
     struct CapturedLog(Arc<Mutex<Vec<u8>>>);
 

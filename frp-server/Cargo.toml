@@ -7,7 +7,7 @@ description = "frps server logic for frp-rs — control handler, proxy registrat
 repository = "https://github.com/viogus/frp-rs"
 
 [dependencies]
-bytes = { workspace = true }
+bytes = { workspace = true, optional = true }
 frp-core = { path = "../frp-core", default-features = false }
 # h2c HTTP vhost support: the byte-level bridge cannot decode HTTP/2 frames; h2
 # is the tokio-official HTTP/2 implementation (Go uses net/http's h2c; Rust has
@@ -16,7 +16,7 @@ frp-core = { path = "../frp-core", default-features = false }
 # 5, MEDIUM): vhost_h2c.rs + h2's dependency tree (indexmap/hashbrown/fnv)
 # were previously forced into micro/tiny builds that never serve vhosts.
 h2 = { workspace = true, optional = true }
-http = { workspace = true }
+http = { workspace = true, optional = true }
 # catch_unwind for the single-spawn bridge panic surfacing (audit round 5,
 # MEDIUM); already a workspace dep (frp-core/frp-client) — no new crate.
 futures-util.workspace = true
@@ -24,8 +24,6 @@ futures-util.workspace = true
 # the global RwLock read-lock contention on every work-conn dispatch).
 dashmap.workspace = true
 russh = { workspace = true, optional = true }
-# NOTE: russh → ssh-cipher → aes-gcm 0.11.0-rc.4 is a pre-release. Only used for
-# SSH feature. Monitor upstream for stable release.
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -50,7 +48,7 @@ quic = ["frp-core/quic"]
 kcp = ["frp-core/kcp"]
 oidc = ["frp-core/oidc"]
 tls = ["frp-core/tls", "dep:tokio-rustls"]
-http-proxy = ["frp-core/http-client", "dep:h2"]
+http-proxy = ["frp-core/http-client", "dep:h2", "dep:bytes", "dep:http"]
 vnet = ["frp-core/vnet"]
 compression = ["frp-core/compression"]
 chacha20 = ["frp-core/chacha20"]
@@ -82,7 +80,6 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tempfile = "3"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 reqwest = { workspace = true, features = ["json"] }
-serde_json = { workspace = true }
 axum = { workspace = true }
 ring = { workspace = true }
 bytes = { workspace = true }

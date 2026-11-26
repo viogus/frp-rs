@@ -93,7 +93,6 @@ frp-rs/
                           (tests in bridge/tests.rs)
       cipher_stream.rs    AES-128-CFB streaming encrypt/decrypt (CipherReader/CipherWriter)
       config/             TOML/YAML/JSON/INI config structs + Go→Rust compat normalization
-      config_store.rs     Runtime config store (client proxy/visitor CRUD)
       encryption.rs       Key derivation (PBKDF2-SHA1) + Snappy compression
       crypto.rs           V2 AEAD algorithms (AES-256-GCM / XChaCha20-Poly1305)
       v2_handshake.rs     V2 ClientHello/ServerHello + capability negotiation

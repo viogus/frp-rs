@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=fab581a500a64cf2dfe4f65272da18ecbacd0eee76b778528b47f1eb44fdad45
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=e517b4aa8aaca7de546ec959c14cc919565cab546060b4f9c18fd1b823854a13
+          guard_data_pin=788ecd16b10b91a44b08eabcfd7cb4dc67cd62c4d2b12259923a211620352efd
           guard_exact=118
           guard_floor=118
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -4454,7 +4454,7 @@ jobs:
         # NO --all-targets here, deliberately. On a --workspace invocation every
         # member is a root, so all dev-dependency edges enter the graph, and
         # frp-server's dev-dependency on frp-client (default features,
-        # frp-server/Cargo.toml:69) plus frp-client's on frp-server re-enable
+        # frp-server/Cargo.toml:67) plus frp-client's on frp-server re-enable
         # both crates' `default` sets. Measured with --all-targets: the micro
         # step compiles frp-client as
         # chacha20,compression,default,http2http,kcp,oidc,quic,tcp-mux,tls,websocket

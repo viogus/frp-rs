@@ -45,7 +45,7 @@ fn bench_key_derivation(c: &mut Criterion) {
 
 fn bench_compression(c: &mut Criterion) {
     // `encryption::compress` returns `Err("compression not compiled")` without
-    // the `compression` feature (frp-core/src/encryption.rs:218), and the
+    // the `compression` feature (frp-core/src/encryption.rs:221), and the
     // `.unwrap()` below runs at registration time — outside `b.iter` — so it
     // panics the whole bench binary. The body is gated instead of the function
     // because the `criterion_group!` invocation at the end of this file lists

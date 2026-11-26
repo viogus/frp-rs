@@ -41,7 +41,7 @@ tracing.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 axum = { workspace = true, optional = true }
-toml.workspace = true
+toml = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 tokio-rustls = { workspace = true, optional = true }
 h2 = { workspace = true, optional = true }
@@ -55,7 +55,7 @@ rand.workspace = true
 # to enable the admin API; `frpc reload`/`status` talk to a running frpc built
 # with this feature and `web_server.port > 0` configured.
 default = ["tls", "kcp", "quic", "websocket", "oidc", "compression", "chacha20", "tcp-mux", "http2http"]
-admin = ["dep:axum", "frp-core/admin-auth"]
+admin = ["dep:axum", "frp-core/admin-auth", "dep:toml"]
 tls = ["frp-core/tls", "dep:rustls", "dep:tokio-rustls"]
 # HTTP/2 (h2) support for the https2http/https2https plugins (enableHTTP2
 # path). Implies `tls` — h2 only makes sense on a TLS listener. Kept out of

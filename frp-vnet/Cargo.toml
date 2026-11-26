@@ -18,9 +18,6 @@ libc = "0.2"
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 
-[target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_Security", "Win32_System_IO"] }
-
 # serde_json is only used by integration tests (frp-vnet/tests/), not by the
 # library itself — dev-only so the library build stays lean. `serde` is not
 # listed: the message types live in `frp-core` (re-exported by
