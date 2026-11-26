@@ -227,6 +227,9 @@ async fn test_socks5_pipelined_handshake_preserves_first_payload() {
 async fn test_socks5_bulk_bidirectional_relay() {
     // Stresses relay_tcp_fast (Linux zero-copy splice / non-Linux lock-free
     // into_split pooled relay) + clean half-close FIN propagation across 2 MiB.
+    #[cfg(target_os = "linux")]
+    let splice_before = frp_core::splice::bridge_splice_calls();
+
     let backend = start_echo_backend().await;
     let cfg = PluginConfig {
         plugin_type: "socks5".into(),
@@ -254,4 +257,10 @@ async fn test_socks5_bulk_bidirectional_relay() {
         .expect("bulk echo read");
     writer.await.unwrap();
     assert_eq!(got, expected);
+
+    #[cfg(target_os = "linux")]
+    assert!(
+        frp_core::splice::bridge_splice_calls() > splice_before,
+        "socks5 CONNECT on Linux must route through zero-copy bridge_splice"
+    );
 }

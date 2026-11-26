@@ -1165,8 +1165,10 @@ where
 
 /// Bidirectional relay between two raw `TcpStream`s.
 ///
-/// - On Linux: uses kernel-space zero-copy [`crate::splice::bridge_splice`]
-///   with identical half-close linger semantics.
+/// - On Linux: uses kernel-space zero-copy `crate::splice::bridge_splice`
+///   with identical half-close linger semantics (note: allocates two kernel
+///   pipe pairs per active connection, matching plain `tcp` proxies in
+///   `frp-client`/`frp-server`).
 /// - On non-Linux (macOS / Windows): uses lock-free `TcpStream::into_split()`
 ///   with pooled 64 KiB buffers, avoiding `tokio::io::split`'s per-socket
 ///   `BiLock` contention on full-duplex traffic.

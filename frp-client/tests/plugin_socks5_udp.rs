@@ -539,15 +539,17 @@ async fn udp_associate_domain_cache_hit_and_burst_round_trip() {
     // 2. Subsequent 24-packet burst of 1,400-byte datagrams hitting the
     //    synchronous DNS cache fast path + opportunistic try_recv_from drain +
     //    in-place zero-copy reply framing.
-    let first_local_ip = tokio::net::lookup_host(("localhost", 0))
+    let mut echo_sock = None;
+    for addr in tokio::net::lookup_host(("localhost", 0))
         .await
         .expect("resolve localhost")
-        .next()
-        .expect("localhost address")
-        .ip();
-    let echo_sock = UdpSocket::bind(SocketAddr::new(first_local_ip, 0))
-        .await
-        .unwrap();
+    {
+        if let Ok(sock) = UdpSocket::bind(SocketAddr::new(addr.ip(), 0)).await {
+            echo_sock = Some(sock);
+            break;
+        }
+    }
+    let echo_sock = echo_sock.expect("bind localhost echo socket");
     let backend = echo_sock.local_addr().unwrap();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];

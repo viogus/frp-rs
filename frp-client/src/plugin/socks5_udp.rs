@@ -32,11 +32,12 @@ const ATYP_IPV6: u8 = 0x04;
 /// and sees only the datagram source, so this is a coalescing window, not an
 /// authentication lifetime.
 const CLIENT_TTL: Duration = Duration::from_secs(600);
-const CLIENT_TTL_MS: u64 = CLIENT_TTL.as_millis() as u64;
+const CLIENT_TTL_NS: u64 = CLIENT_TTL.as_nanos() as u64;
 /// Minimum interval between atomic timestamp writes for an active client (1 s
 /// granularity for a 600 s TTL avoids cross-core cache-line bouncing on hot
-/// bidirectional UDP flows).
-const LAST_TOUCH_GRANULARITY_MS: u64 = 1_000;
+/// bidirectional UDP flows while nanosecond storage preserves strict ordering
+/// across rapid client insertions).
+const LAST_TOUCH_GRANULARITY_NS: u64 = 1_000_000_000;
 /// Maximum SOCKS5 UDP header size: `RSV(2) + FRAG(1) + ATYP(1) + IPv6(16) + PORT(2)`.
 const MAX_UDP_HDR: usize = 22;
 /// Opportunistic non-blocking drain cap per reactor wakeup (adds zero wait for
@@ -264,9 +265,9 @@ async fn run_relay(
             result = socket.recv_from(&mut buf) => match result {
                 Ok((n, from)) => {
                     let now = Instant::now();
-                    let now_ms = state.elapsed_ms(now);
+                    let now_ns = state.elapsed_ns(now);
                     if n > 0 && active.load(Ordering::Acquire) > 0 {
-                        state.handle_at(&socket, &buf[..n], from, now, now_ms).await;
+                        state.handle_at(&socket, &buf[..n], from, now, now_ns).await;
                     }
                     // Opportunistically drain already-queued datagrams from the
                     // kernel receive buffer to amortize `select!` wakeups across
@@ -275,7 +276,7 @@ async fn run_relay(
                         match socket.try_recv_from(&mut buf) {
                             Ok((m, src)) => {
                                 if m > 0 && active.load(Ordering::Acquire) > 0 {
-                                    state.handle_at(&socket, &buf[..m], src, now, now_ms).await;
+                                    state.handle_at(&socket, &buf[..m], src, now, now_ns).await;
                                 }
                             }
                             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -452,10 +453,15 @@ async fn try_send_to_udp(
 }
 
 #[inline]
-fn touch_last_ms(last_ms: &AtomicU64, now_ms: u64) {
-    let prev = last_ms.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(prev) >= LAST_TOUCH_GRANULARITY_MS {
-        last_ms.store(now_ms, Ordering::Relaxed);
+fn elapsed_ns_since(epoch: Instant, now: Instant) -> u64 {
+    u64::try_from(now.saturating_duration_since(epoch).as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[inline]
+fn touch_last_ns(last_ns: &AtomicU64, now_ns: u64) {
+    let prev = last_ns.load(Ordering::Relaxed);
+    if now_ns.saturating_sub(prev) >= LAST_TOUCH_GRANULARITY_NS {
+        last_ns.fetch_max(now_ns, Ordering::Relaxed);
     }
 }
 
@@ -496,8 +502,9 @@ fn encode_reply_header(buf: &mut [u8], target: SocketAddr) -> usize {
 struct ClientRelay {
     v4: Option<FamilyRelay>,
     v6: Option<FamilyRelay>,
-    /// Last activity timestamp in milliseconds since `RelayState::epoch`.
-    last_ms: Arc<AtomicU64>,
+    /// Last activity timestamp in nanoseconds since `RelayState::epoch`
+    /// (`u64::MAX` ns ≈ 584 years).
+    last_ns: Arc<AtomicU64>,
 }
 
 /// Bounded set of target addresses a client has asked for, used both as the
@@ -543,10 +550,15 @@ struct RouteTable {
 }
 
 impl RouteTable {
-    fn insert(&self, target: SocketAddr) {
+    /// Insert `target` and return the exact `evict_gen` observed while holding
+    /// the mutex, so callers caching `(target, gen)` cannot observe a stale
+    /// generation bumped by a concurrent `insert_many` eviction after unlock.
+    fn insert(&self, target: SocketAddr) -> u64 {
         let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
         if guard.insert(target) {
-            self.evict_gen.fetch_add(1, Ordering::Release);
+            self.evict_gen.fetch_add(1, Ordering::Release) + 1
+        } else {
+            self.evict_gen.load(Ordering::Relaxed)
         }
     }
 
@@ -578,7 +590,8 @@ struct FamilyRelay {
     /// is encoded in-place from the source address without allocation.
     routes: Arc<RouteTable>,
     /// Lock-free uplink hint: when `target == last_target` and `evict_gen` is
-    /// unchanged, `target` is guaranteed to remain present in `routes`.
+    /// unchanged since `RouteTable::insert` returned `last_evict_gen`, `target`
+    /// is guaranteed to remain present in `routes`.
     last_target: Option<SocketAddr>,
     last_evict_gen: u64,
     task: tokio::task::JoinHandle<()>,
@@ -589,9 +602,8 @@ impl FamilyRelay {
     fn record_route(&mut self, target: SocketAddr) {
         let cur_gen = self.routes.evict_gen.load(Ordering::Acquire);
         if self.last_target != Some(target) || self.last_evict_gen != cur_gen {
-            self.routes.insert(target);
+            self.last_evict_gen = self.routes.insert(target);
             self.last_target = Some(target);
-            self.last_evict_gen = self.routes.evict_gen.load(Ordering::Acquire);
         }
     }
 }
@@ -616,7 +628,7 @@ async fn spawn_family(
     main: Arc<UdpSocket>,
     client: SocketAddr,
     cancel: tokio_util::sync::CancellationToken,
-    last_ms: Arc<AtomicU64>,
+    last_ns: Arc<AtomicU64>,
     epoch: Instant,
     v6: bool,
 ) -> std::io::Result<FamilyRelay> {
@@ -636,7 +648,7 @@ async fn spawn_family(
 
     let task_socket = socket.clone();
     let task_routes = routes.clone();
-    let task_last = last_ms;
+    let task_last = last_ns;
     let task = tokio::spawn(async move {
         // Reserve MAX_UDP_HDR (22 B) headroom so replies are framed in-place
         // with zero per-packet heap allocation and zero payload copy.
@@ -652,8 +664,8 @@ async fn spawn_family(
             };
             match result {
                 Ok((first_n, first_target)) => {
-                    let now_ms = Instant::now().saturating_duration_since(epoch).as_millis() as u64;
-                    touch_last_ms(&task_last, now_ms);
+                    let now_ns = elapsed_ns_since(epoch, Instant::now());
+                    touch_last_ns(&task_last, now_ns);
                     forward_reply(
                         &main,
                         client,
@@ -774,7 +786,7 @@ fn lookup_dns_cache(dns: &DnsCache, host: &str, now: Instant) -> Option<Arc<[IpA
     } else {
         DNS_TTL
     };
-    if now.duration_since(entry.at) < ttl {
+    if now.saturating_duration_since(entry.at) < ttl {
         Some(Arc::clone(&entry.ips))
     } else {
         None
@@ -790,6 +802,9 @@ struct RelayState {
     pending_dns: Arc<AtomicUsize>,
     cancel: tokio_util::sync::CancellationToken,
     epoch: Instant,
+    /// Monotonic floor for newly inserted client timestamps so rapid insertions
+    /// within the same OS timer tick keep strict FIFO tie-breaking.
+    last_insert_ns: u64,
     last_spawn_warn: Option<Instant>,
 }
 
@@ -801,20 +816,21 @@ impl RelayState {
             pending_dns: Arc::new(AtomicUsize::new(0)),
             cancel,
             epoch: Instant::now(),
+            last_insert_ns: 0,
             last_spawn_warn: None,
         }
     }
 
     #[inline]
-    fn elapsed_ms(&self, now: Instant) -> u64 {
-        now.saturating_duration_since(self.epoch).as_millis() as u64
+    fn elapsed_ns(&self, now: Instant) -> u64 {
+        elapsed_ns_since(self.epoch, now)
     }
 
     #[cfg(test)]
     async fn handle(&mut self, main: &Arc<UdpSocket>, data: &[u8], from: SocketAddr) {
         let now = Instant::now();
-        let now_ms = self.elapsed_ms(now);
-        self.handle_at(main, data, from, now, now_ms).await;
+        let now_ns = self.elapsed_ns(now);
+        self.handle_at(main, data, from, now, now_ns).await;
     }
 
     async fn handle_at(
@@ -823,28 +839,30 @@ impl RelayState {
         data: &[u8],
         from: SocketAddr,
         now: Instant,
-        now_ms: u64,
+        now_ns: u64,
     ) {
         let Some(request) = UdpRequest::parse(data) else {
             debug!(from = %from, bytes = data.len(),
                 "socks5 UDP relay: malformed request dropped");
             return;
         };
-        // Fast path: existing client gets a single HashMap lookup.
-        if !self.clients.contains_key(&from) {
-            // Enforce the fd bound at insertion, not only on the 60s sweep:
-            // an unauthenticated source-address spray must not grow the map
-            // (and its sockets/tasks) for a whole sweep window.
+
+        // Enforce the fd bound before inserting a brand-new client; when below
+        // MAX_CLIENTS (steady state), the `entry()` below is a single lookup.
+        if self.clients.len() >= MAX_CLIENTS && !self.clients.contains_key(&from) {
             self.make_room_for_client();
-            self.clients.insert(
-                from,
-                ClientRelay {
-                    v4: None,
-                    v6: None,
-                    last_ms: Arc::new(AtomicU64::new(now_ms)),
-                },
-            );
         }
+        let last_insert_ns = &mut self.last_insert_ns;
+        let client = self.clients.entry(from).or_insert_with(|| {
+            let insert_ns = now_ns.max(last_insert_ns.saturating_add(1));
+            *last_insert_ns = insert_ns;
+            ClientRelay {
+                v4: None,
+                v6: None,
+                last_ns: Arc::new(AtomicU64::new(insert_ns)),
+            }
+        });
+        touch_last_ns(&client.last_ns, now_ns);
 
         // Normalize IP literals sent inside ATYP_DOMAIN straight to Addr.
         let target = match request.target {
@@ -857,10 +875,6 @@ impl RelayState {
 
         match target {
             UdpTarget::Addr(target) => {
-                let Some(client) = self.clients.get_mut(&from) else {
-                    return;
-                };
-                touch_last_ms(&client.last_ms, now_ms);
                 let Some(family) = ensure_family_on_client(
                     client,
                     main,
@@ -885,10 +899,6 @@ impl RelayState {
                 // allocation and zero task spawn on cache hit (99.9% of domain
                 // UDP traffic). Only cache misses spawn an async resolver task.
                 if let Some(ips) = lookup_dns_cache(&self.dns, host, now) {
-                    let Some(client) = self.clients.get_mut(&from) else {
-                        return;
-                    };
-                    touch_last_ms(&client.last_ms, now_ms);
                     if ips.is_empty() {
                         return;
                     }
@@ -958,13 +968,17 @@ impl RelayState {
                     return;
                 }
 
+                // Avoid allocating payload/host and spawning a task when the
+                // concurrent DNS lookup budget is already full.
+                if self.pending_dns.load(Ordering::Relaxed) >= MAX_PENDING_DNS {
+                    debug!(host = %host, port = %port,
+                        "socks5 UDP relay: DNS lookup budget exhausted; dropping request");
+                    return;
+                }
+
                 // Slow path (DNS cache miss / expired): bind both families so
                 // the spawned resolver can deliver whichever address family
                 // answers without stalling the main receive loop.
-                let Some(client) = self.clients.get_mut(&from) else {
-                    return;
-                };
-                touch_last_ms(&client.last_ms, now_ms);
                 let v4 = ensure_family_on_client(
                     client,
                     main,
@@ -1013,7 +1027,7 @@ impl RelayState {
             let oldest = self
                 .clients
                 .iter()
-                .min_by_key(|(_, c)| c.last_ms.load(Ordering::Relaxed))
+                .min_by_key(|(_, c)| c.last_ns.load(Ordering::Relaxed))
                 .map(|(addr, _)| *addr);
             match oldest {
                 Some(addr) => {
@@ -1027,10 +1041,10 @@ impl RelayState {
     }
 
     fn sweep(&mut self, now: Instant) {
-        let now_ms = self.elapsed_ms(now);
+        let now_ns = self.elapsed_ns(now);
         self.clients.retain(|_, client| {
-            let last_ms = client.last_ms.load(Ordering::Relaxed);
-            let alive = now_ms.saturating_sub(last_ms) < CLIENT_TTL_MS;
+            let last_ns = client.last_ns.load(Ordering::Relaxed);
+            let alive = now_ns.saturating_sub(last_ns) < CLIENT_TTL_NS;
             if !alive {
                 client.abort();
             }
@@ -1058,7 +1072,7 @@ async fn ensure_family_on_client<'a>(
             main.clone(),
             from,
             cancel.clone(),
-            client.last_ms.clone(),
+            client.last_ns.clone(),
             epoch,
             v6,
         )
@@ -1090,8 +1104,7 @@ async fn resolve_cached(
     host: &str,
     port: u16,
 ) -> Option<Arc<[IpAddr]>> {
-    let now = Instant::now();
-    if let Some(ips) = lookup_dns_cache(dns, host, now) {
+    if let Some(ips) = lookup_dns_cache(dns, host, Instant::now()) {
         return Some(ips);
     }
 
@@ -1119,18 +1132,18 @@ async fn resolve_cached(
         }
     };
 
+    let inserted_at = Instant::now();
     let key: Box<str> = host.to_ascii_lowercase().into_boxed_str();
     {
         let mut cache = dns.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= MAX_DNS_ENTRIES {
-            let now = Instant::now();
             cache.retain(|_, entry| {
                 let ttl = if entry.ips.is_empty() {
                     DNS_NEGATIVE_TTL
                 } else {
                     DNS_TTL
                 };
-                now.duration_since(entry.at) < ttl
+                inserted_at.saturating_duration_since(entry.at) < ttl
             });
             if cache.len() >= MAX_DNS_ENTRIES {
                 if let Some(oldest) = cache
@@ -1146,7 +1159,7 @@ async fn resolve_cached(
             key,
             DnsEntry {
                 ips: Arc::clone(&ips),
-                at: now,
+                at: inserted_at,
             },
         );
     }
@@ -1320,7 +1333,7 @@ mod tests {
                 ClientRelay {
                     v4: None,
                     v6: None,
-                    last_ms: Arc::new(AtomicU64::new(i as u64 * 1_000)),
+                    last_ns: Arc::new(AtomicU64::new(i as u64 * 1_000_000_000)),
                 },
             );
         }
@@ -1340,23 +1353,65 @@ mod tests {
         assert_eq!(table.evict_gen.load(Ordering::Acquire), 0);
         let first = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
         for port in 1..=(MAX_ROUTES_PER_CLIENT as u16) {
-            table.insert(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+            assert_eq!(
+                table.insert(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)),
+                0,
+                "filling up to cap must return evict_gen 0"
+            );
         }
         assert_eq!(
-            table.evict_gen.load(Ordering::Acquire),
-            0,
-            "filling up to cap must not bump evict_gen"
-        );
-        table.insert(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            MAX_ROUTES_PER_CLIENT as u16 + 1,
-        ));
-        assert_eq!(
-            table.evict_gen.load(Ordering::Acquire),
+            table.insert(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                MAX_ROUTES_PER_CLIENT as u16 + 1,
+            )),
             1,
-            "evicting oldest route must bump evict_gen so downlink cache invalidates"
+            "evicting oldest route must return bumped evict_gen 1"
         );
+        assert_eq!(table.evict_gen.load(Ordering::Acquire), 1);
         assert!(!table.contains(&first));
+    }
+
+    #[tokio::test]
+    async fn domain_cache_hit_forwards_synchronously_without_spawning() {
+        // Pre-populate the DNS cache with an unresolvable `.invalid` host and
+        // confirm `handle` forwards synchronously via the cache-hit fast path
+        // without bumping `pending_dns` or binding an unused IPv6 socket.
+        let target_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_sock.local_addr().unwrap();
+        let main = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let mut state = RelayState::new(tokio_util::sync::CancellationToken::new());
+        state.dns.lock().unwrap().insert(
+            "cached.invalid".into(),
+            DnsEntry {
+                ips: Arc::from([target_addr.ip()]),
+                at: Instant::now(),
+            },
+        );
+
+        let host = b"Cached.Invalid";
+        let mut req = vec![0, 0, 0, ATYP_DOMAIN, host.len() as u8];
+        req.extend_from_slice(host);
+        req.extend_from_slice(&target_addr.port().to_be_bytes());
+        req.extend_from_slice(b"sync-hit");
+
+        let from: SocketAddr = "127.0.0.1:21000".parse().unwrap();
+        state.handle(&main, &req, from).await;
+
+        assert_eq!(state.pending_dns.load(Ordering::Acquire), 0);
+        let client = state.clients.get(&from).expect("client registered");
+        assert!(client.v4.is_some(), "IPv4 socket must be created");
+        assert!(
+            client.v6.is_none(),
+            "cache-hit IPv4 target must not bind an unused IPv6 socket"
+        );
+
+        let mut buf = [0u8; 64];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), target_sock.recv_from(&mut buf))
+            .await
+            .expect("sync-hit packet must arrive")
+            .unwrap();
+        assert_eq!(&buf[..n], b"sync-hit");
+        state.cancel.cancel();
     }
 
     #[tokio::test]

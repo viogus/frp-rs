@@ -198,7 +198,7 @@ impl fmt::Display for SocksTarget {
 }
 
 enum HandshakeAction {
-    Connect(SocksTarget),
+    Connect(SocksTarget, Option<Box<[u8]>>),
     UdpAssociate,
 }
 
@@ -240,25 +240,17 @@ async fn handle_socks5_conn_state(
     mut client: TcpStream,
     state: &Socks5State,
 ) -> Result<(), String> {
-    let mut hs = HandshakeBuf::new();
-
     // One single timeout anchors the whole handshake — greeting, auth methods,
     // user/pass, and request — replacing 7–10 per-read timer registrations with
-    // one timer entry. The relay phase after CONNECT stays unbounded.
-    let action = tokio::time::timeout(
-        SOCKS5_HANDSHAKE_TIMEOUT,
-        run_handshake(&mut client, &mut hs, state),
-    )
-    .await
-    .map_err(|_| "socks5 handshake timed out".to_string())??;
+    // one timer entry. `HandshakeBuf` lives strictly inside `run_handshake` and
+    // is zeroed and dropped before the long-lived relay or UDP loop begins.
+    let action = tokio::time::timeout(SOCKS5_HANDSHAKE_TIMEOUT, run_handshake(&mut client, state))
+        .await
+        .map_err(|_| "socks5 handshake timed out".to_string())??;
 
     match action {
         HandshakeAction::UdpAssociate => {
             let Some(udp) = state.udp.as_ref() else {
-                client
-                    .write_all(&REPLY_CMD_NOT_SUPPORTED)
-                    .await
-                    .map_err(|e| format!("write reply: {e}"))?;
                 return Err("UDP ASSOCIATE requested but plugin.udp_enable is false".into());
             };
             // The relay binds lazily here (so a reload of a fixed udp_bind_addr
@@ -297,7 +289,7 @@ async fn handle_socks5_conn_state(
             }
             Ok(())
         }
-        HandshakeAction::Connect(target) => {
+        HandshakeAction::Connect(target, pipelined) => {
             // Step 4: Connect to target without formatting/parsing IP literals.
             let connect_res = match &target {
                 SocksTarget::Addr(addr) => TcpStream::connect(*addr).await,
@@ -323,10 +315,9 @@ async fn handle_socks5_conn_state(
             // Flush any client application bytes that arrived pipelined in the
             // same TCP segment as the CONNECT request before handing the raw
             // TcpStreams to zero-copy splice / pooled relay.
-            let pipelined = hs.remaining();
-            if !pipelined.is_empty() {
+            if let Some(bytes) = pipelined {
                 remote
-                    .write_all(pipelined)
+                    .write_all(&bytes)
                     .await
                     .map_err(|e| format!("flush pipelined data: {e}"))?;
             }
@@ -343,6 +334,17 @@ async fn handle_socks5_conn_state(
 }
 
 async fn run_handshake(
+    client: &mut TcpStream,
+    state: &Socks5State,
+) -> Result<HandshakeAction, String> {
+    let mut hs = HandshakeBuf::new();
+    let res = run_handshake_inner(client, &mut hs, state).await;
+    // Wipe plaintext RFC 1929 credentials before dropping the stack buffer.
+    hs.buf.fill(0);
+    res
+}
+
+async fn run_handshake_inner(
     client: &mut TcpStream,
     hs: &mut HandshakeBuf,
     state: &Socks5State,
@@ -465,7 +467,11 @@ async fn run_handshake(
 
     if cmd == CMD_UDP_ASSOCIATE {
         if state.udp.is_none() {
-            return Ok(HandshakeAction::UdpAssociate);
+            client
+                .write_all(&REPLY_CMD_NOT_SUPPORTED)
+                .await
+                .map_err(|e| format!("write reply: {e}"))?;
+            return Err("UDP ASSOCIATE requested but plugin.udp_enable is false".into());
         }
         // The client's declared UDP endpoint is advisory (RFC 1928 §7: it may
         // be all-zero when the source port is not known yet). Parse it to
@@ -484,7 +490,13 @@ async fn run_handshake(
     }
 
     let target = parse_socks5_target(client, hs, atyp).await?;
-    Ok(HandshakeAction::Connect(target))
+    let rem = hs.remaining();
+    let pipelined = if rem.is_empty() {
+        None
+    } else {
+        Some(rem.to_vec().into_boxed_slice())
+    };
+    Ok(HandshakeAction::Connect(target, pipelined))
 }
 
 /// Pure parser: decode a SOCKS5 address (ATYP + addr + port) from bytes.
@@ -625,48 +637,100 @@ fn encode_reply_for_addr(rep: u8, addr: SocketAddr) -> ([u8; 22], usize) {
     }
 }
 
-/// Build a SOCKS5 reply packet (kept for unit-test coverage).
-#[cfg(test)]
-fn make_socks5_reply(rep: u8, atyp: u8, addr: &[u8], port: u16) -> Vec<u8> {
-    let mut reply = Vec::with_capacity(6 + addr.len());
-    reply.push(SOCKS5_VERSION);
-    reply.push(rep);
-    reply.push(0x00); // RSV
-    reply.push(atyp);
-    reply.extend_from_slice(addr);
-    reply.extend_from_slice(&port.to_be_bytes());
-    reply
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_socks5_make_reply_success() {
-        let reply = make_socks5_reply(REP_SUCCEEDED, ATYP_IPV4, &[127, 0, 0, 1], 8080);
+    fn test_socks5_encode_reply_ipv4_and_ipv6() {
+        let v4: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let (reply, len) = encode_reply_for_addr(REP_SUCCEEDED, v4);
+        assert_eq!(len, 10);
         assert_eq!(reply[0], SOCKS5_VERSION);
         assert_eq!(reply[1], REP_SUCCEEDED);
         assert_eq!(reply[2], 0x00); // RSV
         assert_eq!(reply[3], ATYP_IPV4);
         assert_eq!(&reply[4..8], &[127, 0, 0, 1]);
         assert_eq!(u16::from_be_bytes([reply[8], reply[9]]), 8080);
-    }
 
-    #[test]
-    fn test_socks5_make_reply_host_unreachable() {
-        let reply = make_socks5_reply(REP_HOST_UNREACHABLE, ATYP_IPV4, &[0, 0, 0, 0], 0);
-        assert_eq!(reply[1], REP_HOST_UNREACHABLE);
-    }
+        assert_eq!(REPLY_HOST_UNREACHABLE[1], REP_HOST_UNREACHABLE);
 
-    #[test]
-    fn test_socks5_make_reply_ipv6() {
-        let addr: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let reply = make_socks5_reply(REP_SUCCEEDED, ATYP_IPV6, &addr, 443);
+        let v6: SocketAddr = "[::1]:443".parse().unwrap();
+        let (reply, len) = encode_reply_for_addr(REP_SUCCEEDED, v6);
+        assert_eq!(len, 22);
         assert_eq!(reply[3], ATYP_IPV6);
-        assert_eq!(reply.len(), 22); // 4 + 16 + 2
-        assert_eq!(&reply[4..20], &addr);
+        assert_eq!(
+            &reply[4..20],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        );
         assert_eq!(u16::from_be_bytes([reply[20], reply[21]]), 443);
+    }
+
+    #[tokio::test]
+    async fn test_socks5_max_length_auth_and_large_pipelined_connect() {
+        // Exercises the exact 520 B HandshakeBuf boundary: 255-byte username +
+        // 255-byte password (513 B RFC 1929 packet) followed by CONNECT + 600 B
+        // pipelined payload (exceeding HandshakeBuf capacity).
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut s, _) = backend.accept().await.unwrap();
+            let (mut r, mut w) = s.split();
+            let _ = tokio::io::copy(&mut r, &mut w).await;
+        });
+
+        let user = "u".repeat(255);
+        let pass = "p".repeat(255);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let u_srv = user.clone();
+        let p_srv = pass.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_socks5_conn(stream, Some(u_srv), Some(p_srv), None).await;
+        });
+
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        // Greeting with 255 methods (max possible nmethods).
+        let mut greeting = vec![SOCKS5_VERSION, 255];
+        greeting.resize(2 + 254, 0x7F);
+        greeting.push(AUTH_USER_PASS);
+        client.write_all(&greeting).await.unwrap();
+        let mut mrep = [0u8; 2];
+        client.read_exact(&mut mrep).await.unwrap();
+        assert_eq!(mrep, [SOCKS5_VERSION, AUTH_USER_PASS]);
+
+        // Max-size RFC 1929 auth (513 B) + CONNECT + 600 B pipelined payload in one write.
+        let mut combined = Vec::with_capacity(513 + 10 + 600);
+        combined.push(USERPASS_VERSION);
+        combined.push(255);
+        combined.extend_from_slice(user.as_bytes());
+        combined.push(255);
+        combined.extend_from_slice(pass.as_bytes());
+        let IpAddr::V4(v4) = backend_addr.ip() else {
+            unreachable!()
+        };
+        combined.extend_from_slice(&[SOCKS5_VERSION, CMD_CONNECT, 0, ATYP_IPV4]);
+        combined.extend_from_slice(&v4.octets());
+        combined.extend_from_slice(&backend_addr.port().to_be_bytes());
+        let expected: Vec<u8> = (0..600).map(|i| (i % 251) as u8).collect();
+        combined.extend_from_slice(&expected);
+        client.write_all(&combined).await.unwrap();
+
+        let mut arep = [0u8; 2];
+        client.read_exact(&mut arep).await.unwrap();
+        assert_eq!(arep, [USERPASS_VERSION, USERPASS_OK]);
+
+        let mut crep = [0u8; 10];
+        client.read_exact(&mut crep).await.unwrap();
+        assert_eq!(crep[1], REP_SUCCEEDED);
+
+        let mut got = vec![0u8; expected.len()];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, expected);
+
+        drop(client);
+        server.await.unwrap();
     }
 
     #[test]

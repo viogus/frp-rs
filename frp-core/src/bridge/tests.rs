@@ -2134,3 +2134,53 @@ fn without_read_decompression_keeps_the_write_side_compressing() {
     assert!(compress);
     assert!(!decompress_read);
 }
+
+/// Pins the non-Linux lock-free `TcpStream::into_split()` relay path on all
+/// platforms (including Linux CI) for byte-exact bidirectional copy, FIN
+/// propagation, and idle half-close linger abandonment.
+#[tokio::test]
+async fn relay_tcp_pooled_byte_exact_and_abandons_idle_half_closed_peer() {
+    let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = la.local_addr().unwrap();
+    let addr_b = lb.local_addr().unwrap();
+    let (mut conn_a, srv_a) = {
+        let conn_a = tokio::net::TcpStream::connect(addr_a).await.unwrap();
+        let srv_a = la.accept().await.unwrap().0;
+        (conn_a, srv_a)
+    };
+    let (mut conn_b, srv_b) = {
+        let conn_b = tokio::net::TcpStream::connect(addr_b).await.unwrap();
+        let srv_b = lb.accept().await.unwrap().0;
+        (conn_b, srv_b)
+    };
+
+    let linger = Duration::from_millis(250);
+    let relay =
+        tokio::spawn(async move { relay_tcp_pooled_with_linger(srv_a, srv_b, linger).await });
+
+    let a_to_b = pseudo_random_bytes(8192, 0xbeef_0001);
+    let b_to_a = pseudo_random_bytes(4096, 0xbeef_0002);
+    conn_a.write_all(&a_to_b).await.unwrap();
+    conn_b.write_all(&b_to_a).await.unwrap();
+
+    let mut got_b = vec![0u8; a_to_b.len()];
+    conn_b.read_exact(&mut got_b).await.unwrap();
+    assert_eq!(got_b, a_to_b);
+
+    let mut got_a = vec![0u8; b_to_a.len()];
+    conn_a.read_exact(&mut got_a).await.unwrap();
+    assert_eq!(got_a, b_to_a);
+
+    // A half-closes while B stays open and silent: linger must release the relay.
+    conn_a.shutdown().await.unwrap();
+    let mut eof = [0u8; 1];
+    assert_eq!(conn_b.read(&mut eof).await.unwrap(), 0);
+
+    let counts = tokio::time::timeout(Duration::from_secs(5), relay)
+        .await
+        .expect("relay_tcp_pooled_with_linger must not hang on silent half-closed peer")
+        .unwrap()
+        .expect("clean linger end");
+    assert_eq!(counts, (a_to_b.len() as u64, b_to_a.len() as u64));
+}
