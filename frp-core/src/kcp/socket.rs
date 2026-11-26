@@ -1379,24 +1379,15 @@ impl KcpSocket {
                     let err = io::Error::last_os_error();
                     match err.raw_os_error() {
                         Some(libc::EAGAIN) => return 0,
-                        Some(
-                            libc::EINVAL
-                            | libc::EIO
-                            | libc::ENOPROTOOPT
-                            | libc::EOPNOTSUPP
-                            | libc::EMSGSIZE,
-                        ) => {
+                        Some(libc::EINVAL | libc::EIO | libc::ENOPROTOOPT | libc::EOPNOTSUPP) => {
                             // Disable GSO permanently if the kernel/interface
-                            // does not support `UDP_SEGMENT` (except EMSGSIZE
-                            // which could be PMTU-related — still safe to fall
-                            // back to sendmmsg).
-                            if err.raw_os_error() != Some(libc::EMSGSIZE) {
-                                tracing::debug!(
-                                    error = %err,
-                                    "KCP: UDP_SEGMENT (GSO) unsupported, falling back to sendmmsg"
-                                );
-                                UDP_GSO_SUPPORTED.store(false, Ordering::Relaxed);
-                            }
+                            // does not support `UDP_SEGMENT` (EMSGSIZE falls
+                            // through to `sendmmsg` below without latching off).
+                            tracing::debug!(
+                                error = %err,
+                                "KCP: UDP_SEGMENT (GSO) unsupported, falling back to sendmmsg"
+                            );
+                            UDP_GSO_SUPPORTED.store(false, Ordering::Relaxed);
                         }
                         _ => {}
                     }
@@ -1694,9 +1685,10 @@ impl RecvBatch {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
             }; RECV_BATCH],
-            // SAFETY: `sockaddr_storage` and `mmsghdr` are C PODs.
+            // SAFETY: `sockaddr_storage` is a C POD; all-zero is valid.
             #[cfg(target_os = "linux")]
             names: unsafe { std::mem::zeroed() },
+            // SAFETY: `mmsghdr` is a C POD; all-zero is a valid empty header.
             #[cfg(target_os = "linux")]
             msgs: unsafe { std::mem::zeroed() },
             #[cfg(target_os = "linux")]
@@ -1729,10 +1721,10 @@ fn recv_datagrams_into(
     }
     let namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let cmsg_cap = std::mem::size_of::<[u64; 8]>();
-    for idx in 0..count {
+    for (idx, slot) in slots.iter_mut().enumerate().take(count) {
         batch.iovecs[idx] = libc::iovec {
-            iov_base: slots[idx].as_mut_ptr().cast(),
-            iov_len: slots[idx].len(),
+            iov_base: slot.as_mut_ptr().cast(),
+            iov_len: slot.len(),
         };
         batch.msgs[idx].msg_hdr.msg_iov = std::ptr::addr_of_mut!(batch.iovecs[idx]);
         batch.msgs[idx].msg_hdr.msg_iovlen = 1;
@@ -1763,8 +1755,8 @@ fn recv_datagrams_into(
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    for idx in 0..(rc as usize) {
-        let len = (batch.msgs[idx].msg_len as usize).min(slots[idx].len());
+    for (idx, slot) in slots.iter().enumerate().take(rc as usize) {
+        let len = (batch.msgs[idx].msg_len as usize).min(slot.len());
         let src = match socket_addr_from_storage(&batch.names[idx]) {
             Some(addr) => addr,
             None => continue,
