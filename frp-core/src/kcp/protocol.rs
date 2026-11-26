@@ -274,6 +274,14 @@ pub struct Kcp<Output> {
     /// Adopt the conversation ID from the next `input` call.
     input_conv: bool,
 
+    /// Fast-path scan hint: true if any segment in `snd_buf` may have `fastack > 0`.
+    has_fastack: bool,
+    /// Fast-path scan hint: conservative lower bound on the earliest `resendts`
+    /// among already-transmitted (`xmit > 0`) segments in `snd_buf`. When
+    /// `!has_fastack` and `current < min_resendts`, `flush()` skips scanning
+    /// already-sent segments and only transmits newly queued `xmit == 0` ones.
+    min_resendts: Option<u32>,
+
     output: Output,
 }
 
@@ -369,6 +377,8 @@ impl<Output> Kcp<Output> {
             nocwnd: false,
             stream,
             input_conv: false,
+            has_fastack: false,
+            min_resendts: None,
             output,
         }
     }
@@ -667,6 +677,7 @@ impl<Output> Kcp<Output> {
                 break;
             } else if sn != seg.sn && timediff(ts, seg.ts) >= 0 {
                 seg.fastack += 1;
+                self.has_fastack = true;
             }
         }
     }
@@ -805,7 +816,7 @@ impl<Output> Kcp<Output> {
                         flag = true;
                         max_ack = sn;
                         latest_ts = ts;
-                    } else if timediff(sn, max_ack) > 0 && timediff(ts, latest_ts) > 0 {
+                    } else if timediff(sn, max_ack) > 0 && timediff(ts, latest_ts) >= 0 {
                         max_ack = sn;
                         latest_ts = ts;
                     }
@@ -1225,6 +1236,7 @@ impl<Output: Write> Kcp<Output> {
             cwnd = cmp::min(self.cwnd, cwnd);
         }
         // Move data from snd_queue to snd_buf.
+        let old_snd_len = self.snd_buf.len();
         let mut new_segs_count: u32 = 0;
         while timediff(self.snd_nxt, self.snd_una + cwnd as u32) < 0 {
             match self.snd_queue.pop_front() {
@@ -1259,61 +1271,32 @@ impl<Output: Write> Kcp<Output> {
         let mut lost = false;
         let mut change = 0u32;
 
-        // Retransmission logic — order matches kcp-go v5.6.13:
-        //   initial → fast_retransmit → early_retransmit → RTO
-        // (the original C kcp checks RTO before fast_retransmit; kcp-go
-        // reordered it).
-        for snd_segment in &mut self.snd_buf {
-            let mut need_send = false;
+        // Fast-path: if no already-transmitted segment in `0..old_snd_len` has
+        // `fastack > 0` and `current` has not reached the conservative earliest
+        // `resendts` lower bound, none of `0..old_snd_len` can trigger fast
+        // retransmit, early retransmit, or RTO. Skip them and transmit only the
+        // newly queued `xmit == 0` segments at `old_snd_len..`.
+        if old_snd_len == 0 {
+            self.min_resendts = None;
+            self.has_fastack = false;
+        }
+        let skip_existing = old_snd_len == 0
+            || (!self.has_fastack
+                && self
+                    .min_resendts
+                    .is_some_and(|m| timediff(self.current, m) < 0));
 
-            if snd_segment.xmit == 0 {
-                // ── initial transmit ──
-                need_send = true;
+        if skip_existing {
+            for snd_segment in self.snd_buf.range_mut(old_snd_len..) {
+                // Every segment in `old_snd_len..` was just pushed with `xmit == 0`.
                 snd_segment.xmit += 1;
                 snd_segment.rto = self.rx_rto;
                 snd_segment.resendts = self.current + snd_segment.rto + rtomin;
-            } else if snd_segment.fastack >= resent {
-                // ── fast retransmit (kcp-go: before RTO) ──
-                // No xmit cap, matching kcp-go v5.6.13 (which has no fastlimit
-                // concept). The old C-kcp fastlimit gate combined with kcp-go's
-                // branch order could permanently wedge a segment: fastack >= resent
-                // with xmit > fastlimit entered the branch but skipped the send,
-                // and the else-if chain then never evaluated the RTO fallback —
-                // the segment was never retransmitted and the connection froze
-                // under sustained loss.
-                need_send = true;
-                snd_segment.xmit += 1;
-                snd_segment.fastack = 0;
-                // kcp-go: reset rto to rx_rto on fast retransmit.
-                snd_segment.rto = self.rx_rto;
-                snd_segment.resendts = self.current + snd_segment.rto;
-                change += 1;
-            } else if snd_segment.fastack > 0 && new_segs_count == 0 {
-                // ── early retransmit (kcp-go only; not in the original C) ──
-                need_send = true;
-                snd_segment.xmit += 1;
-                snd_segment.fastack = 0;
-                snd_segment.rto = self.rx_rto;
-                snd_segment.resendts = self.current + snd_segment.rto;
-                change += 1;
-            } else if timediff(self.current, snd_segment.resendts) >= 0 {
-                // ── RTO timeout ──
-                need_send = true;
-                snd_segment.xmit += 1;
-                self.xmit += 1;
-                if !self.nodelay {
-                    snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
-                } else {
-                    // kcp-go: LINEAR backoff rto += rx_rto/2
-                    // (the original C kcp uses EXPONENTIAL: rto += rto/2).
-                    snd_segment.rto += self.rx_rto / 2;
-                }
-                snd_segment.fastack = 0;
-                snd_segment.resendts = self.current + snd_segment.rto;
-                lost = true;
-            }
+                self.min_resendts = Some(match self.min_resendts {
+                    Some(m) if timediff(m, snd_segment.resendts) <= 0 => m,
+                    _ => snd_segment.resendts,
+                });
 
-            if need_send {
                 snd_segment.ts = self.current;
                 snd_segment.wnd = segment.wnd;
                 snd_segment.una = self.rcv_nxt;
@@ -1321,7 +1304,12 @@ impl<Output: Write> Kcp<Output> {
                 let need = KCP_OVERHEAD + snd_segment.data.len();
 
                 if self.buf.len() + need > self.mtu {
-                    self.output.write_all(&self.buf)?;
+                    if let Err(e) = self.output.write_all(&self.buf) {
+                        // Conservative reset: remaining tail segments still have
+                        // `xmit == 0`, so the next `flush()` must run a full scan.
+                        self.min_resendts = None;
+                        return Err(e.into());
+                    }
                     self.buf.clear();
                 }
 
@@ -1331,6 +1319,86 @@ impl<Output: Write> Kcp<Output> {
                     self.state = -1; // dead link
                 }
             }
+        } else {
+            // Full retransmission scan — order matches kcp-go v5.6.13:
+            //   initial → fast_retransmit → early_retransmit → RTO
+            // Recomputes exact `min_resendts` and `has_fastack` across `snd_buf`.
+            let mut next_min_resendts: Option<u32> = None;
+            let mut any_fastack = false;
+
+            for snd_segment in &mut self.snd_buf {
+                let mut need_send = false;
+
+                if snd_segment.xmit == 0 {
+                    // ── initial transmit ──
+                    need_send = true;
+                    snd_segment.xmit += 1;
+                    snd_segment.rto = self.rx_rto;
+                    snd_segment.resendts = self.current + snd_segment.rto + rtomin;
+                } else if snd_segment.fastack >= resent {
+                    // ── fast retransmit (kcp-go: before RTO) ──
+                    need_send = true;
+                    snd_segment.xmit += 1;
+                    snd_segment.fastack = 0;
+                    // kcp-go: reset rto to rx_rto on fast retransmit.
+                    snd_segment.rto = self.rx_rto;
+                    snd_segment.resendts = self.current + snd_segment.rto;
+                    change += 1;
+                } else if snd_segment.fastack > 0 && new_segs_count == 0 {
+                    // ── early retransmit (kcp-go only; not in the original C) ──
+                    need_send = true;
+                    snd_segment.xmit += 1;
+                    snd_segment.fastack = 0;
+                    snd_segment.rto = self.rx_rto;
+                    snd_segment.resendts = self.current + snd_segment.rto;
+                    change += 1;
+                } else if timediff(self.current, snd_segment.resendts) >= 0 {
+                    // ── RTO timeout ──
+                    need_send = true;
+                    snd_segment.xmit += 1;
+                    self.xmit += 1;
+                    if !self.nodelay {
+                        snd_segment.rto += cmp::max(snd_segment.rto, self.rx_rto);
+                    } else {
+                        // kcp-go: LINEAR backoff rto += rx_rto/2
+                        // (the original C kcp uses EXPONENTIAL: rto += rto/2).
+                        snd_segment.rto += self.rx_rto / 2;
+                    }
+                    snd_segment.fastack = 0;
+                    snd_segment.resendts = self.current + snd_segment.rto;
+                    lost = true;
+                }
+
+                if snd_segment.fastack > 0 {
+                    any_fastack = true;
+                }
+                next_min_resendts = Some(match next_min_resendts {
+                    Some(m) if timediff(m, snd_segment.resendts) <= 0 => m,
+                    _ => snd_segment.resendts,
+                });
+
+                if need_send {
+                    snd_segment.ts = self.current;
+                    snd_segment.wnd = segment.wnd;
+                    snd_segment.una = self.rcv_nxt;
+
+                    let need = KCP_OVERHEAD + snd_segment.data.len();
+
+                    if self.buf.len() + need > self.mtu {
+                        self.output.write_all(&self.buf)?;
+                        self.buf.clear();
+                    }
+
+                    snd_segment.encode(&mut self.buf);
+
+                    if snd_segment.xmit >= self.dead_link {
+                        self.state = -1; // dead link
+                    }
+                }
+            }
+
+            self.min_resendts = next_min_resendts;
+            self.has_fastack = any_fastack;
         }
 
         // Flush all data left in the buffer.

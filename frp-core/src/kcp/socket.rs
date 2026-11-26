@@ -39,12 +39,16 @@ pub(crate) const KCP_WRITE_BACKLOG_THRESHOLD: usize = 200;
 /// a flow-control signal (KCP's own window remains the flow-control authority).
 pub(crate) const KCP_SND_BACKLOG_THRESHOLD: usize = 4096;
 
-/// Max recycled write chunks kept in the per-socket chunk pool. Each chunk
-/// is a reused bridge-write buffer (one `BUFFER_SIZE`, 64 KiB by default), so
-/// the pool caps recycled memory at 8 × that per socket (512 KiB by default).
-/// Chunks beyond the cap are
-/// simply dropped on return.
-pub(crate) const CHUNK_POOL_CAP: usize = 8;
+/// Max recycled stream write chunks kept in the per-socket chunk pool. Each
+/// chunk is a reused bridge-write buffer (64 KiB by default), isolated from
+/// 1.5 KiB UDP datagrams so stream chunks and datagrams never thrash capacities.
+pub(crate) const CHUNK_POOL_CAP: usize = 16;
+
+/// Max recycled datagram/segment buffers (~1.5 KiB each) kept per socket for
+/// KCP output packets, FEC parity shards, and delivered read segments.
+/// 256 × 1.5 KiB ≈ 384 KiB ceiling per socket — large enough to absorb multi-flush
+/// bursts queued on `frp-kcp-send` without falling through to cross-thread malloc/free.
+pub(crate) const DATAGRAM_POOL_CAP: usize = 256;
 
 /// Pop a reusable write chunk from the pool, or allocate one with
 /// `min_capacity` when the pool is empty (first write, or the pool drained
@@ -130,12 +134,14 @@ const MAX_SESSION_CREATES_PER_IP_PER_WINDOW: usize = 32;
 /// `KcpConfig::clamped`), so 1500 bytes covers every legitimately-sized packet.
 pub(crate) const DRIVER_RECV_BUF_SIZE: usize = 1500;
 
-/// UDP socket receive buffer size (1 MiB). ~5x the OS default (~212KB on Linux),
-/// enough to absorb KCP bursts without 200-client memory blowout.
-const KCP_UDP_RCVBUF: usize = 1_048_576;
+/// UDP socket receive buffer size (4 MiB), matching Go frp's KCP listener
+/// (`SetReadBuffer(4194304)`). Linux allocates skb memory dynamically on demand,
+/// so raising the cap eliminates loopback/WAN `RcvbufErrors` without inflating
+/// idle RSS.
+const KCP_UDP_RCVBUF: usize = 4 * 1024 * 1024;
 
-/// UDP socket send buffer size (1 MiB), matching [`KCP_UDP_RCVBUF`].
-const KCP_UDP_SNDBUF: usize = 1_048_576;
+/// UDP socket send buffer size (4 MiB), matching [`KCP_UDP_RCVBUF`].
+const KCP_UDP_SNDBUF: usize = 4 * 1024 * 1024;
 
 /// Window (segments) a lone busy session is given.
 ///
@@ -247,9 +253,11 @@ pub(crate) struct KcpSocketHandle {
     /// Recycled write-chunk pool shared with the streams of this socket.
     /// poll_write pops a chunk (avoiding a fresh 32 KiB Vec + memcpy per
     /// bridge write); the driver returns chunks after the session's
-    /// segmentation has copied the payload out. Bounded by CHUNK_POOL_CAP;
-    /// lock-free (`ArrayQueue`), so a chunk is never in two hands.
+    /// Recycled stream write-chunk pool (64 KiB bridge writes).
     pub chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// Recycled ~1.5 KiB datagram & read-segment pool shared by KcpSession,
+    /// `frp-kcp-send`, and KcpStream::poll_read.
+    pub datagram_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 pub(crate) struct KcpSocket {
@@ -283,10 +291,10 @@ pub(crate) struct KcpSocket {
     /// Live KcpStream count — shared with KcpSocketHandle, drives the
     /// dial-path driver self-exit check in run().
     alive_streams: Arc<AtomicUsize>,
-    /// Recycled write-chunk pool (see KcpSocketHandle::chunk_pool). The
-    /// driver returns consumed chunks here after segmenting them into the
-    /// session's send queue.
+    /// Recycled stream write-chunk pool (64 KiB bridge writes).
     chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// Recycled ~1.5 KiB datagram & read-segment pool.
+    datagram_pool: Arc<ArrayQueue<Vec<u8>>>,
     /// The pool worker this socket sends through, or `None` when
     /// `[transport.kcp] senderThread = false` asked for the inline path.
     /// Bound once, at construction: all of a socket's runs enter one FIFO,
@@ -343,6 +351,7 @@ impl KcpSocket {
         let write_notify = Arc::new(Notify::new());
         let alive_streams = Arc::new(AtomicUsize::new(0));
         let chunk_pool = Arc::new(ArrayQueue::new(CHUNK_POOL_CAP));
+        let datagram_pool = Arc::new(ArrayQueue::new(DATAGRAM_POOL_CAP));
         // `[transport.kcp] senderThread = false` keeps the send syscalls on
         // the driver thread: the CPU-cheap shape for a host already saturated
         // by several tunnels (see `KcpConfig::sender_thread`).
@@ -364,6 +373,7 @@ impl KcpSocket {
             write_notify: write_notify.clone(),
             alive_streams: alive_streams.clone(),
             chunk_pool: chunk_pool.clone(),
+            datagram_pool: datagram_pool.clone(),
             sender,
             start: Instant::now(),
             pending_udp: VecDeque::new(),
@@ -380,6 +390,7 @@ impl KcpSocket {
             write_notify,
             alive_streams,
             chunk_pool,
+            datagram_pool,
         };
         (this, handle, accept_rx)
     }
@@ -475,20 +486,22 @@ impl KcpSocket {
     /// Batch receive on Linux: one `recvmmsg` per burst, falling back to a
     /// single `recv_from` elsewhere. Returns `(slot, len, src)` per datagram,
     /// empty when the socket has nothing left.
-    async fn drain_recv(&mut self, slots: &mut [Vec<u8>]) {
+    async fn drain_recv(&mut self, slots: &mut [Vec<u8>], recv_batch: &mut RecvBatch) {
         // `try_io` clears tokio's readiness when a batch comes back empty; a
         // raw `recvmmsg` would leave the socket marked readable and starve
         // every other arm of the driver's `select!`.
         //
         // The datagrams of a batch are handed over before the next syscall:
-        // subsequent rounds reuse the same slots.
+        // subsequent rounds reuse the same slots and RecvBatch scratch buffers.
         let count = slots.len().min(RECV_BATCH);
         let mut rounds = 0;
         loop {
-            let batch = {
+            let got = {
                 let socket = &self.socket;
-                match socket.try_io(Interest::READABLE, || recv_datagrams(socket, slots)) {
-                    Ok(b) => b,
+                match socket.try_io(Interest::READABLE, || {
+                    recv_datagrams_into(socket, slots, recv_batch)
+                }) {
+                    Ok(n) => n,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
                     Err(e) => {
                         tracing::warn!(error = %e, "KCP UDP recv error");
@@ -496,8 +509,8 @@ impl KcpSocket {
                     }
                 }
             };
-            let got = batch.len();
-            for (slot, len, src) in batch {
+            for idx in 0..got {
+                let (slot, len, src) = recv_batch.out[idx];
                 self.handle_datagram(&slots[slot][..len], src).await;
             }
             rounds += 1;
@@ -646,7 +659,7 @@ impl KcpSocket {
                     src,
                     self.config.clone(),
                     read_tx,
-                    self.chunk_pool.clone(),
+                    self.datagram_pool.clone(),
                 );
                 if let Err(e) = session.input(data) {
                     tracing::debug!(conv = key.0, peer = %src, error = %e, "KCP new peer: first input failed, dropping");
@@ -669,6 +682,7 @@ impl KcpSocket {
                     self.write_backlog.clone(),
                     self.write_notify.clone(),
                     self.chunk_pool.clone(),
+                    self.datagram_pool.clone(),
                     snd_backlog,
                     snd_notify,
                     session.alive_handle(),
@@ -777,6 +791,7 @@ impl KcpSocket {
         let mut recv_slots: Vec<Vec<u8>> = (0..RECV_BATCH)
             .map(|_| vec![0u8; DRIVER_RECV_BUF_SIZE])
             .collect();
+        let mut recv_batch = RecvBatch::new();
 
         loop {
             tokio::select! {
@@ -824,7 +839,7 @@ impl KcpSocket {
                                     self.sender,
                                     &self.socket,
                                     &mut self.pending_udp,
-                                    &self.chunk_pool,
+                                    &self.datagram_pool,
                                     key.1,
                                     packets,
                                 );
@@ -1004,7 +1019,7 @@ impl KcpSocket {
                 }
 
                 _ = self.socket.readable() => {
-                    self.drain_recv(&mut recv_slots).await;
+                    self.drain_recv(&mut recv_slots, &mut recv_batch).await;
                     // Drain sessions whose read channel closed during this
                     // recv. The tick arm clears `to_remove` before its own
                     // scan, so entries pushed here would otherwise never be
@@ -1245,6 +1260,11 @@ impl KcpSocket {
     ///
     /// Returns how many were sent; the caller recycles those buffers into the
     /// chunk pool and queues the rest.
+    /// Send a run of datagrams to one peer using Linux UDP GSO (`UDP_SEGMENT`)
+    /// when consecutive datagrams share the same length (the common case for
+    /// full-MSS KCP + FEC bursts), falling back to `sendmmsg`. Returns the
+    /// number of datagrams sent from the front of `packets` (0 if the kernel
+    /// buffer is full or `packets.len() < 2`).
     #[cfg(target_os = "linux")]
     pub(crate) fn send_udp_batch(
         socket: &UdpSocket,
@@ -1252,43 +1272,190 @@ impl KcpSocket {
         peer: SocketAddr,
     ) -> usize {
         use std::os::fd::AsRawFd;
+        use std::sync::atomic::AtomicBool;
 
         if packets.len() < 2 {
             return 0;
         }
+
+        // Runtime latch for Linux `UDP_SEGMENT` (kernel >= 4.18). Flips to
+        // false once if the kernel/NIC rejects the cmsg with EINVAL/EIO/etc.,
+        // falling back seamlessly to `sendmmsg`.
+        static UDP_GSO_SUPPORTED: AtomicBool = AtomicBool::new(true);
+
         let (addr, addr_len) = Self::sockaddr_of(&peer);
-        let mut iovs: Vec<libc::iovec> = packets
-            .iter()
-            .map(|p| libc::iovec {
-                iov_base: p.as_ptr() as *mut libc::c_void,
-                iov_len: p.len(),
-            })
-            .collect();
+
+        // Fast path: UDP GSO (`UDP_SEGMENT`) over scatter-gather `iovec`s.
+        // Zero extra user-space copy; the kernel does one route lookup, one
+        // netfilter pass, and one skb allocation for up to 44 equal-length
+        // KCP/FEC datagrams (~62 KiB).
+        const MAX_GSO_SEGS: usize = 44;
+        const MAX_GSO_BYTES: usize = 62 * 1024;
+        const UDP_SEGMENT: libc::c_int = 103;
+
+        if UDP_GSO_SUPPORTED.load(Ordering::Relaxed) {
+            let seg_len = packets[0].len();
+            if seg_len > 0 && seg_len <= u16::MAX as usize {
+                let mut gso_count = 1usize;
+                let mut total_bytes = seg_len;
+                let max_check = packets.len().min(MAX_GSO_SEGS);
+                while gso_count < max_check {
+                    let plen = packets[gso_count].len();
+                    if plen == 0 || total_bytes + plen > MAX_GSO_BYTES {
+                        break;
+                    }
+                    if plen == seg_len {
+                        gso_count += 1;
+                        total_bytes += plen;
+                    } else if plen < seg_len {
+                        // Linux UDP_SEGMENT allows the final segment to be
+                        // strictly shorter than `gso_size`.
+                        gso_count += 1;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+
+                if gso_count >= 2 {
+                    let mut iovs = [libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    }; MAX_GSO_SEGS];
+                    for (i, p) in packets.iter().take(gso_count).enumerate() {
+                        iovs[i] = libc::iovec {
+                            iov_base: p.as_ptr() as *mut libc::c_void,
+                            iov_len: p.len(),
+                        };
+                    }
+
+                    #[repr(C, align(8))]
+                    struct CmsgBuf([u8; 64]);
+                    let mut cmsg_buf = CmsgBuf([0u8; 64]);
+
+                    // SAFETY: `msghdr` is a C POD; all pointers point into
+                    // live stack locals for the duration of `sendmsg`.
+                    let rc = unsafe {
+                        let cmsg_space =
+                            libc::CMSG_SPACE(std::mem::size_of::<u16>() as libc::c_uint) as usize;
+                        let mut msg: libc::msghdr = std::mem::zeroed();
+                        msg.msg_name = (&addr as *const libc::sockaddr_storage).cast_mut().cast();
+                        msg.msg_namelen = addr_len;
+                        msg.msg_iov = iovs.as_mut_ptr();
+                        msg.msg_iovlen = gso_count as _;
+                        msg.msg_control = cmsg_buf.0.as_mut_ptr().cast();
+                        msg.msg_controllen = cmsg_space as _;
+
+                        let cmsg = libc::CMSG_FIRSTHDR(&msg);
+                        if !cmsg.is_null() {
+                            (*cmsg).cmsg_level = libc::SOL_UDP;
+                            (*cmsg).cmsg_type = UDP_SEGMENT;
+                            (*cmsg).cmsg_len =
+                                libc::CMSG_LEN(std::mem::size_of::<u16>() as libc::c_uint) as _;
+                            std::ptr::write_unaligned(
+                                libc::CMSG_DATA(cmsg).cast::<u16>(),
+                                seg_len as u16,
+                            );
+                        }
+
+                        libc::sendmsg(socket.as_raw_fd(), &msg, libc::MSG_DONTWAIT)
+                    };
+
+                    if rc > 0 {
+                        return gso_count;
+                    }
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EAGAIN) => return 0,
+                        Some(
+                            libc::EINVAL
+                            | libc::EIO
+                            | libc::ENOPROTOOPT
+                            | libc::EOPNOTSUPP
+                            | libc::EMSGSIZE,
+                        ) => {
+                            // Disable GSO permanently if the kernel/interface
+                            // does not support `UDP_SEGMENT` (except EMSGSIZE
+                            // which could be PMTU-related — still safe to fall
+                            // back to sendmmsg).
+                            if err.raw_os_error() != Some(libc::EMSGSIZE) {
+                                tracing::debug!(
+                                    error = %err,
+                                    "KCP: UDP_SEGMENT (GSO) unsupported, falling back to sendmmsg"
+                                );
+                                UDP_GSO_SUPPORTED.store(false, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        const SEND_BATCH_MAX: usize = 64;
+        let count = packets.len().min(SEND_BATCH_MAX);
+        let mut iovs = [libc::iovec {
+            iov_base: std::ptr::null_mut(),
+            iov_len: 0,
+        }; SEND_BATCH_MAX];
         // SAFETY: `mmsghdr` is a C POD and an all-zeroed one is a valid empty
         // header (null name/iov/control, zero lengths) that the loop below
         // fills in before the array is handed to the kernel.
-        let zeroed: libc::mmsghdr = unsafe { std::mem::zeroed() };
-        let mut msgs: Vec<libc::mmsghdr> = vec![zeroed; iovs.len()];
+        let mut msgs: [libc::mmsghdr; SEND_BATCH_MAX] = unsafe { std::mem::zeroed() };
         // SAFETY: every pointer handed to the kernel points into a live
-        // `iovs`/`addr` inside this function, and `msgs` is exactly as long as
-        // `iovs`; the lengths come from the slices themselves.
+        // `iovs`/`addr` on this stack frame, and only `0..count` are passed.
         unsafe {
-            for (i, msg) in msgs.iter_mut().enumerate() {
-                msg.msg_hdr.msg_name = (&addr as *const libc::sockaddr_storage).cast_mut().cast();
-                msg.msg_hdr.msg_namelen = addr_len;
-                msg.msg_hdr.msg_iov = &mut iovs[i];
-                msg.msg_hdr.msg_iovlen = 1;
+            for (i, p) in packets.iter().take(count).enumerate() {
+                iovs[i] = libc::iovec {
+                    iov_base: p.as_ptr() as *mut libc::c_void,
+                    iov_len: p.len(),
+                };
+                msgs[i].msg_hdr.msg_name =
+                    (&addr as *const libc::sockaddr_storage).cast_mut().cast();
+                msgs[i].msg_hdr.msg_namelen = addr_len;
+                msgs[i].msg_hdr.msg_iov = &mut iovs[i];
+                msgs[i].msg_hdr.msg_iovlen = 1;
             }
             let sent = libc::sendmmsg(
                 socket.as_raw_fd(),
                 msgs.as_mut_ptr(),
-                msgs.len() as libc::c_uint,
-                0,
+                count as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
             );
             if sent <= 0 {
                 return 0;
             }
             sent as usize
+        }
+    }
+
+    /// Send a single datagram directly via non-blocking `sendto(2)` without
+    /// touching Tokio's `ScheduledIo` readiness bits (safe to call from the
+    /// foreign `frp-kcp-send` thread).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn send_udp_one(
+        socket: &UdpSocket,
+        packet: &[u8],
+        peer: SocketAddr,
+    ) -> io::Result<usize> {
+        use std::os::fd::AsRawFd;
+
+        let (addr, addr_len) = Self::sockaddr_of(&peer);
+        // SAFETY: `packet` and `addr` are live for the duration of `sendto`.
+        let rc = unsafe {
+            libc::sendto(
+                socket.as_raw_fd(),
+                packet.as_ptr().cast(),
+                packet.len(),
+                libc::MSG_DONTWAIT,
+                (&addr as *const libc::sockaddr_storage).cast(),
+                addr_len,
+            )
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(rc as usize)
         }
     }
 
@@ -1343,7 +1510,7 @@ impl KcpSocket {
 
     /// Re-send packets queued by a previous full send buffer (FIFO).
     fn drain_pending_udp(&mut self) {
-        Self::drain_pending(&self.socket, &mut self.pending_udp, &self.chunk_pool);
+        Self::drain_pending(&self.socket, &mut self.pending_udp, &self.datagram_pool);
     }
 
     /// Retry a queue of datagrams the kernel refused before (FIFO), recycling
@@ -1397,7 +1564,7 @@ impl KcpSocket {
             self.sender,
             &self.socket,
             &mut self.pending_udp,
-            &self.chunk_pool,
+            &self.datagram_pool,
             peer_addr,
             packets,
         );
@@ -1437,50 +1604,79 @@ impl KcpSocket {
 /// Datagrams per `recvmmsg` call.
 const RECV_BATCH: usize = 32;
 
-/// Receive every datagram the socket has queued, up to `slots.len()`.
-///
-/// Linux uses one `recvmmsg`; other platforms take a single `recv_from` into
-/// `slots[0]`, which keeps the behaviour identical at one packet per wakeup.
+/// Reusable scratch storage for `recvmmsg` / `recv_from`, allocated once per
+/// driver loop instead of allocating 4 heap `Vec`s + zeroing 6 KiB per syscall.
+struct RecvBatch {
+    #[cfg(target_os = "linux")]
+    iovecs: [libc::iovec; RECV_BATCH],
+    #[cfg(target_os = "linux")]
+    names: [libc::sockaddr_storage; RECV_BATCH],
+    #[cfg(target_os = "linux")]
+    msgs: [libc::mmsghdr; RECV_BATCH],
+    out: Vec<(usize, usize, SocketAddr)>,
+}
+
+// SAFETY: `RecvBatch` is owned exclusively by a single driver task. The raw
+// pointers inside `iovecs` and `msgs` are freshly initialized from `slots` and
+// `self.names`/`self.iovecs` immediately before each synchronous `recvmmsg`
+// call and are never dereferenced across `.await` points.
+unsafe impl Send for RecvBatch {}
+
+impl RecvBatch {
+    fn new() -> Self {
+        Self {
+            #[cfg(target_os = "linux")]
+            iovecs: [libc::iovec {
+                iov_base: std::ptr::null_mut(),
+                iov_len: 0,
+            }; RECV_BATCH],
+            // SAFETY: `sockaddr_storage` and `mmsghdr` are C PODs.
+            #[cfg(target_os = "linux")]
+            names: unsafe { std::mem::zeroed() },
+            #[cfg(target_os = "linux")]
+            msgs: unsafe { std::mem::zeroed() },
+            out: Vec::with_capacity(RECV_BATCH),
+        }
+    }
+}
+
+/// Receive every datagram the socket has queued, up to `slots.len()`, writing
+/// `(slot_idx, len, src)` into `batch.out` and returning `batch.out.len()`.
 #[cfg(target_os = "linux")]
-fn recv_datagrams(
+fn recv_datagrams_into(
     socket: &UdpSocket,
     slots: &mut [Vec<u8>],
-) -> io::Result<Vec<(usize, usize, SocketAddr)>> {
+    batch: &mut RecvBatch,
+) -> io::Result<usize> {
     use std::os::fd::AsRawFd;
 
+    batch.out.clear();
     let count = slots.len().min(RECV_BATCH);
     if count == 0 {
-        return Ok(Vec::new());
+        return Ok(0);
     }
-    let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(count);
-    for slot in slots.iter_mut().take(count) {
-        iovecs.push(libc::iovec {
-            iov_base: slot.as_mut_ptr().cast(),
-            iov_len: slot.len(),
-        });
-    }
-    // SAFETY: `sockaddr_storage` is plain old data, so an all-zero value is a
-    // valid (family-0) instance; the kernel fills it in.
-    let mut names: Vec<libc::sockaddr_storage> = vec![unsafe { std::mem::zeroed() }; count];
-    // SAFETY: `mmsghdr` is a C POD and an all-zeroed one is a valid empty
-    // message header; field literals are not usable because musl's
-    // `msghdr` carries private padding fields.
-    let zeroed: libc::mmsghdr = unsafe { std::mem::zeroed() };
-    let mut msgs: Vec<libc::mmsghdr> = vec![zeroed; count];
+    let namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     for idx in 0..count {
-        msgs[idx].msg_hdr.msg_iov = std::ptr::addr_of_mut!(iovecs[idx]);
-        msgs[idx].msg_hdr.msg_iovlen = 1;
-        msgs[idx].msg_hdr.msg_name = std::ptr::addr_of_mut!(names[idx]).cast();
-        msgs[idx].msg_hdr.msg_namelen =
-            std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        batch.iovecs[idx] = libc::iovec {
+            iov_base: slots[idx].as_mut_ptr().cast(),
+            iov_len: slots[idx].len(),
+        };
+        batch.msgs[idx].msg_hdr.msg_iov = std::ptr::addr_of_mut!(batch.iovecs[idx]);
+        batch.msgs[idx].msg_hdr.msg_iovlen = 1;
+        batch.msgs[idx].msg_hdr.msg_name = std::ptr::addr_of_mut!(batch.names[idx]).cast();
+        batch.msgs[idx].msg_hdr.msg_namelen = namelen;
+        batch.msgs[idx].msg_hdr.msg_control = std::ptr::null_mut();
+        batch.msgs[idx].msg_hdr.msg_controllen = 0;
+        batch.msgs[idx].msg_hdr.msg_flags = 0;
+        batch.msgs[idx].msg_len = 0;
     }
-    // SAFETY: `msgs`, `iovecs` and `names` outlive the call and each
-    // `msg_hdr` points at its own entry; the kernel writes at most one
+    // SAFETY: `batch` outlives the call and each `msg_hdr` points at its own
+    // entry in `batch.iovecs`/`batch.names`; the kernel writes at most one
     // datagram per message, bounded by the slot's length.
     let rc = unsafe {
         libc::recvmmsg(
             socket.as_raw_fd(),
-            msgs.as_mut_ptr(),
+            batch.msgs.as_mut_ptr(),
             count as libc::c_uint,
             libc::MSG_DONTWAIT as _,
             std::ptr::null_mut(),
@@ -1489,36 +1685,45 @@ fn recv_datagrams(
     if rc < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut out = Vec::with_capacity(rc as usize);
-    for (idx, msg) in msgs.iter().enumerate().take(rc as usize) {
-        // The kernel reports the copied length because `MSG_TRUNC` is not
-        // requested; clamp anyway so a surprising value cannot slice past the
-        // slot and panic the driver task.
-        let len = (msg.msg_len as usize).min(slots[idx].len());
-        let src = match socket_addr_from_storage(&names[idx]) {
+    for idx in 0..(rc as usize) {
+        let len = (batch.msgs[idx].msg_len as usize).min(slots[idx].len());
+        let src = match socket_addr_from_storage(&batch.names[idx]) {
             Some(addr) => addr,
             None => continue,
         };
-        out.push((idx, len, src));
+        batch.out.push((idx, len, src));
     }
-    Ok(out)
+    Ok(batch.out.len())
 }
 
 #[cfg(not(target_os = "linux"))]
+fn recv_datagrams_into(
+    socket: &UdpSocket,
+    slots: &mut [Vec<u8>],
+    batch: &mut RecvBatch,
+) -> io::Result<usize> {
+    batch.out.clear();
+    let slot = match slots.first_mut() {
+        Some(slot) => slot,
+        None => return Ok(0),
+    };
+    match socket.try_recv_from(slot) {
+        Ok((len, src)) => {
+            batch.out.push((0, len, src));
+            Ok(1)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
 fn recv_datagrams(
     socket: &UdpSocket,
     slots: &mut [Vec<u8>],
 ) -> io::Result<Vec<(usize, usize, SocketAddr)>> {
-    let slot = match slots.first_mut() {
-        Some(slot) => slot,
-        None => return Ok(Vec::new()),
-    };
-    // `recv_from` on a non-blocking socket reports WouldBlock exactly like
-    // `recvmmsg` does, so the caller's drain loop is unchanged.
-    match socket.try_recv_from(slot) {
-        Ok((len, src)) => Ok(vec![(0, len, src)]),
-        Err(e) => Err(e),
-    }
+    let mut batch = RecvBatch::new();
+    recv_datagrams_into(socket, slots, &mut batch)?;
+    Ok(batch.out)
 }
 
 /// Writes coalesced into one flush in the driver's write arm.
@@ -2054,6 +2259,7 @@ mod tests {
             driver.write_backlog.clone(),
             driver.write_notify.clone(),
             driver.chunk_pool.clone(),
+            driver.datagram_pool.clone(),
             snd_backlog,
             snd_notify,
             alive.clone(),
@@ -2172,6 +2378,7 @@ mod tests {
             rx2,
             Arc::new(AtomicUsize::new(0)),
             Arc::new(Notify::new()),
+            Arc::new(ArrayQueue::new(CHUNK_POOL_CAP)),
             pool.clone(),
             snd_backlog,
             snd_notify,

@@ -184,6 +184,44 @@ unsafe fn xor_mul_avx2(dst: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16])
     }
 }
 
+/// AArch64 NEON: `dst[i] ^= coef * src[i]` for a fixed `coef`, 16 bytes at a
+/// time using `vqtbl1q_u8` (`tbl.16b`) over the same nibble tables as AVX2.
+///
+/// # Safety
+/// Every load/store stays inside `min(src.len(), dst.len())` bytes of live slices.
+/// NEON (`advsimd`) is mandatory on all `aarch64` targets.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn xor_mul_neon(dst: &mut [u8], src: &[u8], lo: &[u8; 16], hi: &[u8; 16]) {
+    use std::arch::aarch64::*;
+
+    // SAFETY: `aarch64` unconditionally provides NEON; all pointer arithmetic
+    // is bounded by `n = src.len().min(dst.len())`.
+    unsafe {
+        let n = src.len().min(dst.len());
+        let mask = vdupq_n_u8(0x0f);
+        let lo_tbl = vld1q_u8(lo.as_ptr());
+        let hi_tbl = vld1q_u8(hi.as_ptr());
+        let (sp, dp) = (src.as_ptr(), dst.as_mut_ptr());
+
+        let mut i = 0usize;
+        while i + 16 <= n {
+            let x = vld1q_u8(sp.add(i));
+            let l = vandq_u8(x, mask);
+            let h = vshrq_n_u8::<4>(x);
+            let prod = veorq_u8(vqtbl1q_u8(lo_tbl, l), vqtbl1q_u8(hi_tbl, h));
+            let acc = vld1q_u8(dp.add(i));
+            vst1q_u8(dp.add(i), veorq_u8(acc, prod));
+            i += 16;
+        }
+        while i < n {
+            let b = *sp.add(i);
+            *dp.add(i) ^= lo[(b & 0x0f) as usize] ^ hi[(b >> 4) as usize];
+            i += 1;
+        }
+    }
+}
+
 /// `dst[i] ^= coef * src[i]`, vectorised when the CPU and length allow it.
 #[inline]
 fn xor_mul_into(dst: &mut [u8], src: &[u8], table: &[u8], nibbles: &[u8]) {
@@ -202,14 +240,21 @@ fn xor_mul_into(dst: &mut [u8], src: &[u8], table: &[u8], nibbles: &[u8]) {
             return;
         }
     }
-    // Non-x86 targets never build the vector path; the nibble table is unused.
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        let lo: &[u8; 16] = nibbles[..16].try_into().expect("lo half is 16 bytes");
+        let hi: &[u8; 16] = nibbles[16..].try_into().expect("hi half is 16 bytes");
+        if src.len() >= 16 {
+            // SAFETY: NEON is mandatory on aarch64 and `xor_mul_neon` bounds
+            // all accesses to `min(dst.len(), src.len())`.
+            unsafe { xor_mul_neon(dst, src, lo, hi) };
+            return;
+        }
+    }
+    // Other architectures fall back to the 256-entry scalar table.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let _ = nibbles;
 
-    // Scalar fallback: one 256-entry lookup per byte, unchanged from before the
-    // vector path existed. Non-AVX2 targets (aarch64, pre-AVX2 x86) pay only the
-    // one-time nibble-table build in `Fec::new` (960 B and 960 multiplies for
-    // 10+3), never more per byte.
     let n = dst.len().min(src.len());
     for (d, &b) in dst.iter_mut().zip(src.iter()).take(n) {
         *d ^= table[b as usize];
@@ -348,6 +393,39 @@ impl Fec {
         output
     }
 
+    /// Compute only the parity shards for `input` directly into caller-provided
+    /// `parity_out` slices (each must be zero-initialized and `block_size` bytes
+    /// long). Avoids per-group heap allocations on the KCP send hot path.
+    pub fn encode_parity_into(&self, input: &[&[u8]], parity_out: &mut [&mut [u8]]) {
+        assert_eq!(
+            input.len(),
+            self.data_shards,
+            "input must equal data_shards"
+        );
+        assert_eq!(
+            parity_out.len(),
+            self.parity_shards,
+            "parity_out must equal parity_shards"
+        );
+        let block_size = input[0].len();
+        for (i, parity) in parity_out.iter_mut().enumerate() {
+            debug_assert_eq!(
+                parity.len(),
+                block_size,
+                "FEC parity slice must match block_size"
+            );
+            for (data_idx, inp) in input.iter().enumerate() {
+                debug_assert_eq!(inp.len(), block_size, "FEC shards must be equal length");
+                xor_mul_into(
+                    parity,
+                    inp,
+                    self.mul_table(i, data_idx),
+                    self.nibble_table(i, data_idx),
+                );
+            }
+        }
+    }
+
     /// Compute only the parity shards for `input` (which must have exactly
     /// `data_shards` rows, each `block_size` bytes). Unlike [`encode`], the data
     /// shards are not copied — callers that only need the FEC parity rows (the
@@ -359,21 +437,12 @@ impl Fec {
             "input must equal data_shards"
         );
         let block_size = input[0].len();
-        let mut parity_shards = Vec::with_capacity(self.parity_shards);
-        for i in 0..self.parity_shards {
-            let mut parity = vec![0u8; block_size];
-            for (data_idx, inp) in input.iter().enumerate() {
-                // See `encode`: the rows must be equal length.
-                debug_assert_eq!(inp.len(), block_size, "FEC shards must be equal length");
-                xor_mul_into(
-                    &mut parity,
-                    inp,
-                    self.mul_table(i, data_idx),
-                    self.nibble_table(i, data_idx),
-                );
-            }
-            parity_shards.push(parity);
-        }
+        let mut parity_shards: Vec<Vec<u8>> = (0..self.parity_shards)
+            .map(|_| vec![0u8; block_size])
+            .collect();
+        let mut out_refs: Vec<&mut [u8]> =
+            parity_shards.iter_mut().map(Vec::as_mut_slice).collect();
+        self.encode_parity_into(input, &mut out_refs);
         parity_shards
     }
 
