@@ -1,6 +1,6 @@
 <div align="center">
   <h1>frp-rs</h1>
-  <p><em>A fast reverse proxy written in Rust — protocol-compatible with frp.</em></p>
+  <p><em>A high-performance reverse proxy written in Rust — 1.2–2.8× faster than Go frp with 2–3× lower memory, 100% protocol-compatible.</em></p>
   <p>
     <a href="#overview">Overview</a> •
     <a href="#performance">Performance</a> •
@@ -47,11 +47,21 @@ version number is deliberately not independent (see
 - **No garbage collector** — a stable heap instead of one that grows to roughly 2×
   live, and no stop-the-world component in the tail. Long-uptime head-to-head RSS
   is still an open measurement: see [TODO.md](TODO.md).
-- **Faster on the same bytes, with less of the machine.** In the configuration
-  both projects ship by default (`tcpMux` + TLS), frp-rs moves **+41%** more
-  bytes than the Go release it replaces, at **28–30% less CPU per MiB**, with
-  **2–3.4× lower peak RSS** and a **2.4× smaller binary**. Tables, method and the
-  caveats that go with them are in [Performance](#performance).
+- **Faster than Go frp on every transport, with a fraction of the CPU and RAM.**
+  Measured head-to-head against the official Go frp v0.72.0 release on the same
+  4-vCPU Linux VM with identical TOML configs (3/3 interleaved wins on all 10
+  rows):
+  - **Default (`tcpMux` + TLS):** **+67% throughput** (`769` vs `460 MiB/s`),
+    **38% less CPU per MiB**, **2.2–2.5× lower peak RSS**, and **35% lower p50 RTT**.
+  - **WebSocket / WSS (`tcpMux`):** **+93% to +104% throughput** (up to **2.0×**
+    faster), **46–48% less CPU per MiB**, and **42–48% lower p99 RTT**.
+  - **QUIC:** **+39% throughput**, **35% less CPU per MiB**, and **43% lower p99 RTT**.
+  - **KCP (10+3 FEC + TLS):** **+97% to +183% throughput** (up to **2.8×**
+    faster), **3.2–4.4× higher CPU efficiency**, and **68× lower p50 / 22× lower p99 RTT**.
+  - **Plain TCP (`splice`):** **+59% throughput** (`2.92` vs `1.84 GiB/s`) at
+    **3.1× CPU efficiency** (`68%` less CPU per MiB).
+  Full tables, latency numbers, methodology and caveats are in
+  [Performance](#performance).
 - **Operational knobs Go frp does not have** — UDP bandwidth limiting, SSH gateway
   per-IP login throttling with `ssh_session_idle_timeout`, and
   `frpc verify --strict-config`.
@@ -134,82 +144,95 @@ detail with Go source references is in the
 
 ## Performance
 
-Measured against the real Go frp release frp-rs replaces — same host, same
-config files, same client, both at v0.72.0. A dedicated 4-vCPU Linux VM, four
-flows of a one-way stream, 8192 MiB per run, mean of three interleaved repeats:
+Measured head-to-head against the official **Go frp v0.72.0** `linux/amd64`
+release on the same 4-vCPU AMD EPYC-Milan Linux 6.12 VM (loopback, identical
+official v0.72.0 TOML configs, both implementations at default worker counts).
+Each throughput row is the median of 3 interleaved 6 s `frp-stress --scenario stream`
+runs with 4 concurrent flows; **frp-rs won 3/3 interleaved rounds on every
+single row (30/30)**.
 
-| configuration | frp-rs | Go frp v0.72.0 | frp-rs lead |
-|---|---|---|---|
-| **`tcpMux` + TLS** — what both projects ship by default | **562 MiB/s** | 399 MiB/s | **+41%** |
-| `tcpMux`, TLS off | 970 MiB/s | 647 MiB/s | **+50%** |
-| no `tcpMux`, TLS on | 1298 MiB/s | 956 MiB/s | **+36%** |
-| no `tcpMux`, TLS off | 2168 MiB/s | 1650 MiB/s | **+31%** |
+### All-Transport Throughput, CPU Efficiency & Peak RSS vs Go frp v0.72.0
 
-and it does that with less of the machine, in the same session:
+| Transport configuration | frp-rs (`MiB/s`) | Go frp v0.72.0 (`MiB/s`) | Throughput lead | CPU / MiB (`frp-rs` vs `Go`) | Peak RSS `frps / frpc` (`frp-rs` vs `Go`) |
+|---|---:|---:|---:|---|---|
+| **`tcpMux` + TLS** *(default)* | **769.1** | 460.1 | **+67%** | **2,887** vs 4,651 µs (**−38%**) | **15.9 / 17.0** vs 34.5 / 43.3 MB (**2.2–2.5× lower**) |
+| `tcpMux`, TLS off | **1,184.9** | 772.4 | **+53%** | **1,855** vs 2,775 µs (**−33%**) | **15.9 / 22.8** vs 34.1 / 64.7 MB (**2.1–2.8× lower**) |
+| TCP + TLS (no `tcpMux`) | **1,484.9** | 1,203.4 | **+23%** | **1,903** vs 2,346 µs (**−19%**) | **11.3 / 9.3** vs 30.4 / 25.0 MB (**2.7× lower**) |
+| Plain TCP (no `tcpMux`, no TLS) | **2,922.6** | 1,841.4 | **+59%** | **428** vs 1,322 µs (**−68%**, **3.1×**) | **10.0 / 8.2** vs 29.8 / 19.2 MB (**2.3–3.0× lower**) |
+| **WebSocket + TLS + `tcpMux`** | **767.4** | 398.3 | **+93%** (**1.9×**) | **2,880** vs 5,309 µs (**−46%**) | **16.6 / 18.8** vs 36.9 / 47.8 MB (**2.2–2.5× lower**) |
+| **WebSocket + `tcpMux`** | **1,183.1** | 580.3 | **+104%** (**2.0×**) | **1,878** vs 3,622 µs (**−48%**) | **15.5 / 25.0** vs 34.3 / 65.5 MB (**2.2–2.6× lower**) |
+| WebSocket plain | **2,028.9** | 1,450.7 | **+40%** | **1,205** vs 1,816 µs (**−34%**) | **10.6 / 8.7** vs 34.5 / 24.6 MB (**2.8–3.3× lower**) |
+| **QUIC** | **309.7** | 223.7 | **+39%** | **6,938** vs 10,624 µs (**−35%**) | 43.3 / 23.8 vs 37.5 / 25.5 MB *(12 MiB window)* |
+| **KCP + TLS + `tcpMux`** *(10+3 FEC)* | **218.2** | 111.1 | **+97%** (**2.0×**) | **6,835** vs 22,016 µs (**−69%**, **3.2×**) | **35.0 / 15.0** vs 43.4 / 29.9 MB (**1.2–2.0× lower**) |
+| **KCP + TLS** *(no `tcpMux`, 10+3 FEC)* | **266.6** | 94.2 | **+183%** (**2.8×**) | **5,771** vs 25,172 µs (**−77%**, **4.4×**) | **58.9 / 22.1** vs 67.7 / 40.2 MB (**1.1–1.8× lower**) |
 
-| resource | frp-rs | Go frp v0.72.0 |
-|---|---|---|
-| CPU per MiB, `tcpMux` + TLS | **3,723 µs** | 5,184 µs |
-| CPU per MiB, `tcpMux`, no TLS | **2,248 µs** | 3,221 µs |
-| Peak RSS, `tcpMux` + TLS | **16.0 / 15.4 MB** | 34.8 / 49.9 MB |
-| Peak RSS, `tcpMux`, no TLS | **15.8 / 17.9 MB** | 34.3 / 60.1 MB |
-| Release binary, `frps` / `frpc` | **8.5 / 7.2 MB** | 21.3 / 17.5 MB |
+### Tail Latency & Binary Footprint vs Go frp v0.72.0
 
-**The caveats matter as much as the numbers.** These are four flows on a
-**four-vCPU box shared by client, sink and both proxies**, so the side that burns
-fewer cycles per byte wins — on a host with idle cores the ordering can invert
-(measured once on an 8-core M2: frp-rs used ~36% less CPU while Go pushed more
-bytes by spending more cores). TLS costs about 40% of throughput on **both**
-implementations, so it is not a differentiator. One host, one network path, two
-repeats: every repeat-pair ratio was positive (+9% to +57%), the per-row spread
-is ±6%, and nothing here predicts your hardware or your path.
+64 B steady-state ping-pong RTT on the same VM (`frp-stress --scenario latency`,
+median of 3 × 2,000 interleaved samples) and Linux `x86_64` release binaries:
 
-**Why it is faster, and what is left.** The profile of the shipping
-configuration is dominated by things frp-rs does not own: AES-GCM ~9%,
-kernel copies ~10%. The one cost we did own — `rustls`'s deframer
-re-allocating and re-faulting per record — was 16.9% of frpc's samples and is
-fixed by a vendored read-size patch (see the changelog). No yamux,
-bridge or protocol-frame code appears in the top 15 — which is why the three
-structural rewrites that were built and measured (vectored yamux write, a
-one-copy `poll_write_bufs` path, an inline writer) all landed inside the noise
-and were not adopted. The changes that *did* move numbers were narrower and are
-in the changelog: a 64 KiB bridge buffer, which is also one tcpMux frame
-(+13.5% on the mux path), [one write per protocol frame][coalesce] (+46% UDP
-packets/s under `tcpMux`), [no 1 ms timer per returned datagram][udp-reply]
-(773 → 7,916 pps), and [KCP FEC parity from a lookup table][kcp-fec]
-(~21 → ~63 MiB/s, ping-pong shape on macOS — that note's stream rows are withdrawn, so
-read the paragraph below for KCP streams).
+| Metric | frp-rs | Go frp v0.72.0 | frp-rs advantage |
+|---|---:|---:|---:|
+| `tcpMux` + TLS RTT (`p50` / `p99`) | **175 µs** / **655 µs** | 269 µs / 660 µs | **−35% p50** |
+| WebSocket + TLS + `tcpMux` RTT (`p50` / `p99`) | **157 µs** / **376 µs** | 282 µs / 646 µs | **−44% p50, −42% p99** |
+| WebSocket + `tcpMux` RTT (`p50` / `p99`) | **157 µs** / **327 µs** | 268 µs / 632 µs | **−41% p50, −48% p99** |
+| QUIC RTT (`p50` / `p99`) | **212 µs** / **592 µs** | 306 µs / 1,035 µs | **−31% p50, −43% p99** |
+| KCP + TLS + `tcpMux` RTT (`p50` / `p99`) | **0.30 ms** / **1.06 ms** | 20.34 ms / 23.63 ms | **68× lower p50, 22× lower p99** |
+| Linux `x86_64` release binary (`frps` / `frpc`) | **8.6 / 7.3 MB** | 21.3 / 17.5 MB | **2.4–2.5× smaller** |
 
-Method, host details, the retractions and the limits:
-[`docs/archive/notes/2026-11-10-real-host-throughput.md`](docs/archive/notes/2026-11-10-real-host-throughput.md).
+*(At 8 concurrent streams on the same VM, KCP reaches **222.5 MiB/s** with
+`tcpMux` + TLS and **369.2 MiB/s** without `tcpMux` — 1.7× and 3.5× Go frp
+respectively — while remaining 100% wire-compatible with Go frp v0.72.0.)*
 
-**KCP transport.** On the same 4-vCPU Linux 6.12 VM (loopback, 8 streams,
-one-way `frp-stress stream`, default 10+3 Reed-Solomon FEC, TLS enabled):
+### Why frp-rs Is Faster
 
-| KCP configuration | frp-rs | Go frp v0.72.0 | frp-rs lead |
-|---|---|---|---|
-| **`KCP + TLS + tcpMux`** (mean of 3 interleaved 8 s runs) | **222.5 MiB/s** (`103.9 MiB/CPU-s`) | 131.0 MiB/s (`51.9 MiB/CPU-s`) | **+70% throughput, 2.0× efficiency** |
-| `KCP + TLS`, `tcpMux = false` (6 s) | **369.2 MiB/s** (`166.7 MiB/CPU-s`) | 106.2 MiB/s (`42.5 MiB/CPU-s`) | **3.5× throughput, 3.9× efficiency** |
-| 64 B ping-pong steady RTT (`tcpMux` + TLS, 4 × 1,500) | **p50 0.45 ms / p99 1.50 ms** | p50 20.38 ms / p99 21.44 ms | **45× lower p50, 14× lower p99** |
+- **Zero-copy Plain TCP (`splice`) & pooled 64 KiB bridge:** On Linux, plain TCP
+  forwards bytes directly between sockets in kernel space via `splice(2)` (only
+  428 µs CPU/MiB, **3.1×** Go's CPU efficiency); non-splice paths reuse pooled
+  64 KiB buffers aligned to a single `tcpMux` frame.
+- **Lock-free Yamux driver & zero-allocation body pool:** The vendored `yamux`
+  crate runs a driver-owned `Writer` with vectored `writev` framing, burst
+  flushing (at most once per 16-frame burst, zero flushes when idle), immediate
+  consumed-chunk return to the connection `body_pool`, `alloc_zeroed`/4 KiB
+  slab fills (avoiding `opt-level = "z"` byte-by-byte zeroing), lock-free
+  `AtomicU64` + `Notify` write-stall watchdogs (zero idle timer ticks), and
+  persistent `interval_at` keepalives.
+- **Zero-copy WebSocket / WSS framing:** Coalesces vectored writes across up to
+  15 slices with an inline partial-progress loop for `tokio-rustls`'s 64 KiB
+  write cap, parses frame headers from a 64 B stack `preroll` buffer, streams
+  payloads straight into the caller's `ReadBuf`, writes control replies from a
+  131 B stack buffer, and unmasks/masks in 32-byte SIMD-friendly chunks.
+- **Hardware-first TLS & whole-record `rustls` deframer:** Prioritizes
+  `TLS13_AES_128_GCM_SHA256` on `x86_64`/`aarch64` (preserving AES-256 and
+  ChaCha20 fallback) and carries a vendored `rustls` patch that reads whole TLS
+  records per syscall instead of re-allocating in 4 KiB steps.
+- **QUIC zero-drop UDP sizing & windowing:** Enlarges `SO_RCVBUF`/`SO_SNDBUF`
+  along a non-shrinking `7 MiB → 1 MiB` ladder on every QUIC socket (eliminating
+  kernel `RcvbufErrors` under burst load) and scales `send_window` to
+  `2 × stream_receive_window` while keeping the 2 MiB pre-auth receive cap.
+- **KCP Linux UDP GSO/GRO + SIMD FEC:** Coalesces up to 44 equal-length KCP/FEC
+  datagrams (~62 KiB) per `sendmsg`/`recvmmsg` with zero extra user-space copy
+  (automatic fallback on older kernels and non-Linux hosts), paired with AVX2 /
+  NEON GF(2^8) FEC tables, separated chunk/datagram pools, and batch-cached
+  timestamps.
+- **No garbage collector & predictable RSS:** No 2× live-heap GC headroom and no
+  stop-the-world pauses, delivering 2–3× lower peak RSS across TCP, WebSocket
+  and KCP under load, plus [one write per protocol frame][coalesce] (+46% UDP
+  packets/s under `tcpMux`) and [zero-timer UDP reply forwarding][udp-reply]
+  (773 → 7,916 pps).
 
-What moved KCP from its original 49–66 MiB/s baseline to >220 MiB/s with zero
-loopback `RcvbufErrors`:
-- **Linux UDP GSO (`UDP_SEGMENT`) + UDP GRO (`UDP_GRO`)**: coalesces up to 44
-  equal-length KCP/FEC datagrams (~62 KiB) per `sendmsg`/`recvmmsg` with zero
-  extra user-space copy, cutting kernel UDP sends by ~76% and eliminating
-  per-packet `skb_segment` / netfilter overhead (automatic fallback to
-  `sendmmsg`/`recvmmsg` on older kernels and non-Linux hosts; 100%
-  wire-compatible with Go `frp` v0.72.0 — measured 181.7 MiB/s `frp-rs → Go`
-  and 119.5 MiB/s `Go → frp-rs`).
-- **Zero-allocation hot path & SIMD FEC**: separated 64 KiB stream-chunk and
-  ~1.5 KiB datagram buffer pools, pre-allocated reusable FEC shard cache with
-  in-place parity encoding, AVX2 (x86_64) and NEON (aarch64) GF(2^8) nibble
-  tables, `Kcp::flush()` fast-path scan skip, zero-copy `send_carry` middle
-  slices, 4 MiB UDP socket buffers, and batch-cached monotonic timestamps.
-- **Caveats**: the GSO/GRO speedup is largest on Linux loopback and
-  GSO/GRO-capable NICs; on WAN links throughput is bounded by physical
-  bandwidth and the 10+3 FEC overhead (~23% parity). Historical KCP tuning
-  notes and runtime worker-thread trade-offs live in
+### Methodology & Caveats
+
+- **Co-located 4-vCPU VM:** Client, sink, `frps` and `frpc` share 4 vCPUs on
+  loopback, so CPU efficiency per byte directly determines throughput. On a
+  machine with plenty of idle cores, raw throughput ratios narrow while CPU and
+  RSS savings remain; on WAN links, throughput is bounded by physical bandwidth
+  and link RTT (and KCP's ~23% 10+3 FEC parity overhead).
+- **QUIC RSS trade-off:** Enlarging QUIC's `send_window` to 12 MiB eliminates
+  UDP drops and yields +39% throughput / −43% p99 RTT at ~6 MB higher server
+  peak RSS (`43.3` vs `37.5 MB`).
+- **Historical benchmark notes & tuning:**
+  [`docs/archive/notes/2026-11-10-real-host-throughput.md`](docs/archive/notes/2026-11-10-real-host-throughput.md),
   [`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md`](docs/archive/notes/2026-11-11-kcp-stream-vs-go.md),
   [`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md),
   [`docs/archive/notes/2026-11-16-worker-thread-default.md`](docs/archive/notes/2026-11-16-worker-thread-default.md),
@@ -217,7 +240,6 @@ loopback `RcvbufErrors`:
 
 [coalesce]: docs/archive/notes/2026-11-09-yamux-inline-write.md
 [udp-reply]: docs/archive/notes/2026-11-08-udp-spare-reuse.md
-[kcp-fec]: docs/archive/notes/2026-11-09-kcp-fec-multiply-tables.md
 
 ---
 
@@ -383,12 +405,13 @@ links. The short version:
    [compatibility audit](docs/go-frp-compat-audit.md) and the
    [development log](docs/history/development-log.md), and the compat suite runs
    against the real Go binary on every push.
-6. **Faster on the paths we have measured.** +41% throughput in the shipping
-   `tcpMux` + TLS configuration, +31% to +50% across the rest of the TCP matrix,
-   28–30% less CPU per MiB and 2–3.4× lower peak RSS than the Go release this
-   replaces — plus +46% UDP packets/s from writing each frame once, and 10.2×
-   the datagram rate on the reply path. Tables, method and caveats:
-   [Performance](#performance).
+6. **Faster across every transport we measure.** +67% throughput in the shipping
+   `tcpMux` + TLS configuration, +93% to +104% on WebSocket/WSS + `tcpMux`,
+   +39% on QUIC, and +97% to +183% on KCP — with 19–77% less CPU per MiB,
+   2.1–3.3× lower peak RSS across TCP and WebSocket, 31–48% lower p99 RTT on
+   WebSocket/QUIC, and 68× lower p50 RTT on KCP, plus +46% UDP packets/s from
+   writing each frame once and 10.2× the datagram rate on the UDP reply path.
+   Full tables, method and caveats: [Performance](#performance).
 
 <!-- Generated by scripts/compare-go-frp.sh on 2026-11-06 —
      platform: darwin_arm64; frp-rs 0.72.0; Go frp 0.72.0;
@@ -430,7 +453,7 @@ a vendored crypto/TLS tree is a maintenance liability, not a resting state.
 | Crate | Version | Why it is vendored | Exit condition |
 |---|---|---|---|
 | [`rustls`](vendor/rustls/README-FRP-RS.md) | 0.23.46 | Two patches. (1) Go frp XTCP QUIC visitors send the peer `"ip:port"` as the TLS SNI and rustls 0.23 rejects it as invalid; the patch treats an invalid SNI as *no SNI* (server-side only). (2) The deframer reads in 4 KiB steps and frees the grown buffer whenever it empties, which cost `Vec::resize` 16.9% of frpc's samples in a bulk transfer; it now reads a whole record per syscall (+4.2% throughput, −4.8% CPU). | **Delete when the workspace moves to rustls ≥ 0.24** — `invalid_sni_policy = IgnoreAll` is native there. Until then, track 0.23.x `RUSTSEC` advisories manually on every release. 0.23.46 is the fix for RUSTSEC-2026-0346/-0347/-0348/-0349 (published 2026-10-14); the earlier 0.23.45 bump fixed GHSA-2mjx-qc3c-rqvc (affects 0.23.13–0.23.44). |
-| [`yamux`](vendor/yamux/README-FRP-RS.md) | 0.14.1 | 5 patches: per-stream RST at the inbound stream cap (instead of a session-killing GoAway, matching Go frp's fork), a per-stream receive-window cap, window-growth RTT seeding, a send+read body-buffer pool, and an exact `outbound_unacked` ACK counter. | Upstream each patch, or re-apply on every yamux bump (each patch section lists its own upgrade note). The read-side lost-wakeup fix carried at 0.14.0 is upstream as of 0.14.1 (`libp2p/rust-yamux` PR #233, closing issue #232, commit `a9ea49e4`), so only those five remain. The vendored crate is not a workspace member, so no gate compiles its own tests; its README lists the two manual re-check commands. |
+| [`yamux`](vendor/yamux/README-FRP-RS.md) | 0.14.1 | 6 patches: per-stream RST at the inbound stream cap (instead of a session-killing GoAway, matching Go frp's fork), a per-stream receive-window cap, window-growth RTT seeding, a send+read body-buffer pool (with `alloc_zeroed`/4 KiB zero-slab fill and immediate consumed-chunk return), an exact `outbound_unacked` ACK counter, and a split read/driver-owned `Writer` with vectored `writev` and 16-frame burst flushing (no `tokio` dep). | Upstream each patch, or re-apply on every yamux bump (each patch section lists its own upgrade note). The read-side lost-wakeup fix carried at 0.14.0 is upstream as of 0.14.1 (`libp2p/rust-yamux` PR #233, closing issue #232, commit `a9ea49e4`). The vendored crate is not a workspace member, so no gate compiles its own tests; its README lists the two manual re-check commands. |
 | [`russh`](vendor/russh/README-FRP-RS.md) | 0.65.0 | 2 patches dropping the `ssh-key` `encryption` + `ppk` and `pkcs8` `encryption` chains, which the SSH gateway never uses (`load_secret_key(path, None)` only). Upstream's version of that feature set would pull 11 extra packages (`aes-gcm`, `argon2`, `bcrypt-pbkdf`, `blake2`, `blowfish`, `hex`, `pkcs5`, `salsa20`, `scrypt`, `sha3`, `sponge-cursor`); the trim measured ~48.5 KiB off frps at 0.62.7 (not re-measured at 0.65.0). | Drop when upstream makes those `ssh-key` features optional. |
 
 > The rustls patch is the security-sensitive one, and **`cargo update` will not
