@@ -183,33 +183,37 @@ read the paragraph below for KCP streams).
 Method, host details, the retractions and the limits:
 [`docs/archive/notes/2026-11-10-real-host-throughput.md`](docs/archive/notes/2026-11-10-real-host-throughput.md).
 
-**Not every shape is faster.** On bulk KCP streams — one to four flows of a
-2048 MiB one-way transfer over loopback, `tcpMux` and TLS on, measured with the
-default worker pool on a four-vCPU VM — frp-rs moves 65-66 MiB/s where Go moves
-99-102, at about 1.5× the CPU per byte (69 against 45 CPU-seconds per
-2048 MiB), while KCP's small-payload latency is far better
-(394 round trips/s against 40 — a different harness and host, so direction
-only). That gap was 49 versus 103 when it was first measured: the AVX2 parity
-pass, one `sendmmsg` per flush and tick, filling segments before sending them,
-one `recvmmsg` per wakeup, one flush per batch of writes, and a 1400-byte MTU
-(matching kcp-go) have closed part of it. The rest is per-packet cost: frp-rs
-sends 1.06× Go's datagrams (568k against 535k per 512 MiB), and most of the
-remainder is one ack datagram per write (74k against Go's 18k) — batching those
-to the tick was measured and costs 28% of throughput, so it stays.
+**KCP transport.** On the same 4-vCPU Linux 6.12 VM (loopback, 8 streams,
+one-way `frp-stress stream`, default 10+3 Reed-Solomon FEC, TLS enabled):
 
-The rest was the runtime, not KCP: task migration between worker threads was the
-limiter. Both binaries now default to one worker per CPU, like Go's `GOMAXPROCS`,
-because each bridged connection runs on one thread; pinning a client to a single
-worker (`transport.workerThreads = 1`) is still the right choice for one fat
-tunnel on a busy machine, where the same 2048 MiB stream runs at
-**89.7-91.2 MiB/s** instead of 65.5-66.6 — +37%, with 28% less CPU. One worker on
-**both** ends reaches 111.8 against Go's 99-102. The key is restart-only; see
-[`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md),
-[`docs/archive/notes/2026-11-16-worker-thread-default.md`](docs/archive/notes/2026-11-16-worker-thread-default.md)
-and the runtime-tuning paragraph in [`docs/deployment.md`](docs/deployment.md).
-The numbers, the evidence that separates them and the unestablished part are in
-[`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md`](docs/archive/notes/2026-11-11-kcp-stream-vs-go.md);
-a per-session affinity design that would keep both properties is a tracked TODO.
+| KCP configuration | frp-rs | Go frp v0.72.0 | frp-rs lead |
+|---|---|---|---|
+| **`KCP + TLS + tcpMux`** (mean of 3 interleaved 8 s runs) | **222.5 MiB/s** (`103.9 MiB/CPU-s`) | 131.0 MiB/s (`51.9 MiB/CPU-s`) | **+70% throughput, 2.0× efficiency** |
+| `KCP + TLS`, `tcpMux = false` (6 s) | **369.2 MiB/s** (`166.7 MiB/CPU-s`) | 106.2 MiB/s (`42.5 MiB/CPU-s`) | **3.5× throughput, 3.9× efficiency** |
+| 64 B ping-pong steady RTT (`tcpMux` + TLS, 4 × 1,500) | **p50 0.45 ms / p99 1.50 ms** | p50 20.38 ms / p99 21.44 ms | **45× lower p50, 14× lower p99** |
+
+What moved KCP from its original 49–66 MiB/s baseline to >220 MiB/s with zero
+loopback `RcvbufErrors`:
+- **Linux UDP GSO (`UDP_SEGMENT`) + UDP GRO (`UDP_GRO`)**: coalesces up to 44
+  equal-length KCP/FEC datagrams (~62 KiB) per `sendmsg`/`recvmmsg` with zero
+  extra user-space copy, cutting kernel UDP sends by ~76% and eliminating
+  per-packet `skb_segment` / netfilter overhead (automatic fallback to
+  `sendmmsg`/`recvmmsg` on older kernels and non-Linux hosts; 100%
+  wire-compatible with Go `frp` v0.72.0 — measured 181.7 MiB/s `frp-rs → Go`
+  and 119.5 MiB/s `Go → frp-rs`).
+- **Zero-allocation hot path & SIMD FEC**: separated 64 KiB stream-chunk and
+  ~1.5 KiB datagram buffer pools, pre-allocated reusable FEC shard cache with
+  in-place parity encoding, AVX2 (x86_64) and NEON (aarch64) GF(2^8) nibble
+  tables, `Kcp::flush()` fast-path scan skip, zero-copy `send_carry` middle
+  slices, 4 MiB UDP socket buffers, and batch-cached monotonic timestamps.
+- **Caveats**: the GSO/GRO speedup is largest on Linux loopback and
+  GSO/GRO-capable NICs; on WAN links throughput is bounded by physical
+  bandwidth and the 10+3 FEC overhead (~23% parity). Historical KCP tuning
+  notes and runtime worker-thread trade-offs live in
+  [`docs/archive/notes/2026-11-11-kcp-stream-vs-go.md`](docs/archive/notes/2026-11-11-kcp-stream-vs-go.md),
+  [`docs/archive/notes/2026-11-12-worker-thread-count.md`](docs/archive/notes/2026-11-12-worker-thread-count.md),
+  [`docs/archive/notes/2026-11-16-worker-thread-default.md`](docs/archive/notes/2026-11-16-worker-thread-default.md),
+  and [`docs/deployment.md`](docs/deployment.md).
 
 [coalesce]: docs/archive/notes/2026-11-09-yamux-inline-write.md
 [udp-reply]: docs/archive/notes/2026-11-08-udp-spare-reuse.md

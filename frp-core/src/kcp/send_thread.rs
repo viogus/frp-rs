@@ -215,7 +215,32 @@ impl SenderPool {
 }
 
 fn run(rx: &Receiver<SendJob>) {
-    while let Ok(job) = rx.recv() {
+    // 1-slot lookahead so we can coalesce consecutive queued runs aimed at the
+    // exact same `(socket, peer)` into a single GSO / `sendmmsg` batch without
+    // ever reordering jobs across sockets or peers.
+    let mut deferred: Option<SendJob> = None;
+    loop {
+        let mut job = match deferred.take() {
+            Some(j) => j,
+            None => match rx.recv() {
+                Ok(j) => j,
+                Err(_) => break,
+            },
+        };
+        const MAX_COALESCED_PACKETS: usize = 128;
+        while job.packets.len() < MAX_COALESCED_PACKETS {
+            match rx.try_recv() {
+                Ok(next) => {
+                    if Arc::ptr_eq(&next.socket, &job.socket) && next.peer == job.peer {
+                        job.packets.extend(next.packets);
+                    } else {
+                        deferred = Some(next);
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         send_run_blocking(&job.socket, &job.pool, job.peer, job.packets);
     }
 }
@@ -244,8 +269,13 @@ fn send_run_blocking(
         }
         // Nothing went out: either the buffer is full (wait for room) or this
         // packet cannot be sent at all (drop it, or a poisoned address would
-        // spin here forever).
-        match socket.try_send_to(&remaining[0], peer) {
+        // spin here forever). On Linux use raw non-blocking `sendto` so the
+        // sender thread never mutates Tokio's `ScheduledIo` readiness bits.
+        #[cfg(target_os = "linux")]
+        let single_res = KcpSocket::send_udp_one(socket, &remaining[0], peer);
+        #[cfg(not(target_os = "linux"))]
+        let single_res = socket.try_send_to(&remaining[0], peer);
+        match single_res {
             Ok(_) => {
                 let pkt = remaining.remove(0);
                 chunk_pool_push(pool, pkt);

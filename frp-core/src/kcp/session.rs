@@ -169,7 +169,12 @@ pub struct KcpSession {
     /// retransmission will NOT recover it.
     pending_read: Option<Vec<u8>>,
     /// Inter-packet FEC: pending data shard RS payloads (SIZE + raw KCP data).
+    /// Reusable data-shard buffers accumulated for the current FEC group.
+    /// Pre-allocated with `data_shards` slots when FEC is enabled; `pending_shard_count`
+    /// tracks how many slots are populated so each group incurs zero heap allocations.
     pending_shards: Vec<Vec<u8>>,
+    /// Number of populated slots in `pending_shards` (`0..=config.data_shards`).
+    pending_shard_count: usize,
     /// Bytes held back because they do not fill a whole KCP segment.
     ///
     /// `send_carry` sends only whole `mss`-sized segments and keeps the
@@ -282,6 +287,13 @@ impl KcpSession {
         // sent immediately) — no action needed.
 
         let alive = Arc::new(AtomicBool::new(true));
+        let pending_shards = if fec.is_some() {
+            (0..config.data_shards)
+                .map(|_| Vec::with_capacity(config.mtu + 2))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         Self {
             conv,
@@ -302,7 +314,8 @@ impl KcpSession {
             data_window_bytes: 0,
             shutdown: false,
             pending_read: None,
-            pending_shards: Vec::new(),
+            pending_shards,
+            pending_shard_count: 0,
             carry: Vec::new(),
             pending_max_size: 0,
             alive,
@@ -449,48 +462,72 @@ impl KcpSession {
                 raw[6..8].copy_from_slice(&(2u16 + payload_len as u16).to_le_bytes());
                 self.fec_seqid = self.fec_seqid.wrapping_add(1);
 
-                // Buffer for parity generation. The parity-input row
-                // (SIZE + payload = raw[6..]) must outlive the datagram —
-                // the chunk is sent and recycled this tick while the RS
-                // group only completes once data_shards have accumulated
-                // across ticks — so the row keeps its persistence copy.
-                let rs_data = raw[6..].to_vec();
-                let rs_len = rs_data.len();
-                self.pending_shards.push(rs_data);
+                // Buffer for parity generation into a pre-allocated reusable slot
+                // (zero heap allocation per data shard). The parity-input row
+                // (SIZE + payload = raw[6..]) must outlive the datagram because
+                // the chunk is sent and recycled this tick while the RS group
+                // completes once `data_shards` have accumulated.
+                let slot = &mut self.pending_shards[self.pending_shard_count];
+                slot.clear();
+                slot.extend_from_slice(&raw[6..]);
+                let rs_len = slot.len();
+                self.pending_shard_count += 1;
                 self.pending_max_size = self.pending_max_size.max(rs_len);
 
                 // Emit the data shard (the pooled chunk itself).
                 self.packets.push(raw);
 
-                // When we have dataShards collected, generate parity.
-                if self.pending_shards.len() == self.config.data_shards {
+                // When we have dataShards collected, generate parity directly into
+                // pooled datagram buffers (zero heap allocations per FEC group).
+                if self.pending_shard_count == self.config.data_shards {
                     let max_size = self.pending_max_size;
+                    let n = self.config.data_shards;
+                    let p = self.config.parity_shards;
 
                     // Pad all data shard RS payloads to equal length.
-                    for shard in &mut self.pending_shards {
+                    for shard in &mut self.pending_shards[..n] {
                         shard.resize(max_size, 0);
                     }
 
-                    let n = self.pending_shards.len();
-                    let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n);
-                    shard_refs.extend(self.pending_shards.iter().map(Vec::as_slice));
-                    // Compute only parity shards — data shard wire packets were
-                    // already emitted above, so the data-shard copies that
-                    // `encode` would produce are discarded immediately.
-                    let parity_shards = fec.encode_parity(&shard_refs[..n]);
-
-                    // Output parity shards (data shards already sent). Parity
-                    // packets keep their existing allocation behavior.
-                    for parity in &parity_shards {
-                        let mut packet = Vec::with_capacity(FEC_HEADER_SIZE + parity.len());
+                    // Allocate pooled output buffers with 6-byte FEC header + zeroed
+                    // `max_size` parity payload, then encode directly into them.
+                    let start_idx = self.packets.len();
+                    for _ in 0..p {
+                        let mut packet = chunk_pool_pop(&self.pool, FEC_HEADER_SIZE + max_size);
+                        packet.clear();
                         packet.extend_from_slice(&self.fec_seqid.to_le_bytes());
                         packet.extend_from_slice(&TYPE_PARITY.to_le_bytes());
-                        packet.extend_from_slice(parity);
+                        packet.resize(FEC_HEADER_SIZE + max_size, 0);
                         self.packets.push(packet);
                         self.fec_seqid = self.fec_seqid.wrapping_add(1);
                     }
 
-                    self.pending_shards.clear();
+                    // Fast stack-slice path for standard configs (e.g. 10+3).
+                    if n <= 16 && p <= 8 {
+                        let mut shard_refs: [&[u8]; 16] = [&[]; 16];
+                        for (i, s) in self.pending_shards[..n].iter().enumerate() {
+                            shard_refs[i] = s.as_slice();
+                        }
+                        let mut parity_refs: [&mut [u8]; 8] = Default::default();
+                        for (i, pkt) in self.packets[start_idx..start_idx + p]
+                            .iter_mut()
+                            .enumerate()
+                        {
+                            parity_refs[i] = &mut pkt[FEC_HEADER_SIZE..];
+                        }
+                        fec.encode_parity_into(&shard_refs[..n], &mut parity_refs[..p]);
+                    } else {
+                        let shard_refs: Vec<&[u8]> =
+                            self.pending_shards[..n].iter().map(Vec::as_slice).collect();
+                        let mut parity_refs: Vec<&mut [u8]> = self.packets
+                            [start_idx..start_idx + p]
+                            .iter_mut()
+                            .map(|pkt| &mut pkt[FEC_HEADER_SIZE..])
+                            .collect();
+                        fec.encode_parity_into(&shard_refs, &mut parity_refs);
+                    }
+
+                    self.pending_shard_count = 0;
                     self.pending_max_size = 0;
                 }
             }
@@ -584,36 +621,46 @@ impl KcpSession {
         if data.is_empty() {
             return Ok(false);
         }
-        if self.carry.is_empty() && data.len() < mss {
-            self.send_chunked(data)?;
+        if self.carry.is_empty() {
+            if data.len() < mss {
+                self.send_chunked(data)?;
+                return Ok(true);
+            }
+            let full = (data.len() / mss) * mss;
+            self.send_chunked(&data[..full])?;
+            self.carry.extend_from_slice(&data[full..]);
             return Ok(true);
         }
 
-        self.carry.extend_from_slice(data);
-        let full = self.carry.len() / mss * mss;
-        if full == 0 {
+        // `self.carry` holds a trailing partial segment (< mss). Top up ONLY
+        // `need` bytes to complete that single segment, then pass the middle
+        // full-MSS runs of `data` directly to `send_chunked` without copying
+        // the entire 64 KiB payload through `self.carry`.
+        let need = mss.saturating_sub(self.carry.len());
+        if data.len() < need {
+            self.carry.extend_from_slice(data);
             return Ok(false);
         }
 
+        self.carry.extend_from_slice(&data[..need]);
         let mut buf = std::mem::take(&mut self.carry);
-        match self.send_chunked(&buf[..full]) {
-            Ok(_) => {
-                // Keep the tail for the next write; capacity is reused.
-                buf.copy_within(full.., 0);
-                buf.truncate(buf.len().saturating_sub(full));
-                self.carry = buf;
-                Ok(true)
-            }
-            Err(e) => {
-                // Nothing left the session: keep every byte so a later flush
-                // retries instead of silently dropping a prefix. Unreachable
-                // today (`send_chunked` splits at 127*mss and `send` only
-                // rejects `count >= KCP_WND_RCV`), but the carry is the one
-                // place where a dropped byte would corrupt the stream.
-                self.carry = buf;
-                Err(e)
-            }
+        let carry_full = (buf.len() / mss) * mss;
+        if let Err(e) = self.send_chunked(&buf[..carry_full]) {
+            buf.extend_from_slice(&data[need..]);
+            self.carry = buf;
+            return Err(e);
         }
+        buf.copy_within(carry_full.., 0);
+        buf.truncate(buf.len() - carry_full);
+        self.carry = buf;
+
+        let rest = &data[need..];
+        let full = (rest.len() / mss) * mss;
+        if full > 0 {
+            self.send_chunked(&rest[..full])?;
+        }
+        self.carry.extend_from_slice(&rest[full..]);
+        Ok(true)
     }
 
     /// Send the held-back tail, if any. Called from the 10 ms tick (so a

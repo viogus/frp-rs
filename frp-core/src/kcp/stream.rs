@@ -62,11 +62,10 @@ pub struct KcpStream {
     /// construction, decremented on drop: the dial driver self-exits once
     /// the last stream is gone and no registrations can arrive.
     alive_streams: Arc<AtomicUsize>,
-    /// Recycled write-chunk pool shared with the KcpSocket driver (see
-    /// KcpSocketHandle::chunk_pool). poll_write pops a chunk here instead
-    /// of allocating a fresh Vec per bridge write; the driver returns
-    /// chunks once the session has segmented them. Bounded by CHUNK_POOL_CAP.
+    /// Recycled write-chunk pool shared with the KcpSocket driver (64 KiB bridge writes).
     chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
+    /// Recycled ~1.5 KiB read-segment pool shared with KcpSession::recv_and_push.
+    read_pool: Arc<ArrayQueue<Vec<u8>>>,
 }
 
 impl KcpStream {
@@ -79,6 +78,7 @@ impl KcpStream {
         write_backlog: Arc<AtomicUsize>,
         write_notify: Arc<Notify>,
         chunk_pool: Arc<ArrayQueue<Vec<u8>>>,
+        read_pool: Arc<ArrayQueue<Vec<u8>>>,
         snd_backlog: Arc<AtomicUsize>,
         snd_notify: Arc<Notify>,
         session_alive: Arc<AtomicBool>,
@@ -104,6 +104,7 @@ impl KcpStream {
             write_notify,
             backpressure_fut: None,
             chunk_pool,
+            read_pool,
             snd_backlog,
             snd_notify,
             session_alive,
@@ -131,7 +132,7 @@ impl Drop for KcpStream {
         // returned. The allocation is wasted either way once the connection
         // is gone; this just lets the pool reuse it.
         if !self.read_buffer.is_empty() {
-            chunk_pool_push(&self.chunk_pool, std::mem::take(&mut self.read_buffer));
+            chunk_pool_push(&self.read_pool, std::mem::take(&mut self.read_buffer));
         }
         // Release the socket driver's liveness signal: the dial driver
         // self-exits once the last stream is dropped and no registrations
@@ -170,7 +171,7 @@ impl AsyncRead for KcpStream {
                 // keeping it at the old length with an empty buffer would
                 // make `0 <= read_pos <= len` false.
                 self.read_pos = 0;
-                chunk_pool_push(&self.chunk_pool, drained);
+                chunk_pool_push(&self.read_pool, drained);
             }
         }
 
@@ -216,7 +217,7 @@ impl AsyncRead for KcpStream {
                     // allocating on every delivered message. The pool
                     // clears on return, so no stale bytes can leak into a
                     // later message.
-                    chunk_pool_push(&self.chunk_pool, data);
+                    chunk_pool_push(&self.read_pool, data);
                 }
                 Poll::Ready(None) => {
                     if filled > 0 {
@@ -528,6 +529,7 @@ mod tests {
             read_rx,
             Arc::new(AtomicUsize::new(1)),
             Arc::new(Notify::new()),
+            Arc::new(ArrayQueue::new(8)),
             Arc::new(ArrayQueue::new(8)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(Notify::new()),

@@ -262,7 +262,7 @@ pub async fn dial_kcp_with_driver(
         remote,
         config.clone(),
         read_tx,
-        handle.chunk_pool.clone(),
+        handle.datagram_pool.clone(),
     );
     let alive_handle = session.alive_handle();
     // Share the session's send-queue backlog counter with the stream so
@@ -311,6 +311,7 @@ pub async fn dial_kcp_with_driver(
             handle.write_backlog.clone(),
             handle.write_notify.clone(),
             handle.chunk_pool.clone(),
+            handle.datagram_pool.clone(),
             snd_backlog,
             snd_notify,
             alive_handle,
