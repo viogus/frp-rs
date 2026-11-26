@@ -496,7 +496,7 @@ impl KcpSocket {
         let count = slots.len().min(RECV_BATCH);
         let mut rounds = 0;
         loop {
-            let got = {
+            let got_msgs = {
                 let socket = &self.socket;
                 match socket.try_io(Interest::READABLE, || {
                     recv_datagrams_into(socket, slots, recv_batch)
@@ -509,18 +509,23 @@ impl KcpSocket {
                     }
                 }
             };
-            for idx in 0..got {
-                let (slot, len, src) = recv_batch.out[idx];
-                self.handle_datagram(&slots[slot][..len], src).await;
+            // Sample the monotonic clock ONCE per `recvmmsg` batch instead of
+            // once per datagram (saves ~1% total CPU in `__vdso_clock_gettime`).
+            let now_ms = self.start.elapsed().as_millis() as u32;
+            let n_pkts = recv_batch.out.len();
+            for idx in 0..n_pkts {
+                let (slot, off, len, src) = recv_batch.out[idx];
+                self.handle_datagram(&slots[slot][off..off + len], src, now_ms)
+                    .await;
             }
             rounds += 1;
-            if !another_drain_round(got, count, rounds) {
+            if !another_drain_round(got_msgs, count, rounds) {
                 return;
             }
         }
     }
 
-    async fn handle_datagram(&mut self, data: &[u8], src: SocketAddr) {
+    async fn handle_datagram(&mut self, data: &[u8], src: SocketAddr, now_ms: u32) {
         if data.is_empty() {
             return;
         }
@@ -538,7 +543,6 @@ impl KcpSocket {
                 // Any inbound activity disproves idleness:
                 // stamp for the accepted-session reaper
                 // (M11) before delivering the data.
-                let now_ms = self.start.elapsed().as_millis() as u32;
                 session.note_inbound(now_ms, data.len());
                 // Deliver received data to the stream
                 // immediately instead of waiting for the
@@ -788,10 +792,18 @@ impl KcpSocket {
         // Batch receive buffers: one `recvmmsg` fills as many as are queued,
         // so the driver pays one syscall for a burst of datagrams instead of
         // one per packet (the recv counterpart of `send_udp_batch`).
-        let mut recv_slots: Vec<Vec<u8>> = (0..RECV_BATCH)
-            .map(|_| vec![0u8; DRIVER_RECV_BUF_SIZE])
-            .collect();
-        let mut recv_batch = RecvBatch::new();
+        // On Linux, enable `UDP_GRO` so GSO super-packets arrive unsegmented
+        // in one skb (up to 64 KiB) instead of triggering kernel `skb_segment`
+        // + 44 separate `udp_recvmsg`/`__slab_free` calls. Fall back to 32 ×
+        // 1500 B slots on kernels without `UDP_GRO` or non-Linux targets.
+        let gro_enabled = enable_udp_gro(&self.socket);
+        let (slot_count, slot_size) = if gro_enabled {
+            (GRO_RECV_BATCH, DRIVER_GRO_BUF_SIZE)
+        } else {
+            (RECV_BATCH, DRIVER_RECV_BUF_SIZE)
+        };
+        let mut recv_slots: Vec<Vec<u8>> = (0..slot_count).map(|_| vec![0u8; slot_size]).collect();
+        let mut recv_batch = RecvBatch::new(gro_enabled);
 
         loop {
             tokio::select! {
@@ -1601,30 +1613,82 @@ impl KcpSocket {
     }
 }
 
-/// Datagrams per `recvmmsg` call.
+/// Datagrams per `recvmmsg` call when `UDP_GRO` is off.
 const RECV_BATCH: usize = 32;
+
+/// Slots per `recvmmsg` call when Linux `UDP_GRO` is active (each slot holds up
+/// to one 64 KiB GRO super-packet, i.e. up to ~44 KCP datagrams per slot).
+const GRO_RECV_BATCH: usize = 8;
+
+/// Receive buffer size per slot when Linux `UDP_GRO` is active (64 KiB).
+const DRIVER_GRO_BUF_SIZE: usize = 65_536;
+
+/// Linux `SOL_UDP` option for UDP Generic Receive Offload (kernel >= 5.0).
+#[cfg(target_os = "linux")]
+const UDP_GRO: libc::c_int = 104;
+
+/// Enable Linux `UDP_GRO` on `socket`. Returns `true` if the kernel accepted
+/// the option (caller must then provide `DRIVER_GRO_BUF_SIZE` receive buffers).
+#[cfg(target_os = "linux")]
+fn enable_udp_gro(socket: &UdpSocket) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let enable: libc::c_int = 1;
+    // SAFETY: `enable` is a valid `c_int` and `socket` owns a live UDP fd.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_UDP,
+            UDP_GRO,
+            (&enable as *const libc::c_int).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        true
+    } else {
+        tracing::debug!(
+            error = %io::Error::last_os_error(),
+            "KCP: UDP_GRO unsupported on this kernel, using standard recvmmsg"
+        );
+        false
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn enable_udp_gro(_socket: &UdpSocket) -> bool {
+    false
+}
 
 /// Reusable scratch storage for `recvmmsg` / `recv_from`, allocated once per
 /// driver loop instead of allocating 4 heap `Vec`s + zeroing 6 KiB per syscall.
 struct RecvBatch {
+    #[cfg(target_os = "linux")]
+    gro_enabled: bool,
     #[cfg(target_os = "linux")]
     iovecs: [libc::iovec; RECV_BATCH],
     #[cfg(target_os = "linux")]
     names: [libc::sockaddr_storage; RECV_BATCH],
     #[cfg(target_os = "linux")]
     msgs: [libc::mmsghdr; RECV_BATCH],
-    out: Vec<(usize, usize, SocketAddr)>,
+    /// 8-byte-aligned control-message scratch buffers for `UDP_GRO` cmsgs.
+    #[cfg(target_os = "linux")]
+    cmsgs: [[u64; 8]; GRO_RECV_BATCH],
+    /// Decoded `(slot_idx, byte_offset, byte_len, src)` tuples for this batch.
+    out: Vec<(usize, usize, usize, SocketAddr)>,
 }
 
 // SAFETY: `RecvBatch` is owned exclusively by a single driver task. The raw
 // pointers inside `iovecs` and `msgs` are freshly initialized from `slots` and
-// `self.names`/`self.iovecs` immediately before each synchronous `recvmmsg`
-// call and are never dereferenced across `.await` points.
+// `self.names`/`self.iovecs`/`self.cmsgs` immediately before each synchronous
+// `recvmmsg` call and are never dereferenced across `.await` points.
 unsafe impl Send for RecvBatch {}
 
 impl RecvBatch {
-    fn new() -> Self {
+    fn new(#[allow(unused_variables)] gro_enabled: bool) -> Self {
         Self {
+            #[cfg(target_os = "linux")]
+            gro_enabled,
             #[cfg(target_os = "linux")]
             iovecs: [libc::iovec {
                 iov_base: std::ptr::null_mut(),
@@ -1635,13 +1699,16 @@ impl RecvBatch {
             names: unsafe { std::mem::zeroed() },
             #[cfg(target_os = "linux")]
             msgs: unsafe { std::mem::zeroed() },
-            out: Vec::with_capacity(RECV_BATCH),
+            #[cfg(target_os = "linux")]
+            cmsgs: [[0u64; 8]; GRO_RECV_BATCH],
+            out: Vec::with_capacity(64),
         }
     }
 }
 
-/// Receive every datagram the socket has queued, up to `slots.len()`, writing
-/// `(slot_idx, len, src)` into `batch.out` and returning `batch.out.len()`.
+/// Receive every datagram (or GRO super-packet) the socket has queued, up to
+/// `slots.len()`, writing `(slot_idx, offset, len, src)` into `batch.out` and
+/// returning the number of kernel messages filled (`rc`).
 #[cfg(target_os = "linux")]
 fn recv_datagrams_into(
     socket: &UdpSocket,
@@ -1651,11 +1718,17 @@ fn recv_datagrams_into(
     use std::os::fd::AsRawFd;
 
     batch.out.clear();
-    let count = slots.len().min(RECV_BATCH);
+    let max_slots = if batch.gro_enabled {
+        GRO_RECV_BATCH
+    } else {
+        RECV_BATCH
+    };
+    let count = slots.len().min(max_slots);
     if count == 0 {
         return Ok(0);
     }
     let namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let cmsg_cap = std::mem::size_of::<[u64; 8]>();
     for idx in 0..count {
         batch.iovecs[idx] = libc::iovec {
             iov_base: slots[idx].as_mut_ptr().cast(),
@@ -1665,14 +1738,19 @@ fn recv_datagrams_into(
         batch.msgs[idx].msg_hdr.msg_iovlen = 1;
         batch.msgs[idx].msg_hdr.msg_name = std::ptr::addr_of_mut!(batch.names[idx]).cast();
         batch.msgs[idx].msg_hdr.msg_namelen = namelen;
-        batch.msgs[idx].msg_hdr.msg_control = std::ptr::null_mut();
-        batch.msgs[idx].msg_hdr.msg_controllen = 0;
+        if batch.gro_enabled {
+            batch.msgs[idx].msg_hdr.msg_control = batch.cmsgs[idx].as_mut_ptr().cast();
+            batch.msgs[idx].msg_hdr.msg_controllen = cmsg_cap as _;
+        } else {
+            batch.msgs[idx].msg_hdr.msg_control = std::ptr::null_mut();
+            batch.msgs[idx].msg_hdr.msg_controllen = 0;
+        }
         batch.msgs[idx].msg_hdr.msg_flags = 0;
         batch.msgs[idx].msg_len = 0;
     }
     // SAFETY: `batch` outlives the call and each `msg_hdr` points at its own
-    // entry in `batch.iovecs`/`batch.names`; the kernel writes at most one
-    // datagram per message, bounded by the slot's length.
+    // entry in `batch.iovecs`/`batch.names`/`batch.cmsgs`; the kernel writes at
+    // most one message per slot, bounded by the slot's length.
     let rc = unsafe {
         libc::recvmmsg(
             socket.as_raw_fd(),
@@ -1691,9 +1769,34 @@ fn recv_datagrams_into(
             Some(addr) => addr,
             None => continue,
         };
-        batch.out.push((idx, len, src));
+        let mut gso_size = 0usize;
+        if batch.gro_enabled && batch.msgs[idx].msg_hdr.msg_controllen > 0 {
+            // SAFETY: `msg_control` was populated by the kernel in `recvmmsg`
+            // within `batch.cmsgs[idx]`; walk cmsgs with standard macros.
+            unsafe {
+                let mut cmsg = libc::CMSG_FIRSTHDR(&batch.msgs[idx].msg_hdr);
+                while !cmsg.is_null() {
+                    if (*cmsg).cmsg_level == libc::SOL_UDP && (*cmsg).cmsg_type == UDP_GRO {
+                        gso_size =
+                            std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<u16>()) as usize;
+                        break;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(&batch.msgs[idx].msg_hdr, cmsg);
+                }
+            }
+        }
+        if gso_size > 0 && gso_size < len {
+            let mut off = 0usize;
+            while off < len {
+                let seg_len = (len - off).min(gso_size);
+                batch.out.push((idx, off, seg_len, src));
+                off += seg_len;
+            }
+        } else {
+            batch.out.push((idx, 0, len, src));
+        }
     }
-    Ok(batch.out.len())
+    Ok(rc as usize)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1709,7 +1812,7 @@ fn recv_datagrams_into(
     };
     match socket.try_recv_from(slot) {
         Ok((len, src)) => {
-            batch.out.push((0, len, src));
+            batch.out.push((0, 0, len, src));
             Ok(1)
         }
         Err(e) => Err(e),
@@ -1721,9 +1824,13 @@ fn recv_datagrams(
     socket: &UdpSocket,
     slots: &mut [Vec<u8>],
 ) -> io::Result<Vec<(usize, usize, SocketAddr)>> {
-    let mut batch = RecvBatch::new();
+    let mut batch = RecvBatch::new(false);
     recv_datagrams_into(socket, slots, &mut batch)?;
-    Ok(batch.out)
+    Ok(batch
+        .out
+        .into_iter()
+        .map(|(slot, _off, len, src)| (slot, len, src))
+        .collect())
 }
 
 /// Writes coalesced into one flush in the driver's write arm.
