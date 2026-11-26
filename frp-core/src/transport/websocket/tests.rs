@@ -1,4 +1,5 @@
 use super::*;
+use crate::transport::IoStream;
 
 #[test]
 fn ws_frame_cap_covers_v2_aead_overhead() {
@@ -1219,4 +1220,514 @@ async fn ws_server_mode_swallows_pong_and_reads_next_frame() {
         "pong must be swallowed, data frame delivered"
     );
     assert_eq!(&out[..n], data);
+}
+
+#[tokio::test]
+async fn ws_poll_write_vectored_emits_single_frame_and_handles_partial_drain() {
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWrite};
+
+    struct CountingVectoredSink {
+        chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+        max_per_call: usize,
+        vectored_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncRead for CountingVectoredSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for CountingVectoredSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let take = buf.len().min(self.max_per_call);
+            self.chunks.lock().unwrap().push(buf[..take].to_vec());
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.vectored_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut flat = Vec::new();
+            for s in bufs {
+                flat.extend_from_slice(s);
+            }
+            let take = flat.len().min(self.max_per_call);
+            self.chunks.lock().unwrap().push(flat[..take].to_vec());
+            Poll::Ready(Ok(take))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    // 1. Server mode (unmasked): yamux [12B hdr, 512B body] goes out as ONE
+    // vectored write with a single WS frame header (4 + 524 bytes).
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let vectored_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let sink = CountingVectoredSink {
+        chunks: chunks.clone(),
+        max_per_call: 4096,
+        vectored_calls: vectored_calls.clone(),
+    };
+    let mut ws = WsByteStream::from_raw(Box::new(sink), false);
+    assert!(Pin::new(&ws).is_write_vectored());
+
+    let hdr = [0x11u8; 12];
+    let body: Vec<u8> = (0..512u16).map(|i| (i & 0xff) as u8).collect();
+    let n = std::future::poll_fn(|cx| {
+        Pin::new(&mut ws).poll_write_vectored(cx, &[IoSlice::new(&hdr), IoSlice::new(&body)])
+    })
+    .await
+    .unwrap();
+    assert_eq!(n, 524);
+    assert_eq!(vectored_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    {
+        let recorded = chunks.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0][0], 0x82);
+        assert_eq!(recorded[0][1], 126);
+        assert_eq!(u16::from_be_bytes([recorded[0][2], recorded[0][3]]), 524);
+        assert_eq!(&recorded[0][4..16], &hdr);
+        assert_eq!(&recorded[0][16..], &body[..]);
+    }
+
+    // 2. Partial write across vectored call drains the remainder cleanly and
+    // decodes back identically in a peer WsByteStream.
+    let (client_io, server_io) = tokio::io::duplex(8192);
+    let mut partial_ws = WsByteStream::from_raw(
+        Box::new(CountingVectoredSink {
+            chunks: Arc::new(Mutex::new(Vec::new())),
+            max_per_call: 7,
+            vectored_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+        false,
+    );
+    let wrote = std::future::poll_fn(|cx| {
+        Pin::new(&mut partial_ws)
+            .poll_write_vectored(cx, &[IoSlice::new(&hdr), IoSlice::new(&body)])
+    })
+    .await
+    .unwrap();
+    assert_eq!(wrote, 524);
+
+    // 3. Client mode (masked): vectored write produces a single masked frame.
+    let mut client_ws = WsByteStream::from_raw(Box::new(client_io), true);
+    let mut peer_ws = WsByteStream::from_raw(Box::new(server_io), false);
+    let big_body: Vec<u8> = (0..5000u32).map(|i| ((i * 31) % 251) as u8).collect();
+    let written = std::future::poll_fn(|cx| {
+        Pin::new(&mut client_ws)
+            .poll_write_vectored(cx, &[IoSlice::new(&hdr), IoSlice::new(&big_body)])
+    })
+    .await
+    .unwrap();
+    assert_eq!(written, 5012);
+    let mut out = vec![0u8; 5012];
+    peer_ws.read_exact(&mut out).await.unwrap();
+    assert_eq!(&out[..12], &hdr);
+    assert_eq!(&out[12..], &big_body[..]);
+
+    // 4. Multi-slice coalescing stops at MAX_WS_FRAME_PAYLOAD so two 40 KiB
+    // slices do not produce an oversized frame that the peer decoder rejects.
+    let cap_chunks = Arc::new(Mutex::new(Vec::new()));
+    let mut cap_ws = WsByteStream::from_raw(
+        Box::new(CountingVectoredSink {
+            chunks: cap_chunks.clone(),
+            max_per_call: 256 * 1024,
+            vectored_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }),
+        false,
+    );
+    let s1 = vec![0xAAu8; 40_000];
+    let s2 = vec![0xBBu8; 40_000];
+    let cap_written = std::future::poll_fn(|cx| {
+        Pin::new(&mut cap_ws).poll_write_vectored(cx, &[IoSlice::new(&s1), IoSlice::new(&s2)])
+    })
+    .await
+    .unwrap();
+    assert_eq!(cap_written, MAX_WS_FRAME_PAYLOAD as usize);
+    let wire = cap_chunks.lock().unwrap();
+    assert_eq!(wire.len(), 1);
+    assert_eq!(wire[0][1] & 0x7f, 127);
+    let encoded_len = u64::from_be_bytes(wire[0][2..10].try_into().unwrap());
+    assert_eq!(encoded_len, MAX_WS_FRAME_PAYLOAD);
+}
+
+#[tokio::test]
+async fn ws_pipelined_multi_frame_reads_across_arbitrary_chunks() {
+    use tokio::io::AsyncReadExt;
+
+    struct TrickleReader {
+        data: Vec<u8>,
+        pos: usize,
+        step: usize,
+    }
+
+    impl AsyncRead for TrickleReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.pos >= self.data.len() {
+                return Poll::Ready(Ok(()));
+            }
+            let take = self
+                .step
+                .min(self.data.len() - self.pos)
+                .min(buf.remaining());
+            buf.put_slice(&self.data[self.pos..self.pos + take]);
+            self.pos += take;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for TrickleReader {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let p1 = b"alpha-";
+    let p2 = b"";
+    let p3: Vec<u8> = (0..2500u32).map(|i| (i % 199) as u8).collect();
+    let p4 = b"omega!";
+
+    let mut wire = Vec::new();
+    wire.extend_from_slice(&ws_masked_frame(p1));
+    wire.extend_from_slice(&ws_masked_control_frame(0x09, b"hb-ping"));
+    wire.extend_from_slice(&ws_masked_frame(p2));
+    wire.extend_from_slice(&ws_masked_frame(&p3));
+    wire.extend_from_slice(&ws_masked_control_frame(0x0a, b"hb-pong"));
+    wire.extend_from_slice(&ws_masked_frame(p4));
+
+    for step in [1usize, 3, 7, 13, 64, 4096] {
+        let trickle = TrickleReader {
+            data: wire.clone(),
+            pos: 0,
+            step,
+        };
+        let mut ws = WsByteStream::from_raw(Box::new(trickle), false);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(p1);
+        expected.extend_from_slice(&p3);
+        expected.extend_from_slice(p4);
+
+        let mut received = vec![0u8; expected.len()];
+        ws.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, expected, "mismatch for trickle step {step}");
+
+        // Next read sees EOF cleanly.
+        let mut tail = [0u8; 8];
+        let n = ws.read(&mut tail).await.unwrap();
+        assert_eq!(n, 0, "expected EOF for trickle step {step}");
+    }
+}
+
+/// Regression pin for tokio-rustls's 65536-byte `sendable_plaintext` cap:
+/// `Stream::poll_write_vectored` returns `Poll::Ready(Ok(65536))` for `[10B WS
+/// header, 65536B payload]` even though the socket did not block. `WsByteStream`
+/// must immediately drain the remaining 10 bytes in the same `poll_write` call
+/// instead of stashing them to `write_buf` and yielding `Poll::Pending`.
+#[test]
+fn ws_vectored_write_completes_64k_tls_capped_chunks_in_single_poll() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncWrite;
+
+    struct CappedVectoredSink {
+        wire: Arc<Mutex<Vec<u8>>>,
+        vectored_calls: Arc<AtomicUsize>,
+        cap: usize,
+    }
+
+    impl AsyncRead for CappedVectoredSink {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for CappedVectoredSink {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let take = buf.len().min(self.cap);
+            self.wire.lock().unwrap().extend_from_slice(&buf[..take]);
+            Poll::Ready(Ok(take))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.vectored_calls.fetch_add(1, Ordering::Relaxed);
+            let mut written = 0usize;
+            let mut guard = self.wire.lock().unwrap();
+            for slice in bufs {
+                if written >= self.cap {
+                    break;
+                }
+                let take = slice.len().min(self.cap - written);
+                guard.extend_from_slice(&slice[..take]);
+                written += take;
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    let wire = Arc::new(Mutex::new(Vec::new()));
+    let vectored_calls = Arc::new(AtomicUsize::new(0));
+    let sink = CappedVectoredSink {
+        wire: wire.clone(),
+        vectored_calls: vectored_calls.clone(),
+        cap: 65_536,
+    };
+    let mut ws = WsByteStream::from_raw(Box::new(sink), false);
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let payload: Vec<u8> = (0..65_536u32).map(|i| (i % 251) as u8).collect();
+
+    // Must finish in ONE poll_write call (Ready(Ok(65536))), draining all
+    // 65546 bytes across 2 vectored calls without stashing or yielding Pending.
+    match Pin::new(&mut ws).poll_write(&mut cx, &payload) {
+        Poll::Ready(Ok(n)) => assert_eq!(n, 65_536),
+        other => panic!("expected Poll::Ready(Ok(65536)), got {other:?}"),
+    }
+    assert_eq!(vectored_calls.load(Ordering::Relaxed), 2);
+    {
+        let recorded = wire.lock().unwrap();
+        assert_eq!(recorded.len(), 10 + 65_536);
+        assert_eq!(&recorded[..2], &[0x82, 127]);
+        assert_eq!(
+            u64::from_be_bytes(recorded[2..10].try_into().unwrap()),
+            65_536
+        );
+        assert_eq!(&recorded[10..], &payload[..]);
+    }
+
+    // Immediate follow-up write works cleanly without drain_completed/stash state.
+    match Pin::new(&mut ws).poll_write(&mut cx, b"next") {
+        Poll::Ready(Ok(n)) => assert_eq!(n, 4),
+        other => panic!("expected Poll::Ready(Ok(4)), got {other:?}"),
+    }
+    assert_eq!(vectored_calls.load(Ordering::Relaxed), 3);
+}
+
+/// Scripted inner stream: reads pop queued results (then stay `Pending`),
+/// writes record at most `limit` bytes per call.
+struct ScriptedIo {
+    reads: std::collections::VecDeque<io::Result<Vec<u8>>>,
+    written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    limit: usize,
+}
+
+impl AsyncRead for ScriptedIo {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.reads.pop_front() {
+            Some(Ok(data)) => {
+                buf.put_slice(&data);
+                Poll::Ready(Ok(()))
+            }
+            Some(Err(e)) => Poll::Ready(Err(e)),
+            None => Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for ScriptedIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let n = buf.len().min(self.limit);
+        self.written.lock().unwrap().extend_from_slice(&buf[..n]);
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// A stashed Pong reply (including a partial tail whose first byte has low
+/// nibble `0x08`) must be drained by `poll_shutdown` WITHOUT counting as the
+/// Close frame, and a 1-/2-/3-byte partial Close write must finish cleanly
+/// without looping or duplicating Close frames.
+#[test]
+fn ws_shutdown_sends_close_after_stashed_pong() {
+    for limit in [1usize, 2, 3] {
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut ws = WsByteStream::from_raw(
+            Box::new(ScriptedIo {
+                reads: Default::default(),
+                written: written.clone(),
+                limit,
+            }),
+            false,
+        );
+        // Simulate a stashed Pong tail starting with `b'H'` (0x48, low nibble 0x08).
+        ws.pending_control_write = vec![b'H', b'i'];
+        ws.pending_control_pos = 0;
+        ws.pending_control_is_close = false;
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut polls = 0usize;
+        loop {
+            polls += 1;
+            assert!(polls < 32, "poll_shutdown looped for limit={limit}");
+            match Pin::new(&mut ws).poll_shutdown(&mut cx) {
+                Poll::Ready(Ok(())) => break,
+                Poll::Ready(Err(e)) => panic!("shutdown failed: {e}"),
+                Poll::Pending => {}
+            }
+        }
+        assert_eq!(
+            *written.lock().unwrap(),
+            vec![b'H', b'i', 0x88, 0x02, 0x03, 0xe8],
+            "limit={limit}: Pong tail drains first, then Close is sent exactly once"
+        );
+    }
+}
+
+/// An inner read error that arrives after payload bytes were already
+/// delivered must surface as an error, never as a clean EOF.
+#[tokio::test]
+async fn ws_read_error_after_partial_payload_is_not_clean_eof() {
+    let frame = ws_masked_frame(&[7u8; 10]);
+    let head_and_part = frame[..10].to_vec();
+    let mut ws = WsByteStream::from_raw(
+        Box::new(ScriptedIo {
+            reads: vec![
+                Ok(head_and_part),
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset")),
+            ]
+            .into(),
+            written: Default::default(),
+            limit: usize::MAX,
+        }),
+        false,
+    );
+    let mut got = 0usize;
+    let err = loop {
+        let mut raw = [0u8; 64];
+        let mut rb = ReadBuf::new(&mut raw);
+        match std::future::poll_fn(|cx| Pin::new(&mut ws).poll_read(cx, &mut rb)).await {
+            Ok(()) => {
+                assert!(!rb.filled().is_empty(), "clean EOF after a mid-frame reset");
+                got += rb.filled().len();
+            }
+            Err(e) => break e,
+        }
+    };
+    assert_eq!(got, 4);
+    assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+}
+
+/// If a peer sends an inbound Close frame and the Close reply takes multiple
+/// polls to drain from `pending_control_write`, `poll_read` must return EOF
+/// immediately once the reply drains rather than reading further frames.
+#[test]
+fn ws_read_close_reply_partial_write_then_eof() {
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let close_frame = ws_masked_control_frame(0x08, &[0x03, 0xe8]);
+    let trailing_data = ws_masked_frame(b"should-not-be-read");
+    let mut combined = close_frame;
+    combined.extend_from_slice(&trailing_data);
+
+    let mut ws = WsByteStream::from_raw(
+        Box::new(ScriptedIo {
+            reads: vec![Ok(combined)].into(),
+            written: written.clone(),
+            limit: 2, // 4-byte server Close reply takes 2 writes
+        }),
+        false,
+    );
+    let waker = futures_util::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    let mut out = [0u8; 64];
+
+    // First poll writes 2 of 4 reply bytes and parks with Pending.
+    let mut rb1 = ReadBuf::new(&mut out);
+    assert!(matches!(
+        Pin::new(&mut ws).poll_read(&mut cx, &mut rb1),
+        Poll::Pending
+    ));
+    assert!(rb1.filled().is_empty());
+
+    // Second poll finishes draining the Close reply and returns clean EOF
+    // without touching the trailing data frame.
+    let mut rb2 = ReadBuf::new(&mut out);
+    assert!(matches!(
+        Pin::new(&mut ws).poll_read(&mut cx, &mut rb2),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(rb2.filled().is_empty());
+    assert_eq!(*written.lock().unwrap(), vec![0x88, 0x02, 0x03, 0xe8]);
+
+    // Subsequent poll_shutdown must NOT emit a duplicate Close frame.
+    assert!(matches!(
+        Pin::new(&mut ws).poll_shutdown(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(*written.lock().unwrap(), vec![0x88, 0x02, 0x03, 0xe8]);
 }

@@ -5,11 +5,10 @@
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use rustls_platform_verifier::BuilderVerifierExt;
-use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
@@ -17,6 +16,54 @@ use tokio_rustls::TlsConnector;
 use crate::TransportError;
 
 use super::{AsyncReadWrite, BoxedReadHalf, BoxedWriteHalf, Transport};
+
+/// Shared `ring`-backed rustls `CryptoProvider` with hardware-AES cipher-suite
+/// preference on `x86_64` and `aarch64` (`TLS13_AES_128_GCM_SHA256` before
+/// `TLS13_AES_256_GCM_SHA384`). Matches Go `crypto/tls` and `quic-go` (~28%
+/// lower AES-GCM round count while keeping every upstream suite enabled for
+/// peer compatibility).
+pub(crate) fn preferred_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    PROVIDER
+        .get_or_init(|| {
+            #[cfg_attr(
+                not(any(target_arch = "x86_64", target_arch = "aarch64")),
+                allow(unused_mut)
+            )]
+            let mut provider = rustls::crypto::ring::default_provider();
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                provider.cipher_suites.sort_by_key(|cs| match cs.suite() {
+                    rustls::CipherSuite::TLS13_AES_128_GCM_SHA256 => 0u8,
+                    rustls::CipherSuite::TLS13_AES_256_GCM_SHA384 => 1,
+                    rustls::CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => 2,
+                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => 3,
+                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => 4,
+                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => 5,
+                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => 6,
+                    rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => 7,
+                    rustls::CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => 8,
+                    _ => 9,
+                });
+            }
+            Arc::new(provider)
+        })
+        .clone()
+}
+
+pub(crate) fn server_config_builder(
+) -> rustls::ConfigBuilder<rustls::ServerConfig, rustls::WantsVerifier> {
+    rustls::ServerConfig::builder_with_provider(preferred_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .expect("default rustls protocol versions are valid")
+}
+
+pub(crate) fn client_config_builder(
+) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    rustls::ClientConfig::builder_with_provider(preferred_crypto_provider())
+        .with_safe_default_protocol_versions()
+        .expect("default rustls protocol versions are valid")
+}
 
 /// TLS-wrapped transport. Holds a type-erased inner stream (any TLS-wrapped
 /// transport — plain TCP, PreRead, KCP) plus the peer address recorded at
@@ -59,6 +106,9 @@ impl AsyncWrite for TlsTransport {
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
@@ -149,7 +199,7 @@ pub fn build_tls_server_config(
                     )))
                 })?;
 
-            rustls::ServerConfig::builder()
+            server_config_builder()
                 .with_client_cert_verifier(verifier)
                 .with_single_cert(certs, key)
                 .map_err(|e| {
@@ -158,7 +208,7 @@ pub fn build_tls_server_config(
                     )))
                 })?
         } else {
-            rustls::ServerConfig::builder()
+            server_config_builder()
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .map_err(|e| {
@@ -166,7 +216,7 @@ pub fn build_tls_server_config(
                 })?
         }
     } else {
-        rustls::ServerConfig::builder()
+        server_config_builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| {
@@ -256,7 +306,7 @@ fn generate_self_signed_cert_and_key() -> Result<
 
 pub fn generate_self_signed_tls_config() -> Result<rustls::ServerConfig, crate::Error> {
     let (cert_der, key_der) = generate_self_signed_cert_and_key()?;
-    let config = rustls::ServerConfig::builder()
+    let config = server_config_builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert_der], key_der)
         .map_err(|e| {
@@ -287,7 +337,7 @@ pub fn generate_self_signed_tls_config_with_ca(
                         "build client cert verifier: {e}"
                     )))
                 })?;
-            rustls::ServerConfig::builder()
+            server_config_builder()
                 .with_client_cert_verifier(verifier)
                 .with_single_cert(vec![cert_der], key_der)
                 .map_err(|e| {
@@ -296,7 +346,7 @@ pub fn generate_self_signed_tls_config_with_ca(
                     )))
                 })
         }
-        _ => rustls::ServerConfig::builder()
+        _ => server_config_builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)
             .map_err(|e| {
@@ -364,12 +414,12 @@ pub(crate) fn build_verifier(
     };
     match (file_roots, use_system_ca) {
         (Some(file_roots), true) => {
-            let platform = rustls_platform_verifier::Verifier::new(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
-            })?;
+            let platform = rustls_platform_verifier::Verifier::new(preferred_crypto_provider())
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "platform verifier: {e}"
+                    )))
+                })?;
             Ok(Arc::new(CompositeVerifier {
                 platform: Arc::new(platform),
                 file_roots,
@@ -378,12 +428,12 @@ pub(crate) fn build_verifier(
         }
         (Some(file_roots), false) => Ok(file_roots),
         (None, true) => {
-            let platform = rustls_platform_verifier::Verifier::new(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
-            })?;
+            let platform = rustls_platform_verifier::Verifier::new(preferred_crypto_provider())
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "platform verifier: {e}"
+                    )))
+                })?;
             Ok(Arc::new(platform) as Arc<dyn rustls::client::danger::ServerCertVerifier>)
         }
         // Unreachable: `verify` requires at least one trust source.
@@ -521,7 +571,7 @@ pub fn build_tls_connector(
                 let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
                 })?;
-                rustls::ClientConfig::builder()
+                client_config_builder()
                     .with_root_certificates(Arc::new(store))
                     .with_client_auth_cert(client_certs, client_key)
                     .map_err(|e| {
@@ -530,12 +580,12 @@ pub fn build_tls_connector(
                         )))
                     })?
             } else {
-                rustls::ClientConfig::builder()
+                client_config_builder()
                     .with_root_certificates(Arc::new(store))
                     .with_no_client_auth()
             }
         } else {
-            rustls::ClientConfig::builder()
+            client_config_builder()
                 .with_root_certificates(Arc::new(store))
                 .with_no_client_auth()
         }
@@ -564,7 +614,7 @@ pub fn build_tls_connector(
                 let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
                 })?;
-                rustls::ClientConfig::builder()
+                client_config_builder()
                     .with_platform_verifier()
                     .map_err(|e| {
                         crate::Error::Transport(TransportError::Other(format!(
@@ -578,7 +628,7 @@ pub fn build_tls_connector(
                         )))
                     })?
             } else {
-                rustls::ClientConfig::builder()
+                client_config_builder()
                     .with_platform_verifier()
                     .map_err(|e| {
                         crate::Error::Transport(TransportError::Other(format!(
@@ -588,9 +638,14 @@ pub fn build_tls_connector(
                     .with_no_client_auth()
             }
         } else {
-            <rustls::ClientConfig as ConfigVerifierExt>::with_platform_verifier().map_err(|e| {
-                crate::Error::Transport(TransportError::Other(format!("platform verifier: {e}")))
-            })?
+            client_config_builder()
+                .with_platform_verifier()
+                .map_err(|e| {
+                    crate::Error::Transport(TransportError::Other(format!(
+                        "platform verifier: {e}"
+                    )))
+                })?
+                .with_no_client_auth()
         }
     };
 
@@ -1028,7 +1083,7 @@ fn build_tls_connector_skip_verify_inner(
             (Some(cert_path), Some(key_path)) => !cert_path.is_empty() && !key_path.is_empty(),
             _ => false,
         };
-        let builder = rustls::ClientConfig::builder()
+        let builder = client_config_builder()
             .dangerous()
             .with_custom_certificate_verifier(verifier);
         if wants_client_cert {
@@ -1091,7 +1146,7 @@ fn build_tls_connector_skip_verify_inner(
                 let client_key = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
                     crate::Error::Transport(TransportError::Other(format!("read client key: {e}")))
                 })?;
-                rustls::ClientConfig::builder()
+                client_config_builder()
                     .dangerous()
                     .with_custom_certificate_verifier(verifier)
                     .with_client_auth_cert(client_certs, client_key)
@@ -1101,13 +1156,13 @@ fn build_tls_connector_skip_verify_inner(
                         )))
                     })?
             } else {
-                rustls::ClientConfig::builder()
+                client_config_builder()
                     .dangerous()
                     .with_custom_certificate_verifier(verifier)
                     .with_no_client_auth()
             }
         } else {
-            rustls::ClientConfig::builder()
+            client_config_builder()
                 .dangerous()
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth()
@@ -1302,6 +1357,104 @@ mod tests {
         assert!(
             server_result.is_err(),
             "mTLS acceptor must reject a client without a certificate"
+        );
+    }
+
+    #[tokio::test]
+    async fn preferred_crypto_provider_prioritizes_aes128_and_preserves_aes256_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        let upstream = rustls::crypto::ring::default_provider();
+        let preferred = preferred_crypto_provider();
+        assert_eq!(
+            preferred.cipher_suites.len(),
+            upstream.cipher_suites.len(),
+            "reordering must keep every cipher suite enabled"
+        );
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(
+            preferred.cipher_suites[0].suite(),
+            rustls::CipherSuite::TLS13_AES_128_GCM_SHA256
+        );
+
+        let (cert, key) = generate_self_signed_cert_and_key().expect("cert");
+
+        // 1) Default peer pair negotiates TLS13_AES_128_GCM_SHA256 on hardware AES hosts.
+        let srv_cfg = server_config_builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.clone_key())
+            .expect("server cfg");
+        let cli_cfg = client_config_builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureSkipVerify))
+            .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = TlsAcceptor::from(Arc::new(srv_cfg))
+                .accept(tcp)
+                .await
+                .unwrap();
+            let suite = tls
+                .get_ref()
+                .1
+                .negotiated_cipher_suite()
+                .expect("negotiated")
+                .suite();
+            let mut b = [0u8; 4];
+            tls.read_exact(&mut b).await.unwrap();
+            tls.write_all(&b).await.unwrap();
+            suite
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let mut tls = TlsConnector::from(Arc::new(cli_cfg))
+            .connect(rustls::pki_types::ServerName::try_from("frp").unwrap(), tcp)
+            .await
+            .unwrap();
+        tls.write_all(b"ping").await.unwrap();
+        let mut resp = [0u8; 4];
+        tls.read_exact(&mut resp).await.unwrap();
+        let negotiated = srv.await.unwrap();
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        assert_eq!(negotiated, rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+
+        // 2) An AES-256-GCM-only peer still negotiates cleanly.
+        let mut aes256_only = rustls::crypto::ring::default_provider();
+        aes256_only
+            .cipher_suites
+            .retain(|cs| cs.suite() == rustls::CipherSuite::TLS13_AES_256_GCM_SHA384);
+        let srv_cfg_256 = server_config_builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server cfg");
+        let cli_cfg_256 = rustls::ClientConfig::builder_with_provider(Arc::new(aes256_only))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(InsecureSkipVerify))
+            .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = TlsAcceptor::from(Arc::new(srv_cfg_256))
+                .accept(tcp)
+                .await
+                .unwrap();
+            tls.get_ref().1.negotiated_cipher_suite().unwrap().suite()
+        });
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _tls = TlsConnector::from(Arc::new(cli_cfg_256))
+            .connect(rustls::pki_types::ServerName::try_from("frp").unwrap(), tcp)
+            .await
+            .unwrap();
+        assert_eq!(
+            srv.await.unwrap(),
+            rustls::CipherSuite::TLS13_AES_256_GCM_SHA384
         );
     }
 }

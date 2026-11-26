@@ -1,5 +1,5 @@
-use crate::connection::{ConnWriter, StreamCommand};
-use crate::frame::Frame;
+use crate::connection::{StreamCommand, WriteBox};
+use crate::frame::{self, Frame};
 use crate::tagged_stream::TaggedStream;
 use crate::Result;
 use crate::StreamId;
@@ -9,27 +9,22 @@ use futures::{ready, Sink, StreamExt};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// A [`Future`] that gracefully closes the yamux connection.
-///
-/// frp-rs patch: it writes through the connection's shared write lock (the
-/// same one streams use for inline writes) instead of owning the socket, and
-/// no longer holds the read half — it never reads.
 #[must_use]
 pub struct Closing {
     state: State,
     stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
     pending_frames: VecDeque<Frame<()>>,
-    writer: Arc<ConnWriter>,
+    writer: frame::Writer<WriteBox>,
 }
 
 impl Closing {
     pub(crate) fn new(
         stream_receivers: SelectAll<TaggedStream<StreamId, mpsc::Receiver<StreamCommand>>>,
         pending_frames: VecDeque<Frame<()>>,
-        writer: Arc<ConnWriter>,
+        writer: frame::Writer<WriteBox>,
     ) -> Self {
         Self {
             state: State::ClosingStreamReceiver,
@@ -74,28 +69,17 @@ impl Future for Closing {
                     }
                 }
                 State::FlushingPendingFrames => {
-                    let writer = this.writer.clone();
-                    // Contended: a stream is writing inline. It closes its
-                    // own sender first (above), so this is a short-lived
-                    // race, and `lock_owner` registers us to be woken.
-                    let Some(mut w) = writer.lock_owner(cx) else {
-                        return Poll::Pending;
-                    };
                     for frame in this.pending_frames.drain(..) {
-                        w.push_data(frame);
+                        this.writer.push_data(frame);
                     }
-                    match w.poll_drain(cx) {
+                    match this.writer.poll_drain(cx) {
                         Poll::Ready(Ok(())) => this.state = State::ClosingSocket,
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                         Poll::Pending => return Poll::Pending,
                     }
                 }
                 State::ClosingSocket => {
-                    let writer = this.writer.clone();
-                    let Some(mut w) = writer.lock_owner(cx) else {
-                        return Poll::Pending;
-                    };
-                    ready!(Pin::new(&mut *w).poll_close(cx))?;
+                    ready!(Pin::new(&mut this.writer).poll_close(cx))?;
 
                     return Poll::Ready(Ok(()));
                 }
@@ -191,18 +175,18 @@ mod tests {
             StreamCommand::CloseStream { ack: true },
         ));
         let pending_frames = vec![frame_pending];
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let closed = Arc::new(AtomicBool::new(false));
+        let written = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let closed = std::sync::Arc::new(AtomicBool::new(false));
         let socket = Socket {
             written: written.clone(),
             closed: closed.clone(),
         };
-        let writer = Arc::new(ConnWriter::new(
+        let writer = frame::Writer::new(
             crate::connection::Id(0),
-            Box::new(socket),
-            Arc::new(crossbeam_queue::ArrayQueue::new(1)),
+            Box::new(socket) as WriteBox,
+            std::sync::Arc::new(crossbeam_queue::ArrayQueue::new(1)),
             crate::DEFAULT_SPLIT_SEND_SIZE,
-        ));
+        );
         let mut closing = Closing::new(stream_receivers, pending_frames.into(), writer);
         futures::executor::block_on(async { poll_fn(|cx| closing.poll_unpin(cx)).await.unwrap() });
         assert!(closing.pending_frames.is_empty());

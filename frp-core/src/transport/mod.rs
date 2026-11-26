@@ -582,6 +582,10 @@ impl AsyncWrite for IoStream {
         Pin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
     }
 
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.get_mut().0).poll_flush(cx)
     }
@@ -2586,6 +2590,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
         Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
     }
 
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
@@ -3399,7 +3407,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2364).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2368).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {

@@ -1772,14 +1772,14 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=fab581a500a64cf2dfe4f65272da18ecbacd0eee76b778528b47f1eb44fdad45
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=f6d1f3881f0bdb3c2b03ab66496094ea57ce127afee773cadd232368bcd6a5b2
+          guard_data_pin=e517b4aa8aaca7de546ec959c14cc919565cab546060b4f9c18fd1b823854a13
           guard_exact=118
           guard_floor=118
           guard_canary='witness M1: one-line insert reddened notes.md:1'
           # The measured live inventory at this head and a floor under it, the
           # `guard_cites`/`guard_cites_floor` pair the TODO.md citation step
           # uses: a *falling* count has to move both literals.
-          guard_cites=612
+          guard_cites=613
           guard_cites_floor=604
           guard_hasher=''
           guard_abc=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad

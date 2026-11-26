@@ -24,7 +24,7 @@ use tokio::sync::oneshot;
 use futures_util::future::poll_fn;
 #[cfg(feature = "tcp-mux")]
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 #[cfg(feature = "tcp-mux")]
@@ -206,7 +206,9 @@ pub(crate) struct ActivityState {
 #[cfg(feature = "tcp-mux")]
 impl ActivityState {
     fn mark(&self) {
-        self.saw_read.store(true, Ordering::Release);
+        if !self.saw_read.load(Ordering::Relaxed) {
+            self.saw_read.store(true, Ordering::Release);
+        }
     }
 
     fn take(&self) -> bool {
@@ -219,34 +221,62 @@ impl ActivityState {
 /// Go frp v0.72.0 `#5595` turned `ConnectionWriteTimeout` into a *write
 /// deadline on the underlying transport*: a write blocked because the peer
 /// stopped reading must fail the session, not park it until the keepalive
-/// reaper notices the silence. This is the observation half — `ActivityIo`
-/// marks the first `Pending` write and clears it on any progress — and
-/// [`write_stall_watchdog`] is the enforcement half.
+/// reaper notices the silence. Lock-free so healthy `poll_write` /
+/// `poll_write_vectored` / `poll_flush` calls pay a single atomic load.
 #[cfg(feature = "tcp-mux")]
-#[derive(Default)]
 pub(crate) struct WriteStall {
-    blocked_since: std::sync::Mutex<Option<tokio::time::Instant>>,
+    epoch: tokio::time::Instant,
+    /// `0` = unstalled; `elapsed_ms_since_epoch + 1` = stalled start time.
+    stalled_since_ms: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+#[cfg(feature = "tcp-mux")]
+impl Default for WriteStall {
+    fn default() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            stalled_since_ms: AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
 }
 
 #[cfg(feature = "tcp-mux")]
 impl WriteStall {
     /// The transport accepted nothing for this write.
     pub(crate) fn pending(&self) {
-        let mut guard = self.blocked_since.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_or_insert_with(tokio::time::Instant::now);
+        if self.stalled_since_ms.load(Ordering::Relaxed) != 0 {
+            return;
+        }
+        let stamped = (self.epoch.elapsed().as_millis() as u64)
+            .saturating_add(1)
+            .max(1);
+        if self
+            .stalled_since_ms
+            .compare_exchange(0, stamped, Ordering::Release, Ordering::Relaxed)
+            .is_ok()
+        {
+            self.notify.notify_one();
+        }
     }
 
     /// Bytes moved: the transport is not stalled.
     pub(crate) fn progress(&self) {
-        *self.blocked_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if self.stalled_since_ms.load(Ordering::Acquire) != 0 {
+            self.stalled_since_ms.store(0, Ordering::Release);
+        }
     }
 
     /// How long the transport has been stalled, if it is.
     pub(crate) fn stalled_for(&self) -> Option<Duration> {
-        self.blocked_since
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .map(|since| since.elapsed())
+        let raw = self.stalled_since_ms.load(Ordering::Acquire);
+        if raw == 0 {
+            return None;
+        }
+        let started_ms = raw - 1;
+        let now_ms = self.epoch.elapsed().as_millis() as u64;
+        Some(Duration::from_millis(now_ms.saturating_sub(started_ms)))
     }
 }
 
@@ -319,6 +349,10 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
             _ => {}
         }
         result
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(
@@ -454,12 +488,8 @@ pub(crate) fn write_stall_watchdog(
     }
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(WRITE_STALL_CHECK_INTERVAL).await;
             // The driver drops its receiver when the session ends.
-            if closer.is_closed() {
-                return;
-            }
-            if closer.borrow().to_owned() {
+            if closer.is_closed() || *closer.borrow() {
                 return;
             }
             if let Some(stalled) = stall.stalled_for() {
@@ -472,6 +502,20 @@ pub(crate) fn write_stall_watchdog(
                     let _ = closer.send(true);
                     return;
                 }
+                let wait = (deadline - stalled).min(WRITE_STALL_CHECK_INTERVAL);
+                tokio::select! {
+                    biased;
+                    _ = closer.closed() => return,
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            } else {
+                // Event-driven wait when unstalled: zero periodic timer wakeups
+                // on healthy connections.
+                tokio::select! {
+                    biased;
+                    _ = closer.closed() => return,
+                    _ = stall.notify.notified() => {}
+                }
             }
         }
     })
@@ -481,7 +525,7 @@ pub(crate) fn write_stall_watchdog(
 ///
 /// The WebSocket transport rejects, on read, any frame whose payload exceeds
 /// `MAX_WS_FRAME_PAYLOAD` — the 64 KiB V2 message cap plus 128 bytes of AEAD
-/// slack (`frp-core/src/transport/websocket.rs:27`). A yamux data frame is
+/// slack (`frp-core/src/transport/websocket.rs:25`). A yamux data frame is
 /// `split_send_size` body bytes plus its 12-byte header (65548 of the 65664
 /// allowed), so 64 KiB fits and anything larger does not. The cap matters
 /// because one oversized frame is refused by the *peer's* transport, which
@@ -555,7 +599,7 @@ fn yamux_config(tcp_mux_cfg: &TcpMuxConfig) -> Config {
     // state: `split_send_size` is the bridge's copy buffer
     // (64 KiB default; knob overrides) - not padded, not split
     // further unless the send window is short (a partly consumed window
-    // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:408-409`)
+    // re-splits one chunk, `vendor/yamux/src/connection/stream.rs:416-417`)
     // or the chunk is short (compression shrinks it, encryption writes the
     // IV first). Frame count is what costs here — each extra frame is
     // another 12-byte header, another window-credit check and another waker
@@ -800,10 +844,10 @@ where
     let activity = Arc::new(ActivityState::default());
     let stall = Arc::new(WriteStall::default());
     let yamux_cfg = yamux_config(mux_cfg);
-    // frp-rs patch: yamux writes a data frame from the task that produced it
-    // (`Stream::poll_write`) rather than through the driver, so the socket is
-    // split here and the halves handed over separately. `ActivityIo` holds its
-    // `Arc`s, so both halves keep reporting activity/write-progress.
+    // frp-rs patch: the socket is split here and the halves handed to yamux
+    // separately (the driver owns the write half and writes frames directly).
+    // `ActivityIo` holds its `Arc`s, so both halves keep reporting
+    // activity/write-progress.
     let io = ActivityIo::new(stream, activity.clone(), stall.clone());
     let (read, write) = tokio::io::split(io);
     let mut conn =
@@ -853,11 +897,6 @@ where
         write_stall_watchdog(stall, mux_cfg.write_deadline, force_close_tx.clone());
 
     // Spawn background task: accept yamux streams and drive connection I/O.
-    //
-    // Double-poll is required because yamux Active::poll processes
-    // StreamCommand::SendFrame AFTER draining pending_frames. The first
-    // poll picks up queued stream writes into pending_frames; the second
-    // poll actually sends them on the wire.
     let keepalive = normalized_keepalive_interval(mux_cfg.keepalive_interval);
     // Dead-session bound in wall-clock time. The configured interval only
     // sets the scan cadence — yamux-rs's actual PING period is a hardcoded
@@ -865,37 +904,27 @@ where
     // peer when the configured interval is small (see const docs).
     let dead_after = idle_dead_bound(keepalive, mux_cfg.idle_dead_timeout);
     let mut consecutive_idle = 0u32;
+    let keepalive_now = tokio::time::Instant::now();
+    let keepalive_overflowed = keepalive_now.checked_add(keepalive).is_none();
+    let keepalive_start = keepalive_now
+        .checked_add(keepalive)
+        .unwrap_or(keepalive_now);
+    let mut keepalive_timer = tokio::time::interval_at(keepalive_start, keepalive);
+    keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tokio::task::spawn(async move {
         let _force_close_keeper = _force_close_keeper;
         loop {
-            // Wake on the explicit supersession close *as well as* on the
-            // keepalive tick. `biased` so a close already signalled wins.
-            let result = tokio::select! {
+            // Wake on the explicit supersession close, inbound connection I/O,
+            // or the persistent keepalive timer (zero per-stream timeout churn).
+            let stream = tokio::select! {
                 biased;
                 _ = wait_force_close(&mut force_close_rx) => {
                     debug!("yamux server: supersession close, dropping the session");
                     break;
                 }
-                r = tokio::time::timeout(
-                    keepalive,
-                    poll_fn(|cx| {
-                        match conn.poll_next_inbound(cx) {
-                            Poll::Ready(r) => Poll::Ready(r),
-                            Poll::Pending => {
-                                // Second poll: flush pending_frames to socket
-                                conn.poll_next_inbound(cx)
-                            }
-                        }
-                    }),
-                ) => r,
-            };
-
-            let stream = match result {
-                Ok(r) => r,
-                Err(_elapsed) => {
-                    // Keepalive: idle connection. poll_next_inbound was
-                    // called (driving I/O including internal PING/PONG), but
-                    // no new stream arrived within keepalive_interval.
+                r = poll_fn(|cx| conn.poll_next_inbound(cx)) => r,
+                _ = keepalive_timer.tick(), if !keepalive_overflowed => {
+                    // Keepalive: idle connection.
                     if activity.take() {
                         consecutive_idle = 0;
                     } else {
@@ -1027,8 +1056,8 @@ where
     // driver free to keep polling poll_next_inbound (processing ACK frames)
     // while an open is in flight — a caller holding the lock to poll the
     // connection would stall those ACK reads and add measurable setup latency.
-    // frp-rs patch: the socket is split so yamux can write a data frame from
-    // the task that produced it (`Stream::poll_write`); see `server_mux`.
+    // frp-rs patch: the socket is split into read/write halves for yamux;
+    // see `server_mux`.
     let io = ActivityIo::new(stream, activity.clone(), stall.clone());
     let (read, write) = tokio::io::split(io);
     let mut conn =
@@ -1129,19 +1158,10 @@ where
                 // Drive connection I/O and serve queued open requests in the
                 // SAME poll.
                 //
-                // Double-poll: with the vendored yamux the first poll already
-                // puts frames on the wire — Active::poll drains stream frames
-                // into the socket's batched write queue and, having drained
-                // anything, continues to poll_ready within the same call, so a
-                // whole batch is flushed before the call returns (there is no
-                // pending_write_frame anymore; nothing is deferred). The second
-                // poll is a harmless no-op that re-registers the same wakers
-                // and returns Pending again.
-                //
-                // Keep the double-poll anyway: it is not wrong and it is nearly
-                // free (the first poll leaves nothing queued, so the second
-                // does no work), and it insulates us against any future yamux
-                // change that defers writes to a later poll.
+                // Single poll: with the vendored yamux, Active::poll writes
+                // stream frames to the socket (vectored, one flush per
+                // 16-frame burst) within the same call, so nothing is
+                // deferred to a later poll and a second poll would be a no-op.
                 //
                 // POLL DISCIPLINE (driver loop invariant): this I/O branch is
                 // the ONLY branch that may touch the connection. It reads
@@ -1199,13 +1219,7 @@ where
                             }
                         }
                     }
-                    // (3) double-poll inbound (ACK + flush).
-                    let first = conn.poll_next_inbound(cx);
-                    match first {
-                        Poll::Ready(r) => return Poll::Ready(r),
-                        Poll::Pending => {}
-                    }
-                    debug!("yamux client: second poll (batch already flushed)");
+                    // (3) single-poll inbound (Active::poll already flushes pending writes).
                     conn.poll_next_inbound(cx)
                 }) => {
                     match result {
@@ -1240,7 +1254,7 @@ where
                     // Synchronous single-poll (Poll::Ready wrapper, never
                     // parks): this is an idle probe, not a blocking read — it
                     // must NOT become an awaited poll, or it could dethrone
-                    // the double-poll I/O branch as the ACK-processing site.
+                    // the I/O branch as the ACK-processing site.
                     let poll_result =
                         poll_fn(|cx| Poll::Ready(conn.poll_next_inbound(cx))).await;
                     match poll_result {
@@ -1824,7 +1838,7 @@ mod tests {
     /// needs ASYMMETRIC caps (client 1025 / server 1024) so one side can
     /// refuse an inbound SYN while the other still opens. Mirrors the
     /// production driver's request-channel architecture (bounded queue,
-    /// non-blocking serve, double-poll I/O, notify, shutdown signal) minus
+    /// non-blocking serve, single-poll I/O, notify, shutdown signal) minus
     /// the keepalive/dead-session bookkeeping — the test peer is a live
     /// duplex socket and the test runs for seconds.
     async fn client_mux_with_config<S>(
@@ -1903,12 +1917,7 @@ mod tests {
                                 }
                             }
                         }
-                        // (3) double-poll inbound (ACKs + flush).
-                        let first = conn.poll_next_inbound(cx);
-                        match first {
-                            Poll::Ready(r) => return Poll::Ready(r),
-                            Poll::Pending => {}
-                        }
+                        // (3) single-poll inbound (Active::poll already flushes pending writes).
                         conn.poll_next_inbound(cx)
                     }) => {
                         match result {
