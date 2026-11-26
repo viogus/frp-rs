@@ -912,7 +912,7 @@ the vhost task no longer holds a copy, so there is no "listener still owns it"
 state for a removal to strand. The other three are
 `frp-server/src/vhost/https.rs:157`/`:171` (HTTPS SNI passthrough — the direct
 frp-rs analogue of Go's fixed `Muxer`, see below), `frp-server/src/tcpmux.rs:665`/`:680`
-and `frp-server/src/vhost_h2c.rs:363`/`:393` (the h2c stream is moved as an
+and `frp-server/src/vhost_h2c.rs:400`/`:430` (the h2c stream is moved as an
 `IoStream::SshChannel`).
 The three ways the send can end all close the connection or transfer it:
 

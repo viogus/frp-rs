@@ -1392,3 +1392,148 @@ async fn h2_backend_chunked_response_strips_content_length() {
         "a chunked response must drop the backend Content-Length row: {headers:?}"
     );
 }
+
+/// Backpressure regression test: when the h2 peer stops releasing flow-control
+/// capacity, `stream_h2_response` must park in `poll_capacity` and stall reads
+/// from the backend duplex rather than queuing the entire 1 MiB body in RAM.
+#[tokio::test]
+async fn h2_plugin_response_respects_peer_flow_control_backpressure() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::AsyncWriteExt;
+
+    const TOTAL: usize = 1024 * 1024;
+    const SLICE: usize = 16 * 1024;
+
+    for chunked in [false, true] {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (mut backend_w, mut backend_r) = tokio::io::duplex(32 * 1024);
+        let written = Arc::new(AtomicUsize::new(0));
+        let written_bg = written.clone();
+
+        let backend_task = tokio::spawn(async move {
+            let head = if chunked {
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_string()
+            } else {
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {TOTAL}\r\n\r\n")
+            };
+            backend_w.write_all(head.as_bytes()).await.unwrap();
+            let mut sent = 0usize;
+            let mut block = vec![0u8; SLICE];
+            while sent < TOTAL {
+                let n = SLICE.min(TOTAL - sent);
+                block[..n].fill((sent / SLICE) as u8);
+                if chunked {
+                    let hdr = format!("{n:X}\r\n");
+                    backend_w.write_all(hdr.as_bytes()).await.unwrap();
+                    backend_w.write_all(&block[..n]).await.unwrap();
+                    backend_w.write_all(b"\r\n").await.unwrap();
+                } else {
+                    backend_w.write_all(&block[..n]).await.unwrap();
+                }
+                sent += n;
+                written_bg.store(sent, Ordering::SeqCst);
+            }
+            if chunked {
+                backend_w.write_all(b"0\r\n\r\n").await.unwrap();
+            }
+            backend_w.shutdown().await.unwrap();
+        });
+
+        let srv_task = tokio::spawn(async move {
+            let mut conn = h2::server::Builder::new()
+                .max_frame_size(super::H2_MAX_FRAME_SIZE)
+                .handshake(server_io)
+                .await
+                .unwrap();
+            let (req, respond) = conn.accept().await.unwrap().unwrap();
+            let _ = req;
+            let driver = tokio::spawn(async move { while conn.accept().await.is_some() {} });
+            super::stream_h2_response(&mut backend_r, respond, false)
+                .await
+                .unwrap();
+            let _ = driver.await;
+        });
+
+        let (mut send_req, conn) = h2::client::Builder::new()
+            .initial_window_size(65_535)
+            .initial_connection_window_size(65_535)
+            .handshake::<_, bytes::Bytes>(client_io)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = http::Request::builder()
+            .method("GET")
+            .uri("https://example.com/large")
+            .body(())
+            .unwrap();
+        let (resp_fut, _send_body) = send_req.send_request(req, true).unwrap();
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let mut body = resp.into_body();
+
+        let mut received = Vec::with_capacity(TOTAL);
+        let first = body.data().await.unwrap().unwrap();
+        received.extend_from_slice(&first);
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        let pushed_while_stalled = written.load(Ordering::SeqCst);
+        assert!(
+            pushed_while_stalled < TOTAL / 2,
+            "chunked={chunked}: backend must be backpressured when peer window is 0 \
+             (pushed {pushed_while_stalled} of {TOTAL} bytes)"
+        );
+
+        body.flow_control().release_capacity(first.len()).unwrap();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let len = chunk.len();
+            received.extend_from_slice(&chunk);
+            body.flow_control().release_capacity(len).unwrap();
+        }
+
+        assert_eq!(received.len(), TOTAL);
+        for (i, slice) in received.chunks(SLICE).enumerate() {
+            assert!(
+                slice.iter().all(|&b| b == i as u8),
+                "chunked={chunked}: byte corruption in slice {i}"
+            );
+        }
+        drop(body);
+        drop(_send_body);
+        drop(send_req);
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend_task)
+            .await
+            .expect("backend task timed out")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), srv_task)
+            .await
+            .expect("server task timed out")
+            .unwrap();
+    }
+}
+
+/// Regression test (Round 1 review P1): `BodyReader::read_line` must stop at
+/// the first `\n` in wire order even when `\r\n` appears later in the buffer,
+/// so an LF-only chunk-size line followed by CRLF body/terminator decodes
+/// cleanly instead of resetting the stream.
+#[tokio::test]
+async fn h2_plugin_chunked_mixed_lf_crlf_line_ordering() {
+    let Some(listener) = bind_or_skip().await else {
+        return;
+    };
+    let addr = spawn_scripted_backend(
+        listener,
+        vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\nhello\r\n0\r\n\r\n".to_vec(),
+        ],
+        0,
+    );
+    let (status, body, err) = h2_round_trip_body_err(addr).await;
+    assert_eq!(status, http::StatusCode::OK);
+    assert!(err.is_none(), "mixed LF/CRLF chunk framing must succeed");
+    assert_eq!(body, b"hello");
+}
