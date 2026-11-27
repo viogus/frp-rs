@@ -63,9 +63,10 @@ pub(super) const START_WORK_CONN_WRITE_TIMEOUT: Duration = Duration::from_secs(2
 
 /// Write budget for one `StartWorkConn` attempt: at most
 /// [`START_WORK_CONN_WRITE_TIMEOUT`], and at most a quarter of the request
-/// budget so a small configured `user_conn_timeout` still leaves retry room
-/// (floor 100 ms — a tiny frame to a healthy conn completes immediately; only
-/// a wedged conn blocks).
+/// budget so a small configured `user_conn_timeout` still leaves retry room.
+/// The 100 ms floor is unreachable today (`pending_request_timeout` only
+/// yields whole seconds ≥ 1 s, so `budget / 4` ≥ 250 ms); it stays as a guard
+/// against a future sub-second budget producing a zero-length write window.
 #[inline]
 pub(super) fn start_work_conn_write_timeout(request_budget: Duration) -> Duration {
     let quarter = request_budget / 4;
@@ -1064,6 +1065,45 @@ mod tests {
         IoStream::from(Box::new(BrokenWorkTransport) as Box<dyn Transport>)
     }
 
+    /// Work transport that accepts writes into a black hole but never flushes —
+    /// a TLS/cipher-wrapped conn whose peer stopped reading. `write_*_frame`
+    /// only hands bytes to the cipher layer, so the stall surfaces at `flush`.
+    struct FlushStalledWorkTransport;
+
+    impl tokio::io::AsyncRead for FlushStalledWorkTransport {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl tokio::io::AsyncWrite for FlushStalledWorkTransport {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Transport for FlushStalledWorkTransport {
+        fn debug_name(&self) -> &'static str {
+            "FlushStalledWorkTransport"
+        }
+    }
+
     fn test_state() -> Arc<crate::state::AppState> {
         let cfg = frp_core::config::ServerConfig::default();
         Arc::new(crate::state::AppState::new(
@@ -1207,6 +1247,51 @@ mod tests {
         assert_eq!(ctl.pending_requests[0].proxy_name, "p1");
         // Replenish ReqWorkConn was written to the control channel.
         assert!(!writer.is_empty(), "ReqWorkConn replenish must be written");
+    }
+
+    /// A `StartWorkConn` that is written but never flushed never reaches the
+    /// client, so the request must come back for re-dispatch instead of being
+    /// parked in a bridge nobody will ever drive. Pre-fix the flush arm only
+    /// logged a warning and fell through, leaving the user conn owned by an
+    /// empty bridge (no retry, no pending entry, no timeout).
+    #[tokio::test]
+    async fn stalled_flush_requeues_request() {
+        let state = test_state();
+        let (ctx, mut ctl) = test_context(&state, "run-flush");
+        let (retry_tx, retry_rx) = mpsc::channel(64);
+        ctl.retry_tx = retry_tx;
+        ctl.retry_rx = retry_rx;
+        ctl.work_pool.push_back(PoolEntry {
+            conn: IoStream::from(Box::new(FlushStalledWorkTransport) as Box<dyn Transport>),
+        });
+        let mut writer = Vec::new();
+
+        assign_or_queue(
+            &mut ctl.work_pool,
+            &mut ctl.pending_requests,
+            &ctx,
+            &mut writer,
+            test_req("p-flush"),
+            tokio_util::sync::CancellationToken::new(),
+            Some(ctl.retry_tx.clone()),
+        )
+        .await
+        .expect("assign_or_queue must not fail the control");
+
+        // The attempt budget is 2 s for the default 10 s request budget.
+        let retried = tokio::time::timeout(Duration::from_secs(5), ctl.retry_rx.recv())
+            .await
+            .expect("a stalled flush must requeue the request after the write budget")
+            .expect("retry_tx must remain open");
+        assert_eq!(retried.proxy_name, "p-flush");
+        assert_eq!(
+            retried.retry_count, 0,
+            "requeue must hand over the untouched request"
+        );
+        assert!(
+            ctl.pending_requests.is_empty(),
+            "request must travel through retry_rx, not be double-queued"
+        );
     }
 
     /// Round-11 audit F1: StartWorkConn's DstAddr/DstPort must be the
@@ -1817,5 +1902,32 @@ mod tests {
             .expect("frame must parse");
         assert!(matches!(msg, FrpMessage::StartWorkConn(swc) if swc.proxy_name == "p-retry"));
         ctl.bridge_cancel.cancel();
+    }
+
+    /// The per-attempt write budget must stay strictly below the request
+    /// budget, otherwise a wedged pooled conn burns the whole lifetime and the
+    /// retry in `handle_retry_pending_request` is a no-op by construction.
+    #[test]
+    fn start_work_conn_write_timeout_clamps_to_a_fraction_of_the_budget() {
+        // Default 10 s request budget → capped at the 2 s attempt budget.
+        assert_eq!(
+            start_work_conn_write_timeout(Duration::from_secs(10)),
+            START_WORK_CONN_WRITE_TIMEOUT
+        );
+        // Unset `user_conn_timeout` falls back to the same 10 s default.
+        assert_eq!(
+            start_work_conn_write_timeout(pending_request_timeout(0)),
+            START_WORK_CONN_WRITE_TIMEOUT
+        );
+        // A 1 s configured timeout must still leave retry room (a quarter).
+        assert_eq!(
+            start_work_conn_write_timeout(Duration::from_secs(1)),
+            Duration::from_millis(250)
+        );
+        // Floor: never a zero-length write window, even for a tiny budget.
+        assert_eq!(
+            start_work_conn_write_timeout(Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
     }
 }

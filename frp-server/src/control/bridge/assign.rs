@@ -88,12 +88,16 @@ const RETRY_ENQUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// Hand a request whose work conn died back to the control loop.
 ///
-/// `try_send` first (the common case: nothing queued), then wait briefly for
-/// capacity instead of dropping the request — the pre-diff path re-enqueued
-/// unconditionally into the `MAX_PENDING_REQUESTS`-bounded queue, so a
-/// momentarily full channel here must not close the user conn. `None` is the
-/// caller's explicit "do not retry" (fresh work conn: a dead one means the
-/// client is gone), logged at debug to keep that pre-existing path quiet.
+/// `send` under a [`RETRY_ENQUEUE_TIMEOUT`] deadline (the channel is drained by
+/// the control loop every iteration, so waiting is what a momentarily full
+/// channel needs — a fast `try_send`-then-sleep poll loop would just churn
+/// wakeups while keeping the dead conn's user socket alive). Losing the
+/// request closes a user conn the server could still have served, which is
+/// exactly what the pre-diff unconditional `push_pending_request` avoided.
+///
+/// `None` is the caller's explicit "do not retry" (fresh work conn: a dead one
+/// means the client is gone), logged at debug to keep that pre-existing path
+/// quiet.
 async fn requeue_dead_work_conn(
     retry_tx: Option<&tokio::sync::mpsc::Sender<Box<PendingRequest>>>,
     req: PendingRequest,
@@ -108,34 +112,23 @@ async fn requeue_dead_work_conn(
         );
         return;
     };
-    let mut req = Box::new(req);
-    let deadline = tokio::time::Instant::now() + RETRY_ENQUEUE_TIMEOUT;
-    loop {
-        match tx.try_send(req) {
-            Ok(()) => return,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(r)) => {
-                warn!(
-                    proxy_name = %proxy_name,
-                    "Retry channel closed, dropping request after {}",
-                    reason
-                );
-                drop(r);
-                return;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(r)) => {
-                req = r;
-                if tokio::time::Instant::now() >= deadline {
-                    warn!(
-                        proxy_name = %proxy_name,
-                        timeout = ?RETRY_ENQUEUE_TIMEOUT,
-                        "Retry channel full for {:?}, dropping request after {}",
-                        RETRY_ENQUEUE_TIMEOUT,
-                        reason
-                    );
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
+    match tokio::time::timeout(RETRY_ENQUEUE_TIMEOUT, tx.send(Box::new(req))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            warn!(
+                proxy_name = %proxy_name,
+                "Retry channel closed, dropping request after {}",
+                reason
+            );
+        }
+        Err(_) => {
+            warn!(
+                proxy_name = %proxy_name,
+                timeout = ?RETRY_ENQUEUE_TIMEOUT,
+                "Retry channel stayed full for {:?}, dropping request after {}",
+                RETRY_ENQUEUE_TIMEOUT,
+                reason
+            );
         }
     }
 }
@@ -254,16 +247,42 @@ pub(crate) fn assign_work_to_proxy(
                 }
 
                 // Flush StartWorkConn to wire before bridge data.
+                //
+                // A flush failure must requeue, not fall through: when the
+                // work conn is TLS/cipher wrapped, `write_*_frame` only buffers
+                // the frame, so a timed-out or failed flush means the client
+                // never sees `StartWorkConn` at all. Proceeding to
+                // `run_work_bridge` would park the user connection forever with
+                // no owner left to re-dispatch it (the request moved into the
+                // bridge). The duplicate-`StartWorkConn` risk is the same one
+                // the write-timeout arm already accepts, and the client's half
+                // of the first attempt dies with that work conn.
                 match tokio::time::timeout_at(deadline, work_conn.flush()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         warn!(error = %e, "Failed to flush StartWorkConn: {}", e);
+                        requeue_dead_work_conn(
+                            retry_tx.as_ref(),
+                            req,
+                            &log_proxy_name,
+                            "flush failed",
+                        )
+                        .await;
+                        return None;
                     }
                     Err(_elapsed) => {
                         warn!(
                             proxy_name = %log_proxy_name,
                             "Timed out flushing StartWorkConn"
                         );
+                        requeue_dead_work_conn(
+                            retry_tx.as_ref(),
+                            req,
+                            &log_proxy_name,
+                            "flush timed out",
+                        )
+                        .await;
+                        return None;
                     }
                 }
 
@@ -271,7 +290,12 @@ pub(crate) fn assign_work_to_proxy(
                 // empty sid after StartWorkConn for Go frpc compatibility.
                 if proxy_info.as_ref().is_some_and(|p| p.proxy_type == "xtcp") {
                     let dummy = FrpMessage::NatHoleSid(msg::NatHoleSid::default());
-                    let nat_res = tokio::time::timeout_at(deadline, async {
+                    // Own short budget: the shared `deadline` above may already
+                    // be spent by the write/flush, and silently skipping the sid
+                    // degrades a Go-provider XTCP hole punch to STCP fallback.
+                    let sid_deadline = tokio::time::Instant::now()
+                        + write_timeout.min(std::time::Duration::from_millis(500));
+                    let nat_res = tokio::time::timeout_at(sid_deadline, async {
                         if v2 {
                             work_conn.write_v2_frame(&dummy).await
                         } else {

@@ -148,6 +148,36 @@ const TLS_HANDSHAKE_WARN_MIN_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(feature = "tls")]
 static LAST_TLS_HANDSHAKE_WARN: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "tls")]
+static LAST_TLS_ACCEPT_WARN: AtomicU64 = AtomicU64::new(0);
+
+/// Warn about a TLS listener accept failure at most once per
+/// [`TLS_HANDSHAKE_WARN_MIN_INTERVAL`].
+///
+/// The accept loop retries every 50 ms, so a persistent `EMFILE`/`ENFILE`
+/// would otherwise log ~20 identical lines per second for as long as the
+/// process lives. Shared interval with the handshake warnings: both mean
+/// "the dashboard listener is not serving".
+#[cfg(feature = "tls")]
+fn warn_tls_accept_rate_limited(error: &std::io::Error) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_TLS_ACCEPT_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TLS_HANDSHAKE_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_TLS_ACCEPT_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another accept failure already logged within this window.
+        return;
+    }
+    tracing::warn!(error = %error, "TLS listener accept error: {}", error);
+}
+
 /// Warn about a failed TLS handshake at most once per
 /// [`TLS_HANDSHAKE_WARN_MIN_INTERVAL`]: the first failure in each window is
 /// logged, the rest are suppressed.
@@ -202,7 +232,7 @@ impl axum::serve::Listener for TlsListener {
                             // queued TLS conns. Mirrors the identical backoff in
                             // `frp-client/src/admin.rs`.
                             drop(permit);
-                            tracing::warn!(error = %e, "TLS listener accept error: {}", e);
+                            warn_tls_accept_rate_limited(&e);
                             tokio::select! {
                                 biased;
                                 Some(ready) = self.ready_rx.recv() => return ready,
