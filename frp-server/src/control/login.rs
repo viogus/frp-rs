@@ -325,7 +325,7 @@ pub(crate) async fn authenticate(
         .run_id
         .clone()
         .filter(|id| !id.is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .unwrap_or_else(frp_core::new_uuid_v4);
 
     // --- Server plugin: login hook (Go parity: BEFORE auth verify) ---
     // Go frp v0.71.0 server/service.go handleConnection: the plugin hook
@@ -448,7 +448,7 @@ pub(crate) async fn authenticate(
             // for the same reason, and this keeps the MUTATED login in
             // sync with the bookkeeping value (the replay table in
             // verify_login_auth derives from this field).
-            login.run_id = Some(uuid::Uuid::new_v4().to_string());
+            login.run_id = Some(frp_core::new_uuid_v4());
         } else if rid.len() > 64 || !rid.chars().all(is_printable_run_id_char) {
             warn!(peer = ?peer, run_id_len = %rid.len(), "Login rejected: invalid run_id (max 64 printable bytes)");
             // Consume a throttle slot: like every other pre-auth failure

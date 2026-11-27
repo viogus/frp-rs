@@ -32,6 +32,7 @@ fn make_info(name: &str, run_id: &str, group: Option<&str>) -> ProxyInfo {
         allow_users: Vec::new(),
         proxy_protocol_version: String::new(),
         response_headers: HashMap::new(),
+        compiled_response_headers: Default::default(),
         custom_domains: Vec::new(),
         route_by_http_user: String::new(),
         multiplexer: String::new(),

@@ -355,7 +355,7 @@ async fn check_token_replay(
                 .run_id
                 .clone()
                 .filter(|id| !id.is_empty())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                .unwrap_or_else(frp_core::new_uuid_v4);
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

@@ -30,7 +30,6 @@ tracing-subscriber = { workspace = true, features = ["registry", "json"] }
 tracing-appender.workspace = true
 thiserror.workspace = true
 axum = { workspace = true, optional = true }
-uuid.workspace = true
 md-5.workspace = true
 aes.workspace = true
 cfb-mode.workspace = true
@@ -79,7 +78,7 @@ opentelemetry-otlp = { version = "0.33", optional = true, default-features = fal
 tracing-opentelemetry = { version = "0.34", optional = true, default-features = false }
 [features]
 default = ["kcp", "quic", "websocket", "oidc", "tls", "compression", "chacha20", "vnet", "tcp-mux", "stun"]
-tcp-mux = ["dep:yamux"]
+tcp-mux = ["dep:yamux", "tokio-util/compat"]
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-platform-verifier", "dep:rcgen"]
 admin-auth = ["dep:axum"]
 compression = ["dep:snap"]

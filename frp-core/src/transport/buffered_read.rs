@@ -35,6 +35,12 @@ impl AsyncRead for BufferedReadTransport {
             let n = remaining.len().min(buf.remaining());
             buf.put_slice(&remaining[..n]);
             self.pos += n;
+            if self.pos >= self.buf.len() {
+                // Free the buffered prefix buffer immediately once drained so
+                // long-lived connections do not retain it on the heap.
+                self.buf = Vec::new();
+                self.pos = 0;
+            }
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut self.inner).poll_read(cx, buf)
@@ -106,6 +112,33 @@ impl Transport for BufferedReadTransport {
             None
         }
     }
+    fn into_yamux(self: Box<Self>) -> Option<super::YamuxStream> {
+        if self.pos >= self.buf.len() {
+            self.inner.into_yamux()
+        } else {
+            None
+        }
+    }
+    #[cfg(feature = "tls")]
+    fn into_tls(self: Box<Self>) -> Option<super::TlsTransport> {
+        if self.pos >= self.buf.len() {
+            self.inner.into_tls()
+        } else {
+            None
+        }
+    }
+    fn is_buffered_read(&self) -> bool {
+        true
+    }
+    fn into_buffered_read_parts(self: Box<Self>) -> Option<(Vec<u8>, usize, Box<dyn Transport>)> {
+        Some((self.buf, self.pos, self.inner))
+    }
+    fn is_yamux_wrappable(&self) -> bool {
+        self.inner.is_yamux_wrappable()
+    }
+    fn bridge_split_err(&self) -> Option<&'static str> {
+        self.inner.bridge_split_err()
+    }
     fn into_encrypted(self: Box<Self>, key: [u8; 16]) -> io::Result<Box<dyn Transport>> {
         // Buffered bytes are preserved inside the returned Cipher wrapper;
         // they will be replayed before encrypted reads begin.
@@ -122,8 +155,8 @@ impl Transport for BufferedReadTransport {
             ));
         }
         Ok(Box::new(BufferedReadTransport {
-            buf,
-            pos,
+            buf: Vec::new(),
+            pos: 0,
             inner: inner.into_encrypted(key)?,
         }))
     }
@@ -249,5 +282,48 @@ mod tests {
             "IoStream::BufferedRead",
             "wrapper must survive into_encrypted"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_and_nested_buffered_read_flattens_and_releases_buffer() {
+        use tokio::io::AsyncReadExt;
+
+        let (duplex, mut peer) = tokio::io::duplex(64);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = peer.write_all(b"-tail").await;
+        });
+
+        // Empty prefix unwraps directly without a BufferedRead layer.
+        let (d2, _) = tokio::io::duplex(64);
+        let unwrapped = super::super::IoStream::BufferedRead(
+            Vec::new(),
+            0,
+            Box::new(CipherStream::new(d2, [0u8; 16]).expect("rng")),
+        );
+        assert_eq!(unwrapped.debug_name(), "IoStream::Cipher");
+
+        // Nested BufferedRead layers coalesce into one layer and release buf once drained.
+        let base: Box<dyn Transport> = Box::new(CipherStream::new(duplex, [0u8; 16]).expect("rng"));
+        let _ = base;
+        let (client, srv) = tcp_pair().await;
+        let inner = super::super::IoStream::BufferedRead(
+            b"world".to_vec(),
+            0,
+            Box::new(client) as Box<dyn Transport>,
+        );
+        let mut outer = super::super::IoStream::BufferedRead(
+            b"hello ".to_vec(),
+            0,
+            Box::new(inner) as Box<dyn Transport>,
+        );
+        assert!(outer.try_tcp().is_none());
+
+        let mut got = [0u8; 11];
+        outer.read_exact(&mut got).await.expect("read coalesced");
+        assert_eq!(&got, b"hello world");
+        // After draining the coalesced prefix, try_tcp exposes the underlying socket.
+        assert!(outer.try_tcp().is_some());
+        drop(srv);
     }
 }

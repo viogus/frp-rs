@@ -1456,17 +1456,20 @@ fn test_app_state() -> Arc<AppState> {
 /// Hand-built VhostRoute for find_matching_route / sort_by_longest_location.
 fn route(name: &str, locations: &[String]) -> VhostRoute {
     VhostRoute {
-        proxy_name: name.into(),
-        run_id: "run".into(),
+        config: Arc::new(VhostRouteConfig {
+            proxy_name: name.into(),
+            run_id: "run".into(),
+            group: "".into(),
+            host_header_rewrite: "".into(),
+            host_header_rewrite_sanitized: "".into(),
+            http_user: "".into(),
+            http_pwd: "".into(),
+            route_by_http_user: "".into(),
+            headers: Arc::new(Vec::new()),
+            compiled_headers: Default::default(),
+        }),
         scheme: "http".into(),
-        group: "".into(),
         locations: locations.to_vec(),
-        host_header_rewrite: "".into(),
-        host_header_rewrite_sanitized: "".into(),
-        http_user: "".into(),
-        http_pwd: "".into(),
-        route_by_http_user: "".into(),
-        headers: Arc::new(Vec::new()),
     }
 }
 
@@ -3297,5 +3300,174 @@ fn test_validate_vhost_head_lines_verdicts() {
     assert_eq!(
         validate_vhost_head_lines("GET / HTTP/1.1\r\nno colon here\r\n\r\n"),
         HeadLineVerdict::Malformed
+    );
+}
+
+#[test]
+fn transform_non_connect_vhost_head_matches_legacy_three_step_pipeline() {
+    let peer = std::net::SocketAddr::from(([198, 51, 100, 77], 54321));
+    let headers = vec![
+        ("X-Custom".to_string(), "alpha".to_string()),
+        (
+            "X-Forwarded-Host".to_string(),
+            "override.example.com".to_string(),
+        ),
+        (
+            "X-Injected-Bad".to_string(),
+            "line1\r\nX-Evil: 1".to_string(),
+        ),
+    ];
+    let compiled = crate::vhost::router::PrecompiledRequestHeaders::compile(&headers);
+
+    let cases: &[(&[u8], Option<&str>, &str)] = &[
+        (
+            b"GET /hello?x=1 HTTP/1.1\r\nHost: in.example.com\r\nConnection: keep-alive, x-drop\r\nKeep-Alive: timeout=5\r\nX-Drop: secret\r\nProxy-Authorization: Basic abc\r\nX-Custom: old\r\nX-Forwarded-For: 10.0.0.1\r\n\r\nPOST-BODY",
+            Some("backend.internal:8080"),
+            "in.example.com",
+        ),
+        (
+            b"GET /ws HTTP/1.1\r\nHost: ws.example.com\r\nConnection: Upgrade, keep-alive\r\nUpgrade: websocket\r\nTe: trailers\r\nTransfer-Encoding: chunked\r\nForwarded: for=1.1.1.1\r\nX-Forwarded-Proto: https\r\nX-Forwarded-For: 203.0.113.1,\r\n 203.0.113.2\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+            None,
+            "ws.example.com",
+        ),
+        (
+            b"GET / HTTP/1.0\r\nX-Forwarded-Host: spoofed\r\nX-Keep: v1\r\n\r\n",
+            Some("rewritten.local"),
+            "",
+        ),
+    ];
+
+    for (raw, rewrite_host, xfh) in cases {
+        let legacy = {
+            let (stripped, up) =
+                crate::vhost::forward::strip_vhost_hop_by_hop_headers(raw.to_vec());
+            let valid = up
+                .as_deref()
+                .is_none_or(|u| u.iter().all(|b| (0x20..=0x7e).contains(b)));
+            assert!(valid);
+            let rewritten = match rewrite_host {
+                Some(h) => rewrite_host_header(stripped, h),
+                None => stripped,
+            };
+            inject_vhost_request_headers(rewritten, peer, xfh, &headers)
+        };
+        let fused = crate::vhost::forward::transform_non_connect_vhost_head(
+            raw.to_vec(),
+            *rewrite_host,
+            peer,
+            xfh,
+            &compiled,
+        )
+        .expect("valid upgrade header");
+        assert_eq!(
+            String::from_utf8_lossy(&fused),
+            String::from_utf8_lossy(&legacy)
+        );
+    }
+
+    let bad_upgrade =
+        b"GET / HTTP/1.1\r\nHost: a.com\r\nConnection: Upgrade\r\nUpgrade: bad\x01val\r\n\r\n";
+    assert!(crate::vhost::forward::transform_non_connect_vhost_head(
+        bad_upgrade.to_vec(),
+        None,
+        peer,
+        "a.com",
+        &compiled,
+    )
+    .is_err());
+}
+
+#[test]
+fn transform_non_connect_vhost_head_handles_obs_fold_and_protected_conn_tokens() {
+    let peer = std::net::SocketAddr::from(([198, 51, 100, 88], 12345));
+    let headers = vec![
+        ("".to_string(), "ignored".to_string()),
+        ("\r\n".to_string(), "ignored2".to_string()),
+        ("X-Forwarded-Proto\r".to_string(), "https".to_string()),
+    ];
+    let compiled = crate::vhost::router::PrecompiledRequestHeaders::compile(&headers);
+    assert!(compiled.overrides_xfp);
+
+    // obs-fold in Connection/Upgrade/Te, multiple Te headers, and Connection naming
+    // Host/Trailer/Transfer-Encoding(non-chunked)/X-Forwarded-For.
+    let raw = b"GET / HTTP/1.1\r\n\
+Host: in.example.com\r\n\
+\x20fold-host-tail\r\n\
+Connection: keep-alive,\r\n X-Drop, Host, Trailer, Transfer-Encoding, X-Forwarded-For,\r\n Upgrade\r\n\
+X-Drop: secret\r\n\
+Trailer: X-Ck\r\n\
+Transfer-Encoding: gzip\r\n\
+Upgrade: web\r\n socket\r\n\
+Te:\r\n trailers\r\n\
+Te: deflate\r\n\
+X-Forwarded-Proto: http\r\n\
+X-Forwarded-For: 10.0.0.1\r\n\
+\r\n";
+    let out = crate::vhost::forward::transform_non_connect_vhost_head(
+        raw.to_vec(),
+        Some("rewritten.internal"),
+        peer,
+        "in.example.com",
+        &compiled,
+    )
+    .expect("valid upgrade");
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("Host: rewritten.internal\r\n"), "{text:?}");
+    assert!(!text.contains("fold-host-tail"), "{text:?}");
+    assert!(!text.contains("X-Drop: secret"), "{text:?}");
+    assert!(text.contains("Trailer: X-Ck\r\n"), "{text:?}");
+    assert!(text.contains("Transfer-Encoding: gzip\r\n"), "{text:?}");
+    assert!(text.contains("Connection: Upgrade\r\n"), "{text:?}");
+    assert!(text.contains("Upgrade: web socket\r\n"), "{text:?}");
+    assert!(text.contains("Te: trailers\r\n"), "{text:?}");
+    assert!(
+        text.contains("X-Forwarded-For: 10.0.0.1, 198.51.100.88\r\n"),
+        "{text:?}"
+    );
+    assert_eq!(text.matches("X-Forwarded-Proto:").count(), 1, "{text:?}");
+    assert!(text.contains("X-Forwarded-Proto: https\r\n"), "{text:?}");
+    assert!(!text.contains(": ignored"), "{text:?}");
+
+    // Folded Transfer-Encoding: chunked must collapse to one canonical header;
+    // folded Transfer-Encoding: chunked\r\n gzip is non-chunked and must survive verbatim.
+    let te_folded_chunked =
+        b"GET / HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding:\r\n chunked\r\n\r\n";
+    let out_chunked = String::from_utf8(
+        crate::vhost::forward::transform_non_connect_vhost_head(
+            te_folded_chunked.to_vec(),
+            None,
+            peer,
+            "a.com",
+            &compiled,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        out_chunked.matches("Transfer-Encoding:").count(),
+        1,
+        "{out_chunked:?}"
+    );
+    assert!(
+        out_chunked.contains("Transfer-Encoding: chunked\r\n"),
+        "{out_chunked:?}"
+    );
+
+    let te_folded_gzip =
+        b"GET / HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding: chunked\r\n\x20gzip\r\n\r\n";
+    let out_gzip = String::from_utf8(
+        crate::vhost::forward::transform_non_connect_vhost_head(
+            te_folded_gzip.to_vec(),
+            None,
+            peer,
+            "a.com",
+            &compiled,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        out_gzip.contains("Transfer-Encoding: chunked\r\n gzip\r\n"),
+        "{out_gzip:?}"
     );
 }

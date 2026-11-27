@@ -905,8 +905,8 @@ is structural rather than tested.
 
 **Every handoff moves the stream.** There are four of them, one per surface
 (HTTP/1.1 vhost, HTTPS SNI passthrough, tcpmux, h2c) and they all have the same
-shape. `frp-server/src/vhost.rs:723` looks the route's `run_id` up in
-`run_id_to_ctl_tx`, and `:723` sends `InternalMsg::ProxyUserConn { user_conn:
+shape. `frp-server/src/vhost.rs:725` looks the route's `run_id` up in
+`run_id_to_ctl_tx`, and `:725` sends `InternalMsg::ProxyUserConn { user_conn:
 wrap(stream), .. }`. The stream is **moved** into the message: after that call
 the vhost task no longer holds a copy, so there is no "listener still owns it"
 state for a removal to strand. The other three are
@@ -929,7 +929,7 @@ The three ways the send can end all close the connection or transfer it:
   close rather than waiting on a read timeout.
 
 A route whose control is already gone never reaches the send at all:
-`frp-server/src/vhost.rs:765` writes Go's `NotFoundResponse` and returns,
+`frp-server/src/vhost.rs:767` writes Go's `NotFoundResponse` and returns,
 dropping the stream; the tcpmux path answers the same way at
 `frp-server/src/tcpmux.rs:714`.
 

@@ -1558,6 +1558,7 @@ mod vnet_route_tests {
             proxy_protocol_version: String::new(),
             udp_packet_codec: String::new(),
             response_headers: std::collections::HashMap::new(),
+            compiled_response_headers: Default::default(),
             custom_domains: Vec::new(),
             route_by_http_user: String::new(),
             multiplexer: String::new(),

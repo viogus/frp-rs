@@ -471,6 +471,38 @@ pub fn hex_encode(bytes: &[u8]) -> String {
     s
 }
 
+/// Generate a random RFC 4122 version 4 UUID string (`8-4-4-4-12` lowercase hex)
+/// using `rand::rngs::SysRng` (removes the `uuid` crate dependency without pulling
+/// `ring::rand::SystemRandom` into minimal builds).
+pub fn new_uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    if rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes).is_err() {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        bytes[..8].copy_from_slice(&(nanos as u64).to_le_bytes());
+        // Big-endian keeps the low 56 bits of `seq` out of `bytes[8]`, whose
+        // top 2 variant bits are overwritten right below.
+        bytes[8..].copy_from_slice(&(((nanos >> 64) as u64) ^ seq).to_be_bytes());
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(36);
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push(b'-');
+        }
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
+    }
+    String::from_utf8(out).expect("UUID ASCII")
+}
+
 /// Format a host:port string correctly for IPv4 and IPv6.
 /// IPv6 addresses are wrapped in brackets: [::1]:7000.
 /// Hostnames and IPv4 addresses use plain format: 0.0.0.0:7000.
@@ -479,5 +511,28 @@ pub fn format_socket_addr(host: &str, port: u16) -> String {
         std::net::SocketAddr::new(ip, port).to_string()
     } else {
         format!("{host}:{port}")
+    }
+}
+
+#[cfg(test)]
+mod uuid_tests {
+    #[test]
+    fn new_uuid_v4_matches_rfc4122_shape() {
+        let u1 = super::new_uuid_v4();
+        let u2 = super::new_uuid_v4();
+        assert_eq!(u1.len(), 36);
+        assert_eq!(u2.len(), 36);
+        assert_ne!(u1, u2);
+        let bytes = u1.as_bytes();
+        for &dash in &[8usize, 13, 18, 23] {
+            assert_eq!(bytes[dash], b'-');
+        }
+        assert_eq!(bytes[14], b'4');
+        assert!(matches!(bytes[19], b'8' | b'9' | b'a' | b'b'));
+        assert!(bytes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !matches!(i, 8 | 13 | 18 | 23))
+            .all(|(_, b)| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
     }
 }

@@ -108,6 +108,7 @@ impl VnetController {
         mut tun_packet_rx: mpsc::Receiver<Arc<[u8]>>,
     ) -> anyhow::Result<()> {
         let mut tun_buf = vec![0u8; tun_read_buf_len(tun.mtu())];
+        let routes = self.client.route_table();
         // Rate-limits "dropping packet" warnings (oversized TUN writes, full
         // control queue) to at most one per second: a misbehaving peer or a
         // slow control writer must not be able to flood the log at TUN read
@@ -161,12 +162,23 @@ impl VnetController {
 
                         // Fall back to control-connection VnetPacket routing
                         // (visitor host routes and peer TUN-backed proxies).
-                        let routes = self.client.route_table();
-                        let target = routes
-                            .read()
-                            .await
-                            .lookup(&self.vnet, &dst_ip)
-                            .map(str::to_string);
+                        // Try uncontended sync read first to avoid RwLock::read()
+                        // async state overhead on every packet.
+                        let target = {
+                            if let Ok(guard) = routes.try_read() {
+                                Some(guard.lookup(&self.vnet, &dst_ip).map(str::to_string))
+                            } else {
+                                None
+                            }
+                        };
+                        let target = match target {
+                            Some(t) => t,
+                            None => routes
+                                .read()
+                                .await
+                                .lookup(&self.vnet, &dst_ip)
+                                .map(str::to_string),
+                        };
                         if let Some(target) = target {
                             let vnet_pkt = frp_core::msg::VnetPacket {
                                 proxy_name: target,

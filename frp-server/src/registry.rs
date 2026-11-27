@@ -4,9 +4,18 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::lock::RwLockExt;
+
+/// Default retention window for disconnected clients that supplied an explicit
+/// `raw_client_id`: kept for 24 hours so dashboards still show recently
+/// disconnected persistent clients without growing unboundedly.
+pub(crate) const DEFAULT_OFFLINE_CLIENT_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Hard cap on retained offline persistent client records to absorb bursts of
+/// distinct offline client IDs before the periodic reaper runs.
+pub(crate) const MAX_OFFLINE_CLIENTS: usize = 4096;
 
 /// Metadata about a connected frpc instance.
 #[derive(Debug, Clone)]
@@ -221,7 +230,8 @@ impl ClientRegistry {
                     info.run_id = String::new();
                     info.control_id = 0;
                     info.online = false;
-                    info.disconnected_at = Some(Instant::now());
+                    let now = Instant::now();
+                    info.disconnected_at = Some(now);
                     info.disconnected_at_unix = Some(unix_now());
                     // The run_id → key row dies with the session even for a
                     // persistent (raw_client_id) client: the record survives
@@ -229,9 +239,69 @@ impl ClientRegistry {
                     // NEXT registration of the same run_id and accumulate
                     // one orphan per reconnect cycle.
                     run_index.remove(run_id);
+
+                    // Bound offline persistent entries under churn spikes.
+                    let offline_count = clients.values().filter(|c| !c.online).count();
+                    if offline_count > MAX_OFFLINE_CLIENTS {
+                        let excess = offline_count - MAX_OFFLINE_CLIENTS;
+                        if excess == 1 {
+                            // Common single-disconnect eviction at cap: zero Vec allocs.
+                            let victim_key = clients
+                                .iter()
+                                .filter(|(_, c)| !c.online)
+                                .min_by_key(|(_, c)| {
+                                    c.disconnected_at.unwrap_or(c.last_connected_at)
+                                })
+                                .map(|(k, _)| k.clone());
+                            if let Some(evict_key) = victim_key {
+                                if let Some(removed) = clients.remove(&evict_key) {
+                                    if !removed.run_id.is_empty() {
+                                        run_index.remove(&removed.run_id);
+                                    }
+                                }
+                            }
+                        } else {
+                            let mut offline: Vec<(String, Instant)> = clients
+                                .iter()
+                                .filter(|(_, c)| !c.online)
+                                .map(|(k, c)| {
+                                    (k.clone(), c.disconnected_at.unwrap_or(c.last_connected_at))
+                                })
+                                .collect();
+                            let mid = excess - 1;
+                            offline.select_nth_unstable_by_key(mid, |(_, t)| *t);
+                            for (evict_key, _) in offline.into_iter().take(excess) {
+                                if let Some(removed) = clients.remove(&evict_key) {
+                                    if !removed.run_id.is_empty() {
+                                        run_index.remove(&removed.run_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+
+    /// Prune offline client records whose `disconnected_at` is at least
+    /// `max_age` in the past. Returns the number of records removed.
+    pub fn prune_expired_offline(&self, max_age: Duration) -> usize {
+        let now = Instant::now();
+        let mut run_index = self.run_index.write_ok();
+        let mut clients = self.clients.write_ok();
+        let before = clients.len();
+        clients.retain(|_, info| {
+            let keep = info.online
+                || info
+                    .disconnected_at
+                    .is_none_or(|t| now.saturating_duration_since(t) < max_age);
+            if !keep && !info.run_id.is_empty() {
+                run_index.remove(&info.run_id);
+            }
+            keep
+        });
+        before.saturating_sub(clients.len())
     }
 
     /// Return a snapshot of all known clients.
@@ -488,5 +558,36 @@ mod tests {
         let (_, conflict) = register_test_client(&r, "u", "", "run-x");
         assert!(!conflict);
         assert!(r.get_by_key("u.run-x").is_some());
+    }
+
+    #[test]
+    fn prune_expired_offline_evicts_expired_but_keeps_online_and_recent() {
+        let r = mk_registry();
+        register_test_client(&r, "u", "old-off", "r1");
+        r.mark_offline_by_run_id("r1");
+        std::thread::sleep(Duration::from_millis(20));
+
+        register_test_client(&r, "u", "recent-off", "r2");
+        register_test_client(&r, "u", "online-c", "r3");
+        r.mark_offline_by_run_id("r2");
+
+        let pruned = r.prune_expired_offline(Duration::from_millis(12));
+        assert_eq!(pruned, 1);
+        assert!(r.get_by_key("u.old-off").is_none());
+        assert!(r.get_by_key("u.recent-off").is_some());
+        assert!(r.get_by_key("u.online-c").is_some());
+    }
+
+    #[test]
+    fn offline_cap_evicts_oldest_persistent_clients() {
+        let r = mk_registry();
+        let total = MAX_OFFLINE_CLIENTS + 10;
+        for i in 0..total {
+            let cid = format!("cid-{i:05}");
+            let rid = format!("run-{i:05}");
+            register_test_client(&r, "u", &cid, &rid);
+            r.mark_offline_by_run_id(&rid);
+        }
+        assert_eq!(r.list().len(), MAX_OFFLINE_CLIENTS);
     }
 }

@@ -527,7 +527,7 @@ async fn run_work_bridge(
     let injector_headers = proxy_info
         .as_ref()
         .filter(|p| p.proxy_type == "http" && !req.request_is_connect)
-        .map(|p| p.response_headers.clone());
+        .map(|p| p.compiled_response_headers.clone());
 
     // For encrypted bridges, pre_read bytes are passed into bridge_encrypted
     // which writes them through the CipherWriter (matching Go frp streaming CFB).
@@ -569,7 +569,8 @@ async fn run_work_bridge(
             } else {
                 decrypted
             };
-            let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+            let injector =
+                ResponseHeaderInjector::with_compiled(injector_r, headers, header_timeout);
             // The injector owns the absolute response-head deadline (armed
             // at construction above); the frp-core bridge gets NO one-shot
             // header_timeout here — a duplicate would consume on the first
@@ -709,7 +710,8 @@ async fn run_work_bridge(
                     } else {
                         w_r
                     };
-                    let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                    let injector =
+                        ResponseHeaderInjector::with_compiled(injector_r, headers, header_timeout);
                     // No one-shot header_timeout to the bridge: the injector
                     // owns the absolute response-head deadline (see the
                     // encrypted arm above).
@@ -766,7 +768,8 @@ async fn run_work_bridge(
                     } else {
                         w_r
                     };
-                    let injector = ResponseHeaderInjector::new(injector_r, headers, header_timeout);
+                    let injector =
+                        ResponseHeaderInjector::with_compiled(injector_r, headers, header_timeout);
                     // No one-shot header_timeout to the bridge: the injector
                     // owns the absolute response-head deadline (see the
                     // encrypted arm above).

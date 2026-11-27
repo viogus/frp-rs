@@ -157,61 +157,32 @@ pub(crate) async fn resolve_vhost_request(
     // cross-tenant hijack (any registered proxy could impersonate the
     // redirect target) and is removed (audit round 3, M12).
 
-    // EOL canonicalization: the read loop accepts bare-LF/mixed-EOL heads
-    // (Go textproto semantics), but Go net/http re-serializes every parsed
-    // request head with CRLF on write (`req.Write(remote)` — connectHandler
-    // and the reverse proxy both forward the parsed request, never the raw
-    // inbound bytes). The head region is therefore re-encoded here, before
-    // the rewrite/inject block below edits it and before either branch
-    // forwards it; the host-line and header-line scans that follow may rely
-    // on CRLF anchors. Tail bytes (entity body / pipelined requests) are
-    // forwarded verbatim — Go copies the body separately, and a body line
-    // must never be mistaken for a header (audit fix). A CRLF-only head maps
-    // byte-identically (no copy) — the common case.
+    // EOL canonicalization + single-pass header transform:
+    // Go net/http re-serializes every parsed request head with CRLF on write
+    // (reverseproxy.go / connectHandler). CONNECT forwards raw after CRLF
+    // canonicalization; non-CONNECT runs host_header_rewrite, Go
+    // removeHopByHopHeaders (with Upgrade ASCII-printability check and Te/Upgrade
+    // re-adds), X-Forwarded-* injection, and precompiled requestHeaders in a
+    // single output buffer pass (zero intermediate whole-head allocations).
     let request_head = frp_core::textproto::canonicalize_head_crlf(request_head);
-
-    // Host rewrite + forwarded-header injection apply only to non-CONNECT
-    // requests: Go's ServeHTTP routes CONNECT to connectHandler, which writes
-    // `req.Write(remote)` RAW (http.go:282-285) — no host rewrite, no
-    // SetXForwarded, no rc.Headers. Auth still gates above: checkRouteAuthByRequest
-    // runs BEFORE the method gate, so a CONNECT to an auth-protected route is
-    // still 407/401 before any byte is forwarded.
-    let request_head = if !is_connect && !route.host_header_rewrite.is_empty() {
-        rewrite_host_header(request_head, &route.host_header_rewrite_sanitized)
-    } else {
-        request_head
-    };
-
-    // Go frp compat (pkg/util/vhost/http.go reverse proxy + stdlib
-    // httputil.ProxyRequest.SetXForwarded): inject X-Forwarded-For (append
-    // to existing value), X-Forwarded-Host (inbound Host as received, BEFORE
-    // host_header_rewrite — Go rewrites `req.Host` after SetXForwarded),
-    // X-Forwarded-Proto (always "http" here: r.In.TLS == nil on this plain
-    // HTTP path; the HTTPS vhost muxer is SNI passthrough and never
-    // injects), then requestHeaders (Set semantics — user-configured
-    // overrides win, exactly like Go's rc.Headers loop after SetXForwarded).
-    // The hop-by-hop strip (F3) runs FIRST, mirroring Go's ServeHTTP order:
-    // removeHopByHopHeaders (with its Te/Upgrade re-adds) happens before the
-    // Rewrite hook that SetXForwarded and the rc.Headers loop live in.
     let request_head = if is_connect {
-        // CONNECT forwards raw — Go connectHandler (http.go:282-285):
-        // no hop strip, no forwarded-header injection (Rewrite never runs).
         request_head
     } else {
-        let (request_head, req_up_type) = strip_vhost_hop_by_hop_headers(request_head);
-        // Go checks the requested upgrade protocol's printability BEFORE
-        // stripping (reverseproxy.go: `if !ascii.IsPrint(reqUpType)`) and
-        // answers through the proxy ErrorHandler — Go frp's 404 route-miss
-        // response (http.go:128-137). req_up_type is Some only when the
-        // Connection value named Upgrade; a non-printable value must never
-        // reach a backend.
-        if let Some(up) = &req_up_type {
-            if !up.iter().all(|b| (0x20..=0x7e).contains(b)) {
+        let rewrite_host = (!route.host_header_rewrite.is_empty())
+            .then_some(route.host_header_rewrite_sanitized.as_ref());
+        match transform_non_connect_vhost_head(
+            request_head,
+            rewrite_host,
+            peer,
+            raw_host,
+            &route.compiled_headers,
+        ) {
+            Ok(head) => head,
+            Err(()) => {
                 warn!(host = %host, path = %path, peer = %peer, "{} VHost: rejecting request for non-printable upgrade protocol (Go ascii.IsPrint gate)", scheme);
                 return Err(VhostResolveError::NotFound);
             }
         }
-        inject_vhost_request_headers(request_head, peer, raw_host, route.headers.as_slice())
     };
 
     Ok(VhostForward {
@@ -219,6 +190,349 @@ pub(crate) async fn resolve_vhost_request(
         run_id: group_run_id,
         request_head,
     })
+}
+
+/// OWS trim (space/tab) — Go textproto.TrimString.
+#[inline]
+fn trim_ows(b: &[u8]) -> &[u8] {
+    let s = b
+        .iter()
+        .position(|c| *c != b' ' && *c != b'\t')
+        .unwrap_or(b.len());
+    let e = b
+        .iter()
+        .rposition(|c| *c != b' ' && *c != b'\t')
+        .map(|i| i + 1)
+        .unwrap_or(s);
+    &b[s..e]
+}
+
+#[inline]
+fn trim_line_eol(line: &[u8]) -> &[u8] {
+    line.strip_suffix(b"\r\n")
+        .or_else(|| line.strip_suffix(b"\n"))
+        .unwrap_or(line)
+}
+
+#[inline]
+fn is_fixed_hop_header(name: &[u8]) -> bool {
+    name.eq_ignore_ascii_case(b"connection")
+        || name.eq_ignore_ascii_case(b"te")
+        || name.eq_ignore_ascii_case(b"upgrade")
+        || name.eq_ignore_ascii_case(b"proxy-connection")
+        || name.eq_ignore_ascii_case(b"keep-alive")
+        || name.eq_ignore_ascii_case(b"proxy-authenticate")
+        || name.eq_ignore_ascii_case(b"proxy-authorization")
+}
+
+/// Unfold obs-fold continuation lines (`SP`/`HT`-prefixed physical lines
+/// following a header line) using Go `net/textproto.Reader.readContinuedLineSlice`
+/// single-space joining. Returns `Cow::Borrowed` with zero allocation when no
+/// continuation line follows.
+fn unfold_header_value<'a>(
+    hdr_bytes: &'a [u8],
+    pos: &mut usize,
+    initial_value: &'a [u8],
+) -> std::borrow::Cow<'a, [u8]> {
+    let mut folded: Option<Vec<u8>> = None;
+    while *pos < hdr_bytes.len() {
+        let next = hdr_bytes[*pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| *pos + i + 1)
+            .unwrap_or(hdr_bytes.len());
+        let t = trim_line_eol(&hdr_bytes[*pos..next]);
+        if matches!(t.first(), Some(b' ' | b'\t')) {
+            let out = folded.get_or_insert_with(|| initial_value.to_vec());
+            let cont = trim_ows(t);
+            if !cont.is_empty() {
+                if !out.is_empty() {
+                    out.push(b' ');
+                }
+                out.extend_from_slice(cont);
+            }
+            *pos = next;
+        } else {
+            break;
+        }
+    }
+    match folded {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(initial_value),
+    }
+}
+
+/// Collect custom `Connection`-named hop-by-hop header names (Pass 1), excluding
+/// fixed hop headers and protected headers (`Host`, `Trailer`, non-chunked
+/// `Transfer-Encoding`, `X-Forwarded-For`) that Go / raw-body framing preserve.
+fn collect_conn_tokens(val: &[u8], connection_upgrade: &mut bool, conn_named: &mut Vec<Vec<u8>>) {
+    for tok in val.split(|&b| b == b',') {
+        let tok = trim_ows(tok);
+        if tok.is_empty() {
+            continue;
+        }
+        if tok.eq_ignore_ascii_case(b"upgrade") {
+            *connection_upgrade = true;
+        } else if !is_fixed_hop_header(tok)
+            && !tok.eq_ignore_ascii_case(b"host")
+            && !tok.eq_ignore_ascii_case(b"trailer")
+            && !tok.eq_ignore_ascii_case(b"transfer-encoding")
+            && !tok.eq_ignore_ascii_case(b"x-forwarded-for")
+            && !conn_named.iter().any(|c| c.eq_ignore_ascii_case(tok))
+        {
+            conn_named.push(tok.to_vec());
+        }
+    }
+}
+
+/// Combined single-allocation non-CONNECT VHost request-head transformation:
+/// Host rewrite + Go `removeHopByHopHeaders` + `SetXForwarded` + precompiled
+/// `requestHeaders`. Returns `Err(())` when `Connection` names `Upgrade` and
+/// the `Upgrade` value fails Go's `ascii.IsPrint` gate (`0x20..=0x7e`).
+#[cfg_attr(not(test), inline)]
+pub(super) fn transform_non_connect_vhost_head(
+    data: Vec<u8>,
+    rewrite_host: Option<&str>,
+    peer: std::net::SocketAddr,
+    x_forwarded_host: &str,
+    compiled: &super::router::PrecompiledRequestHeaders,
+) -> Result<Vec<u8>, ()> {
+    use std::borrow::Cow;
+    use std::io::Write;
+
+    let header_end = frp_core::textproto::head_end(&data).unwrap_or(data.len());
+    let head = &data[..header_end];
+    let tail = &data[header_end..];
+
+    let line0_end = head
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(head.len());
+    let request_line = &head[..line0_end];
+    let hdr_bytes = &head[line0_end..];
+
+    // Pass 1 (zero-alloc for common requests): collect Connection tokens,
+    // Upgrade state/value, Te: trailers, and Transfer-Encoding: chunked,
+    // unfolding obs-fold continuations on those headers if present.
+    let mut conn_named: Vec<Vec<u8>> = Vec::new();
+    let mut upgrade_value: Option<Cow<'_, [u8]>> = None;
+    let mut connection_upgrade = false;
+    let mut te_trailers = false;
+    let mut te_chunked = false;
+
+    let mut ppos = 0usize;
+    while ppos < hdr_bytes.len() {
+        let next = hdr_bytes[ppos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| ppos + i + 1)
+            .unwrap_or(hdr_bytes.len());
+        let line = &hdr_bytes[ppos..next];
+        ppos = next;
+
+        let trimmed = trim_line_eol(line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(colon) = trimmed.iter().position(|&b| b == b':') else {
+            continue;
+        };
+        let name = &trimmed[..colon];
+        let value = trim_ows(&trimmed[colon + 1..]);
+
+        if name.eq_ignore_ascii_case(b"connection") {
+            let val = unfold_header_value(hdr_bytes, &mut ppos, value);
+            collect_conn_tokens(&val, &mut connection_upgrade, &mut conn_named);
+        } else if name.eq_ignore_ascii_case(b"te") {
+            let val = unfold_header_value(hdr_bytes, &mut ppos, value);
+            te_trailers |= val
+                .split(|&b| b == b',')
+                .map(trim_ows)
+                .any(|t| t.eq_ignore_ascii_case(b"trailers"));
+        } else if name.eq_ignore_ascii_case(b"upgrade") {
+            let val = unfold_header_value(hdr_bytes, &mut ppos, value);
+            if upgrade_value.is_none() {
+                upgrade_value = Some(val);
+            }
+        } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            let val = unfold_header_value(hdr_bytes, &mut ppos, value);
+            if val.eq_ignore_ascii_case(b"chunked") {
+                te_chunked = true;
+            }
+        }
+    }
+
+    let upgrade = if connection_upgrade {
+        upgrade_value.as_deref()
+    } else {
+        None
+    };
+    if let Some(up) = upgrade {
+        if !up.iter().all(|b| (0x20..=0x7e).contains(b)) {
+            return Err(());
+        }
+    }
+
+    // Pass 2 (single output allocation): filter, rewrite Host, unfold XFF,
+    // emit re-adds + SetXForwarded + precompiled wire_block + body tail.
+    let mut out = Vec::with_capacity(
+        data.len()
+            + 96
+            + compiled.wire_block.len()
+            + rewrite_host.map_or(0, str::len)
+            + x_forwarded_host.len(),
+    );
+    out.extend_from_slice(request_line);
+
+    let mut existing_xff: Vec<u8> = Vec::new();
+    let mut host_rewritten = false;
+    let mut pos = 0usize;
+
+    let swallow_continuations = |pos: &mut usize| {
+        while *pos < hdr_bytes.len() {
+            let next = hdr_bytes[*pos..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .map(|i| *pos + i + 1)
+                .unwrap_or(hdr_bytes.len());
+            let t = trim_line_eol(&hdr_bytes[*pos..next]);
+            if matches!(t.first(), Some(b' ' | b'\t')) {
+                *pos = next;
+            } else {
+                break;
+            }
+        }
+    };
+
+    while pos < hdr_bytes.len() {
+        let next = hdr_bytes[pos..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|i| pos + i + 1)
+            .unwrap_or(hdr_bytes.len());
+        let line = &hdr_bytes[pos..next];
+        pos = next;
+
+        let trimmed = trim_line_eol(line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(colon) = trimmed.iter().position(|&b| b == b':') else {
+            out.extend_from_slice(line);
+            continue;
+        };
+        let name = &trimmed[..colon];
+        let value = trim_ows(&trimmed[colon + 1..]);
+
+        // Hop-by-hop removal (Go removeHopByHopHeaders pass 1 & 2).
+        if is_fixed_hop_header(name) || conn_named.iter().any(|c| name.eq_ignore_ascii_case(c)) {
+            swallow_continuations(&mut pos);
+            continue;
+        }
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            let mut probe = pos;
+            if unfold_header_value(hdr_bytes, &mut probe, value).eq_ignore_ascii_case(b"chunked") {
+                pos = probe;
+                continue;
+            }
+        }
+
+        // Configured request_headers override takes precedence over both
+        // inbound values and Host rewrite (matching legacy Pass 1 -> Pass 3).
+        if compiled.matches_override(trimmed) {
+            if !host_rewritten && name.eq_ignore_ascii_case(b"host") {
+                host_rewritten = true;
+            }
+            swallow_continuations(&mut pos);
+            continue;
+        }
+
+        if !host_rewritten && name.eq_ignore_ascii_case(b"host") {
+            host_rewritten = true;
+            if let Some(new_host) = rewrite_host {
+                out.extend_from_slice(b"Host: ");
+                out.extend_from_slice(new_host.as_bytes());
+                out.extend_from_slice(b"\r\n");
+                swallow_continuations(&mut pos);
+                continue;
+            }
+        }
+
+        if name.eq_ignore_ascii_case(b"x-forwarded-for") {
+            existing_xff.extend_from_slice(value);
+            while pos < hdr_bytes.len() {
+                let next_c = hdr_bytes[pos..]
+                    .iter()
+                    .position(|&b| b == b'\n')
+                    .map(|i| pos + i + 1)
+                    .unwrap_or(hdr_bytes.len());
+                let t = trim_line_eol(&hdr_bytes[pos..next_c]);
+                match t.first() {
+                    Some(b' ' | b'\t') => {
+                        let content = t
+                            .iter()
+                            .position(|&b| b != b' ' && b != b'\t')
+                            .map(|p| &t[p..])
+                            .unwrap_or(&[]);
+                        existing_xff.push(b' ');
+                        existing_xff.extend_from_slice(content);
+                        pos = next_c;
+                    }
+                    _ => break,
+                }
+            }
+            existing_xff.extend_from_slice(b", ");
+            continue;
+        }
+
+        if name.eq_ignore_ascii_case(b"x-forwarded-host")
+            || name.eq_ignore_ascii_case(b"x-forwarded-proto")
+            || name.eq_ignore_ascii_case(b"forwarded")
+        {
+            swallow_continuations(&mut pos);
+            continue;
+        }
+
+        out.extend_from_slice(line);
+    }
+
+    // Re-add surviving hop-by-hop declarations (Te: trailers, TE: chunked,
+    // Connection: Upgrade + Upgrade: <val>) unless overridden by request_headers.
+    if te_trailers && !compiled.matches_override(b"te:") {
+        out.extend_from_slice(b"Te: trailers\r\n");
+    }
+    if te_chunked && !compiled.matches_override(b"transfer-encoding:") {
+        out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+    }
+    if let Some(u) = upgrade {
+        if !compiled.matches_override(b"connection:") {
+            out.extend_from_slice(b"Connection: Upgrade\r\n");
+        }
+        if !compiled.matches_override(b"upgrade:") {
+            out.extend_from_slice(b"Upgrade: ");
+            out.extend_from_slice(u);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+
+    if !compiled.overrides_xff {
+        out.extend_from_slice(b"X-Forwarded-For: ");
+        out.extend_from_slice(&existing_xff);
+        let _ = write!(out, "{}\r\n", peer.ip());
+    }
+    if !compiled.overrides_xfh {
+        out.extend_from_slice(b"X-Forwarded-Host: ");
+        out.extend_from_slice(x_forwarded_host.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if !compiled.overrides_xfp {
+        out.extend_from_slice(b"X-Forwarded-Proto: http\r\n");
+    }
+    out.extend_from_slice(&compiled.wire_block);
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(tail);
+    Ok(out)
 }
 
 /// Strip CR/LF from a configured `host_header_rewrite` value to prevent HTTP
@@ -237,6 +551,7 @@ pub(super) fn sanitize_rewrite_host(host: &str) -> String {
 ///
 /// `new_host` must already be CR/LF-sanitized — every caller passes the
 /// route's registration-time `host_header_rewrite_sanitized`.
+#[cfg(test)]
 pub(super) fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
     // Only the header block up to the first blank line is scanned (audit
     // fix): bytes past the terminator are entity body / pipelined requests
@@ -346,7 +661,8 @@ pub(super) fn rewrite_host_header(data: Vec<u8>, new_host: &str) -> Vec<u8> {
 /// enforces Go's `!ascii.IsPrint(reqUpType)` rejection (checked BEFORE
 /// stripping in ServeHTTP, answered via the proxy ErrorHandler → Go frp's
 /// 404 route-miss response).
-fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
+#[cfg(test)]
+pub(super) fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
     let header_end = frp_core::textproto::head_end(&data).unwrap_or(data.len());
     let head = &data[..header_end];
     let tail = &data[header_end..];
@@ -504,6 +820,7 @@ fn strip_vhost_hop_by_hop_headers(data: Vec<u8>) -> (Vec<u8>, Option<Vec<u8>>) {
 /// `r.Out.Host` after it). An empty value still emits
 /// `X-Forwarded-Host:` — Go `Header.Set` on a missing header writes an
 /// empty-valued line unconditionally (pinned by the unit test below).
+#[cfg(test)]
 pub(super) fn inject_vhost_request_headers(
     data: Vec<u8>,
     peer: std::net::SocketAddr,

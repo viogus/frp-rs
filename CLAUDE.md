@@ -171,7 +171,7 @@ not be cited for them.
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | zero warnings (pinned toolchain) |
 | `cargo test --workspace --all-features` | must pass — needs an all-features `frps` binary, see Testing & Tooling. **The pass count is a runtime fact; do not quote a stored number here.** The in-tree test-function total is not stable either — it changes with every test-adding PR, and the same tree has measured differently in CI vs locally — so read it from `bash scripts/repo-health.sh` ("Tests") instead of storing it |
 | `cargo build --release` | all 4 profiles pass — sizes in [Binary Variants](#binary-variants) |
-| `unsafe` (`repo-health.sh`) | frp-core: 46 blocks + 5 `unsafe fn` + 2 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 40 blocks. Every block carries a `// SAFETY:` comment |
+| `unsafe` (`repo-health.sh`) | frp-core: 46 blocks + 5 `unsafe fn` + 2 `unsafe impl` (comment-stripped: a doc comment mentioning `unsafe impl` is not code); frp-vnet: 42 blocks. Every block carries a `// SAFETY:` comment |
 | `scripts/compat-test.sh` vs Go frp v0.72.0 | 86 passed, 0 failed |
 | `scripts/protocol-matrix.sh` | 11/11 transport rows move data |
 | Security audit | `cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071` + `cargo deny check` before release |
@@ -256,7 +256,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 | Logging | `tracing` + `tracing-subscriber` + `tracing-appender` | env-filter |
 | Error handling | `anyhow` + `thiserror` | |
 | Random | `rand` | 0.10.3 direct; 0.9.5 remains in the lock via the opt-in `otel` chain (`opentelemetry_sdk` 0.33) and via `axum` 0.8 → `tokio-tungstenite` 0.29 → `tungstenite` — third-party pins, latest releases |
-| Misc | `bytes`, `uuid`, `futures-util`, `tokio-util`, `socket2`, `prometheus` | |
+| Misc | `bytes`, `futures-util`, `tokio-util`, `socket2`, `prometheus` | |
 
 **Removed and banned as direct dependencies** (do not reintroduce without approval):
 - `aws-lc-sys` / `aws-lc-rs` — replaced by ring (russh default → ring feature)
@@ -273,6 +273,7 @@ Pre-approved tech stack. Use these unless strong reason to deviate:
 - `hex` — replaced by inline `frp_core::hex_encode`
 - `tokio-tungstenite` — replaced by in-tree manual RFC 6455 framing (`frp-core/src/transport/websocket.rs`)
 - `jsonwebtoken` — replaced by in-tree ring-based JWS verification (`frp-core/src/auth/oidc_jwt.rs`) on 2026-10-30; 11.x has no `ring` backend, so the 9.3.1 line could not be upgraded
+- `uuid` — replaced by inline `frp_core::new_uuid_v4()` on `rand::rngs::SysRng`
 - `libc` — active direct dependency (frp-core Linux splice(2), frp-vnet TUN ioctl)
 
 > Note: "banned" means no **direct** dependency. Several still exist **transitively** in the default frps dependency tree via the SSH feature chain (russh 0.65.0 → ssh-key 0.7.0-rc): `data-encoding` (pulled in by russh itself), `sha2`, `hkdf`, `hmac` (via ed25519-dalek / elliptic-curve / rsa), plus `base64`/`lazy_static` via the dev-only pprof and tracing paths. `aes-gcm` is no longer compiled into frps — it survives only as an orphaned `Cargo.lock` entry. They cannot be removed without replacing russh; only direct use is forbidden.

@@ -291,7 +291,7 @@ impl HttpPluginManager {
             // Forgiving join (join_plugin_base): trims a trailing '/' from
             // addr (never the http:// scheme), adds a leading '/' to a bare
             // path, and defaults a missing scheme to http://.
-            let reqid = uuid::Uuid::new_v4().to_string();
+            let reqid = frp_core::new_uuid_v4();
             let url = format!(
                 "{}?version={}&op={}",
                 join_plugin_base(&plugin.cfg.addr, &plugin.cfg.path),

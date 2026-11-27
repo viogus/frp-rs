@@ -391,9 +391,9 @@ sites under `tcp-mux`, and all four treat that as terminal:
   `keepalive_timer.tick()` branch;
 - the client driver (`frp-core/src/mux.rs:1232`/`:1237`) — same, inside a
   `select!` whose other branch is a synchronous single poll (never parks);
-- the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1126`/`:1132`) — tick-bounded;
-- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:804`/`:957`, terminal at
-  `:1037`/`:1041`) — timeout-bounded.
+- the XTCP P2P driver (`frp-core/src/xtcp_p2p.rs:1136`/`:1142`) — tick-bounded;
+- the XTCP tunnel driver (`frp-core/src/xtcp_session.rs:814`/`:967`, terminal at
+  `:1047`/`:1051`) — timeout-bounded.
 
 So a `Ready`-forever terminal state has no caller that can keep polling it.
 

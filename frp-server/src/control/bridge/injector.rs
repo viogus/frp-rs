@@ -22,7 +22,7 @@ use super::*;
 /// configured headers into a head Go would reject outright.
 pub(super) struct ResponseHeaderInjector<R> {
     inner: R,
-    headers: std::collections::HashMap<String, String>,
+    headers: Arc<crate::proxy::PrecompiledResponseHeaders>,
     /// Emission content: the injected final/101 head (spliced headers,
     /// trailing body bytes attached), a raw interim 1xx head, or the
     /// truncated post-EOF tail. Never emitted before its boundary is in
@@ -202,9 +202,22 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn new(
         inner: R,
         headers: std::collections::HashMap<String, String>,
+        header_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        Self::with_compiled(
+            inner,
+            Arc::new(crate::proxy::PrecompiledResponseHeaders::from_map(&headers)),
+            header_timeout,
+        )
+    }
+
+    pub(super) fn with_compiled(
+        inner: R,
+        headers: Arc<crate::proxy::PrecompiledResponseHeaders>,
         header_timeout: Option<std::time::Duration>,
     ) -> Self {
         Self {
@@ -322,7 +335,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
     /// like a backend one.
     fn splice_head_deduplicated(
         head_region: &[u8],
-        headers: &std::collections::HashMap<String, String>,
+        headers: &crate::proxy::PrecompiledResponseHeaders,
         suppress: &'static [&'static str],
         out: &mut Vec<u8>,
     ) {
@@ -338,9 +351,7 @@ impl<R: AsyncRead + Unpin> ResponseHeaderInjector<R> {
             if !is_continuation {
                 if let Some(colon) = body.iter().position(|&b| b == b':') {
                     let name = &body[..colon];
-                    if headers
-                        .keys()
-                        .any(|k| k.as_bytes().eq_ignore_ascii_case(name))
+                    if headers.contains_name(name)
                         || suppress
                             .iter()
                             .any(|s| name.eq_ignore_ascii_case(s.as_bytes()))
@@ -1180,59 +1191,17 @@ impl<R: AsyncRead + Unpin> AsyncRead for ResponseHeaderInjector<R> {
                         suppress,
                         &mut injected,
                     );
-                    // A6 (round-13 review): Go frp applies the configured
-                    // headers with Header.Set (vhost http.go modifyResponse)
-                    // — keys canonicalize, so "X-Custom" + "x-custom" in the
-                    // config are ONE header and the wire carries ONE line
-                    // (which value wins is Go map-iteration luck). Emit
-                    // deterministically: original keys sorted, a
-                    // case-insensitive collision resolves to the LAST key in
-                    // sorted order (one of Go's possible outcomes) — never
-                    // both lines, which would read as two headers to the
-                    // client and break first-value-wins security headers.
-                    //
-                    // Round-16/18: the write-layer suppression also hits a
-                    // CONFIGURED Content-Length / Transfer-Encoding /
-                    // Content-Type on a 204/304 — Go's ModifyResponse
-                    // `Header.Set` runs BEFORE chunkWriter.writeHeader's
-                    // delHeader sweep, so a configured suppressed name is
-                    // filtered from the emission exactly like the splice
-                    // dropped backend lines above.
-                    let mut sorted: Vec<(&String, &String)> = this
-                        .headers
-                        .iter()
-                        .filter(|(k, _)| {
-                            !suppress
+                    if suppress.is_empty() {
+                        injected.extend_from_slice(this.headers.wire_all());
+                    } else {
+                        for entry in this.headers.entries() {
+                            if !suppress
                                 .iter()
-                                .any(|s| k.as_bytes().eq_ignore_ascii_case(s.as_bytes()))
-                        })
-                        .collect();
-                    sorted.sort_by(|a, b| a.0.cmp(b.0));
-                    let mut prev_key: Option<&[u8]> = None;
-                    let mut prev_start = 0usize;
-                    for (k, v) in sorted {
-                        if prev_key.is_some_and(|pk| pk.eq_ignore_ascii_case(k.as_bytes())) {
-                            // Same canonical header as the previous (sorted)
-                            // key — rewind the whole previous emitted line
-                            // and let this entry replace it.
-                            injected.truncate(prev_start);
+                                .any(|s| entry.name.eq_ignore_ascii_case(s.as_bytes()))
+                            {
+                                injected.extend_from_slice(&entry.wire_line);
+                            }
                         }
-                        // Sanitize header names/values to prevent HTTP
-                        // header injection.
-                        let safe_k: String =
-                            k.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                        let safe_v: String =
-                            v.chars().filter(|&c| c != '\r' && c != '\n').collect();
-                        // Configured headers always go out CRLF (Go
-                        // net/http renders every response header CRLF,
-                        // whatever the backend wrote) — a backend LF-only
-                        // head intentionally ends up mixed-EOL; the
-                        // injected lines remain parseable and the trailing
-                        // blank keeps the backend's own EOL.
-                        prev_start = injected.len();
-                        injected
-                            .extend_from_slice(format!("{}: {}\r\n", safe_k, safe_v).as_bytes());
-                        prev_key = Some(k.as_bytes());
                     }
                     if matches!(status, Some(204) | Some(304)) {
                         // Round-18 C3b: bytes a backend writes after a
