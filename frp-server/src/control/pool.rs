@@ -38,6 +38,11 @@ pub(super) const MAX_PENDING_REQUESTS: usize = 256;
 /// connections before waiting in `pending_requests` for a fresh work conn.
 const MAX_POOL_WORK_CONN_RETRIES: u8 = 2;
 
+/// Maximum concurrent background `reply_work_conn_rejection` tasks per control
+/// when `work_pool` is full, preventing excess work-conn floods from retaining
+/// unbounded tasks and socket fds.
+pub(super) const MAX_CONCURRENT_POOL_REJECTIONS: usize = 16;
+
 /// Return the pending request timeout from the configured user_conn_timeout (seconds),
 /// or the 10s default when the configured value is 0 (unset).
 #[inline]
@@ -202,6 +207,25 @@ fn push_pending_request(pending_requests: &mut VecDeque<PendingRequest>, req: Pe
     }
 }
 
+/// Re-insert a retried `PendingRequest` in ascending `created_at` order so the
+/// queue's front-only expiry sweep (`control/mod.rs`), `pending_timer`, FIFO
+/// fairness, and oldest-eviction stay strictly monotonic even when a dead
+/// pooled work conn returns an older request behind newer arrivals.
+fn reinsert_pending_request(pending_requests: &mut VecDeque<PendingRequest>, req: PendingRequest) {
+    let pos = pending_requests
+        .iter()
+        .position(|existing| existing.created_at > req.created_at)
+        .unwrap_or(pending_requests.len());
+    pending_requests.insert(pos, req);
+    if pending_requests.len() > MAX_PENDING_REQUESTS {
+        tracing::warn!(
+            pending = %pending_requests.len(),
+            "pending_requests queue full (>{MAX_PENDING_REQUESTS}), dropping oldest"
+        );
+        pending_requests.pop_front();
+    }
+}
+
 /// Assign `req` to a pooled work connection if one is available (pool hit),
 /// otherwise record a miss, send `ReqWorkConn`, and queue the request.
 /// Returns `Err(())` if the `ReqWorkConn` write failed — caller must break.
@@ -218,7 +242,9 @@ where
     W: AsyncWriteExt + Unpin,
 {
     if let Some(entry) = work_pool.pop_front() {
-        ctx.state.pool.hits.fetch_add(1, Ordering::Relaxed);
+        if req.retry_count == 0 {
+            ctx.state.pool.hits.fetch_add(1, Ordering::Relaxed);
+        }
         ctx.pool_stats
             .pool_size
             .store(work_pool.len() as i64, Ordering::Relaxed);
@@ -298,8 +324,9 @@ where
         );
         return Ok(());
     }
-    if !ctl.work_pool.is_empty() && req.retry_count < MAX_POOL_WORK_CONN_RETRIES {
-        req.retry_count += 1;
+    let can_retry_pool = !ctl.work_pool.is_empty() && req.retry_count < MAX_POOL_WORK_CONN_RETRIES;
+    req.retry_count = req.retry_count.saturating_add(1);
+    if can_retry_pool {
         warn!(
             proxy_name = %req.proxy_name,
             retry_count = req.retry_count,
@@ -320,7 +347,7 @@ where
             proxy_name = %req.proxy_name,
             "Pooled work conn died before StartWorkConn; re-enqueueing request for replacement"
         );
-        push_pending_request(&mut ctl.pending_requests, req);
+        reinsert_pending_request(&mut ctl.pending_requests, req);
         ctx.pool_stats
             .pending_requests
             .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
@@ -345,7 +372,7 @@ pub(crate) struct NatHoleWorkConnParams<'a> {
 ///
 /// NOTE: Go frp v0.70.1 server only writes NatHoleSid on the work connection
 /// (no StartWorkConn). See /tmp/frp-source/server/proxy/xtcp.go:88-92.
-/// The Rust frpc currently expects StartWorkConn first (frp-client/src/work_conn.rs:798),
+/// The Rust frpc currently expects StartWorkConn first (frp-client/src/work_conn.rs:813),
 /// so Go frps → Rust frpc XTCP is NOT compatible for the provider side.
 /// Rust frps sends both StartWorkConn (Rust frpc compat) + NatHoleSid
 /// (Go frpc compat) to support both.
@@ -533,7 +560,9 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 }
             }
             if let Some(req) = ctl.pending_requests.pop_front() {
-                ctx.state.pool.hits.fetch_add(1, Ordering::Relaxed);
+                if req.retry_count == 0 {
+                    ctx.state.pool.hits.fetch_add(1, Ordering::Relaxed);
+                }
                 ctx.pool_stats
                     .pending_requests
                     .store(ctl.pending_requests.len() as i64, Ordering::Relaxed);
@@ -563,28 +592,31 @@ pub(crate) async fn handle_new_work_conn<W: AsyncWriteExt + Unpin>(
                 debug!(run_id = %ctx.run_id, pool_size = %ctl.work_pool.len(), pool_cap = %ctx.pool_cap, "Work pool full for {} ({}/{}), dropping work conn", ctx.run_id, ctl.work_pool.len(), ctx.pool_cap);
                 // Go frps parity (control.go:329-335 + service.go:517-522):
                 // reject with a StartWorkConn error frame off the control loop
-                // under a short timeout so a stalled excess work conn cannot
-                // freeze control frames.
-                let v2 = ctx.v2;
-                let detailed = ctx.state.detailed_errors_to_client;
-                let bridge_cancel = ctl.bridge_cancel.clone();
-                let shutdown = ctx.state.shutdown_token.clone();
-                tokio::spawn(async move {
-                    let reject = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        reply_work_conn_rejection(
-                            &mut stream,
-                            v2,
-                            detailed,
-                            "work connection pool is full, discarding".to_string(),
-                        ),
-                    );
-                    tokio::select! {
-                        _ = reject => {}
-                        _ = bridge_cancel.cancelled() => {}
-                        _ = shutdown.cancelled() => {}
-                    }
-                });
+                // under a short timeout AND a per-control concurrency cap so an
+                // excess work-conn flood cannot accumulate unbounded tasks/fds.
+                if let Ok(permit) = ctl.reject_sem.clone().try_acquire_owned() {
+                    let v2 = ctx.v2;
+                    let detailed = ctx.state.detailed_errors_to_client;
+                    let bridge_cancel = ctl.bridge_cancel.clone();
+                    let shutdown = ctx.state.shutdown_token.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let reject = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            reply_work_conn_rejection(
+                                &mut stream,
+                                v2,
+                                detailed,
+                                "work connection pool is full, discarding".to_string(),
+                            ),
+                        );
+                        tokio::select! {
+                            _ = reject => {}
+                            _ = bridge_cancel.cancelled() => {}
+                            _ = shutdown.cancelled() => {}
+                        }
+                    });
+                }
             }
         }
     }
@@ -1167,7 +1199,7 @@ mod tests {
             udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
-        let (retry_tx, retry_rx) = mpsc::channel(64);
+        let (retry_tx, retry_rx) = mpsc::channel(MAX_PENDING_REQUESTS);
         let ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
@@ -1184,6 +1216,9 @@ mod tests {
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_tx,
             retry_rx,
+            reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_POOL_REJECTIONS,
+            )),
         };
         (ctx, ctl)
     }
@@ -1928,6 +1963,91 @@ mod tests {
         assert_eq!(
             start_work_conn_write_timeout(Duration::from_millis(100)),
             Duration::from_millis(100)
+        );
+    }
+
+    /// Re-inserting an older retried request after newer arrivals must preserve
+    /// ascending `created_at` order so front-only expiry and FIFO dispatch work.
+    #[test]
+    fn reinsert_pending_request_preserves_created_at_monotonicity() {
+        let mut q = VecDeque::new();
+        let t0 = Instant::now();
+        let mut newer = test_req("newer");
+        newer.created_at = t0 + Duration::from_secs(2);
+        let mut older = test_req("older");
+        older.created_at = t0;
+        let mut newest = test_req("newest");
+        newest.created_at = t0 + Duration::from_secs(4);
+
+        push_pending_request(&mut q, newer);
+        push_pending_request(&mut q, newest);
+        reinsert_pending_request(&mut q, older);
+
+        let names: Vec<&str> = q.iter().map(|r| r.proxy_name.as_str()).collect();
+        assert_eq!(names, vec!["older", "newer", "newest"]);
+    }
+
+    /// Excess stalled work connections arriving when `work_pool` is full must
+    /// be capped by `ctl.reject_sem` (`MAX_CONCURRENT_POOL_REJECTIONS`) rather
+    /// than spawning unbounded tasks.
+    #[tokio::test]
+    async fn pool_full_rejection_is_bounded_by_reject_sem() {
+        struct StalledRejectIo;
+
+        impl tokio::io::AsyncRead for StalledRejectIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl tokio::io::AsyncWrite for StalledRejectIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                Poll::Pending
+            }
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Pending
+            }
+        }
+        impl Transport for StalledRejectIo {
+            fn debug_name(&self) -> &'static str {
+                "StalledRejectIo"
+            }
+        }
+
+        let state = test_state();
+        let (mut ctx, mut ctl) = test_context(&state, "run-flood");
+        ctx.pool_cap = 0; // force every incoming work conn into the pool-full branch
+        let mut writer = Vec::new();
+
+        for _ in 0..(MAX_CONCURRENT_POOL_REJECTIONS * 3) {
+            let io = IoStream::from(Box::new(StalledRejectIo) as Box<dyn Transport>);
+            handle_new_work_conn(&mut ctx, &mut ctl, &mut writer, io)
+                .await
+                .unwrap();
+        }
+        assert_eq!(ctl.reject_sem.available_permits(), 0);
+        // Cancel frees all 16 permits promptly.
+        ctl.bridge_cancel.cancel();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            ctl.reject_sem.available_permits(),
+            MAX_CONCURRENT_POOL_REJECTIONS
         );
     }
 }

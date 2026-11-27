@@ -190,9 +190,6 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         } else {
             ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
         }
-        ctx.state.proxy_metrics.remove(&cp.proxy_name);
-        #[cfg(feature = "dashboard")]
-        crate::metrics::prom::proxy_removed(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
         {
             ctx.state
@@ -204,26 +201,23 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
     if let Some(handle) = ctl.listener_handles.remove(&cp.proxy_name) {
         handle.abort();
     }
-    // Remove the proxy from the registry and release the counters it owns
-    // (https SNI-sniff gate count, per-client port-budget slot) ONLY when
-    // this call actually performed the removal. The dashboard delete path
-    // races this handler — both observe the proxy before either removes it
-    // — and a double release would decrement client_ports_used twice (S4:
-    // the budget drifts below the live count and max_ports_per_client
-    // admits extra proxies) and leave https_proxy_count at 0 while https
-    // proxies still exist, silently disabling SNI sniff (HTTPS vhost
-    // routing). Gating on remove()'s result makes exactly one path
-    // release; the port marks and shared group-listener teardown below are
-    // idempotent and run on every path (as before).
+    // Remove the proxy from the registry and release the counters + metrics it
+    // owns ONLY when this call actually performed the removal, so a losing
+    // racer against dashboard delete cannot wipe a surviving proxy's metrics.
     match info {
         Some(i) => {
-            proxy_ops::remove_proxy_and_release_client_counts(&ctx.state, &i).await;
+            if proxy_ops::remove_proxy_and_release_client_counts(&ctx.state, &i).await {
+                ctx.state.proxy_metrics.remove(&cp.proxy_name);
+                #[cfg(feature = "dashboard")]
+                crate::metrics::prom::proxy_removed(&cp.proxy_name).await;
+            }
         }
         None => {
-            // `info` was None only if the proxy vanished between the
-            // ownership check and the fetch — remove() by name then reports
-            // false and releases nothing (there was nothing to release).
-            ctx.state.proxy_manager.remove(&cp.proxy_name).await;
+            if ctx.state.proxy_manager.remove(&cp.proxy_name).await {
+                ctx.state.proxy_metrics.remove(&cp.proxy_name);
+                #[cfg(feature = "dashboard")]
+                crate::metrics::prom::proxy_removed(&cp.proxy_name).await;
+            }
         }
     }
     // Stop the shared TCP group listener when the last member closes so it
@@ -665,6 +659,7 @@ mod tests {
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_tx,
             retry_rx,
+            reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         };
         // Simulate the handle_new_proxy registration: per-proxy child token.
         let token = ctl.udp_cancel.child_token();
@@ -739,6 +734,7 @@ mod tests {
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_tx,
             retry_rx,
+            reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         };
         let bridge_token = ctl.bridge_cancel.clone();
         assert!(!bridge_token.is_cancelled(), "token starts live");
@@ -816,6 +812,7 @@ mod tests {
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_tx,
             retry_rx,
+            reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         };
 
         let mut writer = Vec::new();
@@ -913,6 +910,7 @@ mod tests {
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_tx,
             retry_rx,
+            reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         };
 
         let mut writer = Vec::new();

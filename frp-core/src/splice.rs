@@ -530,8 +530,8 @@ async fn bridge_splice_with_linger(
 async fn bridge_splice_with_pipes(
     user: tokio::net::TcpStream,
     work: tokio::net::TcpStream,
-    (u2w_r, u2w_w, u2w_cap): (OwnedFd, OwnedFd, usize),
-    (w2u_r, w2u_w, w2u_cap): (OwnedFd, OwnedFd, usize),
+    (u2w_r, u2w_w, u2w_cap): (AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize),
+    (w2u_r, w2u_w, w2u_cap): (AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize),
     linger: Duration,
 ) -> io::Result<(u64, u64)> {
     BRIDGE_SPLICE_CALLS.fetch_add(1, Ordering::Relaxed);

@@ -1049,7 +1049,8 @@ pub(crate) async fn authenticate(
             _run_mu_guard: run_mu_guard,
         },
         {
-            let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(64);
+            let retry_cap = super::pool::MAX_PENDING_REQUESTS.max(pool_cap);
+            let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(retry_cap);
             ControlState {
                 shutting_down,
                 shutdown_done: None,
@@ -1066,6 +1067,9 @@ pub(crate) async fn authenticate(
                 superseded,
                 retry_tx,
                 retry_rx,
+                reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::pool::MAX_CONCURRENT_POOL_REJECTIONS,
+                )),
             }
         },
         internal_tx,

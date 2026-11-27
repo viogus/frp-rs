@@ -269,28 +269,34 @@ pub(crate) async fn unregister_control(
             }
         }
     }
-    let mut udp_ports = state.used_udp_ports.write().await;
-    for p in &proxies {
-        if let Some(port) = p.remote_port {
-            if p.proxy_type == "udp" || p.proxy_type == "sudp" {
-                // For SUDP, only release the port if no other live proxy
-                // (any run_id) still shares it.
-                if p.proxy_type == "sudp" && udp_port_shared.get(&p.name).copied().unwrap_or(false)
-                {
-                    continue;
-                }
-                udp_ports.remove(&port);
-                if port > 0 {
-                    state
-                        .port_reservations
-                        .write()
-                        .await
-                        .insert(p.name.clone(), (port, true, std::time::Instant::now()));
+    let mut udp_to_reserve: Vec<(String, u16)> = Vec::new();
+    {
+        let mut udp_ports = state.used_udp_ports.write().await;
+        for p in &proxies {
+            if let Some(port) = p.remote_port {
+                if p.proxy_type == "udp" || p.proxy_type == "sudp" {
+                    // For SUDP, only release the port if no other live proxy
+                    // (any run_id) still shares it.
+                    if p.proxy_type == "sudp"
+                        && udp_port_shared.get(&p.name).copied().unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    udp_ports.remove(&port);
+                    if port > 0 {
+                        udp_to_reserve.push((p.name.clone(), port));
+                    }
                 }
             }
         }
     }
-    drop(udp_ports);
+    if !udp_to_reserve.is_empty() {
+        let now = std::time::Instant::now();
+        let mut reservations = state.port_reservations.write().await;
+        for (name, port) in udp_to_reserve {
+            reservations.insert(name, (port, true, now));
+        }
+    }
     // Clear per-client port usage tracking (matching Go frp's portsUsedNum
     // cleanup). Decrement by the number of port-consuming proxies actually
     // removed: the per-run_id counter is shared with a superseding control's
@@ -388,9 +394,18 @@ pub(crate) async fn unregister_control(
         } else {
             state.tcpmux_manager.unregister(&p.name).await;
         }
-        state.proxy_metrics.remove(&p.name);
-        #[cfg(feature = "dashboard")]
-        crate::metrics::prom::proxy_removed(&p.name).await;
+        // Re-check ownership after the route awaits above so a superseding
+        // registration that landed mid-teardown does not lose its metrics.
+        if state
+            .proxy_manager
+            .get(&p.name)
+            .await
+            .is_none_or(|cur| cur.control_id <= p.control_id)
+        {
+            state.proxy_metrics.remove(&p.name);
+            #[cfg(feature = "dashboard")]
+            crate::metrics::prom::proxy_removed(&p.name).await;
+        }
     }
     #[cfg(feature = "vnet")]
     {

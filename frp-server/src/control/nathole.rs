@@ -1526,6 +1526,7 @@ mod vnet_route_tests {
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             retry_tx,
             retry_rx,
+            reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
         };
         (ctx, ctl)
     }

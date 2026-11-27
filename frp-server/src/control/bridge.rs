@@ -153,7 +153,18 @@ async fn relay_plain_fast_inner(
                 metrics.record_traffic(a, b);
             }
             Err(e) => {
-                tracing::debug!(error = %e, "TCP fast-path bridge closed with error: {}", e);
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                        | std::io::ErrorKind::UnexpectedEof
+                ) {
+                    tracing::debug!(error = %e, "TCP fast-path bridge closed: {}", e);
+                } else {
+                    tracing::warn!(error = %e, "TCP fast-path bridge closed with error: {}", e);
+                }
             }
         }
     } else {

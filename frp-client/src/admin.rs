@@ -856,6 +856,29 @@ const TLS_HANDSHAKE_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration
 #[cfg(feature = "tls")]
 static LAST_ADMIN_TLS_HANDSHAKE_WARN: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "tls")]
+static LAST_ADMIN_TLS_ACCEPT_WARN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "tls")]
+fn warn_admin_tls_accept_rate_limited(error: &std::io::Error) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_ADMIN_TLS_ACCEPT_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TLS_HANDSHAKE_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_ADMIN_TLS_ACCEPT_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(error = %error, "TLS listener accept error: {}", error);
+}
 
 #[cfg(feature = "tls")]
 fn warn_admin_tls_handshake_rate_limited(addr: std::net::SocketAddr, error: &std::io::Error) {
@@ -939,7 +962,7 @@ impl axum::serve::Listener for TlsListener {
                         Ok(conn) => conn,
                         Err(e) => {
                             drop(permit);
-                            tracing::warn!(error = %e, "TLS listener accept error: {}", e);
+                            warn_admin_tls_accept_rate_limited(&e);
                             tokio::select! {
                                 biased;
                                 Some(ready) = self.ready_rx.recv() => return ready,
@@ -1077,7 +1100,7 @@ async fn handle_head_not_allowed() -> StatusCode {
 ///    honoured only when auth is set.
 /// 3. A *blanket* switch of `apply_admin_auth` to `route_layer` is out of scope:
 ///    the helper is shared (`frp-core/src/admin_auth.rs:36`), called from this
-///    file and from `frp-server/src/dashboard.rs:3670/3672/3696`, so it would
+///    file and from `frp-server/src/dashboard.rs:3744/3746/3770`, so it would
 ///    change the frps dashboard too. C is admin-local and leaves the helper and
 ///    the dashboard alone.
 ///

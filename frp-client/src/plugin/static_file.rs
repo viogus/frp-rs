@@ -459,12 +459,112 @@ async fn handle_static_file_conn(
             canon: std::path::PathBuf,
             err: String,
         },
-        File {
-            file: std::fs::File,
-            meta: std::fs::Metadata,
-            canon: std::path::PathBuf,
-            from_index: bool,
+        FileNeedsSlashRedirect,
+        FileNotModified304 {
+            mt: u64,
         },
+        SmallFile {
+            buf: frp_core::buffer_pool::PoolGuard,
+            len: usize,
+            mtime: Option<u64>,
+            canon: std::path::PathBuf,
+        },
+        SmallFileReadFailed(std::io::Error),
+        LargeFile {
+            file: std::fs::File,
+            size: u64,
+            mtime: Option<u64>,
+            canon: std::path::PathBuf,
+        },
+    }
+
+    fn resolve_open_file_in_blocking(
+        mut file: std::fs::File,
+        meta: std::fs::Metadata,
+        canon: std::path::PathBuf,
+        from_index: bool,
+        slash_terminated: bool,
+        ims_parsed: Option<u64>,
+    ) -> StaticFsResolution {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if !from_index && slash_terminated {
+            return StaticFsResolution::FileNeedsSlashRedirect;
+        }
+        let mtime = mtime_secs(&meta);
+        if let (Some(ims), Some(mt)) = (ims_parsed, mtime) {
+            if mt <= ims {
+                return StaticFsResolution::FileNotModified304 { mt };
+            }
+        }
+        let size = meta.len();
+        // Fast-path small regular files (<= 64 KiB) right inside this single
+        // `spawn_blocking` hop using a pooled 64 KiB buffer, avoiding both
+        // `tokio::fs::File`'s extra `spawn_blocking` read/drop hops and its
+        // internal staging-buffer allocation.
+        const SMALL_FILE_MAX: u64 = 64 * 1024;
+        if meta.is_file() && size <= SMALL_FILE_MAX {
+            let mut buf = frp_core::buffer_pool::PoolGuard::acquire();
+            let cap = buf.as_mut_slice().len();
+            if size <= cap as u64 {
+                let mut filled = 0usize;
+                loop {
+                    match file.read(&mut buf.as_mut_slice()[filled..]) {
+                        Ok(0) => {
+                            if filled as u64 == size {
+                                return StaticFsResolution::SmallFile {
+                                    buf,
+                                    len: filled,
+                                    mtime,
+                                    canon,
+                                };
+                            }
+                            // File size changed concurrently; rewind and stream.
+                            break;
+                        }
+                        Ok(n) => {
+                            filled += n;
+                            if filled == cap {
+                                // Probe 1 byte to confirm EOF vs concurrent growth.
+                                let mut probe = [0u8; 1];
+                                match file.read(&mut probe) {
+                                    Ok(0) if filled as u64 == size => {
+                                        return StaticFsResolution::SmallFile {
+                                            buf,
+                                            len: filled,
+                                            mtime,
+                                            canon,
+                                        };
+                                    }
+                                    Ok(_) => break,
+                                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => break,
+                                    Err(e) => return StaticFsResolution::SmallFileReadFailed(e),
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) => return StaticFsResolution::SmallFileReadFailed(e),
+                    }
+                }
+                if let Err(e) = file.seek(SeekFrom::Start(0)) {
+                    return StaticFsResolution::SmallFileReadFailed(e);
+                }
+                let refreshed_size = file.metadata().map(|m| m.len()).unwrap_or(size);
+                return StaticFsResolution::LargeFile {
+                    file,
+                    size: refreshed_size,
+                    mtime,
+                    canon,
+                };
+            }
+        }
+
+        StaticFsResolution::LargeFile {
+            file,
+            size,
+            mtime,
+            canon,
+        }
     }
 
     let slash_terminated = url_remainder.is_empty() || url_remainder.ends_with(b"/");
@@ -473,9 +573,9 @@ async fn handle_static_file_conn(
         .and_then(parse_if_modified_since);
 
     // Run all synchronous filesystem syscalls (open, canonicalize, fd realpath
-    // containment check, stat, index.html probe, and directory listing) on
-    // Tokio's blocking pool in a single hop so slow/network filesystems never
-    // stall async worker threads.
+    // containment check, stat, index.html probe, small-file read, and directory
+    // listing) on Tokio's blocking pool in a single hop so slow/network
+    // filesystems never stall async worker threads.
     let fs_full_path = full_path.clone();
     let fs_local_path = local_path.to_string();
     let resolution = tokio::task::spawn_blocking(move || {
@@ -531,12 +631,14 @@ async fn handle_static_file_conn(
                 }
             }
             if !f_meta.is_dir() {
-                return StaticFsResolution::File {
-                    file: f,
-                    meta: f_meta,
-                    canon: f_canon,
-                    from_index: true,
-                };
+                return resolve_open_file_in_blocking(
+                    f,
+                    f_meta,
+                    f_canon,
+                    true,
+                    slash_terminated,
+                    ims_parsed,
+                );
             }
 
             let mtime = mtime_secs(&f_meta);
@@ -553,18 +655,13 @@ async fn handle_static_file_conn(
                 },
             }
         } else {
-            StaticFsResolution::File {
-                file: f,
-                meta: f_meta,
-                canon: f_canon,
-                from_index: false,
-            }
+            resolve_open_file_in_blocking(f, f_meta, f_canon, false, slash_terminated, ims_parsed)
         }
     })
     .await
     .map_err(|e| format!("static_file blocking task failed: {e}"))?;
 
-    let (f, f_meta, f_canon) = match resolution {
+    match resolution {
         StaticFsResolution::OpenFailed(e) => {
             // Round-17 finding F: Go serveError → toHTTPError (fs.go:
             // 680-696) maps IsNotExist → 404 page, IsPermission → 403
@@ -674,28 +771,47 @@ async fn handle_static_file_conn(
                 .map_err(|e| format!("write body: {e}"))?;
             return Ok(());
         }
-        StaticFsResolution::File {
-            file,
-            meta,
-            canon,
-            from_index: true,
-        } => {
-            return serve_open_file(
-                &mut client,
-                file,
-                &meta,
-                &canon,
-                if_modified_since.as_deref(),
-            )
-            .await;
+        StaticFsResolution::FileNeedsSlashRedirect => {
+            // Handled below using `rel_components` / `raw_query`.
         }
-        StaticFsResolution::File {
-            file,
-            meta,
+        StaticFsResolution::FileNotModified304 { mt } => {
+            let resp = format!(
+                "HTTP/1.1 304 Not Modified\r\nLast-Modified: {}\r\nConnection: close\r\n\r\n",
+                format_http_date(mt)
+            );
+            client
+                .write_all(resp.as_bytes())
+                .await
+                .map_err(|e| format!("write 304: {e}"))?;
+            return Ok(());
+        }
+        StaticFsResolution::SmallFile {
+            buf,
+            len,
+            mtime,
             canon,
-            from_index: false,
-        } => (file, meta, canon),
-    };
+        } => {
+            return write_small_file_response(&mut client, &buf.raw_buf()[..len], mtime, &canon)
+                .await;
+        }
+        StaticFsResolution::SmallFileReadFailed(e) => {
+            // Preserve pre-optimization error behavior if reading at offset 0
+            // fails before any headers were sent: respond 500 via Go's
+            // serveError shape rather than silently dropping an unwritten conn.
+            let resp =
+                http_error_render("500 Internal Server Error", "500 Internal Server Error\n");
+            let _ = client.write_all(resp.as_bytes()).await;
+            return Err(format!("failed to read file: {e}"));
+        }
+        StaticFsResolution::LargeFile {
+            file,
+            size,
+            mtime,
+            canon,
+        } => {
+            return serve_open_file(&mut client, file, size, mtime, &canon).await;
+        }
+    }
 
     if slash_terminated {
         // Round-16 FIX 4: Go serveFile's file-with-trailing-slash redirect
@@ -751,23 +867,76 @@ async fn handle_static_file_conn(
         return Err(format!("file target with trailing slash: {url_path}"));
     }
 
-    // File arm — Go serveContent (fs.go:759-761). The body lives in
-    // `serve_open_file` below, shared with the index-swap-to-file path
-    // inside the directory block above (Go re-tests `d.IsDir()` after the
-    // swap and serves a swapped index FILE here; the listing arm there is
-    // the still-a-directory case).
-    serve_open_file(
-        &mut client,
-        f,
-        &f_meta,
-        &f_canon,
-        if_modified_since.as_deref(),
-    )
-    .await
+    unreachable!("all non-slash-redirect resolutions returned above")
 }
 
-/// Go serveContent tail (fs.go:759-761): IMS precondition + bounded-chunk
-/// body stream for an already-open, inode-verified file handle. Streams the
+/// Write a pre-read small file (`<= 64 KiB`) in a single vectored write pass
+/// (`writev` of HTTP response headers + body slice), avoiding both a second
+/// `write` syscall and any heap copy of the body.
+async fn write_small_file_response(
+    client: &mut TcpStream,
+    body: &[u8],
+    mtime: Option<u64>,
+    mime_path: &std::path::Path,
+) -> Result<(), String> {
+    let mime = mime_from_path(mime_path);
+    let mut head = String::with_capacity(192);
+    head.push_str("HTTP/1.1 200 OK\r\nContent-Type: ");
+    head.push_str(mime);
+    head.push_str("\r\n");
+    if let Some(mt) = mtime {
+        head.push_str("Last-Modified: ");
+        head.push_str(&format_http_date(mt));
+        head.push_str("\r\n");
+    }
+    use std::fmt::Write as _;
+    let _ = write!(
+        head,
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+
+    let head_bytes = head.as_bytes();
+    let mut head_pos = 0usize;
+    let mut body_pos = 0usize;
+    while head_pos < head_bytes.len() || body_pos < body.len() {
+        let n = if head_pos < head_bytes.len() && body_pos < body.len() {
+            let slices = [
+                std::io::IoSlice::new(&head_bytes[head_pos..]),
+                std::io::IoSlice::new(&body[body_pos..]),
+            ];
+            client
+                .write_vectored(&slices)
+                .await
+                .map_err(|e| format!("write response: {e}"))?
+        } else if head_pos < head_bytes.len() {
+            client
+                .write(&head_bytes[head_pos..])
+                .await
+                .map_err(|e| format!("write headers: {e}"))?
+        } else {
+            client
+                .write(&body[body_pos..])
+                .await
+                .map_err(|e| format!("write body: {e}"))?
+        };
+        if n == 0 {
+            return Err("write response: write zero".into());
+        }
+        let head_rem = head_bytes.len() - head_pos;
+        if n <= head_rem {
+            head_pos += n;
+        } else {
+            head_pos = head_bytes.len();
+            body_pos += n - head_rem;
+        }
+    }
+    Ok(())
+}
+
+/// Go serveContent tail (fs.go:759-761): bounded-chunk body stream for an
+/// already-open, inode-verified large file handle (`> 64 KiB`, after IMS check
+/// in `resolve_open_file_in_blocking`). Streams the
 /// body instead of buffering it whole: the old path blocked the async task
 /// on std::fs::read_to_end and truncated at 64 MiB (Content-Length then
 /// lied). Go's http.FileServer streams the file — so do we, from the
@@ -777,43 +946,13 @@ async fn handle_static_file_conn(
 async fn serve_open_file(
     client: &mut TcpStream,
     file: std::fs::File,
-    meta: &std::fs::Metadata,
+    size: u64,
+    mtime: Option<u64>,
     mime_path: &std::path::Path,
-    if_modified_since: Option<&str>,
 ) -> Result<(), String> {
-    let size = meta.len();
-    let mtime = mtime_secs(meta);
-    let mime = mime_from_path(mime_path);
+    use tokio::io::AsyncBufReadExt;
 
-    // If-Modified-Since precondition — Go serveContent checkPreconditions.
-    // The mtime is truncated to whole seconds (the header has 1 s
-    // resolution); mtime <= IMS → 304. Round-16 FIX 5: the FILE 304 keeps
-    // its Last-Modified — Go runs setLastModified BEFORE
-    // checkPreconditions, and writeNotModified deletes Last-Modified only
-    // when an ETag is set; FileServer never sets one (probe vs go1.25.12:
-    // file 304 carries Last-Modified). The dir arm above differs: its
-    // setLastModified runs after the IMS gate, hence the no-LM dir 304.
-    // Round-16 FIX 9: a zero-time (epoch) mtime is None here — no
-    // Last-Modified is emitted and the precondition never fires (Go
-    // isZeroTime → condNone → always 200). An unparsable IMS is condNone →
-    // serve 200 (Go http.ParseTime error). A None mtime (platform cannot
-    // report it, pre-epoch clock, zero time) disables both Last-Modified
-    // and the precondition.
-    if let Some(ims) = if_modified_since.and_then(parse_if_modified_since) {
-        if let Some(mt) = mtime {
-            if mt <= ims {
-                let resp = format!(
-                    "HTTP/1.1 304 Not Modified\r\nLast-Modified: {}\r\nConnection: close\r\n\r\n",
-                    format_http_date(mt)
-                );
-                client
-                    .write_all(resp.as_bytes())
-                    .await
-                    .map_err(|e| format!("write 304: {e}"))?;
-                return Ok(());
-            }
-        }
-    }
+    let mime = mime_from_path(mime_path);
 
     // The 200 arm gains Last-Modified: <mtime as RFC 1123 GMT> (Go
     // serveContent setLastModified). Method is exactly "GET" when this arm
@@ -854,20 +993,22 @@ async fn serve_open_file(
     //   IMS under a non-matching INM answers 200 in Go where frp-rs (no
     //   INM handling) answers 304. Token-less requests are parity; "*" is
     //   Go-304 / frp-rs-200. The audit scoped Last-Modified/304 only.
-    let mut file = tokio::fs::File::from_std(file);
-    let mut chunk = frp_core::buffer_pool::PoolGuard::acquire();
+    let buf_cap = size.clamp(64 * 1024, 256 * 1024) as usize;
+    let mut reader = tokio::io::BufReader::with_capacity(buf_cap, tokio::fs::File::from_std(file));
     loop {
-        let n = file
-            .read(chunk.as_mut_slice())
+        let chunk = reader
+            .fill_buf()
             .await
             .map_err(|e| format!("failed to read file: {e}"))?;
-        if n == 0 {
+        if chunk.is_empty() {
             break;
         }
+        let n = chunk.len();
         client
-            .write_all(&chunk.raw_buf()[..n])
+            .write_all(chunk)
             .await
             .map_err(|e| format!("write body: {e}"))?;
+        reader.consume(n);
     }
 
     Ok(())

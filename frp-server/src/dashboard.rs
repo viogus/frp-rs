@@ -1304,17 +1304,9 @@ async fn handle_store_proxy_delete(
     } else {
         state.tcpmux_manager.unregister(&name).await;
     }
-    state.proxy_metrics.remove(&name);
-    crate::metrics::prom::proxy_removed(&name).await;
-    // Remove the proxy and release the counters it owns (https SNI-sniff
-    // gate count, per-client port-budget slot) ONLY when this call actually
-    // performed the removal — the client CloseProxy handler races this path
-    // and both may observe the proxy before either removes it. A double
-    // release would decrement client_ports_used twice (S4: the budget drifts
-    // below the live count and max_ports_per_client admits extra proxies)
-    // and leave https_proxy_count at 0 while https proxies still exist,
-    // silently disabling SNI sniff (HTTPS vhost routing).
     if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+        state.proxy_metrics.remove(&name);
+        crate::metrics::prom::proxy_removed(&name).await;
         // Clean up port marks AFTER the registry removal (TCP/UDP manager,
         // TCP group last-member semantics — same lifecycle as the client
         // CloseProxy path). M5: post-remove the group-last check counts only
@@ -1391,15 +1383,9 @@ async fn handle_proxies_delete(
             } else {
                 state.tcpmux_manager.unregister(name).await;
             }
-            state.proxy_metrics.remove(name);
-            crate::metrics::prom::proxy_removed(name).await;
-            // Remove the proxy and release the counters it owns (https
-            // SNI-sniff gate count, per-client port-budget slot) ONLY when
-            // this call actually performed the removal — CloseProxy / client
-            // disconnect race this bulk delete, and a double release would
-            // double-decrement client_ports_used (S4) and leave
-            // https_proxy_count at 0 while https proxies still exist.
             if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+                state.proxy_metrics.remove(name);
+                crate::metrics::prom::proxy_removed(name).await;
                 // Port-mark cleanup AFTER the registry removal — same M5
                 // race-safe ordering as the single-delete path. Skipped on a
                 // lost race: the winner ran its own cleanup.

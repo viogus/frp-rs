@@ -11423,7 +11423,7 @@ fn test_legacy_ini_slice_values_use_go_strings_semantics() {
 /// `pkg/auth/legacy/legacy.go:25,28` bools read with `Key.Bool()`) accepts Go's
 /// wider `parseBool` spelling set for **`.ini` only**.
 ///
-/// The server enforces these scopes (`frp-server/src/control/proxy.rs:417-424`),
+/// The server enforces these scopes (`frp-server/src/control/proxy.rs:411-418`),
 /// so applying the wider set in every format — as the first cut of this fix did
 /// through a format-agnostic `ini_truthy` — silently changed the meaning of a
 /// TOML/JSON/YAML config that base ignored. These rows go through the **real
