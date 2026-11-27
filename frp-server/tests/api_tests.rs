@@ -1,10 +1,10 @@
 use frp_core::metrics::{ConnGuard, ProxyMetricsRegistry};
 use std::sync::atomic::Ordering;
 
-#[tokio::test]
-async fn test_metrics_snapshot_after_counting() {
+#[test]
+fn test_metrics_snapshot_after_counting() {
     let reg = ProxyMetricsRegistry::new();
-    let m = reg.get_or_create("ssh").await;
+    let m = reg.get_or_create("ssh");
     m.bytes_in.fetch_add(1024, Ordering::Relaxed);
     m.bytes_out.fetch_add(512, Ordering::Relaxed);
     {
@@ -19,22 +19,22 @@ async fn test_metrics_snapshot_after_counting() {
     assert_eq!(snap.total_conns, 1);
 }
 
-#[tokio::test]
-async fn test_registry_multiple_proxies_independent() {
+#[test]
+fn test_registry_multiple_proxies_independent() {
     let reg = ProxyMetricsRegistry::new();
-    reg.get_or_create("p1").await;
-    reg.get_or_create("p2").await;
-    assert!(reg.get("p1").await.is_some());
-    assert!(reg.get("p2").await.is_some());
-    reg.remove("p1").await;
-    assert!(reg.get("p1").await.is_none());
-    assert!(reg.get("p2").await.is_some());
+    reg.get_or_create("p1");
+    reg.get_or_create("p2");
+    assert!(reg.get("p1").is_some());
+    assert!(reg.get("p2").is_some());
+    reg.remove("p1");
+    assert!(reg.get("p1").is_none());
+    assert!(reg.get("p2").is_some());
 }
 
-#[tokio::test]
-async fn test_registry_remove_nonexistent_no_panic() {
+#[test]
+fn test_registry_remove_nonexistent_no_panic() {
     let reg = ProxyMetricsRegistry::new();
-    reg.remove("no_such_proxy").await; // should not panic
+    reg.remove("no_such_proxy"); // should not panic
 }
 
 #[test]

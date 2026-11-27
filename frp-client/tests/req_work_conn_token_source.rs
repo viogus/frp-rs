@@ -4,7 +4,7 @@
 //! source — not a cached md5 key, and not nothing at all.
 //!
 //! `TODO.md:10506` residue: the OIDC NewWorkConn path was pinned only at the
-//! `spawn_work_conn` seam (`frp-client/src/work_conn.rs:1528`,
+//! `spawn_work_conn` seam (`frp-client/src/work_conn.rs:1585`,
 //! `oidc_token_source_fills_new_work_conn_privilege_key` builds its own
 //! `WorkConnConfig`), so `handle_req_work_conn`
 //! (`frp-client/src/service.rs:950`) — the only production call site that

@@ -553,17 +553,17 @@ async fn bridge_cancel_terminates_half_open_tcp_bridge() {
             ),
         )),
         request_is_connect: false,
+        retry_count: 0,
     };
-    let spawn_res = assign_work_to_proxy(
+    assign_work_to_proxy(
         IoStream::Tcp(work),
         req,
         [0u8; 16],
         state,
         false,
         cancel.clone(),
-    )
-    .await;
-    assert!(spawn_res.is_ok(), "bridge spawn must succeed");
+        None,
+    );
 
     // Let the bridge reach its blocking copy point on the half-open pair.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -2238,6 +2238,7 @@ async fn mixed_sudp_bridge_counts_connection_and_active_guard_once() {
         user_conn_permit: None,
         proxy_info: Some(proxy_info.clone()),
         request_is_connect: false,
+        retry_count: 0,
     };
 
     let bridge = tokio::spawn(run_work_bridge(

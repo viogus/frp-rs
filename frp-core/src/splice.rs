@@ -486,12 +486,52 @@ pub fn bridge_splice_calls() -> u64 {
 /// One increment per bridged connection, not per `splice(2)` call.
 static BRIDGE_SPLICE_CALLS: AtomicU64 = AtomicU64::new(0);
 
+/// Attempt zero-copy `splice(2)` bridging between two raw TCP streams.
+///
+/// Allocates the two kernel pipe pairs BEFORE consuming the `TcpStream`s via
+/// `into_std()`. If pipe allocation fails (e.g. `EMFILE`/`ENFILE`/`ENOMEM`),
+/// returns `Err((user, work, err))` so callers can seamlessly fall back to a
+/// userspace pooled-buffer relay without dropping the connection.
+pub async fn try_bridge_splice(
+    user: tokio::net::TcpStream,
+    work: tokio::net::TcpStream,
+) -> Result<io::Result<(u64, u64)>, (tokio::net::TcpStream, tokio::net::TcpStream, io::Error)> {
+    let (u2w_r, u2w_w, u2w_cap) = match create_pipe_pair() {
+        Ok(p) => p,
+        Err(e) => return Err((user, work, e)),
+    };
+    let (w2u_r, w2u_w, w2u_cap) = match create_pipe_pair() {
+        Ok(p) => p,
+        Err(e) => return Err((user, work, e)),
+    };
+    Ok(bridge_splice_with_pipes(
+        user,
+        work,
+        (u2w_r, u2w_w, u2w_cap),
+        (w2u_r, w2u_w, w2u_cap),
+        crate::bridge::HALF_CLOSE_LINGER_TIMEOUT,
+    )
+    .await)
+}
+
 /// [`bridge_splice`] with an injectable half-close linger, so tests can pin
 /// the abandon-a-stalled-peer behaviour without waiting out the production
 /// window.
 async fn bridge_splice_with_linger(
     user: tokio::net::TcpStream,
     work: tokio::net::TcpStream,
+    linger: Duration,
+) -> io::Result<(u64, u64)> {
+    let u2w = create_pipe_pair()?;
+    let w2u = create_pipe_pair()?;
+    bridge_splice_with_pipes(user, work, u2w, w2u, linger).await
+}
+
+async fn bridge_splice_with_pipes(
+    user: tokio::net::TcpStream,
+    work: tokio::net::TcpStream,
+    (u2w_r, u2w_w, u2w_cap): (AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize),
+    (w2u_r, w2u_w, w2u_cap): (AsyncFd<OwnedFd>, AsyncFd<OwnedFd>, usize),
     linger: Duration,
 ) -> io::Result<(u64, u64)> {
     BRIDGE_SPLICE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -514,13 +554,7 @@ async fn bridge_splice_with_linger(
     // open for the `AsyncFd`'s lifetime, so the same contract holds.
     let work_async = unsafe { AsyncFd::register(work_owned) }?;
 
-    // Step 3: Create two pipe pairs (one per direction). Each pair reports
-    // its achieved capacity so the splice length arguments use the real size
-    // (they may be smaller than PIPE_CAPACITY under a pipe rlimit).
-    let (u2w_r, u2w_w, u2w_cap) = create_pipe_pair()?;
-    let (w2u_r, w2u_w, w2u_cap) = create_pipe_pair()?;
-
-    // Step 4: Shared byte counters.
+    // Step 3: Shared byte counters (pipe pairs were pre-allocated above).
     let u2w_count = AtomicU64::new(0);
     let w2u_count = AtomicU64::new(0);
 

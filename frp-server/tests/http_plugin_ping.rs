@@ -274,7 +274,7 @@ async fn test_plugin_ping_rejection_answers_pong_error_and_keeps_control() {
 }
 
 /// Critical semantic pin (Go server/control.go handlePing parity, comment
-/// at frp-server/src/control/proxy.rs:462-466): a ping rejected by the plugin must NOT
+/// at frp-server/src/control/proxy.rs:456-460): a ping rejected by the plugin must NOT
 /// update last_ping. The observable seam is the server heartbeat watchdog:
 /// with heartbeat_timeout = 3s, a client whose pings are ALL rejected is
 /// still disconnected at ~3s after login — its last_ping stays frozen at

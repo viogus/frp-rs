@@ -97,8 +97,17 @@ static REAL_TUNNEL_PEER: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<u16, SocketAddr>>,
 > = std::sync::OnceLock::new();
 
+#[cfg(feature = "tls")]
+static REAL_TUNNEL_PEER_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> =
+    std::sync::OnceLock::new();
+
 fn real_tunnel_peer_map() -> &'static std::sync::Mutex<std::collections::HashMap<u16, SocketAddr>> {
     REAL_TUNNEL_PEER.get_or_init(Default::default)
+}
+
+#[cfg(feature = "tls")]
+fn real_tunnel_peer_notify() -> &'static tokio::sync::Notify {
+    REAL_TUNNEL_PEER_NOTIFY.get_or_init(tokio::sync::Notify::new)
 }
 
 /// RAII handle for a REAL_TUNNEL_PEER entry (audit F5). The work-conn task
@@ -139,6 +148,8 @@ pub(crate) fn register_plugin_peer(dialer_port: u16, real_peer: SocketAddr) -> P
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .insert(dialer_port, real_peer);
+    #[cfg(feature = "tls")]
+    real_tunnel_peer_notify().notify_waiters();
     PluginPeerGuard {
         dialer_port,
         real_peer,
@@ -179,13 +190,31 @@ fn take_plugin_peer(dialer_port: u16) -> Option<SocketAddr> {
 
 #[cfg(feature = "tls")]
 pub(crate) async fn plugin_peer_ip(peer: SocketAddr) -> std::net::IpAddr {
-    for _ in 0..8 {
+    // Fast path: work_conn pre-binds its local loopback port and registers the
+    // real tunnel peer BEFORE `connect()` sends SYN, so normal tunneled
+    // connections hit immediately with zero delay.
+    if let Some(real) = take_plugin_peer(peer.port()) {
+        return real.ip();
+    }
+    // Event-driven fallback for callers that register concurrently after
+    // `connect()`: enable the Notify waiter BEFORE re-checking the map so no
+    // concurrent registration can be missed, waking in microseconds instead of
+    // polling 1 ms sleep ticks.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(8);
+    let notify = real_tunnel_peer_notify();
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if let Some(real) = take_plugin_peer(peer.port()) {
             return real.ip();
         }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            return take_plugin_peer(peer.port())
+                .map(|real| real.ip())
+                .unwrap_or_else(|| peer.ip());
+        }
     }
-    peer.ip()
 }
 
 /// Shared plugin server skeleton — handles bind, shutdown channel, accept

@@ -236,8 +236,8 @@ differently:
 | 2 | `const VALID_PROXY_TYPES` — `frp-client/src/store.rs:16`, used by `validate_proxy` at `frp-client/src/store.rs:258` | The runtime config store behind the admin API (`/api/store/*`) | Store writes are rejected with `invalid proxy type: <type>`, and an existing store file that contains your type **fails to load** |
 | 3 | the seed list in `by_type` — `frp-client/src/admin.rs:391` (feature `admin`) | `/api/proxy/<type>` (Go parity: every known type appears, even empty) | Cosmetic: the endpoint returns no entry for your type |
 | 4 | `const VALID_PROXY_TYPES` — `frp-server/src/ssh_gateway/args.rs:711` (feature `ssh`) | Proxy types accepted over the SSH tunnel gateway | `invalid proxy type: <type>, support types: [tcp http https tcpmux stcp]` |
-| 5 | `let valid_types = [...]` — `frp-server/src/dashboard.rs:659`, guard at `:662` (feature `dashboard`) | The dashboard v1 API's per-type endpoint | `404` for your type (a deliberate divergence from Go, which returns an empty list) |
-| 6 | `const VALID_TYPES` — `frp-server/src/dashboard.rs:1577`, enforced by `fn validate_type` at `frp-server/src/dashboard.rs:2145` (called at `:2690`; feature `dashboard`) | The dashboard v2 API's `proxy_type` filter | `400 BAD_REQUEST`: `type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp` (`frp-server/src/dashboard.rs:2151`) |
+| 5 | `let valid_types = [...]` — `frp-server/src/dashboard.rs:752`, guard at `:755` (feature `dashboard`) | The dashboard v1 API's per-type endpoint | `404` for your type (a deliberate divergence from Go, which returns an empty list) |
+| 6 | `const VALID_TYPES` — `frp-server/src/dashboard.rs:1653`, enforced by `fn validate_type` at `frp-server/src/dashboard.rs:2221` (called at `:2766`; feature `dashboard`) | The dashboard v2 API's `proxy_type` filter | `400 BAD_REQUEST`: `type must be one of tcp, udp, http, https, tcpmux, stcp, xtcp, sudp` (`frp-server/src/dashboard.rs:2227`) |
 
 **The SSH gateway has two gates, not one.** List 4 is only the first: every flag
 also carries a scope, matched by `FlagScope::allows`
@@ -282,7 +282,7 @@ it is a deliberate Rust-only extension, say so explicitly in the PR and in
 The registration call chain is:
 
 ```
-handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:122
+handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:132
   └─ build_proxy_info       frp-server/src/control/proxy_ops/registry.rs:48
   └─ register_proxy_entry   frp-server/src/control/proxy_ops/registry.rs:291
        ├─ register_sk_index frp-server/src/control/proxy_ops/registry.rs:127   (stcp/xtcp/sudp only)
@@ -294,8 +294,8 @@ handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:122
 registry (`remove` at `frp-server/src/proxy.rs:363`).
 
 **Where the port is actually reserved.** `allocate_proxy_port`
-(`frp-server/src/control/proxy_ops/ports.rs:86`), called from `handle_new_proxy` at
-`frp-server/src/control/proxy_ops/mod.rs:382`, is the allocator — and it takes
+(`frp-server/src/control/proxy_ops/ports.rs:100`), called from `handle_new_proxy` at
+`frp-server/src/control/proxy_ops/mod.rs:392`, is the allocator — and it takes
 `consumes_port` as an argument:
 
 ```rust
@@ -326,11 +326,11 @@ optional:
 
 | # | Line | Site | Purpose |
 |---|---|---|---|
-| 1 | `frp-server/src/control/proxy_ops/ports.rs:458` | `fn proxy_consumes_client_port` | The mirror of the registration increments, shared by the removal path and the sweep |
+| 1 | `frp-server/src/control/proxy_ops/ports.rs:628` | `fn proxy_consumes_client_port` | The mirror of the registration increments, shared by the removal path and the sweep |
 | 2 | `frp-server/src/control/proxy_ops/registry.rs:318` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
 | 3 | `frp-server/src/control/proxy_ops/registry.rs:349` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
 | 4 | `frp-server/src/control/proxy_ops/registry.rs:374` | the `client_ports_used` increment (`*c += 1`, under the guard at `:368`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
-| 5 | `frp-server/src/control/proxy_ops/mod.rs:217` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
+| 5 | `frp-server/src/control/proxy_ops/mod.rs:227` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
 | 6 | `frp-server/src/control/proxy_ops/listener.rs:379` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
 
 Do not pattern-match this table blindly; decide by asking what your type *is*.
@@ -348,17 +348,17 @@ close handler alone has two) — the group port and its shared listener are owne
 the group, so missing one releases them while a sibling is still live:
 
 - the replacement release in `free_replaced_port`
-  (`frp-server/src/control/proxy_ops/ports.rs:375`);
+  (`frp-server/src/control/proxy_ops/ports.rs:545`);
 - the join check in `handle_new_proxy`
-  (`frp-server/src/control/proxy_ops/mod.rs:301-302`);
+  (`frp-server/src/control/proxy_ops/mod.rs:311-312`);
 - the `unregister_control` sweep (`frp-server/src/control/proxy_ops/teardown.rs:179-180`);
 - the close handler `handle_close_proxy`, both its membership check
   (`frp-server/src/control/proxy.rs:79-80`) and its port snapshot
   (`frp-server/src/control/proxy.rs:108-109`);
 - the dashboard delete path, `cleanup_deleted_proxy_port`
-  (`frp-server/src/dashboard.rs:1138-1139`);
+  (`frp-server/src/dashboard.rs:1228-1229`);
 - the TCP-group load-balance filter in the pool dispatch path
-  (`frp-server/src/control/pool.rs:702`, in `handle_proxy_user_conn`).
+  (`frp-server/src/control/pool.rs:815`, in `handle_proxy_user_conn`).
 
 Those are the **tcp**-group sites; HTTP/HTTPS and TCPMux group members route
 through their own, separate predicates. The `kind_https` line at
@@ -466,8 +466,8 @@ green registration and a dead port.** The only guard is the end-to-end test in
 **Bridging needs no new code for a TCP-like type.** Once the user connection
 reaches the control handler as `InternalMsg::ProxyUserConn`, the existing path
 pops a work connection, sends `StartWorkConn`, and pumps bytes.
-`assign_work_to_proxy` (`frp-server/src/control/bridge/assign.rs:88`) prepares the
-assignment and `run_work_bridge` (`frp-server/src/control/bridge.rs:378`) selects
+`assign_work_to_proxy` (`frp-server/src/control/bridge/assign.rs:147`) prepares the
+assignment and `run_work_bridge` (`frp-server/src/control/bridge.rs:373`) selects
 plain vs encrypted/compressed. Add code there only if your type rewrites the
 stream (host headers, protocol framing). On the client side, registration builds
 the wire message in `create_new_proxy_msg` (`frp-client/src/proxy.rs:94`) and the
@@ -908,7 +908,7 @@ mechanism.
 The surface is much smaller than a proxy type's, and unlike a proxy type it has
 **no config allow-list at all**:
 
-- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:307`) is the only
+- `dispatch_plugin_start` (`frp-client/src/plugin/mod.rs:336`) is the only
   dispatcher. It matches `plugin_cfg.plugin_type.as_str()` and returns
   `Err(frp_core::Error::Config("unknown plugin type: <name>"))` for anything it
   does not know — at *runtime*, when frpc starts the plugin, not at config load.
@@ -1310,7 +1310,7 @@ of the workspace.** `oidc` — one of the nine features named just above — has
 live sibling of exactly this class: `AuthMethod::Oidc` is gated in `frp-core`
 and matched in `frp-server`, so
 `cargo check -p frp-server --no-default-features --features dashboard --all-targets`
-still fails with `E0004` at `frp-server/src/dashboard.rs:2352`. [`../TODO.md`](../TODO.md)
+still fails with `E0004` at `frp-server/src/dashboard.rs:2428`. [`../TODO.md`](../TODO.md)
 records it; the fix here was per-variant, not a guarantee that no other
 feature-gated variant exists.
 
@@ -4074,7 +4074,7 @@ is default-on (`frp-server/Cargo.toml:44`). The `http-proxy` feature is
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 Go-parity client plugins, `virtual_net`, is the TUN-backed path with no
-listener of its own (`frp-client/src/plugin/mod.rs:391`), so it follows the
+listener of its own (`frp-client/src/plugin/mod.rs:420`), so it follows the
 opt-in `vnet` tier: it is named in the Opt-in row above and is the one
 Go-parity client plugin not counted in Keep. `http2connect` is the additional
 frp-rs extension, also named in that row.

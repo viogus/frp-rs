@@ -1048,20 +1048,29 @@ pub(crate) async fn authenticate(
                 .unwrap_or_default(),
             _run_mu_guard: run_mu_guard,
         },
-        ControlState {
-            shutting_down,
-            shutdown_done: None,
-            udp_cancel: tokio_util::sync::CancellationToken::new(),
-            udp_cancels,
-            bridge_cancel: tokio_util::sync::CancellationToken::new(),
-            work_pool,
-            pending_requests,
-            pending_udp,
-            pending_nat_hole_sids,
-            listener_handles,
-            udp_sockets,
-            last_ping,
-            superseded,
+        {
+            let retry_cap = super::pool::MAX_PENDING_REQUESTS.max(pool_cap);
+            let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(retry_cap);
+            ControlState {
+                shutting_down,
+                shutdown_done: None,
+                udp_cancel: tokio_util::sync::CancellationToken::new(),
+                udp_cancels,
+                bridge_cancel: tokio_util::sync::CancellationToken::new(),
+                work_pool,
+                pending_requests,
+                pending_udp,
+                pending_nat_hole_sids,
+                listener_handles,
+                udp_sockets,
+                last_ping,
+                superseded,
+                retry_tx,
+                retry_rx,
+                reject_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                    super::pool::MAX_CONCURRENT_POOL_REJECTIONS,
+                )),
+            }
         },
         internal_tx,
         internal_rx,

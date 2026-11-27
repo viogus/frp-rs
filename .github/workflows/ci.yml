@@ -1772,7 +1772,7 @@ jobs:
           guard_subject=scripts/tests/pathline-cite-guard.sh
           guard_subject_pin=fab581a500a64cf2dfe4f65272da18ecbacd0eee76b778528b47f1eb44fdad45
           guard_data_file=scripts/tests/pathline-cite-expectations.txt
-          guard_data_pin=a54e1f778df4ecea5637416236be1293ea148fb60d543240deb368b5b3a03c1c
+          guard_data_pin=dce72b91dfa120c875220dc884f73127e1e879587ef08ef79a3138885a5e1007
           guard_exact=118
           guard_floor=118
           guard_canary='witness M1: one-line insert reddened notes.md:1'
@@ -2629,7 +2629,7 @@ jobs:
           sed -e 's/\x1b\[[0-9;]*m//g' "$log" > "$log.plain"
           cargo test -p frp-server --no-default-features --features dashboard --lib --color never -- --list 2>&1 | sed -e 's/\x1b\[[0-9;]*m//g' > "$list"
           n=$(grep -E -c '^[^ ].*: test$' "$list" || true)
-          n_expected=375
+          n_expected=381
           status=0
           [ "$run_status" = "0" ] || status=1
           grep -q "test result: ok. $n_expected passed; 0 failed" "$log.plain" || status=1
@@ -4377,8 +4377,8 @@ jobs:
       - name: Run the admin-without-TLS warning-delivery lane
         # The third answer of `WebServerTlsEnableReader::from_features`. `admin`
         # compiles the client's admin server; `tls` gates the acceptor that
-        # server builds (`frp-client/src/admin.rs:1149`, with the
-        # `not(feature = "tls")` discard arm at `frp-client/src/admin.rs:1164`). The step above
+        # server builds (`frp-client/src/admin.rs:1264`, with the
+        # `not(feature = "tls")` discard arm at `frp-client/src/admin.rs:1279`). The step above
         # (`--features admin`, frp-client's defaults) always has `tls`, and the
         # `--no-default-features --all-targets` lanes have neither feature — so
         # until this step no lane EXECUTED `reload_warning_delivery` in the third

@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::sync::Mutex;
-use tokio::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Per-proxy traffic counters using atomics for lock-free reads.
 pub struct ProxyMetrics {
@@ -176,27 +174,39 @@ impl ProxyMetricsRegistry {
         }
     }
 
-    pub async fn get_or_create(&self, name: &str) -> Arc<ProxyMetrics> {
+    pub fn get_or_create(&self, name: &str) -> Arc<ProxyMetrics> {
         // Read-first: bridge setup calls this on every connection and the
         // entry almost always exists — avoid taking the write lock (which
         // excludes all other readers) on the hot path. The create path
         // re-checks under the write lock, so a concurrent insert between
         // the two looks up the existing entry (same semantics as entry()).
-        if let Some(metrics) = self.metrics.read().await.get(name) {
+        if let Some(metrics) = self
+            .metrics
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+        {
             return metrics.clone();
         }
-        let mut map = self.metrics.write().await;
+        let mut map = self.metrics.write().unwrap_or_else(|e| e.into_inner());
         map.entry(name.to_string())
             .or_insert_with(|| Arc::new(ProxyMetrics::new(name.to_string())))
             .clone()
     }
 
-    pub async fn get(&self, name: &str) -> Option<Arc<ProxyMetrics>> {
-        self.metrics.read().await.get(name).cloned()
+    pub fn get(&self, name: &str) -> Option<Arc<ProxyMetrics>> {
+        self.metrics
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
     }
 
-    pub async fn remove(&self, name: &str) {
-        self.metrics.write().await.remove(name);
+    pub fn remove(&self, name: &str) {
+        self.metrics
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
     }
 }
 
@@ -233,22 +243,22 @@ mod tests {
         assert_eq!(s.bytes_out, 200);
     }
 
-    #[tokio::test]
-    async fn test_registry_reuses_metrics() {
+    #[test]
+    fn test_registry_reuses_metrics() {
         let reg = ProxyMetricsRegistry::new();
-        let m1 = reg.get_or_create("p1").await;
+        let m1 = reg.get_or_create("p1");
         m1.record_traffic(10, 0);
-        let m2 = reg.get_or_create("p1").await;
+        let m2 = reg.get_or_create("p1");
         assert_eq!(m2.snapshot().bytes_in, 10);
     }
 
-    #[tokio::test]
-    async fn test_registry_remove() {
+    #[test]
+    fn test_registry_remove() {
         let reg = ProxyMetricsRegistry::new();
-        reg.get_or_create("p1").await;
-        assert!(reg.get("p1").await.is_some());
-        reg.remove("p1").await;
-        assert!(reg.get("p1").await.is_none());
+        reg.get_or_create("p1");
+        assert!(reg.get("p1").is_some());
+        reg.remove("p1");
+        assert!(reg.get("p1").is_none());
     }
 
     #[test]

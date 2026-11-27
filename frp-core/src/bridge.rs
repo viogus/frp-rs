@@ -1178,7 +1178,16 @@ pub async fn relay_tcp_fast(
 ) -> io::Result<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
-        crate::splice::bridge_splice(a, b).await
+        match crate::splice::try_bridge_splice(a, b).await {
+            Ok(res) => res,
+            Err((a, b, e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "splice pipe allocation failed ({e}); falling back to pooled TCP relay"
+                );
+                relay_tcp_pooled_with_linger(a, b, HALF_CLOSE_LINGER_TIMEOUT).await
+            }
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -1186,7 +1195,24 @@ pub async fn relay_tcp_fast(
     }
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+/// Ignore `ENOTCONN` / `EPIPE` on peer write-half shutdown (peer already
+/// disconnected), matching `splice.rs` so `try_join!` does not cancel the
+/// sibling direction or discard traffic counts.
+#[inline]
+fn ignore_peer_closed_shutdown(res: io::Result<()>) -> io::Result<()> {
+    match res {
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotConnected | io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 async fn relay_tcp_pooled_with_linger(
     a: tokio::net::TcpStream,
     b: tokio::net::TcpStream,
@@ -1201,7 +1227,7 @@ async fn relay_tcp_pooled_with_linger(
         async move {
             let n = copy_pooled(&mut a_r, &mut b_w, rx, linger).await?;
             let _ = tx.send(true);
-            b_w.shutdown().await?;
+            ignore_peer_closed_shutdown(b_w.shutdown().await)?;
             Ok::<u64, io::Error>(n)
         }
     };
@@ -1210,7 +1236,7 @@ async fn relay_tcp_pooled_with_linger(
         async move {
             let n = copy_pooled(&mut b_r, &mut a_w, half_closed_rx, linger).await?;
             let _ = tx.send(true);
-            a_w.shutdown().await?;
+            ignore_peer_closed_shutdown(a_w.shutdown().await)?;
             Ok::<u64, io::Error>(n)
         }
     };
@@ -1245,7 +1271,7 @@ where
             // already closed (EOF was read), so the sibling may start its
             // linger window immediately.
             let _ = tx.send(true);
-            b_w.shutdown().await?;
+            ignore_peer_closed_shutdown(b_w.shutdown().await)?;
             Ok::<u64, io::Error>(n)
         }
     };
@@ -1254,7 +1280,7 @@ where
         async move {
             let n = copy_pooled(&mut b_r, &mut a_w, half_closed_rx, linger).await?;
             let _ = tx.send(true);
-            a_w.shutdown().await?;
+            ignore_peer_closed_shutdown(a_w.shutdown().await)?;
             Ok::<u64, io::Error>(n)
         }
     };

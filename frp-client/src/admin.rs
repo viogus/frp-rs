@@ -317,7 +317,7 @@ async fn handle_metrics(State(state): State<AdminState>) -> String {
     let mut current_conns = String::new();
 
     for (name, info) in proxies.iter() {
-        if let Some(m) = state.proxy_metrics.get(name).await {
+        if let Some(m) = state.proxy_metrics.get(name) {
             let s = m.snapshot();
             let labels = format!(
                 "{{name=\"{}\",type=\"{}\"}}",
@@ -847,19 +847,92 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(feature = "tls")]
 use tokio_rustls::server::TlsAcceptor;
 
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "tls")]
+const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_WARN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "tls")]
+static LAST_ADMIN_TLS_HANDSHAKE_WARN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "tls")]
+static LAST_ADMIN_TLS_ACCEPT_WARN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "tls")]
+fn warn_admin_tls_accept_rate_limited(error: &std::io::Error) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_ADMIN_TLS_ACCEPT_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TLS_HANDSHAKE_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_ADMIN_TLS_ACCEPT_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(error = %error, "TLS listener accept error: {}", error);
+}
+
+#[cfg(feature = "tls")]
+fn warn_admin_tls_handshake_rate_limited(addr: std::net::SocketAddr, error: &std::io::Error) {
+    use std::sync::atomic::Ordering;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_ADMIN_TLS_HANDSHAKE_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TLS_HANDSHAKE_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_ADMIN_TLS_HANDSHAKE_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    tracing::warn!(addr = %addr, error = %error, "TLS handshake error from {}: {}", addr, error);
+}
+
 /// TLS listener wrapper implementing axum's Listener trait.
+///
+/// Handshakes run concurrently in bounded background tasks (`JoinSet`,
+/// automatically aborted when the listener is dropped) with a hard
+/// [`TLS_HANDSHAKE_TIMEOUT`], so a slow or stalled TLS client can never block
+/// subsequent admin/metrics connections.
 #[cfg(feature = "tls")]
 pub(crate) struct TlsListener {
     inner: TcpListener,
     acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
+    handshake_sem: Arc<tokio::sync::Semaphore>,
+    ready_tx: tokio::sync::mpsc::Sender<(
+        tokio_rustls::server::TlsStream<TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    ready_rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    in_flight: tokio::task::JoinSet<()>,
 }
 
 #[cfg(feature = "tls")]
 impl TlsListener {
     pub(crate) fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        let (ready_tx, ready_rx) = tokio::sync::mpsc::channel(MAX_CONCURRENT_TLS_HANDSHAKES);
         Self {
             inner,
             acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
+            handshake_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES)),
+            ready_tx,
+            ready_rx,
+            in_flight: tokio::task::JoinSet::new(),
         }
     }
 }
@@ -871,24 +944,66 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, addr) = match self.inner.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(error = %e, "TLS listener accept error: {}", e);
-                    continue;
-                }
-            };
-            let tls_acceptor = self
-                .acceptor
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-                .expect("TLS acceptor not initialized");
-            match tls_acceptor.accept(stream).await {
-                Ok(tls_stream) => return (tls_stream, addr),
-                Err(e) => {
-                    tracing::warn!(addr = %addr, error = %e, "TLS handshake error from {}: {}", addr, e);
-                    continue;
+            while self.in_flight.try_join_next().is_some() {}
+
+            tokio::select! {
+                biased;
+                Some(ready) = self.ready_rx.recv() => return ready,
+                permit = self.handshake_sem.clone().acquire_owned() => {
+                    let Ok(permit) = permit else {
+                        continue;
+                    };
+                    let accepted = tokio::select! {
+                        biased;
+                        Some(ready) = self.ready_rx.recv() => return ready,
+                        res = self.inner.accept() => res,
+                    };
+                    let (stream, addr) = match accepted {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            drop(permit);
+                            warn_admin_tls_accept_rate_limited(&e);
+                            tokio::select! {
+                                biased;
+                                Some(ready) = self.ready_rx.recv() => return ready,
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => continue,
+                            }
+                        }
+                    };
+                    frp_core::transport::set_nodelay(&stream);
+                    let Some(tls_acceptor) = self
+                        .acceptor
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                    else {
+                        tracing::warn!("TLS acceptor not initialized, skipping connection");
+                        continue;
+                    };
+                    let tx = self.ready_tx.clone();
+                    self.in_flight.spawn(async move {
+                        let _permit = permit;
+                        match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            tls_acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                let _ = tx.send((tls_stream, addr)).await;
+                            }
+                            Ok(Err(e)) => {
+                                warn_admin_tls_handshake_rate_limited(addr, &e);
+                            }
+                            Err(_) => {
+                                let err = io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "TLS handshake timed out",
+                                );
+                                warn_admin_tls_handshake_rate_limited(addr, &err);
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -985,7 +1100,7 @@ async fn handle_head_not_allowed() -> StatusCode {
 ///    honoured only when auth is set.
 /// 3. A *blanket* switch of `apply_admin_auth` to `route_layer` is out of scope:
 ///    the helper is shared (`frp-core/src/admin_auth.rs:36`), called from this
-///    file and from `frp-server/src/dashboard.rs:3670/3672/3696`, so it would
+///    file and from `frp-server/src/dashboard.rs:3744/3746/3770`, so it would
 ///    change the frps dashboard too. C is admin-local and leaves the helper and
 ///    the dashboard alone.
 ///

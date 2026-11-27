@@ -417,7 +417,7 @@ async fn handle_visitor_conn(
     }
 
     // 5. Bridge user_conn ↔ server_stream
-    let (u_r, u_w) = tokio::io::split(user_conn);
+    let (u_r, u_w) = user_conn.into_split();
     let (s_r, s_w) = match frp_core::transport::split_work_conn_halves(server_stream) {
         Ok(pair) => pair,
         Err(e) => {

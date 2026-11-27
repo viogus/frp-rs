@@ -96,20 +96,45 @@ use tokio::net::TcpStream;
 #[cfg(feature = "tls")]
 use tokio_rustls::server::TlsAcceptor;
 
+#[cfg(feature = "tls")]
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "tls")]
+const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 64;
+
 /// TLS listener wrapper implementing axum's Listener trait.
-/// Used by dashboard and admin API servers to accept TLS connections.
+/// Used by dashboard and metrics servers to accept TLS connections.
+///
+/// Handshakes run concurrently in bounded background tasks (`JoinSet`,
+/// automatically aborted when the listener is dropped) with a hard
+/// [`TLS_HANDSHAKE_TIMEOUT`], so a slow or stalled TLS client can never block
+/// subsequent dashboard/metrics accepts.
 #[cfg(feature = "tls")]
 pub(crate) struct TlsListener {
     inner: TcpListener,
     acceptor: Arc<std::sync::RwLock<Option<TlsAcceptor>>>,
+    handshake_sem: Arc<tokio::sync::Semaphore>,
+    ready_tx: tokio::sync::mpsc::Sender<(
+        tokio_rustls::server::TlsStream<TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    ready_rx: tokio::sync::mpsc::Receiver<(
+        tokio_rustls::server::TlsStream<TcpStream>,
+        std::net::SocketAddr,
+    )>,
+    in_flight: tokio::task::JoinSet<()>,
 }
 
 #[cfg(feature = "tls")]
 impl TlsListener {
     pub(crate) fn new(inner: TcpListener, acceptor: TlsAcceptor) -> Self {
+        let (ready_tx, ready_rx) = tokio::sync::mpsc::channel(MAX_CONCURRENT_TLS_HANDSHAKES);
         Self {
             inner,
             acceptor: Arc::new(std::sync::RwLock::new(Some(acceptor))),
+            handshake_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES)),
+            ready_tx,
+            ready_rx,
+            in_flight: tokio::task::JoinSet::new(),
         }
     }
 }
@@ -122,6 +147,36 @@ impl TlsListener {
 const TLS_HANDSHAKE_WARN_MIN_INTERVAL: Duration = Duration::from_secs(10);
 #[cfg(feature = "tls")]
 static LAST_TLS_HANDSHAKE_WARN: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "tls")]
+static LAST_TLS_ACCEPT_WARN: AtomicU64 = AtomicU64::new(0);
+
+/// Warn about a TLS listener accept failure at most once per
+/// [`TLS_HANDSHAKE_WARN_MIN_INTERVAL`].
+///
+/// The accept loop retries every 50 ms, so a persistent `EMFILE`/`ENFILE`
+/// would otherwise log ~20 identical lines per second for as long as the
+/// process lives. Shared interval with the handshake warnings: both mean
+/// "the dashboard listener is not serving".
+#[cfg(feature = "tls")]
+fn warn_tls_accept_rate_limited(error: &std::io::Error) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_TLS_ACCEPT_WARN.load(Ordering::Relaxed);
+    if last != 0 && now.saturating_sub(last) < TLS_HANDSHAKE_WARN_MIN_INTERVAL.as_secs() {
+        return;
+    }
+    if LAST_TLS_ACCEPT_WARN
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        // Another accept failure already logged within this window.
+        return;
+    }
+    tracing::warn!(error = %error, "TLS listener accept error: {}", error);
+}
 
 /// Warn about a failed TLS handshake at most once per
 /// [`TLS_HANDSHAKE_WARN_MIN_INTERVAL`]: the first failure in each window is
@@ -153,28 +208,69 @@ impl axum::serve::Listener for TlsListener {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            let (stream, addr) = match self.inner.accept().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(error = %e, "TLS listener accept error: {}", e);
-                    continue;
-                }
-            };
-            // Go net/http sets TCP_NODELAY on accepted conns by default —
-            // parity for the dashboard TLS path (before the TLS wrap).
-            frp_core::transport::set_nodelay(&stream);
-            let tls_acceptor = match self.acceptor.read_ok().clone() {
-                Some(acceptor) => acceptor,
-                None => {
-                    tracing::warn!("TLS acceptor not initialized, skipping connection");
-                    continue;
-                }
-            };
-            match tls_acceptor.accept(stream).await {
-                Ok(tls_stream) => return (tls_stream, addr),
-                Err(e) => {
-                    warn_tls_handshake_rate_limited(addr, &e);
-                    continue;
+            while self.in_flight.try_join_next().is_some() {}
+
+            tokio::select! {
+                biased;
+                Some(ready) = self.ready_rx.recv() => return ready,
+                permit = self.handshake_sem.clone().acquire_owned() => {
+                    let Ok(permit) = permit else {
+                        continue;
+                    };
+                    let accepted = tokio::select! {
+                        biased;
+                        Some(ready) = self.ready_rx.recv() => return ready,
+                        res = self.inner.accept() => res,
+                    };
+                    let (stream, addr) = match accepted {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            // Do not hold the handshake permit across the
+                            // backoff, and let already-established conns through
+                            // while sleeping: a transient accept error (EMFILE,
+                            // a peer that resets mid-handshake) must not stall
+                            // queued TLS conns. Mirrors the identical backoff in
+                            // `frp-client/src/admin.rs`.
+                            drop(permit);
+                            warn_tls_accept_rate_limited(&e);
+                            tokio::select! {
+                                biased;
+                                Some(ready) = self.ready_rx.recv() => return ready,
+                                _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
+                            }
+                        }
+                    };
+                    // Go net/http sets TCP_NODELAY on accepted conns by default —
+                    // parity for the dashboard TLS path (before the TLS wrap).
+                    frp_core::transport::set_nodelay(&stream);
+                    let Some(tls_acceptor) = self.acceptor.read_ok().clone() else {
+                        tracing::warn!("TLS acceptor not initialized, skipping connection");
+                        continue;
+                    };
+                    let tx = self.ready_tx.clone();
+                    self.in_flight.spawn(async move {
+                        let _permit = permit;
+                        match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            tls_acceptor.accept(stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls_stream)) => {
+                                let _ = tx.send((tls_stream, addr)).await;
+                            }
+                            Ok(Err(e)) => {
+                                warn_tls_handshake_rate_limited(addr, &e);
+                            }
+                            Err(_) => {
+                                let err = io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "TLS handshake timed out",
+                                );
+                                warn_tls_handshake_rate_limited(addr, &err);
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -484,7 +580,7 @@ async fn build_serverinfo(state: &Arc<AppState>) -> ServerInfoResp {
     let mut cur_conns: i64 = 0;
     for p in state.proxy_manager.list().await {
         *proxy_type_counts.entry(p.proxy_type.clone()).or_insert(0) += 1;
-        if let Some(m) = state.proxy_metrics.get(&p.name).await {
+        if let Some(m) = state.proxy_metrics.get(&p.name) {
             let (tin, tout) = m.daily.snapshot();
             total_traffic_in += tin[0] as i64;
             total_traffic_out += tout[0] as i64;
@@ -540,7 +636,6 @@ async fn handle_proxies(
         let traffic = state
             .proxy_metrics
             .get(&p.name)
-            .await
             .map(|m| m.snapshot())
             .unwrap_or_default();
         entries.push(ProxyEntry {
@@ -575,7 +670,6 @@ async fn handle_proxy_detail(
     let traffic = state
         .proxy_metrics
         .get(&name)
-        .await
         .map(|m| m.snapshot())
         .unwrap_or_default();
 
@@ -629,7 +723,6 @@ async fn handle_proxy_traffic(
     let (traffic_in, traffic_out) = state
         .proxy_metrics
         .get(&name)
-        .await
         .map(|m| m.daily.snapshot())
         .unwrap_or(([0u64; 7], [0u64; 7]));
 
@@ -672,7 +765,6 @@ async fn handle_proxies_by_type(
         let traffic = state
             .proxy_metrics
             .get(&p.name)
-            .await
             .map(|m| m.snapshot())
             .unwrap_or_default();
         entries.push(ProxyEntry {
@@ -712,7 +804,6 @@ async fn handle_proxy_by_type_name(
     let traffic = state
         .proxy_metrics
         .get(&name)
-        .await
         .map(|m| m.snapshot())
         .unwrap_or_default();
 
@@ -872,7 +963,6 @@ async fn handle_client_detail(
         let traffic = state
             .proxy_metrics
             .get(&p.name)
-            .await
             .map(|m| m.snapshot())
             .unwrap_or_default();
         proxies.push(ProxyEntry {
@@ -1214,17 +1304,9 @@ async fn handle_store_proxy_delete(
     } else {
         state.tcpmux_manager.unregister(&name).await;
     }
-    state.proxy_metrics.remove(&name).await;
-    crate::metrics::prom::proxy_removed(&name).await;
-    // Remove the proxy and release the counters it owns (https SNI-sniff
-    // gate count, per-client port-budget slot) ONLY when this call actually
-    // performed the removal — the client CloseProxy handler races this path
-    // and both may observe the proxy before either removes it. A double
-    // release would decrement client_ports_used twice (S4: the budget drifts
-    // below the live count and max_ports_per_client admits extra proxies)
-    // and leave https_proxy_count at 0 while https proxies still exist,
-    // silently disabling SNI sniff (HTTPS vhost routing).
     if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+        state.proxy_metrics.remove(&name);
+        crate::metrics::prom::proxy_removed(&name).await;
         // Clean up port marks AFTER the registry removal (TCP/UDP manager,
         // TCP group last-member semantics — same lifecycle as the client
         // CloseProxy path). M5: post-remove the group-last check counts only
@@ -1301,15 +1383,9 @@ async fn handle_proxies_delete(
             } else {
                 state.tcpmux_manager.unregister(name).await;
             }
-            state.proxy_metrics.remove(name).await;
-            crate::metrics::prom::proxy_removed(name).await;
-            // Remove the proxy and release the counters it owns (https
-            // SNI-sniff gate count, per-client port-budget slot) ONLY when
-            // this call actually performed the removal — CloseProxy / client
-            // disconnect race this bulk delete, and a double release would
-            // double-decrement client_ports_used (S4) and leave
-            // https_proxy_count at 0 while https proxies still exist.
             if crate::control::remove_proxy_and_release_client_counts(&state, &proxy).await {
+                state.proxy_metrics.remove(name);
+                crate::metrics::prom::proxy_removed(name).await;
                 // Port-mark cleanup AFTER the registry removal — same M5
                 // race-safe ordering as the single-delete path. Skipped on a
                 // lost race: the winner ran its own cleanup.
@@ -1494,7 +1570,7 @@ async fn emit_traffic_events_tick(
     last_values.retain(|name, _| live.contains(name.as_str()));
 
     for proxy in &proxies {
-        if let Some(metrics) = state.proxy_metrics.get(&proxy.name).await {
+        if let Some(metrics) = state.proxy_metrics.get(&proxy.name) {
             let snap = metrics.snapshot();
             let changed = last_values
                 .get(&proxy.name)
@@ -2474,7 +2550,7 @@ mod v2 {
         let mut cur_conns: i64 = 0;
         for p in &proxies {
             *proxy_type_counts.entry(p.proxy_type.clone()).or_insert(0) += 1;
-            if let Some(m) = state.proxy_metrics.get(&p.name).await {
+            if let Some(m) = state.proxy_metrics.get(&p.name) {
                 let (tin, tout) = m.daily.snapshot();
                 // Go ServerStats: TotalTrafficIn/Out are TodayCount().
                 total_traffic_in += tin[0] as i64;
@@ -2658,7 +2734,7 @@ mod v2 {
             let proxies = state.proxy_manager.list_client(&info.run_id).await;
             let mut cur_conns = 0i64;
             for p in &proxies {
-                if let Some(m) = state.proxy_metrics.get(&p.name).await {
+                if let Some(m) = state.proxy_metrics.get(&p.name) {
                     cur_conns += m.snapshot().current_conns;
                 }
             }
@@ -2716,7 +2792,6 @@ mod v2 {
             let (today_in, today_out, cur_conns) = state
                 .proxy_metrics
                 .get(&p.name)
-                .await
                 .map(|m| {
                     let s = m.snapshot();
                     let (tin, tout) = m.daily.snapshot();
@@ -2777,7 +2852,6 @@ mod v2 {
         let (today_in, today_out, cur_conns) = state
             .proxy_metrics
             .get(&p.name)
-            .await
             .map(|m| {
                 let s = m.snapshot();
                 let (tin, tout) = m.daily.snapshot();
@@ -2830,7 +2904,7 @@ mod v2 {
             .await
             .ok_or_else(|| err(StatusCode::NOT_FOUND, "no proxy info found"))?;
 
-        let history = if let Some(m) = state.proxy_metrics.get(&p.name).await {
+        let history = if let Some(m) = state.proxy_metrics.get(&p.name) {
             let (tin, tout) = m.daily.snapshot();
             let today_secs = SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2892,7 +2966,7 @@ mod v2 {
         let mut cleared = 0usize;
         for p in &all {
             if !state.run_id_to_ctl_tx.contains_key(&p.run_id) {
-                state.proxy_metrics.remove(&p.name).await;
+                state.proxy_metrics.remove(&p.name);
                 crate::metrics::prom::proxy_removed(&p.name).await;
                 cleared += 1;
             }
@@ -3124,10 +3198,10 @@ mod v2 {
                 .register("run-2".into(), proxy_info("p2", "udp"))
                 .await
                 .unwrap();
-            let m1 = state.proxy_metrics.get_or_create("p1").await;
+            let m1 = state.proxy_metrics.get_or_create("p1");
             m1.record_traffic(1000, 2000);
             m1.current_conns.fetch_add(3, Ordering::Relaxed);
-            let m2 = state.proxy_metrics.get_or_create("p2").await;
+            let m2 = state.proxy_metrics.get_or_create("p2");
             m2.record_traffic(3000, 4000);
             m2.current_conns.fetch_add(1, Ordering::Relaxed);
 
@@ -3421,7 +3495,7 @@ mod v2 {
                 .register("run-1".into(), proxy_info("p1", "tcp"))
                 .await
                 .unwrap();
-            let metrics = state.proxy_metrics.get_or_create("p1").await;
+            let metrics = state.proxy_metrics.get_or_create("p1");
             metrics.record_traffic(100, 200);
 
             let (event_tx, mut rx) = tokio::sync::broadcast::channel(64);
@@ -3965,5 +4039,70 @@ mod cleanup_deleted_proxy_port_tests {
             !state.used_udp_ports.read().await.contains(&7000),
             "last SUDP owner delete must release the mark"
         );
+    }
+
+    /// Non-blocking TLS handshake pin: a slow/stalled TCP client that never
+    /// sends a ClientHello must not head-of-line block a subsequent legitimate
+    /// TLS client on `TlsListener::accept()`.
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn tls_listener_does_not_block_on_stalled_client() {
+        use axum::serve::Listener as _;
+        use tokio_rustls::rustls;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let cert_der = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+        );
+
+        let srv_cfg = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(srv_cfg));
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.add(cert_der).unwrap();
+        let cli_cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(cli_cfg));
+
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let mut tls_listener = TlsListener::new(tcp, acceptor);
+
+        // Client 1: slowloris TCP client — completes TCP handshake and sends 0 bytes.
+        let _stalled = TcpStream::connect(addr).await.unwrap();
+
+        // Drive accept() in background so Client 1 is accepted into the in-flight
+        // handshake pool while Client 2 connects and completes TLS.
+        let accept_task = tokio::spawn(async move { tls_listener.accept().await });
+
+        // Give the listener a brief moment to accept the stalled TCP conn first.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Client 2: good TLS client must succeed immediately despite Client 1 stalling.
+        let good_tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let client_tls = tokio::time::timeout(
+            Duration::from_secs(2),
+            connector.connect(server_name, good_tcp),
+        )
+        .await
+        .expect("good TLS client must not be head-of-line blocked by stalled client")
+        .expect("TLS handshake must succeed");
+
+        let (_server_tls, accepted_addr) =
+            tokio::time::timeout(Duration::from_secs(2), accept_task)
+                .await
+                .expect("TlsListener::accept must yield good TLS client")
+                .expect("accept task must not panic");
+        assert_eq!(accepted_addr, client_tls.get_ref().0.local_addr().unwrap());
     }
 }

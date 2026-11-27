@@ -1167,10 +1167,10 @@ async fn handle_connect(
         }
     }
 
-    // Bidirectional relay through pooled buffers (audit round-8 P1: the
-    // copy_bidirectional_with_sizes pair of fresh buffers per conn is gone;
-    // relay_plain_pooled has identical FIN-propagation semantics).
-    if let Err(e) = frp_core::bridge::relay_plain_pooled(client, remote).await {
+    // Bidirectional TCP relay: Linux zero-copy splice(2) (with automatic
+    // fallback to pooled TCP relay on pipe exhaustion), non-Linux lock-free
+    // `TcpStream::into_split()` with pooled buffers.
+    if let Err(e) = frp_core::bridge::relay_tcp_fast(client, remote).await {
         tracing::debug!(error = %e, "plugin relay error: {}", e);
     }
     Ok(())
