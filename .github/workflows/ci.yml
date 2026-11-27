@@ -4169,14 +4169,14 @@ jobs:
         # *declared* literal so a count and its literal lowered in one edit
         # still red. Re-derived with
         # `cargo test -p frp-server --features dashboard --lib --color never --
-        # --list` (62 `^vhost::tests::` lines; the same 62 under
+        # --list` (64 `^vhost::tests::` lines; the same 64 under
         # `--all-features`), and the filtered run's summary measured as
-        # `test result: ok. 62 passed; 0 failed`.
+        # `test result: ok. 64 passed; 0 failed`.
         shell: bash
         run: |
           set -eo pipefail
-          expected=62
-          expected_floor=62
+          expected=64
+          expected_floor=64
           case "$expected_floor" in
             ''|*[!0-9]*)
               echo "::error::frp-server vhost guard: expected_floor must be a non-negative integer (got '$expected_floor')"
