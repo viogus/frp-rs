@@ -1340,7 +1340,7 @@ impl Service {
             });
             // 2. Send NatHoleClient on control (Go v0.70 compat: protocol "kcp").
             // Use a unique transaction_id per request (Go frp compat: UUID).
-            let txn_id = uuid::Uuid::new_v4().to_string();
+            let txn_id = frp_core::new_uuid_v4();
             let client_msg = FrpMessage::NatHoleClient(Box::new(msg::NatHoleClient {
                 transaction_id: txn_id.clone(),
                 proxy_name: proxy_name.clone(),

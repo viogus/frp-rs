@@ -82,7 +82,7 @@ pub(super) async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession
         };
         let pre_check_req = crate::service::VisitorRequest {
             nhv: msg::NatHoleVisitor {
-                transaction_id: uuid::Uuid::new_v4().to_string(),
+                transaction_id: frp_core::new_uuid_v4(),
                 proxy_name: cfg.sn.clone(),
                 pre_check: true,
                 protocol: Some(cfg.pp.to_string()),
@@ -196,7 +196,7 @@ pub(super) async fn do_hole_punch(cfg: &XtcpPunchConfig) -> Result<TunnelSession
     // 3. Send NatHoleVisitor on the control connection and wait for
     //    NatHoleResp (5s — Go frp client/xtcp.go waits 5s for the server's
     //    NatHoleResp; the server's own NAT_HOLE_TIMEOUT is 10s).
-    let txn_id = uuid::Uuid::new_v4().to_string();
+    let txn_id = frp_core::new_uuid_v4();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

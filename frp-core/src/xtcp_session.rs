@@ -418,7 +418,11 @@ pub async fn xtcp_p2p_connect_yamux_session(
     // instead of parking it. Same mechanism as `frp-core/src/mux.rs`.
     let activity = std::sync::Arc::new(crate::mux::ActivityState::default());
     let stall = std::sync::Arc::new(crate::mux::WriteStall::default());
-    let compat_stream = crate::mux::ActivityIo::new(kcp_stream, activity, stall.clone()).compat();
+    let (read, write) = tokio::io::split(crate::mux::ActivityIo::new(
+        kcp_stream,
+        activity,
+        stall.clone(),
+    ));
 
     // 3. Create the yamux Connection. Go frp v0.71 sets
     //    KeepAliveInterval=10s and MaxStreamWindowSize=6MB in the XTCP path
@@ -444,12 +448,18 @@ pub async fn xtcp_p2p_connect_yamux_session(
     // bound; the connection window keeps bounding the sum.
     yamux_cfg.set_max_stream_receive_window(Some(6 * 1024 * 1024));
     yamux_cfg.set_max_num_streams(MAX_TUNNEL_STREAMS);
+    yamux_cfg.set_split_send_size(crate::mux::mux_split_size(*crate::buffer_pool::BUFFER_SIZE));
     let mode = if yamux_client {
         Mode::Client
     } else {
         Mode::Server
     };
-    let conn = Connection::new(compat_stream, yamux_cfg, mode);
+    let conn = Connection::new_split(
+        read.compat(),
+        crate::mux::VectoredWrite(write),
+        yamux_cfg,
+        mode,
+    );
     tracing::info!(
         conv,
         role = if yamux_client { "client" } else { "server" },

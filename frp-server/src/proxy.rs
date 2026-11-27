@@ -37,6 +37,89 @@ impl GroupMemberHealth {
     }
 }
 
+/// One pre-compiled HTTP response header ready for injection by `ResponseHeaderInjector`.
+#[derive(Debug, Clone)]
+pub struct CompiledRespHeader {
+    pub(crate) name: Box<[u8]>,
+    pub(crate) wire_line: Box<[u8]>,
+}
+
+/// Pre-sorted, case-insensitively deduplicated, CR/LF-sanitized response headers
+/// compiled once per proxy registration and shared via `Arc`.
+#[derive(Debug, Clone, Default)]
+pub struct PrecompiledResponseHeaders {
+    pub(crate) entries: Box<[CompiledRespHeader]>,
+    pub(crate) wire_all: Box<[u8]>,
+}
+
+impl PrecompiledResponseHeaders {
+    /// Compile a `response_headers` map once at proxy registration.
+    ///
+    /// Mirrors Go `Header.Set` semantics (case-insensitive deduplication with
+    /// last sorted key winning) plus CR/LF sanitization, pre-rendering each
+    /// `"Name: Value\r\n"` line.
+    pub fn from_map(map: &HashMap<String, String>) -> Self {
+        if map.is_empty() {
+            return Self::default();
+        }
+        // Sanitize first and skip empty keys, then sort case-insensitively
+        // (lower, sanitized) so case-colliding keys sit strictly adjacent even
+        // when mixed-case names would otherwise sort apart in raw ASCII.
+        let mut entries_raw: Vec<(String, String, String)> = Vec::with_capacity(map.len());
+        for (k, v) in map {
+            let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            if safe_k.is_empty() {
+                continue;
+            }
+            let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            let lower_k = safe_k.to_ascii_lowercase();
+            entries_raw.push((lower_k, safe_k, safe_v));
+        }
+        entries_raw.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut deduped: Vec<CompiledRespHeader> = Vec::with_capacity(entries_raw.len());
+        let mut prev_lower: Option<String> = None;
+        for (lower_k, safe_k, safe_v) in entries_raw {
+            if prev_lower.as_deref() == Some(lower_k.as_str()) {
+                deduped.pop();
+            }
+            let wire_line = format!("{safe_k}: {safe_v}\r\n")
+                .into_bytes()
+                .into_boxed_slice();
+            deduped.push(CompiledRespHeader {
+                name: safe_k.into_bytes().into_boxed_slice(),
+                wire_line,
+            });
+            prev_lower = Some(lower_k);
+        }
+
+        let total_len: usize = deduped.iter().map(|e| e.wire_line.len()).sum();
+        let mut wire_all = Vec::with_capacity(total_len);
+        for e in &deduped {
+            wire_all.extend_from_slice(&e.wire_line);
+        }
+
+        Self {
+            entries: deduped.into_boxed_slice(),
+            wire_all: wire_all.into_boxed_slice(),
+        }
+    }
+
+    pub(crate) fn contains_name(&self, name: &[u8]) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(name))
+    }
+
+    pub(crate) fn entries(&self) -> &[CompiledRespHeader] {
+        &self.entries
+    }
+
+    pub(crate) fn wire_all(&self) -> &[u8] {
+        &self.wire_all
+    }
+}
+
 /// A registered proxy on the server side.
 #[derive(Debug, Clone)]
 pub struct ProxyInfo {
@@ -70,6 +153,8 @@ pub struct ProxyInfo {
     pub udp_packet_codec: String,
     /// Response headers to inject into HTTP responses.
     pub response_headers: std::collections::HashMap<String, String>,
+    /// Pre-compiled response headers shared across HTTP bridges via `Arc`.
+    pub compiled_response_headers: Arc<PrecompiledResponseHeaders>,
     /// Custom domains for HTTP vhost routing.
     pub custom_domains: Vec<String>,
     /// Per-user routing: extract username from Authorization header and route
@@ -1085,6 +1170,7 @@ mod tests {
             allow_users: Vec::new(),
             proxy_protocol_version: String::new(),
             response_headers: std::collections::HashMap::new(),
+            compiled_response_headers: Arc::default(),
             custom_domains: Vec::new(),
             route_by_http_user: String::new(),
             multiplexer: String::new(),

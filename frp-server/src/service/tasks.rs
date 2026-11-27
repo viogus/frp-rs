@@ -186,6 +186,9 @@ impl Service {
                     _ = interval.tick() => {}
                     _ = state.shutdown_token.cancelled() => return,
                 }
+                state
+                    .client_registry
+                    .prune_expired_offline(crate::registry::DEFAULT_OFFLINE_CLIENT_TTL);
                 let stale: Vec<(String, u64)> = state
                     .run_id_to_ctl_tx
                     .iter()

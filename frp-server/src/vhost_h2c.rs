@@ -168,7 +168,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PreReadStream<S> {
 ///
 /// The handshake and the first accept are bounded by a single absolute
 /// `vhost_http_timeout` deadline — the exact parallel of the HTTP/1.1 head
-/// read at frp-server/src/vhost.rs:204-214 (same `<= 0 → 60s` Go floor, same
+/// read at frp-server/src/vhost.rs:206-216 (same `<= 0 → 60s` Go floor, same
 /// `Instant::now() + from_secs` idiom). An unauthenticated client that sends
 /// the 24-byte preface and then goes silent must not park a task, an fd, and
 /// — when `max_connections` is configured — a `conn_semaphore` permit (held
@@ -185,7 +185,7 @@ pub(crate) async fn serve_h2c_request<S>(
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    // Same absolute-deadline idiom as the HTTP/1.1 head read (frp-server/src/vhost.rs:204-
+    // Same absolute-deadline idiom as the HTTP/1.1 head read (frp-server/src/vhost.rs:206-
     // 214): the whole handshake must complete within vhost_http_timeout, not
     // a per-read timeout a drip-feeding client could stretch indefinitely.
     // `<= 0` floors at 60s (Go parity, shared clamp in vhost.rs).
@@ -204,7 +204,7 @@ pub(crate) async fn serve_h2c_request<S>(
                 // cap per-connection memory.
                 .max_concurrent_streams(100)
                 // Cap the header block at the same 4096-byte bound the HTTP/1.1
-                // head path enforces (frp-server/src/vhost.rs:353, :368). h2's 16 MiB default
+                // head path enforces (frp-server/src/vhost.rs:355, :370). h2's 16 MiB default
                 // × 100 concurrent streams would otherwise leave an
                 // unauthenticated client a ~1.6 GiB per-connection memory ceiling
                 // to park on.
@@ -421,7 +421,7 @@ async fn handle_stream(
     let (client, control) = tokio::io::duplex(H2C_DUPLEX_BUF_SIZE);
     // send().await: backpressure is correct — a full control channel must
     // not silently drop a user connection (the HTTP/1.1 path uses the same
-    // pattern). Bounded (frp-server/src/vhost.rs:721-727 parity): a control handler that
+    // pattern). Bounded (frp-server/src/vhost.rs:723-729 parity): a control handler that
     // stops draining must not pin this task + fd + permit forever; after
     // CTL_SEND_TIMEOUT the send is abandoned and the h2 stream answers the
     // backend-unreachable 404 (FIX 2, see the timeout arm below).

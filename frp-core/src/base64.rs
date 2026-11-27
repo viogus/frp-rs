@@ -44,34 +44,38 @@ impl std::error::Error for Base64Error {}
 
 /// Encode `data` as base64 with the standard alphabet and `=` padding.
 pub fn encode(data: &[u8]) -> String {
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut out = Vec::with_capacity(data.len().div_ceil(3) * 4);
     let (chunks, remainder) = data.as_chunks::<3>();
     for chunk in chunks {
-        let b0 = chunk[0];
-        let b1 = chunk[1];
-        let b2 = chunk[2];
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
-        out.push(ALPHABET[((b1 & 0x0f) << 2 | b2 >> 6) as usize] as char);
-        out.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        let b0 = chunk[0] as usize;
+        let b1 = chunk[1] as usize;
+        let b2 = chunk[2] as usize;
+        out.extend_from_slice(&[
+            ALPHABET[b0 >> 2],
+            ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)],
+            ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)],
+            ALPHABET[b2 & 0x3f],
+        ]);
     }
     match remainder {
         [] => {}
         [b0] => {
-            out.push(ALPHABET[(b0 >> 2) as usize] as char);
-            out.push(ALPHABET[((b0 & 0x03) << 4) as usize] as char);
-            out.push('=');
-            out.push('=');
+            let b0 = *b0 as usize;
+            out.extend_from_slice(&[ALPHABET[b0 >> 2], ALPHABET[(b0 & 0x03) << 4], b'=', b'=']);
         }
         [b0, b1] => {
-            out.push(ALPHABET[(b0 >> 2) as usize] as char);
-            out.push(ALPHABET[((b0 & 0x03) << 4 | b1 >> 4) as usize] as char);
-            out.push(ALPHABET[((b1 & 0x0f) << 2) as usize] as char);
-            out.push('=');
+            let b0 = *b0 as usize;
+            let b1 = *b1 as usize;
+            out.extend_from_slice(&[
+                ALPHABET[b0 >> 2],
+                ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)],
+                ALPHABET[(b1 & 0x0f) << 2],
+                b'=',
+            ]);
         }
         _ => unreachable!("remainder is at most 2 bytes"),
     }
-    out
+    String::from_utf8(out).expect("base64 ALPHABET is valid ASCII")
 }
 
 fn decode_char(c: u8, pos: usize) -> Result<u8, Base64Error> {

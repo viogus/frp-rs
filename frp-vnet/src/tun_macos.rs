@@ -258,6 +258,9 @@ impl AsyncRead for MacOSTun {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
         // Count of consecutive header-only reads (n <= 4: AF header with
         // no payload) within this poll; bounds the retry so a pathological
         // kernel cannot spin this task forever.
@@ -269,14 +272,32 @@ impl AsyncRead for MacOSTun {
                 Poll::Pending => return Poll::Pending,
             };
 
-            let dst = buf.initialize_unfilled();
+            // Scatter-read the 4-byte utun AF header straight into a stack
+            // buffer and the IP packet directly into ReadBuf's unfilled slice,
+            // avoiding both initialize_unfilled() zeroing and copy_within().
+            let mut hdr = [0u8; 4];
+            // SAFETY: no uninitialized bytes are read from `dst`; `readv`
+            // initializes `actual` prefix bytes before `buf.assume_init(actual)`.
+            let dst = unsafe { buf.unfilled_mut() };
+            let dst_len = dst.len();
+            let dst_ptr = dst.as_mut_ptr();
             match guard.try_io(|fd| {
                 let fd = fd.as_raw_fd();
                 let n = loop {
-                    // SAFETY: fd is the utun fd registered with AsyncFd
-                    // for readiness; dst is initialized_unfilled with
-                    // correct length; read() is a standard POSIX call.
-                    let n = unsafe { libc::read(fd, dst.as_mut_ptr() as *mut _, dst.len()) };
+                    let mut iov = [
+                        libc::iovec {
+                            iov_base: hdr.as_mut_ptr().cast::<libc::c_void>(),
+                            iov_len: hdr.len(),
+                        },
+                        libc::iovec {
+                            iov_base: dst_ptr.cast::<libc::c_void>(),
+                            iov_len: dst_len,
+                        },
+                    ];
+                    // SAFETY: fd is the utun fd registered with AsyncFd;
+                    // iov[0] points to valid initialized 4-byte stack buffer;
+                    // iov[1] points to `buf.unfilled_mut()` of `dst_len` bytes.
+                    let n = unsafe { libc::readv(fd, iov.as_mut_ptr(), 2) };
                     if n >= 0 {
                         break n;
                     }
@@ -292,7 +313,7 @@ impl AsyncRead for MacOSTun {
             }) {
                 Ok(Ok(n)) => {
                     if n == 0 {
-                        // utun fd closed/destroyed: read() returns 0 forever.
+                        // utun fd closed/destroyed: readv() returns 0 forever.
                         // Signal EOF instead of spinning on the ready fd.
                         return Poll::Ready(Ok(()));
                     }
@@ -310,8 +331,12 @@ impl AsyncRead for MacOSTun {
                         }
                         continue;
                     }
-                    let actual = n - 4;
-                    dst.copy_within(4..n, 0);
+                    let actual = (n - 4).min(dst_len);
+                    // SAFETY: readv() wrote `n` sequential bytes across hdr (4)
+                    // and dst[..actual], so those `actual` bytes are initialized.
+                    unsafe {
+                        buf.assume_init(actual);
+                    }
                     buf.advance(actual);
                     return Poll::Ready(Ok(()));
                 }

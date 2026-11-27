@@ -609,7 +609,7 @@ impl FrpsArgs {
         // `dashboard_tls_mode`, which has no effective field:
         // `web_server.tls.enable` is inert (`frp-core/src/config/server.rs:975`)
         // and TLS is decided by the two files
-        // (`frp-server/src/dashboard.rs:3842`).
+        // (`frp-server/src/dashboard.rs:3843`).
         let Self {
             config: _,
             config_dir: _,

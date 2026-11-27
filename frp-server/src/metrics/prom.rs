@@ -68,20 +68,18 @@ static TRAFFIC_OUT: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("metric definition must be valid")
 });
 
-/// Traffic delta key: (proxy_name, proxy_type).
-type TrafficKey = (String, String);
 /// (bytes_in, bytes_out) cumulative pair.
 type TrafficPair = (u64, u64);
 
-/// Last-reported cumulative traffic per `(proxy_name, proxy_type)`.
+/// Last-reported cumulative traffic keyed by proxy name -> `(proxy_type, pair)`.
 /// Used to compute per-scrape deltas so Prometheus counters accumulate
-/// monotonically (rate() in PromQL requires counters to never decrease).
+/// monotonically (`rate()` in PromQL requires counters to never decrease).
 ///
-/// Uses `tokio::sync::Mutex` because the guard must be held across `.await`
-/// points inside `sync_from_state` — `std::sync::MutexGuard` is `!Send`
-/// and would make the async future non-`Send`, breaking the axum handler.
-static LAST_TRAFFIC: LazyLock<tokio::sync::Mutex<HashMap<TrafficKey, TrafficPair>>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(HashMap::new()));
+/// Uses `std::sync::Mutex` and is locked ONCE per `sync_from_state` pass
+/// (strictly after all `.await`s so no `MutexGuard` ever crosses a suspend
+/// point), eliminating O(N) tokio mutex acquisitions and per-proxy String clones.
+static LAST_TRAFFIC: LazyLock<std::sync::Mutex<HashMap<String, (String, TrafficPair)>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 // --- Pool metrics (new in frp-rs, no Go frp equivalent) ---
 
@@ -167,62 +165,70 @@ pub async fn sync_from_state(state: &AppState) {
     CONNECTION_COUNTS.reset();
 
     let proxies = state.proxy_manager.list().await;
-    let mut type_counts: HashMap<String, i64> = HashMap::new();
+    let mut type_counts: HashMap<&str, i64> = HashMap::new();
 
-    for p in &proxies {
-        *type_counts.entry(p.proxy_type.clone()).or_default() += 1;
+    // Hold the baseline mutex once across the pure-sync proxy loop (no `.await`
+    // inside this block so the future stays `Send`).
+    {
+        let mut last_traffic = LAST_TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
+        for p in &proxies {
+            *type_counts.entry(p.proxy_type.as_str()).or_default() += 1;
 
-        let snap = state
-            .proxy_metrics
-            .get(&p.name)
-            .map(|m| m.snapshot())
-            .unwrap_or_else(|| frp_core::metrics::MetricsSnapshot {
-                bytes_in: 0,
-                bytes_out: 0,
-                current_conns: 0,
-                total_conns: 0,
-            });
+            let snap = state
+                .proxy_metrics
+                .get(&p.name)
+                .map(|m| m.snapshot())
+                .unwrap_or_else(|| frp_core::metrics::MetricsSnapshot {
+                    bytes_in: 0,
+                    bytes_out: 0,
+                    current_conns: 0,
+                    total_conns: 0,
+                });
 
-        let pt = &p.proxy_type;
-        let pn = &p.name;
+            let pt = &p.proxy_type;
+            let pn = &p.name;
 
-        PROXY_COUNTS_DETAILED.with_label_values(&[pt, pn]).set(1);
-        CONNECTION_COUNTS
-            .with_label_values(&[pn, pt])
-            .set(snap.current_conns);
+            PROXY_COUNTS_DETAILED.with_label_values(&[pt, pn]).set(1);
+            CONNECTION_COUNTS
+                .with_label_values(&[pn, pt])
+                .set(snap.current_conns);
 
-        // Delta-tracking: compute bytes since last scrape and inc_by(delta).
-        // The original reset+inc_by(cumulative) gave correct point-in-time
-        // values but broke Prometheus counter monotonicity — counters would
-        // drop to 0 between scrapes, making rate() return garbage.
-        let key = (pn.clone(), pt.clone());
-        // The baseline map lock used to be held for the ENTIRE per-proxy
-        // loop, awaits included (audit §3 item 7). It is now a single short
-        // critical section per proxy. The guarantee is exactly
-        // pair-atomicity of the remove+conditional-insert: no OTHER holder
-        // of the lock (`proxy_removed`, a concurrent scrape) can interleave
-        // between them, so a baseline can never be lost or double-counted
-        // mid-pair (the round-18 E1 false-delta shape). The guard release
-        // is itself a boundary — a `proxy_removed` landing right after it
-        // leaves the next scrape of this key without a baseline, reporting
-        // the current cumulative as its first delta.
-        let (delta_in, delta_out) = {
-            let mut last_traffic = LAST_TRAFFIC.lock().await;
-            let (prev_in, prev_out) = last_traffic.remove(&key).unwrap_or((0, 0));
-            // Store cumulative values for the next scrape's delta calculation.
-            if snap.bytes_in > 0 || snap.bytes_out > 0 {
-                last_traffic.insert(key, (snap.bytes_in, snap.bytes_out));
+            // Delta-tracking: compute bytes since last scrape and inc_by(delta).
+            // Updated in place when the proxy type matches (zero String clones).
+            let (delta_in, delta_out) = match last_traffic.get_mut(pn.as_str()) {
+                Some((stored_type, pair)) if stored_type == pt => {
+                    let di = snap.bytes_in.saturating_sub(pair.0);
+                    let do_ = snap.bytes_out.saturating_sub(pair.1);
+                    if snap.bytes_in > 0 || snap.bytes_out > 0 {
+                        *pair = (snap.bytes_in, snap.bytes_out);
+                    } else {
+                        last_traffic.remove(pn.as_str());
+                    }
+                    (di, do_)
+                }
+                Some(_) => {
+                    if snap.bytes_in > 0 || snap.bytes_out > 0 {
+                        last_traffic
+                            .insert(pn.clone(), (pt.clone(), (snap.bytes_in, snap.bytes_out)));
+                    } else {
+                        last_traffic.remove(pn.as_str());
+                    }
+                    (snap.bytes_in, snap.bytes_out)
+                }
+                None => {
+                    if snap.bytes_in > 0 || snap.bytes_out > 0 {
+                        last_traffic
+                            .insert(pn.clone(), (pt.clone(), (snap.bytes_in, snap.bytes_out)));
+                    }
+                    (snap.bytes_in, snap.bytes_out)
+                }
+            };
+            if delta_in > 0 {
+                TRAFFIC_IN.with_label_values(&[pn, pt]).inc_by(delta_in);
             }
-            (
-                snap.bytes_in.saturating_sub(prev_in),
-                snap.bytes_out.saturating_sub(prev_out),
-            )
-        };
-        if delta_in > 0 {
-            TRAFFIC_IN.with_label_values(&[pn, pt]).inc_by(delta_in);
-        }
-        if delta_out > 0 {
-            TRAFFIC_OUT.with_label_values(&[pn, pt]).inc_by(delta_out);
+            if delta_out > 0 {
+                TRAFFIC_OUT.with_label_values(&[pn, pt]).inc_by(delta_out);
+            }
         }
     }
     // Proxies absent from this scrape leave no trace: their baselines were
@@ -231,7 +237,7 @@ pub async fn sync_from_state(state: &AppState) {
     // deltas from zero instead of stalling against the pre-removal total.
 
     for (pt, count) in &type_counts {
-        PROXY_COUNTS.with_label_values(&[pt]).set(*count);
+        PROXY_COUNTS.with_label_values(&[*pt]).set(*count);
     }
 
     // Pool metrics — aggregate from AppState counters + per-client PoolStats
@@ -257,11 +263,14 @@ pub async fn sync_from_state(state: &AppState) {
 /// Render Prometheus text format from the frp registry.
 /// Used by the axum /metrics handler.
 pub fn render_metrics_text() -> String {
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(16 * 1024);
     let encoder = TextEncoder::new();
     let metric_families = REGISTRY.gather();
     match encoder.encode(&metric_families, &mut buf) {
-        Ok(()) => String::from_utf8_lossy(&buf).to_string(),
+        Ok(()) => match String::from_utf8(buf) {
+            Ok(s) => s,
+            Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+        },
         Err(e) => {
             tracing::error!(error = %e, "Prometheus text encoding failed");
             String::new()
@@ -285,8 +294,8 @@ pub fn render_metrics_text() -> String {
 pub async fn proxy_removed(name: &str) {
     LAST_TRAFFIC
         .lock()
-        .await
-        .retain(|(proxy_name, _), _| proxy_name != name);
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(name);
 }
 
 #[cfg(test)]
@@ -503,29 +512,30 @@ mod tests {
         // Scrape 2: cumulative in=250, out=120 → delta in=150, out=70
         // After both scrapes, counter should be 100+150=250 in, 50+70=120 out
         {
-            let mut lt = LAST_TRAFFIC.lock().await;
+            let mut lt = LAST_TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
             // Scrape 1: first visit → no previous record, delta = cumulative
-            let key = ("delta_test".to_string(), "tcp".to_string());
-            let (prev_in, prev_out) = lt.remove(&key).unwrap_or((0, 0));
+            let (prev_in, prev_out) = lt.remove("delta_test").map(|(_, p)| p).unwrap_or((0, 0));
             assert_eq!((prev_in, prev_out), (0, 0));
             let delta_in = 100u64.saturating_sub(prev_in);
             let delta_out = 50u64.saturating_sub(prev_out);
             assert_eq!((delta_in, delta_out), (100, 50));
-            lt.insert(key.clone(), (100, 50));
+            lt.insert("delta_test".to_string(), ("tcp".to_string(), (100, 50)));
         }
         // Scrape 2: cumulative increased
         {
-            let mut lt = LAST_TRAFFIC.lock().await;
-            let key = ("delta_test".to_string(), "tcp".to_string());
-            let (prev_in, prev_out) = lt.remove(&key).unwrap_or((0, 0));
+            let mut lt = LAST_TRAFFIC.lock().unwrap_or_else(|e| e.into_inner());
+            let (prev_in, prev_out) = lt.remove("delta_test").map(|(_, p)| p).unwrap_or((0, 0));
             assert_eq!((prev_in, prev_out), (100, 50));
             let delta_in = 250u64.saturating_sub(prev_in);
             let delta_out = 120u64.saturating_sub(prev_out);
             assert_eq!((delta_in, delta_out), (150, 70));
-            lt.insert(key, (250, 120));
+            lt.insert("delta_test".to_string(), ("tcp".to_string(), (250, 120)));
         }
 
         // Cleanup
-        LAST_TRAFFIC.lock().await.clear();
+        LAST_TRAFFIC
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 }

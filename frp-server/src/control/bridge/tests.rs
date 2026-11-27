@@ -1906,6 +1906,58 @@ async fn injector_config_case_duplicate_keys_emit_single_line() {
     assert!(s.ends_with("ok"), "body must survive: {s:?}");
 }
 
+#[tokio::test]
+async fn precompiled_response_headers_nonadjacent_case_crlf_and_empty_keys() {
+    use tokio::io::AsyncWriteExt;
+    let mut headers = std::collections::HashMap::new();
+    headers.insert("".to_string(), "empty".to_string());
+    headers.insert("\r\n".to_string(), "crlf".to_string());
+    // "X-Beta" sorts between "X-Alpha" and "x-alpha" in bytewise ASCII!
+    headers.insert("X-Alpha".to_string(), "1".to_string());
+    headers.insert("X-Beta".to_string(), "2".to_string());
+    headers.insert("x-alpha".to_string(), "3".to_string());
+    headers.insert("Content-Length\r".to_string(), "99".to_string());
+    let compiled = Arc::new(crate::proxy::PrecompiledResponseHeaders::from_map(&headers));
+
+    // 200 OK: deduplicates X-Alpha + x-alpha -> single x-alpha: 3; skips empty keys.
+    {
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::with_compiled(inner_r, compiled.clone(), None);
+        inner_w
+            .write_all(b"HTTP/1.1 200 OK\r\nX-Alpha: old\r\nContent-Length: 2\r\n\r\nok")
+            .await
+            .unwrap();
+        inner_w.shutdown().await.unwrap();
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        let alphas: Vec<&str> = s
+            .lines()
+            .filter(|l| l.to_ascii_lowercase().starts_with("x-alpha:"))
+            .collect();
+        assert_eq!(alphas, vec!["x-alpha: 3"], "{s:?}");
+        assert!(!s.contains("\r\n:"), "empty header emitted: {s:?}");
+    }
+
+    // 204 No Content: sanitized Content-Length\r must still be suppressed.
+    {
+        let (mut inner_w, inner_r) = tokio::io::duplex(64 * 1024);
+        let mut injector = ResponseHeaderInjector::with_compiled(inner_r, compiled, None);
+        inner_w
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+        inner_w.shutdown().await.unwrap();
+        drop(inner_w);
+        let out = injector_read_all(&mut injector).await;
+        let s = String::from_utf8_lossy(&out);
+        assert!(
+            !s.to_ascii_lowercase().contains("content-length:"),
+            "204 must suppress configured Content-Length even with CR stripped: {s:?}"
+        );
+    }
+}
+
 // B1 (round-13 review): a backend header whose lowercase spelling
 // matches a configured key is dropped WITH its obs-fold tail; the
 // configured value goes out alone.
@@ -2213,6 +2265,7 @@ async fn mixed_sudp_bridge_counts_connection_and_active_guard_once() {
         allow_users: Vec::new(),
         proxy_protocol_version: String::new(),
         response_headers: std::collections::HashMap::new(),
+        compiled_response_headers: Default::default(),
         custom_domains: Vec::new(),
         route_by_http_user: String::new(),
         multiplexer: String::new(),

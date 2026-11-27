@@ -20,7 +20,9 @@ use forward::{inject_vhost_request_headers, rewrite_host_header};
 use forward::{resolve_vhost_request, sanitize_rewrite_host, VhostResolveError};
 #[cfg(test)]
 use router::{find_matching_route, sort_by_longest_location};
-pub use router::{RouterConfigConflict, VhostManager, VhostRoute, VhostRouteMatch};
+pub use router::{
+    RouterConfigConflict, VhostManager, VhostRoute, VhostRouteConfig, VhostRouteMatch,
+};
 
 /// HTTP/2 cleartext (h2c) vhost handling — see `vhost_h2c.rs`.
 /// Only compiled when the `http-proxy` feature is enabled (audit round 5:

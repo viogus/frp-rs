@@ -53,6 +53,10 @@ pub(super) async fn build_proxy_info(
     port: u16,
 ) -> ProxyInfo {
     let virtual_net = np.virtual_net.clone().filter(|v| !v.is_empty());
+    let response_headers = np.response_headers.clone().unwrap_or_default();
+    let compiled_response_headers = Arc::new(crate::proxy::PrecompiledResponseHeaders::from_map(
+        &response_headers,
+    ));
     ProxyInfo {
         name: np.proxy_name.clone(),
         proxy_type: np.proxy_type.clone(),
@@ -70,7 +74,8 @@ pub(super) async fn build_proxy_info(
         virtual_net: virtual_net.clone(),
         allow_users: np.allow_users.clone().unwrap_or_default(),
         proxy_protocol_version: np.proxy_protocol_version.clone().unwrap_or_default(),
-        response_headers: np.response_headers.clone().unwrap_or_default(),
+        response_headers,
+        compiled_response_headers,
         custom_domains: np.custom_domains.clone().unwrap_or_default(),
         route_by_http_user: np.route_by_http_user.clone().unwrap_or_default(),
         multiplexer: np.multiplexer.clone().unwrap_or_default(),

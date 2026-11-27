@@ -385,7 +385,7 @@ impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ActivityIo<T> {
 /// non-empty slice only — and yamux's one-`writev`-per-frame emission would
 /// silently degrade to two syscalls per frame.
 #[cfg(feature = "tcp-mux")]
-struct VectoredWrite<W>(W);
+pub(crate) struct VectoredWrite<W>(pub(crate) W);
 
 #[cfg(feature = "tcp-mux")]
 impl<W: tokio::io::AsyncWrite + Unpin> futures_util::io::AsyncWrite for VectoredWrite<W> {
@@ -538,7 +538,7 @@ const MAX_MUX_FRAME_PAYLOAD: usize = 64 * 1024;
 /// yamux data-frame payload for a given bridge copy-buffer size: the buffer
 /// itself, capped so a frame always fits the WebSocket transport.
 #[cfg(feature = "tcp-mux")]
-fn mux_split_size(buffer_size: usize) -> usize {
+pub(crate) fn mux_split_size(buffer_size: usize) -> usize {
     buffer_size.min(MAX_MUX_FRAME_PAYLOAD)
 }
 

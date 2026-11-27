@@ -1100,7 +1100,7 @@ async fn handle_head_not_allowed() -> StatusCode {
 ///    honoured only when auth is set.
 /// 3. A *blanket* switch of `apply_admin_auth` to `route_layer` is out of scope:
 ///    the helper is shared (`frp-core/src/admin_auth.rs:36`), called from this
-///    file and from `frp-server/src/dashboard.rs:3744/3746/3770`, so it would
+///    file and from `frp-server/src/dashboard.rs:3745/3747/3771`, so it would
 ///    change the frps dashboard too. C is admin-local and leaves the helper and
 ///    the dashboard alone.
 ///

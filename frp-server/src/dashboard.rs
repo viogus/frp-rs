@@ -3079,6 +3079,7 @@ mod v2 {
                 allow_users: Vec::new(),
                 proxy_protocol_version: String::new(),
                 response_headers: HashMap::new(),
+                compiled_response_headers: Default::default(),
                 custom_domains: Vec::new(),
                 route_by_http_user: String::new(),
                 multiplexer: String::new(),

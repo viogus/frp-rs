@@ -284,14 +284,14 @@ The registration call chain is:
 ```
 handle_new_proxy            frp-server/src/control/proxy_ops/mod.rs:132
   └─ build_proxy_info       frp-server/src/control/proxy_ops/registry.rs:48
-  └─ register_proxy_entry   frp-server/src/control/proxy_ops/registry.rs:291
-       ├─ register_sk_index frp-server/src/control/proxy_ops/registry.rs:127   (stcp/xtcp/sudp only)
-       └─ ProxyManager      frp-server/src/proxy.rs:116
-            register / register_or_replace   frp-server/src/proxy.rs:159 / :174
+  └─ register_proxy_entry   frp-server/src/control/proxy_ops/registry.rs:296
+       ├─ register_sk_index frp-server/src/control/proxy_ops/registry.rs:132   (stcp/xtcp/sudp only)
+       └─ ProxyManager      frp-server/src/proxy.rs:201
+            register / register_or_replace   frp-server/src/proxy.rs:244 / :259
 ```
 
-`ProxyInfo` is `frp-server/src/proxy.rs:42`; `ProxyManager` holds the live
-registry (`remove` at `frp-server/src/proxy.rs:363`).
+`ProxyInfo` is `frp-server/src/proxy.rs:125`; `ProxyManager` holds the live
+registry (`remove` at `frp-server/src/proxy.rs:448`).
 
 **Where the port is actually reserved.** `allocate_proxy_port`
 (`frp-server/src/control/proxy_ops/ports.rs:100`), called from `handle_new_proxy` at
@@ -315,7 +315,7 @@ exactly why a happy-path test will not tell you.
 
 A caution from this section's own history: the text it replaces said
 "`register_proxy_entry` allocates via `allocate_port_multi()`". Open
-`allocate_port_multi` (`frp-server/src/proxy.rs:823`) and you will find it
+`allocate_port_multi` (`frp-server/src/proxy.rs:908`) and you will find it
 referenced only by its own unit tests at `612f7df1` — it reads like the allocator
 from its name and is not one. Open every citation.
 
@@ -327,16 +327,16 @@ optional:
 | # | Line | Site | Purpose |
 |---|---|---|---|
 | 1 | `frp-server/src/control/proxy_ops/ports.rs:628` | `fn proxy_consumes_client_port` | The mirror of the registration increments, shared by the removal path and the sweep |
-| 2 | `frp-server/src/control/proxy_ops/registry.rs:318` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
-| 3 | `frp-server/src/control/proxy_ops/registry.rs:349` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
-| 4 | `frp-server/src/control/proxy_ops/registry.rs:374` | the `client_ports_used` increment (`*c += 1`, under the guard at `:368`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
+| 2 | `frp-server/src/control/proxy_ops/registry.rs:323` | `let replaceable = matches!(...)` | Whether re-registering the same name replaces or is rejected |
+| 3 | `frp-server/src/control/proxy_ops/registry.rs:354` | the replaced-entry release condition | Releasing the **old** entry's port slot when a replacement lands |
+| 4 | `frp-server/src/control/proxy_ops/registry.rs:379` | the `client_ports_used` increment (`*c += 1`, under the guard at `:373`) | Go's `portsUsedNum`; what `max_ports_per_client` counts |
 | 5 | `frp-server/src/control/proxy_ops/mod.rs:227` | `let consumes_port = matches!(...)` in `handle_new_proxy` | The admission check for `max_ports_per_client` |
 | 6 | `frp-server/src/control/proxy_ops/listener.rs:379` | the `tcp` listener branch of `setup_proxy_listeners` | Binds the per-proxy listener. **Load-bearing — see 2.4** |
 
 Do not pattern-match this table blindly; decide by asking what your type *is*.
 The neighbouring types show the branches that exist: `register_sk_index`
-(`frp-server/src/control/proxy_ops/registry.rs:127`) is for the secret-key routing of
-`stcp`/`xtcp`/`sudp`; `VhostManager` (`frp-server/src/vhost/router.rs:262`) for
+(`frp-server/src/control/proxy_ops/registry.rs:132`) is for the secret-key routing of
+`stcp`/`xtcp`/`sudp`; `VhostManager` (`frp-server/src/vhost/router.rs:334`) for
 `http`/`https` domain routing; `TcpMuxManager` (`frp-server/src/tcpmux.rs:34`)
 for `tcpmux`. A type that routes by domain or by secret key belongs in the
 corresponding predicate; a type with a real remote port belongs in the port
@@ -429,7 +429,7 @@ peer branches. It has three *type* branches, a group branch, and a fall-through:
 - the `} else {` fall-through (`frp-server/src/control/proxy_ops/listener.rs:413`) —
   everything else, including `http` and `https`. There is no per-proxy listener:
   the shared VHost listener routes by host/domain
-  (`frp-server/src/vhost/router.rs:262`).
+  (`frp-server/src/vhost/router.rs:334`).
 
 Note the asymmetry: `http`/`https` are *not* a branch of their own, they fall
 through. A type that forgets to add itself lands here rather than hitting an `else`
@@ -1079,7 +1079,7 @@ RUSTFLAGS="-D warnings" cargo check --workspace --no-default-features --features
 
 They deliberately omit `--all-targets`. On a `--workspace` invocation every
 member is a root, so the dev-dependency edges enter the graph, and
-`frp-server`'s dev-dependency on `frp-client` (`frp-server/Cargo.toml:67`,
+`frp-server`'s dev-dependency on `frp-client` (`frp-server/Cargo.toml:66`,
 default features) plus `frp-client`'s on `frp-server` re-enable both crates'
 `default` sets — measured, the micro graph flips from `frp-client = []` to
 `frp-client = [chacha20, compression, default, http2http, kcp, oidc, quic,
@@ -4065,16 +4065,16 @@ scope.
 | **Freeze** — bug-fix only | No new Go-parity work, no Go-parity-only tests, no refactor. Not removed. | SUDP; h2c; Windows TUN; the non-default XTCP data plane (KCP+yamux). |
 
 Three build-tier facts the tier names alone would hide. The dashboard is
-**Keep** even though it is an opt-in Cargo feature (`frp-server/Cargo.toml:45`)
+**Keep** even though it is an opt-in Cargo feature (`frp-server/Cargo.toml:44`)
 — it is part of the product, just not of every binary — while the SSH gateway
-is default-on (`frp-server/Cargo.toml:44`). The `http-proxy` feature is
-**default-on** (`frp-server/Cargo.toml:43`), so the server-side
+is default-on (`frp-server/Cargo.toml:43`). The `http-proxy` feature is
+**default-on** (`frp-server/Cargo.toml:42`), so the server-side
 `[[httpPlugins]]` manager is Keep; that same feature gates the frozen h2c module
-(`frp-server/src/vhost.rs:28`), so h2c's freeze is a code-review rule rather
+(`frp-server/src/vhost.rs:30`), so h2c's freeze is a code-review rule rather
 than a build gate — the frozen code still compiles into the default and tiny
 tiers, and splitting the feature is not part of this policy. Finally, one of
 the 10 Go-parity client plugins, `virtual_net`, is the TUN-backed path with no
-listener of its own (`frp-client/src/plugin/mod.rs:420`), so it follows the
+listener of its own (`frp-client/src/plugin/mod.rs:429`), so it follows the
 opt-in `vnet` tier: it is named in the Opt-in row above and is the one
 Go-parity client plugin not counted in Keep. `http2connect` is the additional
 frp-rs extension, also named in that row.

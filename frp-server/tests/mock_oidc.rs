@@ -44,8 +44,8 @@ impl MockOidcProvider {
     /// Returns after the server is ready to accept connections.
     pub async fn start(port: u16) -> Self {
         let issuer = format!("http://127.0.0.1:{}", port);
-        let secret = uuid::Uuid::new_v4().to_string();
-        let kid = uuid::Uuid::new_v4().to_string();
+        let secret = frp_core::new_uuid_v4();
+        let kid = frp_core::new_uuid_v4();
         let encoded_secret = base64_encode(secret.as_bytes());
 
         let jwks = serde_json::json!({

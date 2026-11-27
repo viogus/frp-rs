@@ -11,37 +11,85 @@ use tokio::sync::RwLock;
 
 use super::sanitize_rewrite_host;
 
-/// A route mapping: domain or location -> proxy entry.
+/// Pre-compiled `request_headers` rules for the VHost HTTP forwarding path.
 ///
-/// String fields are `Arc<str>` (refcounted) so that per-request route
-/// matching can hand out clones without allocating: `VhostRouteMatch` bumps
-/// the refcount instead of copying every `String`.
-#[derive(Debug, Clone)]
-pub struct VhostRoute {
+/// Built once per route registration inside [`VhostRouteConfig`] so every
+/// forwarded request avoids re-allocating lowercased header prefixes and
+/// sanitizing configured names/values per request.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PrecompiledRequestHeaders {
+    pub(crate) override_prefixes: Vec<Box<[u8]>>,
+    pub(crate) overrides_xff: bool,
+    pub(crate) overrides_xfh: bool,
+    pub(crate) overrides_xfp: bool,
+    pub(crate) wire_block: Box<[u8]>,
+}
+
+impl PrecompiledRequestHeaders {
+    pub(crate) fn compile(request_headers: &[(String, String)]) -> Self {
+        if request_headers.is_empty() {
+            return Self::default();
+        }
+        let mut override_prefixes = Vec::with_capacity(request_headers.len());
+        let mut overrides_xff = false;
+        let mut overrides_xfh = false;
+        let mut overrides_xfp = false;
+        let mut wire_block = Vec::with_capacity(request_headers.len() * 24);
+
+        for (k, v) in request_headers {
+            let safe_k: String = k.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            if safe_k.is_empty() {
+                continue;
+            }
+            let safe_v: String = v.chars().filter(|&c| c != '\r' && c != '\n').collect();
+            let mut prefix = Vec::with_capacity(safe_k.len() + 1);
+            prefix.extend(safe_k.as_bytes().iter().map(|b| b.to_ascii_lowercase()));
+            prefix.push(b':');
+            match prefix.as_slice() {
+                b"x-forwarded-for:" => overrides_xff = true,
+                b"x-forwarded-host:" => overrides_xfh = true,
+                b"x-forwarded-proto:" => overrides_xfp = true,
+                _ => {}
+            }
+            override_prefixes.push(prefix.into_boxed_slice());
+
+            wire_block.extend_from_slice(safe_k.as_bytes());
+            wire_block.extend_from_slice(b": ");
+            wire_block.extend_from_slice(safe_v.as_bytes());
+            wire_block.extend_from_slice(b"\r\n");
+        }
+
+        Self {
+            override_prefixes,
+            overrides_xff,
+            overrides_xfh,
+            overrides_xfp,
+            wire_block: wire_block.into_boxed_slice(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn matches_override(&self, trimmed_line: &[u8]) -> bool {
+        self.override_prefixes.iter().any(|p| {
+            trimmed_line.len() >= p.len() && trimmed_line[..p.len()].eq_ignore_ascii_case(p)
+        })
+    }
+}
+
+/// Shared immutable configuration of a registered VHost route.
+///
+/// Bundled into a single `Arc<VhostRouteConfig>` so every request match performs
+/// one atomic refcount bump instead of cloning nine separate `Arc` fields.
+#[derive(Debug)]
+pub struct VhostRouteConfig {
     pub proxy_name: Arc<str>,
     pub run_id: Arc<str>,
-    /// Scheme this route was registered under: "http" or "https". Go frp
-    /// keeps SEPARATE router sets per muxer — HTTP proxies share
-    /// `httpVhostRouter` (server/service.go:179) while HTTPS proxies
-    /// register in their own Muxer's `registryRouter` (vhost/vhost.go:56-70)
-    /// — so an HTTP proxy and an HTTPS proxy for the same domain never
-    /// conflict in Go, and lookups never cross schemes: http.go routes by
-    /// Host inside httpVhostRouter only, https.go by SNI inside the HTTPS
-    /// Muxer's registryRouter only. frp-rs stores both schemes in one
-    /// VhostTables, so the scheme partitions BOTH the conflict check and
-    /// every lookup — find_matching_route only matches routes whose scheme
-    /// equals the lookup's (HTTP call sites pass "http", SNI call sites
-    /// "https"), so a plain HTTP request can never land on an HTTPS
-    /// proxy's backend nor an SNI connection on an HTTP proxy's backend.
-    pub scheme: String,
     /// Non-empty when this route belongs to an HTTP/HTTPS group (Go frp
     /// v0.71.0 HTTPGroup): requests are dispatched round-robin across the
     /// group's members instead of always to `proxy_name`. The route is
     /// created by the group's first member; `proxy_name`/`run_id` carry the
     /// first member's identity as fallback.
     pub group: Arc<str>,
-    /// Location prefixes for this proxy (empty = host-only routing).
-    pub locations: Vec<String>,
     /// Rewrite Host header to this value before forwarding (Go frp compat).
     pub host_header_rewrite: Arc<str>,
     /// `host_header_rewrite` with CR/LF stripped, precomputed at registration
@@ -65,41 +113,65 @@ pub struct VhostRoute {
     /// Request headers to inject before forwarding (Go frp compat:
     /// requestHeaders). Set semantics — override same-name headers.
     pub headers: Arc<Vec<(String, String)>>,
+    pub(crate) compiled_headers: PrecompiledRequestHeaders,
 }
 
-/// Borrowed match result — avoids cloning VhostRoute (especially the locations Vec)
-/// on every HTTP request. Fields are owned `Arc<str>` because the caller holds them
-/// across await points after the RwLock read guard is dropped; cloning the match is
-/// an O(1) refcount bump per field rather than a String allocation.
+/// A route mapping: domain or location -> proxy entry.
+///
+/// Shares its immutable fields via a single `Arc<VhostRouteConfig>` so that
+/// per-request route matching (`VhostRouteMatch`) performs one refcount bump
+/// instead of allocating or cloning nine fields.
+#[derive(Debug, Clone)]
+pub struct VhostRoute {
+    pub config: Arc<VhostRouteConfig>,
+    /// Scheme this route was registered under: "http" or "https". Go frp
+    /// keeps SEPARATE router sets per muxer — HTTP proxies share
+    /// `httpVhostRouter` (server/service.go:179) while HTTPS proxies
+    /// register in their own Muxer's `registryRouter` (vhost/vhost.go:56-70)
+    /// — so an HTTP proxy and an HTTPS proxy for the same domain never
+    /// conflict in Go, and lookups never cross schemes: http.go routes by
+    /// Host inside httpVhostRouter only, https.go by SNI inside the HTTPS
+    /// Muxer's registryRouter only. frp-rs stores both schemes in one
+    /// VhostTables, so the scheme partitions BOTH the conflict check and
+    /// every lookup — find_matching_route only matches routes whose scheme
+    /// equals the lookup's (HTTP call sites pass "http", SNI call sites
+    /// "https"), so a plain HTTP request can never land on an HTTPS
+    /// proxy's backend nor an SNI connection on an HTTP proxy's backend.
+    pub scheme: String,
+    /// Location prefixes for this proxy (empty = host-only routing).
+    pub locations: Vec<String>,
+}
+
+impl std::ops::Deref for VhostRoute {
+    type Target = VhostRouteConfig;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+/// Borrowed match result — avoids cloning `VhostRoute` (especially the
+/// `locations` Vec) on every HTTP request by holding a single `Arc<VhostRouteConfig>`.
 #[derive(Debug, Clone)]
 pub struct VhostRouteMatch {
-    pub proxy_name: Arc<str>,
-    pub run_id: Arc<str>,
-    /// Non-empty when the matched route belongs to an HTTP group; the
-    /// request must be dispatched round-robin across the group members.
-    pub group: Arc<str>,
-    pub host_header_rewrite: Arc<str>,
-    /// Pre-sanitized rewrite value — see `VhostRoute::host_header_rewrite_sanitized`.
-    pub host_header_rewrite_sanitized: Arc<str>,
-    pub http_user: Arc<str>,
-    pub http_pwd: Arc<str>,
-    pub route_by_http_user: Arc<str>,
-    /// Request headers to inject before forwarding (Go frp requestHeaders).
-    pub headers: Arc<Vec<(String, String)>>,
+    pub config: Arc<VhostRouteConfig>,
+}
+
+impl std::ops::Deref for VhostRouteMatch {
+    type Target = VhostRouteConfig;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
 }
 
 impl VhostRouteMatch {
+    #[inline]
     fn from_route(route: &VhostRoute) -> Self {
         Self {
-            proxy_name: Arc::clone(&route.proxy_name),
-            run_id: Arc::clone(&route.run_id),
-            group: Arc::clone(&route.group),
-            host_header_rewrite: Arc::clone(&route.host_header_rewrite),
-            host_header_rewrite_sanitized: Arc::clone(&route.host_header_rewrite_sanitized),
-            http_user: Arc::clone(&route.http_user),
-            http_pwd: Arc::clone(&route.http_pwd),
-            route_by_http_user: Arc::clone(&route.route_by_http_user),
-            headers: Arc::clone(&route.headers),
+            config: Arc::clone(&route.config),
         }
     }
 }
@@ -296,20 +368,24 @@ impl VhostManager {
         headers: &[(String, String)],
         group: &str,
     ) -> Result<(), RouterConfigConflict> {
+        let compiled_headers = PrecompiledRequestHeaders::compile(headers);
         let route = VhostRoute {
-            proxy_name: proxy_name.into(),
-            run_id: run_id.into(),
+            config: Arc::new(VhostRouteConfig {
+                proxy_name: proxy_name.into(),
+                run_id: run_id.into(),
+                group: group.into(),
+                host_header_rewrite: host_header_rewrite.into(),
+                // Sanitize ONCE here instead of per request (audit §3 item 4).
+                // \r and \n are stripped to prevent HTTP header injection.
+                host_header_rewrite_sanitized: sanitize_rewrite_host(host_header_rewrite).into(),
+                http_user: http_user.into(),
+                http_pwd: http_pwd.into(),
+                route_by_http_user: route_by_http_user.into(),
+                headers: Arc::new(headers.to_vec()),
+                compiled_headers,
+            }),
             scheme: scheme.to_string(),
-            group: group.into(),
             locations: locations.to_vec(),
-            host_header_rewrite: host_header_rewrite.into(),
-            // Sanitize ONCE here instead of per request (audit §3 item 4).
-            // \r and \n are stripped to prevent HTTP header injection.
-            host_header_rewrite_sanitized: sanitize_rewrite_host(host_header_rewrite).into(),
-            http_user: http_user.into(),
-            http_pwd: http_pwd.into(),
-            route_by_http_user: route_by_http_user.into(),
-            headers: Arc::new(headers.to_vec()),
         };
 
         let mut tables = self.inner.write().await;

@@ -29,7 +29,6 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-uuid.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 tokio-util.workspace = true
 # TARGET: Remove the axum "ws" feature (dashboard WebSocket) when v1

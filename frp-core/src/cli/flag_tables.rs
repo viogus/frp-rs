@@ -137,7 +137,7 @@ macro_rules! frps_flag_specs {
                     /// above 24 h is accepted here and then silently shortened. Measured by the
                     /// unit pin `frp-server/src/vhost/tests.rs:252` (`test_clamp_vhost_timeout`):
                     /// `0 → 60`, `-1 → 60`, `86400 → 86400`, `86401 → 86400`, `i64::MAX →
-                    /// 86400`; the cap is `frp-server/src/vhost.rs:128`
+                    /// 86400`; the cap is `frp-server/src/vhost.rs:130`
                     /// (`VHOST_TIMEOUT_CAP_SECS`).
                     vhost_http_timeout: Option<i64>,
                     go ( long: "vhost-http-timeout", short: None, varname: Some("int"), usage: "vhost http response header timeout (default 60)" )

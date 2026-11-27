@@ -529,7 +529,7 @@ impl Handler for SshSession {
         if !self.begin_authentication() {
             return Err(anyhow!("SSH authentication expired or already completed"));
         }
-        self.run_id = uuid::Uuid::new_v4().to_string();
+        self.run_id = frp_core::new_uuid_v4();
         self.ssh_handle = Some(session.handle());
 
         let enc_key = frp_core::encryption::derive_key(&self.server_token);

@@ -251,6 +251,19 @@ pub trait Transport: AsyncRead + AsyncWrite + Unpin + Send + 'static {
         None
     }
 
+    /// Return whether this transport is a [`BufferedReadTransport`] (or wraps one
+    /// via `IoStream`) so [`IoStream::BufferedRead`] can flatten layers without
+    /// consuming non-buffered transports.
+    fn is_buffered_read(&self) -> bool {
+        false
+    }
+
+    /// Unwrap a [`BufferedReadTransport`] layer, returning `(buf, pos, inner)`.
+    /// Only [`BufferedReadTransport`] (and `IoStream` forwarding) overrides this.
+    fn into_buffered_read_parts(self: Box<Self>) -> Option<(Vec<u8>, usize, Box<dyn Transport>)> {
+        None
+    }
+
     /// Whether Go frp would wrap this transport in yamux (every non-QUIC
     /// transport). QUIC never gets yamux-wrapped — the QUIC connection itself
     /// multiplexes streams.
@@ -356,9 +369,34 @@ impl IoStream {
     /// Used when V2 magic is detected on a yamux stream: if the bytes are NOT
     /// V2 magic, they're buffered and replayed for V1 processing. The usize
     /// tracks the current read position into the buffer.
+    ///
+    /// Unwraps directly when no unread bytes remain and coalesces nested
+    /// `BufferedRead` wrappers so chained protocol sniffs stay one layer deep.
     #[allow(non_snake_case)]
-    pub fn BufferedRead(buf: Vec<u8>, pos: usize, inner: Box<dyn Transport>) -> Self {
-        Self(Box::new(BufferedReadTransport::new(buf, pos, inner)))
+    pub fn BufferedRead(mut buf: Vec<u8>, mut pos: usize, mut inner: Box<dyn Transport>) -> Self {
+        loop {
+            if !inner.is_buffered_read() {
+                return if pos >= buf.len() {
+                    Self(inner)
+                } else {
+                    Self(Box::new(BufferedReadTransport::new(buf, pos, inner)))
+                };
+            }
+            let Some((ibuf, ipos, next_inner)) = inner.into_buffered_read_parts() else {
+                return Self(Box::new(SshChannelTransport(Box::new(tokio::io::empty()))));
+            };
+            if pos >= buf.len() {
+                buf = ibuf;
+                pos = ipos;
+            } else if ipos < ibuf.len() {
+                let mut combined = Vec::with_capacity((buf.len() - pos) + (ibuf.len() - ipos));
+                combined.extend_from_slice(&buf[pos..]);
+                combined.extend_from_slice(&ibuf[ipos..]);
+                buf = combined;
+                pos = 0;
+            }
+            inner = next_inner;
+        }
     }
 
     /// Consume and return the inner boxed transport.
@@ -539,6 +577,12 @@ impl Transport for IoStream {
     }
     fn into_parts(self: Box<Self>) -> Option<(Vec<u8>, Box<dyn Transport>)> {
         self.0.into_parts()
+    }
+    fn is_buffered_read(&self) -> bool {
+        self.0.is_buffered_read()
+    }
+    fn into_buffered_read_parts(self: Box<Self>) -> Option<(Vec<u8>, usize, Box<dyn Transport>)> {
+        self.0.into_buffered_read_parts()
     }
     fn is_yamux_wrappable(&self) -> bool {
         self.0.is_yamux_wrappable()
@@ -3406,7 +3450,7 @@ fn test_parse_dns_response_malformed_never_panics() {
     // below is still parsed; the pointer target is never dereferenced.
     assert!(ok.is_ok(), "pointer is not followed; got: {ok:?}");
 }
-// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2366).
+// `connect_ws_raw` is `#[cfg(feature = "websocket")]` (frp-core/src/transport/mod.rs:2410).
 #[cfg(feature = "websocket")]
 #[tokio::test]
 async fn test_connect_ws_raw_rejects_accept_mismatch() {
