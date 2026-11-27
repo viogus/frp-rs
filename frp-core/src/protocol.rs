@@ -396,6 +396,52 @@ pub async fn read_v2_magic_or_replay<R: AsyncReadExt + Unpin>(
     }
 }
 
+/// Write a V2 frame whose 8-byte header slot (`buf[..V2_FRAME_HEADER_LEN]`)
+/// was already reserved by the caller ahead of the payload.
+///
+/// Patches the header in place and issues a single contiguous `write_all(buf)`
+/// — zero heap allocation and zero payload copy on every transport (including
+/// non-vectored transports like yamux, TLS, WebSocket, and `CipherWriter`
+/// where [`write_v2_frame_raw`] would otherwise merge header + payload into a
+/// temporary buffer).
+pub async fn write_v2_frame_in_place<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    frame_type: u16,
+    flags: u16,
+    buf: &mut [u8],
+) -> Result<(), crate::Error> {
+    if buf.len() < V2_FRAME_HEADER_LEN {
+        return Err(crate::Error::Protocol(
+            "V2 frame buffer shorter than header".into(),
+        ));
+    }
+    let payload_len = buf.len() - V2_FRAME_HEADER_LEN;
+    if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
+        return Err(crate::Error::Protocol(
+            format!("V2 payload too large: {payload_len} > {V2_MAX_FRAME_PAYLOAD}").into(),
+        ));
+    }
+    buf[0..2].copy_from_slice(&frame_type.to_be_bytes());
+    buf[2..4].copy_from_slice(&flags.to_be_bytes());
+    buf[4..8].copy_from_slice(&(payload_len as u32).to_be_bytes());
+
+    tracing::trace!(
+        frame_type = %frame_type,
+        flags = %flags,
+        payload_len = payload_len,
+        "write V2 frame (in-place): type={}, flags={}, len={}",
+        frame_type,
+        flags,
+        payload_len
+    );
+
+    writer
+        .write_all(buf)
+        .await
+        .map_err(|e| crate::Error::Protocol(format!("write V2 frame: {e}").into()))?;
+    Ok(())
+}
+
 /// Write a raw V2 frame: type(2 BE) + flags(2 BE) + length(4 BE) + payload.
 /// This is the Go wire.Conn.WriteFrame format — magic is NOT repeated per frame.
 pub async fn write_v2_frame_raw<W: AsyncWriteExt + Unpin>(
@@ -593,35 +639,31 @@ pub(crate) async fn write_msg_v2_inner<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
 ) -> Result<(), crate::Error> {
+    let mut buf = Vec::with_capacity(V2_FRAME_HEADER_LEN + 2 + 512);
+    write_msg_v2_inner_scratch(writer, msg, &mut buf).await
+}
+
+/// [`write_msg_v2_inner`] reusing a caller-owned `scratch` buffer (cleared per
+/// call) with 8-byte V2 frame header headroom, eliminating per-message heap
+/// allocations on repeated V2 JSON sends.
+async fn write_msg_v2_inner_scratch<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    msg: &FrpMessage,
+    scratch: &mut Vec<u8>,
+) -> Result<(), crate::Error> {
     let type_id = msg.v2_type_id();
 
-    // Build complete frame in a single Vec: header(8) + type_id(2) + JSON.
-    // Previously this used serde_json::to_vec + payload Vec + write_v2_frame_raw
-    // inner Vec (3 allocs).  Now serde_json::to_writer writes directly into the
-    // frame buffer (1 alloc, plus growth if estimate is low).
-    let mut buf = Vec::with_capacity(V2_FRAME_HEADER_LEN + 2 + 512);
-    buf.resize(V2_FRAME_HEADER_LEN, 0);
-    buf.extend_from_slice(&type_id.to_be_bytes());
-    serde_json::to_writer(&mut buf, msg)
-        .map_err(|e| crate::Error::Protocol(format!("V2 JSON serialize: {e}").into()))?;
-
-    let payload_len = buf.len() - V2_FRAME_HEADER_LEN;
-    if payload_len > V2_MAX_FRAME_PAYLOAD as usize {
+    scratch.clear();
+    scratch.resize(V2_FRAME_HEADER_LEN, 0);
+    scratch.extend_from_slice(&type_id.to_be_bytes());
+    if let Err(e) = serde_json::to_writer(&mut *scratch, msg) {
+        scratch.clear();
         return Err(crate::Error::Protocol(
-            format!("V2 payload too large: {payload_len} > {V2_MAX_FRAME_PAYLOAD}").into(),
+            format!("V2 JSON serialize: {e}").into(),
         ));
     }
 
-    // Fill in frame header now that payload length is known
-    buf[0..2].copy_from_slice(&V2_FRAME_TYPE_MESSAGE.to_be_bytes());
-    buf[2..4].copy_from_slice(&0u16.to_be_bytes());
-    buf[4..8].copy_from_slice(&(payload_len as u32).to_be_bytes());
-
-    writer
-        .write_all(&buf)
-        .await
-        .map_err(|e| crate::Error::Protocol(format!("write V2 msg: {e}").into()))?;
-    Ok(())
+    write_v2_frame_in_place(writer, V2_FRAME_TYPE_MESSAGE, 0, scratch).await
 }
 
 /// Write a FrpMessage using Go-compatible V2 framing.
@@ -898,9 +940,9 @@ pub async fn read_msg_v2_udp_binary_socket<R: AsyncReadExt + Unpin>(
 ///
 /// `no_flush` mirrors `write_msg_v2_nof`: skip the trailing flush syscall for
 /// raw TcpStream data planes where TCP_NODELAY already flushes per write.
-/// `scratch` is the reusable buffer for the binary codec path (cleared per
-/// call) — pass a buffer owned by the caller's task to avoid per-packet
-/// allocations.
+/// `scratch` is the reusable buffer for both the binary codec and JSON paths
+/// (cleared per call) — pass a buffer owned by the caller's task to avoid
+/// per-packet allocations.
 pub async fn write_msg_v2_with_udp_codec<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     msg: &FrpMessage,
@@ -911,14 +953,20 @@ pub async fn write_msg_v2_with_udp_codec<W: AsyncWriteExt + Unpin>(
     let binary = udp_packet_codec == Some(crate::udp_binary::UDP_PACKET_CODEC_BINARY);
     if binary {
         if let FrpMessage::UDPPacket(packet) = msg {
-            // Reuse the caller's scratch: type ID + binary body, zero
-            // allocation per packet (was: body Vec + payload Vec = 2 allocs).
+            // Reserve the 8-byte V2 frame header slot ahead of type_id + body
+            // so `write_v2_frame_in_place` patches the header in place and
+            // emits one contiguous write — zero alloc and zero payload copy
+            // even on non-vectored transports (yamux, TLS, CipherWriter).
             scratch.clear();
+            scratch.resize(V2_FRAME_HEADER_LEN, 0);
             scratch.extend_from_slice(&msg::V2_TYPE_UDP_PACKET_BINARY.to_be_bytes());
-            crate::udp_binary::encode_udp_packet_binary_into(packet, scratch).map_err(|e| {
-                crate::Error::Protocol(format!("encode binary UDP packet: {e}").into())
-            })?;
-            write_v2_frame_raw(writer, V2_FRAME_TYPE_MESSAGE, 0, scratch).await?;
+            if let Err(e) = crate::udp_binary::encode_udp_packet_binary_into(packet, scratch) {
+                scratch.clear();
+                return Err(crate::Error::Protocol(
+                    format!("encode binary UDP packet: {e}").into(),
+                ));
+            }
+            write_v2_frame_in_place(writer, V2_FRAME_TYPE_MESSAGE, 0, scratch).await?;
             // Flush unless the caller manages it (raw TcpStream + TCP_NODELAY,
             // or a CipherWriter that must flush to emit its IV). Without this,
             // buffered transports (TLS, yamux, WebSocket) and encrypted
@@ -931,7 +979,7 @@ pub async fn write_msg_v2_with_udp_codec<W: AsyncWriteExt + Unpin>(
             return Ok(());
         }
     }
-    write_msg_v2_inner(writer, msg).await?;
+    write_msg_v2_inner_scratch(writer, msg, scratch).await?;
     if !no_flush {
         writer
             .flush()

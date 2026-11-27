@@ -15,8 +15,8 @@ use frp_core::metrics::ConnGuard;
 use frp_core::msg::{self, FrpMessage};
 use frp_core::protocol::{
     read_msg_v1, read_msg_v2_udp_binary_socket, read_msg_v2_with_udp_codec, write_msg_v1,
-    write_msg_v2_with_udp_codec, write_v1_frame_scratch, write_v2_frame_raw, UdpBinaryRead,
-    V2_FRAME_TYPE_MESSAGE,
+    write_msg_v2_with_udp_codec, write_v1_frame_scratch, write_v2_frame_in_place, UdpBinaryRead,
+    V2_FRAME_HEADER_LEN, V2_FRAME_TYPE_MESSAGE,
 };
 use frp_core::snappy_stream::{SnappyStreamReader, SnappyStreamWriter};
 use frp_core::transport::{split_work_conn_halves, IoStream};

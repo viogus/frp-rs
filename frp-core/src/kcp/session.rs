@@ -34,6 +34,16 @@ pub(crate) const FEC_HEADER_SIZE: usize = 6;
 const TYPE_DATA: u16 = 0xf1;
 const TYPE_PARITY: u16 = 0xf2;
 const MAX_SHARD_SETS: usize = 3;
+/// Max recycled FEC receive shard buffers kept in the session-private free
+/// list (single-threaded driver-owned, zero atomics, zero contention with
+/// `datagram_pool`).
+const FEC_RX_POOL_CAP: usize = 32;
+/// Max capacity retained in `fec_rx_pool` (4 KiB, well above max wire MTU
+/// 1500 B). Jumbo datagrams are dropped on retire instead of pinning 64 KiB
+/// buffers in the free list.
+const FEC_RX_BUF_MAX_CAP: usize = 4096;
+/// Max recycled outer `ShardGroup::shards` slot vectors kept per session.
+const FEC_GROUP_POOL_CAP: usize = 4;
 /// kcp-go `fecExpire` (fec.go, ms): a shard that sits in the FEC decoder
 /// longer than this is treated as stale residue and dropped by the time-based
 /// continuity check (`fecDecoder.decode()` timeout policy, applied on every
@@ -94,6 +104,11 @@ impl KcpWriter {
     }
 
     fn drain(&mut self) -> Vec<Vec<u8>> {
+        // Skip the 64-element Vec allocation on idle ticks (100 ticks/s per
+        // idle session would otherwise allocate and immediately drop ~1.5 KiB).
+        if self.packets.is_empty() {
+            return Vec::new();
+        }
         // Replace current batch with a fresh pre-allocated Vec.
         // The old batch is returned; the new Vec starts with capacity 64,
         // ready for the next KCP tick's output without reallocation.
@@ -132,6 +147,12 @@ pub struct KcpSession {
     fec_seqid: u32,
     /// Received FEC shard groups, keyed by shard_begin (seqid - seqid % total).
     shard_groups: HashMap<u32, ShardGroup>,
+    /// Session-private, single-threaded free list of FEC receive shard buffers.
+    /// Avoids cross-thread atomic CAS contention with `self.pool`
+    /// (`datagram_pool`, shared with `frp-kcp-send` and `KcpStream::poll_read`).
+    fec_rx_pool: Vec<Vec<u8>>,
+    /// Session-private free list of `ShardGroup::shards` outer Vecs.
+    fec_group_pool: Vec<Vec<Option<Vec<u8>>>>,
     /// Monotonic clock used for FEC group expiry (ms since session creation).
     fec_clock_base: std::time::Instant,
     /// Clock override: when set, `fec_now_ms()` returns it instead of the
@@ -303,6 +324,8 @@ impl KcpSession {
             config,
             fec_seqid: 0,
             shard_groups: HashMap::new(),
+            fec_rx_pool: Vec::new(),
+            fec_group_pool: Vec::new(),
             fec_clock_base: std::time::Instant::now(),
             fec_clock_override: None,
             read_tx,
@@ -462,35 +485,46 @@ impl KcpSession {
                 raw[6..8].copy_from_slice(&(2u16 + payload_len as u16).to_le_bytes());
                 self.fec_seqid = self.fec_seqid.wrapping_add(1);
 
-                // Buffer for parity generation into a pre-allocated reusable slot
-                // (zero heap allocation per data shard). The parity-input row
-                // (SIZE + payload = raw[6..]) must outlive the datagram because
-                // the chunk is sent and recycled this tick while the RS group
-                // completes once `data_shards` have accumulated.
-                let slot = &mut self.pending_shards[self.pending_shard_count];
-                slot.clear();
-                slot.extend_from_slice(&raw[6..]);
-                let rs_len = slot.len();
-                self.pending_shard_count += 1;
-                self.pending_max_size = self.pending_max_size.max(rs_len);
+                let rs_len = raw.len() - FEC_HEADER_SIZE;
+                let n = self.config.data_shards;
+                let p = self.config.parity_shards;
+                let is_group_complete = self.pending_shard_count + 1 == n;
 
-                // Emit the data shard (the pooled chunk itself).
-                self.packets.push(raw);
-
-                // When we have dataShards collected, generate parity directly into
-                // pooled datagram buffers (zero heap allocations per FEC group).
-                if self.pending_shard_count == self.config.data_shards {
-                    let max_size = self.pending_max_size;
-                    let n = self.config.data_shards;
-                    let p = self.config.parity_shards;
-
-                    // Pad all data shard RS payloads to equal length.
-                    for shard in &mut self.pending_shards[..n] {
+                if !is_group_complete {
+                    // Buffer for parity generation into a pre-allocated reusable
+                    // slot (zero heap allocation per data shard). The parity-input
+                    // row (SIZE + payload = raw[6..]) must outlive the datagram
+                    // because the chunk is sent and recycled this tick while the
+                    // RS group completes once `data_shards` have accumulated.
+                    let slot = &mut self.pending_shards[self.pending_shard_count];
+                    slot.clear();
+                    slot.extend_from_slice(&raw[FEC_HEADER_SIZE..]);
+                    self.pending_shard_count += 1;
+                    self.pending_max_size = self.pending_max_size.max(rs_len);
+                    self.packets.push(raw);
+                } else {
+                    // Final data shard of the FEC group: emit it BEFORE parity
+                    // shards (identical wire order), and when it already meets
+                    // `max_size` (the common full-MTU case), borrow `&raw[6..]`
+                    // directly out of `self.packets` instead of copying it into
+                    // `pending_shards[n - 1]`.
+                    let max_size = self.pending_max_size.max(rs_len);
+                    for shard in &mut self.pending_shards[..n - 1] {
                         shard.resize(max_size, 0);
                     }
+                    let last_in_place = rs_len == max_size;
+                    if !last_in_place {
+                        let slot = &mut self.pending_shards[n - 1];
+                        slot.clear();
+                        slot.extend_from_slice(&raw[FEC_HEADER_SIZE..]);
+                        slot.resize(max_size, 0);
+                    }
+                    let last_data_idx = self.packets.len();
+                    self.packets.push(raw);
 
-                    // Allocate pooled output buffers with 6-byte FEC header + zeroed
-                    // `max_size` parity payload, then encode directly into them.
+                    // Allocate pooled output buffers with 6-byte FEC header +
+                    // zeroed `max_size` parity payload, then encode directly
+                    // into them.
                     let start_idx = self.packets.len();
                     for _ in 0..p {
                         let mut packet = chunk_pool_pop(&self.pool, FEC_HEADER_SIZE + max_size);
@@ -502,25 +536,30 @@ impl KcpSession {
                         self.fec_seqid = self.fec_seqid.wrapping_add(1);
                     }
 
+                    let (data_part, parity_part) = self.packets.split_at_mut(start_idx);
+                    let last_slice: &[u8] = if last_in_place {
+                        &data_part[last_data_idx][FEC_HEADER_SIZE..]
+                    } else {
+                        self.pending_shards[n - 1].as_slice()
+                    };
+
                     // Fast stack-slice path for standard configs (e.g. 10+3).
                     if n <= 16 && p <= 8 {
                         let mut shard_refs: [&[u8]; 16] = [&[]; 16];
-                        for (i, s) in self.pending_shards[..n].iter().enumerate() {
+                        for (i, s) in self.pending_shards[..n - 1].iter().enumerate() {
                             shard_refs[i] = s.as_slice();
                         }
+                        shard_refs[n - 1] = last_slice;
                         let mut parity_refs: [&mut [u8]; 8] = Default::default();
-                        for (i, pkt) in self.packets[start_idx..start_idx + p]
-                            .iter_mut()
-                            .enumerate()
-                        {
+                        for (i, pkt) in parity_part[..p].iter_mut().enumerate() {
                             parity_refs[i] = &mut pkt[FEC_HEADER_SIZE..];
                         }
                         fec.encode_parity_into(&shard_refs[..n], &mut parity_refs[..p]);
                     } else {
-                        let shard_refs: Vec<&[u8]> =
-                            self.pending_shards[..n].iter().map(Vec::as_slice).collect();
-                        let mut parity_refs: Vec<&mut [u8]> = self.packets
-                            [start_idx..start_idx + p]
+                        let mut shard_refs: Vec<&[u8]> = Vec::with_capacity(n);
+                        shard_refs.extend(self.pending_shards[..n - 1].iter().map(Vec::as_slice));
+                        shard_refs.push(last_slice);
+                        let mut parity_refs: Vec<&mut [u8]> = parity_part[..p]
                             .iter_mut()
                             .map(|pkt| &mut pkt[FEC_HEADER_SIZE..])
                             .collect();
@@ -717,10 +756,34 @@ impl KcpSession {
         self.fec_encode_output(output)
     }
 
+    /// Return every buffered shard Vec (and optionally the outer slot Vec)
+    /// back to the session-private, non-atomic FEC receive free lists.
+    /// Oversized buffers (`> FEC_RX_BUF_MAX_CAP`) are dropped so jumbo UDP
+    /// datagrams cannot inflate steady-state RSS.
+    fn recycle_fec_shards(
+        rx_pool: &mut Vec<Vec<u8>>,
+        group_pool: &mut Vec<Vec<Option<Vec<u8>>>>,
+        mut shards: Vec<Option<Vec<u8>>>,
+    ) {
+        for slot in &mut shards {
+            if let Some(mut v) = slot.take() {
+                if v.capacity() <= FEC_RX_BUF_MAX_CAP && rx_pool.len() < FEC_RX_POOL_CAP {
+                    v.clear();
+                    rx_pool.push(v);
+                }
+            }
+        }
+        if !shards.is_empty() && group_pool.len() < FEC_GROUP_POOL_CAP {
+            shards.clear();
+            group_pool.push(shards);
+        }
+    }
+
     /// Feed received UDP data into KCP. Handles FEC decode if enabled.
     pub fn input(&mut self, data: &[u8]) -> io::Result<()> {
-        self.prune_old_groups();
-
+        if !self.shard_groups.is_empty() {
+            self.prune_old_groups();
+        }
         if let Some(ref fec) = self.fec {
             if data.len() < FEC_HEADER_SIZE {
                 tracing::debug!(
@@ -795,14 +858,19 @@ impl KcpSession {
             // Refresh activity: any shard received for this group keeps it
             // alive (kcp-go stamps every inserted fecElement with currentMs()).
             let now = self.fec_now_ms();
-            let group = self
-                .shard_groups
-                .entry(shard_begin)
-                .or_insert_with(|| ShardGroup {
-                    shards: vec![None; total],
+            let group_pool = &mut self.fec_group_pool;
+            let group = self.shard_groups.entry(shard_begin).or_insert_with(|| {
+                let mut shards = group_pool
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(total));
+                shards.clear();
+                shards.resize_with(total, || None);
+                ShardGroup {
+                    shards,
                     received_count: 0,
                     last_active_ms: now,
-                });
+                }
+            });
             group.last_active_ms = now;
 
             // Belt-and-braces: an entry whose shards vec no longer matches
@@ -817,7 +885,8 @@ impl KcpSession {
                     group.shards.len(),
                     total
                 );
-                group.shards = vec![None; total];
+                let old = std::mem::replace(&mut group.shards, vec![None; total]);
+                Self::recycle_fec_shards(&mut self.fec_rx_pool, &mut self.fec_group_pool, old);
                 group.received_count = 0;
             }
 
@@ -836,7 +905,33 @@ impl KcpSession {
             }
 
             if group.shards[shard_index].is_none() {
-                group.shards[shard_index] = Some(shard_data.to_vec());
+                // Zero-copy fast path: when this is the final missing data
+                // shard of a loss-free group, it was already fed to KCP above
+                // — skip copying it into the group, recycle the earlier
+                // shards to the session-private pool, and retire immediately.
+                if flag == TYPE_DATA
+                    && shard_index < self.config.data_shards
+                    && group.received_count + 1 >= self.config.data_shards
+                    && (0..self.config.data_shards)
+                        .all(|i| i == shard_index || group.shards[i].is_some())
+                {
+                    if let Some(done) = self.shard_groups.remove(&shard_begin) {
+                        Self::recycle_fec_shards(
+                            &mut self.fec_rx_pool,
+                            &mut self.fec_group_pool,
+                            done.shards,
+                        );
+                    }
+                    self.reconcile_snd_backlog();
+                    return Ok(());
+                }
+                let mut buf = self
+                    .fec_rx_pool
+                    .pop()
+                    .unwrap_or_else(|| Vec::with_capacity(shard_data.len()));
+                buf.clear();
+                buf.extend_from_slice(shard_data);
+                group.shards[shard_index] = Some(buf);
                 group.received_count += 1;
             }
 
@@ -848,14 +943,21 @@ impl KcpSession {
                     .iter()
                     .all(|s| s.is_some())
                 {
-                    self.shard_groups.remove(&shard_begin);
+                    if let Some(done) = self.shard_groups.remove(&shard_begin) {
+                        Self::recycle_fec_shards(
+                            &mut self.fec_rx_pool,
+                            &mut self.fec_group_pool,
+                            done.shards,
+                        );
+                    }
                     // Data shards fed above may carry ACKs; keep counter in sync.
                     self.reconcile_snd_backlog();
                     return Ok(());
                 }
 
                 // Track which data shards were already received (to avoid double-feed).
-                let mut had_data = vec![false; group.shards.len()];
+                // `config.data_shards <= 256` (clamped at construction).
+                let mut had_data = [false; 256];
                 for (i, s) in group
                     .shards
                     .iter()
@@ -915,6 +1017,11 @@ impl KcpSession {
                         }
                     }
                 }
+                Self::recycle_fec_shards(
+                    &mut self.fec_rx_pool,
+                    &mut self.fec_group_pool,
+                    decode_shards,
+                );
                 self.shard_groups.remove(&shard_begin);
                 if let Some(e) = feed_err {
                     return Err(e);
@@ -1138,14 +1245,28 @@ impl KcpSession {
     /// memory indefinitely after extreme reordering or a long silent period.
     fn prune_old_groups(&mut self) {
         let now = self.fec_now_ms();
-        self.shard_groups
-            .retain(|_, g| now.saturating_sub(g.last_active_ms) <= FEC_GROUP_EXPIRE_MS);
+        let rx_pool = &mut self.fec_rx_pool;
+        let group_pool = &mut self.fec_group_pool;
+        self.shard_groups.retain(|_, g| {
+            if now.saturating_sub(g.last_active_ms) <= FEC_GROUP_EXPIRE_MS {
+                true
+            } else {
+                Self::recycle_fec_shards(rx_pool, group_pool, std::mem::take(&mut g.shards));
+                false
+            }
+        });
 
         // Keep the existing "max 3 shard sets" cap on top of the time check.
         while self.shard_groups.len() > MAX_SHARD_SETS {
             let oldest = self.shard_groups.keys().copied().min();
             if let Some(key) = oldest {
-                self.shard_groups.remove(&key);
+                if let Some(done) = self.shard_groups.remove(&key) {
+                    Self::recycle_fec_shards(
+                        &mut self.fec_rx_pool,
+                        &mut self.fec_group_pool,
+                        done.shards,
+                    );
+                }
             } else {
                 break;
             }
@@ -1166,6 +1287,14 @@ impl KcpSession {
     #[cfg(test)]
     pub fn set_fec_clock_ms(&mut self, ms: u64) {
         self.fec_clock_override = Some(ms);
+    }
+}
+
+impl Drop for KcpSession {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_read.take() {
+            chunk_pool_push(&self.pool, pending);
+        }
     }
 }
 
@@ -2302,5 +2431,115 @@ mod tests {
             futures_util::poll!(&mut n).is_ready(),
             "notify_one must store a permit that a late waiter consumes immediately"
         );
+    }
+
+    #[test]
+    fn test_fec_last_shard_zero_copy_parity_and_pool_recycling() {
+        // Exercise both FEC encode paths for the final data shard in a 4+2
+        // group: (1) equal-length full-MTU shards (in-place borrow from
+        // `self.packets`), and (2) shorter final shard (padded copy), plus
+        // verify decode recovery and datagram pool recycling on group retire.
+        let mut cfg = test_config();
+        cfg.data_shards = 4;
+        cfg.parity_shards = 2;
+
+        let tx_pool = Arc::new(ArrayQueue::new(64));
+        let rx_pool = Arc::new(ArrayQueue::new(64));
+        let (tx1, _rx1) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+
+        let mut sender = KcpSession::with_chunk_pool(
+            77,
+            "127.0.0.1:10001".parse().unwrap(),
+            cfg.clone(),
+            tx1,
+            tx_pool,
+        );
+        let mut receiver = KcpSession::with_chunk_pool(
+            77,
+            "127.0.0.1:10002".parse().unwrap(),
+            cfg,
+            tx2,
+            rx_pool.clone(),
+        );
+
+        // Send enough bytes to produce at least two full FEC groups: one full
+        // equal-length group and one tail group with a shorter last shard.
+        let mss = sender.kcp.mss();
+        let payload: Vec<u8> = (0..(mss * 7 + 137)).map(|i| (i % 251) as u8).collect();
+        sender.send_chunked(&payload).unwrap();
+        let pkts = sender.force_flush(10).unwrap();
+        assert!(
+            pkts.len() >= 12,
+            "expected >= 2 complete 4+2 FEC groups, got {} packets",
+            pkts.len()
+        );
+
+        // Group 1 (pkts 0..6): drop data shard #3 (last data shard, equal-len
+        // in-place path) and deliver the remaining 3 data shards + 1st parity
+        // shard to prove the zero-copy parity reconstructs shard #3 bit-for-bit.
+        for (i, p) in pkts[..5].iter().enumerate() {
+            if i == 3 {
+                continue;
+            }
+            receiver.input(p).unwrap();
+        }
+        assert!(
+            receiver.shard_groups.is_empty(),
+            "recovered FEC group 1 must be retired immediately"
+        );
+        assert!(
+            !receiver.fec_rx_pool.is_empty(),
+            "decoded FEC group must return shard buffers to session-private fec_rx_pool"
+        );
+        assert!(
+            !receiver.fec_group_pool.is_empty(),
+            "decoded FEC group must return outer shard slot vec to fec_group_pool"
+        );
+
+        // Group 2 (pkts 6..12): deliver all 4 data shards loss-free (with a
+        // shorter tail shard #9) to exercise the zero-copy last-data-shard
+        // fast path + pool return.
+        for p in &pkts[6..10] {
+            receiver.input(p).unwrap();
+        }
+        assert!(
+            receiver.shard_groups.is_empty(),
+            "loss-free FEC group 2 must be retired via zero-copy last-shard fast path"
+        );
+
+        // Also verify the shorter-tail-shard parity encode path by dropping
+        // tail shard #9 on a fresh receiver and reconstructing it from parity.
+        let (tx3, mut rx3) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+        let mut receiver2 = KcpSession::with_chunk_pool(
+            77,
+            "127.0.0.1:10003".parse().unwrap(),
+            sender.config.clone(),
+            tx3,
+            Arc::new(ArrayQueue::new(64)),
+        );
+        for p in &pkts[..4] {
+            receiver2.input(p).unwrap();
+        }
+        for (i, p) in pkts[6..11].iter().enumerate() {
+            if i == 3 {
+                continue; // drop shorter tail data shard #9
+            }
+            receiver2.input(p).unwrap();
+        }
+        assert!(receiver2.shard_groups.is_empty());
+        receiver2.recv_and_push().unwrap();
+        let mut got2 = Vec::new();
+        while let Ok(chunk) = rx3.try_recv() {
+            got2.extend_from_slice(&chunk);
+        }
+        assert_eq!(got2, payload);
+
+        receiver.recv_and_push().unwrap();
+        let mut got = Vec::new();
+        while let Ok(chunk) = rx2.try_recv() {
+            got.extend_from_slice(&chunk);
+        }
+        assert_eq!(got, payload);
     }
 }

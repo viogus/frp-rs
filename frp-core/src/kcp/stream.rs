@@ -270,12 +270,10 @@ impl AsyncRead for KcpStream {
     }
 }
 
-impl AsyncWrite for KcpStream {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
+impl KcpStream {
+    /// Check liveness, shutdown, and write/KCP send-queue backpressure gates.
+    /// Shared by `poll_write` and `poll_write_vectored`.
+    fn poll_write_ready(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         // Check if the underlying KCP session is still alive.
         // Sessions removed by the driver (dead link, error, timeout) can no
         // longer deliver data, and writes would be silently discarded.
@@ -351,19 +349,25 @@ impl AsyncWrite for KcpStream {
             }
         }
 
-        tracing::trace!(
-            "KCP WRITE: {} bytes first_hex={}",
-            buf.len(),
-            crate::hex_encode(&buf[..buf.len().min(32)])
-        );
+        Poll::Ready(Ok(()))
+    }
 
-        // M1 perf: pop a recycled chunk from the pool (or allocate with
-        // with_capacity when the pool is empty) instead of buf.to_vec()'s
-        // fresh chunk-sized alloc + memcpy on every bridge write. The driver
-        // returns the chunk to the pool once the session's segmentation has
-        // copied the payload out.
-        let mut chunk = chunk_pool_pop(&self.chunk_pool, buf.len());
-        chunk.extend_from_slice(buf);
+    /// Enqueue one populated write chunk onto `write_tx` with backpressure
+    /// accounting and debug stats. Shared by `poll_write` and
+    /// `poll_write_vectored`.
+    fn enqueue_write_chunk(
+        &mut self,
+        cx: &mut Context<'_>,
+        chunk: Vec<u8>,
+    ) -> Poll<io::Result<usize>> {
+        let n = chunk.len();
+        #[cfg(debug_assertions)]
+        let mut first_prefix = [0u8; 32];
+        #[cfg(debug_assertions)]
+        let first_len = n.min(first_prefix.len());
+        #[cfg(debug_assertions)]
+        first_prefix[..first_len].copy_from_slice(&chunk[..first_len]);
+
         let req = WriteRequest::Data(chunk);
 
         // Increment backlog BEFORE try_send so it reflects queued messages,
@@ -380,11 +384,17 @@ impl AsyncWrite for KcpStream {
                 if let WriteRequest::Data(chunk) = msg.1 {
                     chunk_pool_push(&self.chunk_pool, chunk);
                 }
-                // Apply backpressure — wait for socket to drain.
+                // Apply backpressure — wait for socket to drain. If a stored
+                // permit fires synchronously (`Poll::Ready(())`), clear the
+                // future and re-wake immediately instead of returning
+                // `Poll::Pending` un-registered (lost-wakeup deadlock).
                 let notified = self.write_notify.clone().notified_owned();
                 self.backpressure_fut = Some(Box::pin(notified));
                 if let Some(ref mut fut) = self.backpressure_fut {
-                    let _ = fut.as_mut().poll(cx);
+                    if fut.as_mut().poll(cx).is_ready() {
+                        self.backpressure_fut = None;
+                        cx.waker().wake_by_ref();
+                    }
                 }
                 return Poll::Pending;
             }
@@ -405,7 +415,6 @@ impl AsyncWrite for KcpStream {
         // Channel backpressure is handled by the backlog gate above.
         // Write errors surface via the driver's debug log.
 
-        let n = buf.len();
         self.write_count += n as u64;
         KCP_WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
         #[cfg(debug_assertions)]
@@ -419,7 +428,7 @@ impl AsyncWrite for KcpStream {
                 n = n,
                 total = self.write_count,
                 global_total = KCP_WRITE_BYTES.load(Ordering::Relaxed),
-                first_hex = %crate::hex_encode(&buf[..n.min(32)]),
+                first_hex = %crate::hex_encode(&first_prefix[..first_len]),
                 "KCP write: {} bytes (stream total={}, global total={})",
                 n,
                 self.write_count,
@@ -427,6 +436,89 @@ impl AsyncWrite for KcpStream {
             );
         }
         Poll::Ready(Ok(n))
+    }
+}
+
+impl AsyncWrite for KcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_write_ready(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        tracing::trace!(
+            "KCP WRITE: {} bytes first_hex={}",
+            buf.len(),
+            crate::hex_encode(&buf[..buf.len().min(32)])
+        );
+
+        // M1 perf: pop a recycled chunk from the pool (or allocate with
+        // with_capacity when the pool is empty) instead of buf.to_vec()'s
+        // fresh chunk-sized alloc + memcpy on every bridge write. The driver
+        // returns the chunk to the pool once the session's segmentation has
+        // copied the payload out.
+        let mut chunk = chunk_pool_pop(&self.chunk_pool, buf.len());
+        chunk.extend_from_slice(buf);
+        self.enqueue_write_chunk(cx, chunk)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        true
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        /// Cap a single vectored gather at 64 KiB (matching bridge writes) so
+        /// huge or aliased `IoSlice` lists cannot overflow `usize` or inflate
+        /// `chunk_pool`. Partial writes are standard `AsyncWrite` semantics.
+        const VECTORED_WRITE_MAX: usize = 64 * 1024;
+
+        match self.poll_write_ready(cx) {
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+            Poll::Pending => return Poll::Pending,
+        }
+        let mut total = 0usize;
+        for slice in bufs {
+            total = total.saturating_add(slice.len());
+            if total >= VECTORED_WRITE_MAX {
+                total = VECTORED_WRITE_MAX;
+                break;
+            }
+        }
+        if total == 0 {
+            return Poll::Ready(Ok(0));
+        }
+
+        // Gather iovecs (up to `VECTORED_WRITE_MAX`) into a single pooled
+        // write chunk so callers like yamux / V1 / V2 framing pay one channel
+        // hop and one `send_carry` instead of splitting header and payload.
+        let mut chunk = chunk_pool_pop(&self.chunk_pool, total);
+        chunk.clear();
+        chunk.reserve(total);
+        let mut rem = total;
+        for slice in bufs {
+            if rem == 0 {
+                break;
+            }
+            if !slice.is_empty() {
+                let take = slice.len().min(rem);
+                chunk.extend_from_slice(&slice[..take]);
+                rem -= take;
+            }
+        }
+        self.enqueue_write_chunk(cx, chunk)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -463,10 +555,15 @@ impl AsyncWrite for KcpStream {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Backlog gate should prevent this; defensive fallback.
+                    // If a stored permit fires synchronously, re-wake rather
+                    // than returning `Poll::Pending` un-registered.
                     let notified = self.write_notify.clone().notified_owned();
                     self.backpressure_fut = Some(Box::pin(notified));
                     if let Some(ref mut fut) = self.backpressure_fut {
-                        let _ = fut.as_mut().poll(cx);
+                        if fut.as_mut().poll(cx).is_ready() {
+                            self.backpressure_fut = None;
+                            cx.waker().wake_by_ref();
+                        }
                     }
                     return Poll::Pending;
                 }
@@ -690,5 +787,47 @@ mod tests {
             }
             other => panic!("a dead session must fail fast, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn poll_write_vectored_gathers_iovecs_into_one_chunk() {
+        let (write_tx, mut write_rx) = mpsc::channel(8);
+        let (_read_tx, read_rx) = mpsc::channel(8);
+        let mut stream = KcpStream::new(
+            42,
+            "127.0.0.1:1".parse().unwrap(),
+            write_tx,
+            read_rx,
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Notify::new()),
+            Arc::new(ArrayQueue::new(8)),
+            Arc::new(ArrayQueue::new(8)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Notify::new()),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        assert!(stream.is_write_vectored());
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let slices = [
+            io::IoSlice::new(b"HDR8BYTE"),
+            io::IoSlice::new(b""),
+            io::IoSlice::new(b"payload-body"),
+        ];
+        let poll = Pin::new(&mut stream).poll_write_vectored(&mut cx, &slices);
+        assert!(matches!(poll, Poll::Ready(Ok(20))));
+
+        let (conv, req) = write_rx.try_recv().expect("expected single WriteRequest");
+        assert_eq!(conv, 42);
+        match req {
+            WriteRequest::Data(bytes) => assert_eq!(bytes, b"HDR8BYTEpayload-body"),
+            WriteRequest::Flush(_) => panic!("unexpected Flush"),
+        }
+        assert!(
+            write_rx.try_recv().is_err(),
+            "vectored write must coalesce all iovecs into one WriteRequest"
+        );
     }
 }
