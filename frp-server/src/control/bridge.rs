@@ -129,17 +129,18 @@ async fn relay_plain_fast(
     relay_plain_fast_inner(user_conn, work_conn, metrics).await
 }
 
-/// Linux: try splice(2) zero-copy relay when both sides are raw TCP.
-#[cfg(target_os = "linux")]
+/// Fast plain relay: when both sides are raw TCP, uses `relay_tcp_fast`
+/// (zero-copy `splice(2)` on Linux; lock-free `TcpStream::into_split()` with
+/// pooled buffers on non-Linux). Falls back to `relay_plain_pooled` for
+/// non-TCP transports (yamux, QUIC, KCP, TLS, WebSocket).
 async fn relay_plain_fast_inner(
     user_conn: IoStream,
     work_conn: IoStream,
     metrics: &Arc<frp_core::metrics::ProxyMetrics>,
 ) {
     // Two-arm dispatch so the Tcp arm consumes the streams while the other
-    // arm binds new mutable variables for the copy_bidirectional fallthrough.
-    // try_tcp() (borrow check) then into_tcp() (owned) — no await between,
-    // so the transport cannot change.
+    // arm hands them to `relay_plain_pooled`. `try_tcp()` (borrow check) then
+    // `into_tcp()` (owned) — no await between, so the transport cannot change.
     if user_conn.try_tcp().is_some() && work_conn.try_tcp().is_some() {
         let user = user_conn
             .into_tcp()
@@ -147,12 +148,12 @@ async fn relay_plain_fast_inner(
         let work = work_conn
             .into_tcp()
             .expect("try_tcp confirmed raw TCP above");
-        match frp_core::splice::bridge_splice(user, work).await {
+        match frp_core::bridge::relay_tcp_fast(user, work).await {
             Ok((a, b)) => {
                 metrics.record_traffic(a, b);
             }
             Err(e) => {
-                tracing::warn!(error = %e, "splice bridge closed with error: {}", e);
+                tracing::debug!(error = %e, "TCP fast-path bridge closed with error: {}", e);
             }
         }
     } else {
@@ -166,23 +167,6 @@ async fn relay_plain_fast_inner(
             Err(e) => {
                 tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
             }
-        }
-    }
-}
-
-/// Non-Linux: pooled-buffer bidirectional relay (splice(2) unavailable).
-#[cfg(not(target_os = "linux"))]
-async fn relay_plain_fast_inner(
-    user_conn: IoStream,
-    work_conn: IoStream,
-    metrics: &Arc<frp_core::metrics::ProxyMetrics>,
-) {
-    match frp_core::bridge::relay_plain_pooled(user_conn, work_conn).await {
-        Ok((a, b)) => {
-            metrics.record_traffic(a, b);
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "plain fast-path bridge closed: {}", e);
         }
     }
 }

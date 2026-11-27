@@ -210,10 +210,14 @@ struct AeadReadState {
     header_read: bool,
     frame_count: u64,
     max_frame_count: Option<u64>,
-    /// Fixed pre-allocated frame buffer, sized `max_ciphertext` once at
-    /// construction and never resized. Ciphertext is read into `buf[..]`,
-    /// decrypted in place, and served to callers via `buf_pos` — no
-    /// per-frame allocation or copy (mirrors the `header_buf` pattern).
+    /// Reusable frame buffer, allocated on demand: empty until the first
+    /// frame, then grown to that frame's ciphertext length and thereafter
+    /// reused for every frame that fits (a short frame reuses the tail of the
+    /// larger buffer via `buf[..ciphertext_len]`). Growth is bounded by
+    /// `DEFAULT_MAX_PAYLOAD_SIZE + overhead`, checked before any resize.
+    /// Ciphertext is read into `buf[..ciphertext_len]`, decrypted in place,
+    /// and served to callers via `buf_pos` — no per-frame allocation or copy
+    /// (mirrors the `header_buf` pattern).
     buf: Vec<u8>,
     /// Bytes of decrypted plaintext currently available in `buf` to serve.
     buf_filled: usize,
@@ -293,12 +297,10 @@ impl AeadStream {
         let nonce_size = algorithm.nonce_size();
         let write_nonce = generate_random(nonce_size)?;
 
-        // Pre-allocate the read frame buffer to max frame size once. The
-        // buffer is zero-filled here (a single construction-time memset),
-        // then read into and decrypted in place for the lifetime of the
-        // stream — no per-frame allocation, memset, or split-off copy.
-        let max_ciphertext = DEFAULT_MAX_PAYLOAD_SIZE + algorithm.overhead();
-
+        // Grow the read frame buffer lazily on demand up to `max_ciphertext`.
+        // Idle or small-frame control streams avoid paying a 64 KiB+ eager
+        // allocation and zero-fill at construction while still decrypting
+        // every frame in place without per-frame allocations once sized.
         Ok(Self {
             inner,
             algorithm,
@@ -310,7 +312,7 @@ impl AeadStream {
                 header_read: false,
                 frame_count: 0,
                 max_frame_count: algorithm.max_frame_count(),
-                buf: vec![0u8; max_ciphertext],
+                buf: Vec::new(),
                 buf_filled: 0,
                 buf_pos: 0,
                 err: None,
@@ -493,8 +495,11 @@ impl AeadStream {
             )));
         }
 
-        // Read the ciphertext into the fixed frame buffer, then decrypt in
-        // place — no per-frame allocation or copy.
+        // Lazily grow the reusable frame buffer to fit this frame (bounded by
+        // `max_ciphertext` above), then read and decrypt in place.
+        if self.read.buf.len() < ciphertext_len {
+            self.read.buf.resize(ciphertext_len, 0);
+        }
         match Self::poll_read_exact(
             &mut self.inner,
             cx,
@@ -1286,5 +1291,42 @@ mod tests {
             Ok(Ok(n)) => panic!("duplicate frame: peer decrypted {n} extra bytes"),
             Ok(Err(e)) => panic!("peer read error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_aead_stream_lazy_read_buffer_grows_on_demand() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let key = generate_random(32).unwrap();
+        let (a, b) = tokio::io::duplex(1 << 20);
+        let mut writer =
+            AeadStream::new(Box::new(a), AeadAlgorithm::Aes256Gcm, &key, &key).unwrap();
+        let mut reader =
+            AeadStream::new(Box::new(b), AeadAlgorithm::Aes256Gcm, &key, &key).unwrap();
+
+        // Construction must not eagerly allocate a 64 KiB read frame buffer.
+        assert_eq!(reader.read.buf.capacity(), 0);
+
+        // Small frame: buffer grows only to the received frame size.
+        let small = b"hello lazy aead read buf";
+        writer.write_all(small).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut got_small = vec![0u8; small.len()];
+        reader.read_exact(&mut got_small).await.unwrap();
+        assert_eq!(got_small, small);
+        assert!(
+            reader.read.buf.len() < 1024,
+            "small frame should not allocate a 64 KiB buffer (len={})",
+            reader.read.buf.len()
+        );
+
+        // Larger frame: buffer grows smoothly and decrypts in place.
+        let large: Vec<u8> = (0..20_000).map(|i| (i % 251) as u8).collect();
+        writer.write_all(&large).await.unwrap();
+        writer.flush().await.unwrap();
+        let mut got_large = vec![0u8; large.len()];
+        reader.read_exact(&mut got_large).await.unwrap();
+        assert_eq!(got_large, large);
+        assert!(reader.read.buf.len() >= large.len());
     }
 }

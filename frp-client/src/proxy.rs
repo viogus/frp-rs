@@ -339,7 +339,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
         "Bridging streams for proxy: {} (encrypted: {}, compressed: {}, bandwidth-limited: {})",
         name, use_encryption, use_compression, bw_limiter.is_some());
 
-    let proxy_metrics = metrics.get_or_create(name).await;
+    let proxy_metrics = metrics.get_or_create(name);
     let _guard = ConnGuard::new(proxy_metrics.clone());
 
     // One decision table for the three shapes: encrypted work connection (the
@@ -383,7 +383,7 @@ pub async fn bridge_streams(params: BridgeStreamsParams<'_>) {
             debug!(name = %name, "Proxy {} encrypted bridge closed", name);
         }
         bridge::BridgeChoice::PlainSplit => {
-            let (l_r, l_w) = tokio::io::split(local);
+            let (l_r, l_w) = local.into_split();
             let (w_r, w_w) = match split_work_conn_halves(work) {
                 Ok(pair) => pair,
                 Err(e) => {

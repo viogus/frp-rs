@@ -1509,6 +1509,7 @@ mod vnet_route_tests {
             udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
+        let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(64);
         let ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
@@ -1523,6 +1524,8 @@ mod vnet_route_tests {
             udp_sockets: HashMap::new(),
             last_ping: Instant::now(),
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retry_tx,
+            retry_rx,
         };
         (ctx, ctl)
     }

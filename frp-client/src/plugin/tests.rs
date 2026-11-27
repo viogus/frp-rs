@@ -92,6 +92,23 @@ fn plugin_peer_ip_now(peer: SocketAddr) -> std::net::IpAddr {
         .unwrap_or(peer.ip())
 }
 
+/// Notify-backed resolution wakes immediately when a concurrent dialer
+/// registers its mapping after `plugin_peer_ip` has already checked the map.
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn plugin_peer_ip_wakes_on_concurrent_registration() {
+    let dialer = SocketAddr::from(([127, 0, 0, 1], 44449));
+    let real = SocketAddr::from(([198, 51, 100, 42], 6000));
+    let resolver = tokio::spawn(plugin_peer_ip(dialer));
+    tokio::task::yield_now().await;
+    let _guard = register_plugin_peer(dialer.port(), real);
+    let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), resolver)
+        .await
+        .expect("resolver must wake promptly")
+        .expect("resolver task must not panic");
+    assert_eq!(resolved, real.ip());
+}
+
 /// Fake AsyncRead for BodyReader tests: serves a fixed byte blob in
 /// fixed-size chunks, counting the bytes handed out in a shared counter
 /// (readable while the reader still borrows the stream).

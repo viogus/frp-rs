@@ -2184,3 +2184,75 @@ async fn relay_tcp_pooled_byte_exact_and_abandons_idle_half_closed_peer() {
         .expect("clean linger end");
     assert_eq!(counts, (a_to_b.len() as u64, b_to_a.len() as u64));
 }
+
+/// Regression pin for lock-free `TcpReadHalf` / `TcpWriteHalf` in
+/// `transport::tcp`: dropping `TcpWriteHalf` must NOT implicitly call
+/// `shutdown(SHUT_WR)` (preserving `tokio::io::WriteHalf` semantics). When
+/// `had_pre_read` is true (VHost HTTP request forwarded via `pre_read`),
+/// `bridge_user_to_work` skips explicit shutdown and drops `writer` once the
+/// user side hits EOF; a client that half-closes right after sending its
+/// request must still receive the backend's response without the backend
+/// observing a premature TCP FIN on its read side.
+#[tokio::test]
+async fn tcp_into_split_pre_read_does_not_send_premature_fin() {
+    let lu = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let lw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (mut user_client, user_srv) = {
+        let c = tokio::net::TcpStream::connect(lu.local_addr().unwrap())
+            .await
+            .unwrap();
+        let s = lu.accept().await.unwrap().0;
+        (c, s)
+    };
+    let (mut backend, work_srv) = {
+        let c = tokio::net::TcpStream::connect(lw.local_addr().unwrap())
+            .await
+            .unwrap();
+        let s = lw.accept().await.unwrap().0;
+        (c, s)
+    };
+
+    let (u_r, u_w) = crate::transport::IoStream::Tcp(user_srv)
+        .into_split()
+        .unwrap();
+    let (w_r, w_w) = crate::transport::IoStream::Tcp(work_srv)
+        .into_split()
+        .unwrap();
+
+    let pre_read = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+    let expected_req = pre_read.clone();
+    let bridge = tokio::spawn(async move {
+        bridge_plain(u_r, u_w, w_r, w_w, false, pre_read, None).await;
+    });
+
+    // User half-closes its write half immediately (no further request bytes).
+    user_client.shutdown().await.unwrap();
+
+    // Backend receives the pre_read request.
+    let mut got_req = vec![0u8; expected_req.len()];
+    backend.read_exact(&mut got_req).await.unwrap();
+    assert_eq!(got_req, expected_req);
+
+    // Backend must NOT observe premature EOF while preparing its response.
+    let mut probe = [0u8; 1];
+    let premature =
+        tokio::time::timeout(Duration::from_millis(120), backend.read(&mut probe)).await;
+    assert!(
+        premature.is_err(),
+        "backend must not see premature FIN while had_pre_read bridge awaits response: {premature:?}"
+    );
+
+    // Backend writes its response and closes; user receives full response.
+    let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    backend.write_all(resp).await.unwrap();
+    backend.shutdown().await.unwrap();
+
+    let mut got_resp = Vec::new();
+    user_client.read_to_end(&mut got_resp).await.unwrap();
+    assert_eq!(got_resp, resp);
+
+    tokio::time::timeout(Duration::from_secs(2), bridge)
+        .await
+        .expect("bridge must terminate cleanly")
+        .unwrap();
+}

@@ -175,7 +175,6 @@ pub async fn sync_from_state(state: &AppState) {
         let snap = state
             .proxy_metrics
             .get(&p.name)
-            .await
             .map(|m| m.snapshot())
             .unwrap_or_else(|| frp_core::metrics::MetricsSnapshot {
                 bytes_in: 0,
@@ -364,7 +363,7 @@ mod tests {
             .register("run-1".into(), proxy_info(name, "tcp", "run-1", None, 1))
             .await
             .expect("register proxy");
-        let m = state.proxy_metrics.get_or_create(name).await;
+        let m = state.proxy_metrics.get_or_create(name);
         m.record_traffic(bytes_in, bytes_out);
         state
     }
@@ -422,7 +421,6 @@ mod tests {
         state
             .proxy_metrics
             .get_or_create(pname)
-            .await
             .record_traffic(150, 70);
         sync_from_state(&state).await;
         let text = render_metrics_text();
@@ -442,7 +440,7 @@ mod tests {
         // Cleanup this test's registry + baseline so parallel tests are not
         // affected by the shared statics.
         state.proxy_manager.remove(pname).await;
-        state.proxy_metrics.remove(pname).await;
+        state.proxy_metrics.remove(pname);
         proxy_removed(pname).await;
     }
 
@@ -472,7 +470,7 @@ mod tests {
         // Proxy removed (mirrors the hook sequence at the CloseProxy /
         // control-sweep / dashboard-delete / prune removal sites).
         state.proxy_manager.remove(pname).await;
-        state.proxy_metrics.remove(pname).await;
+        state.proxy_metrics.remove(pname);
         proxy_removed(pname).await;
 
         // Registration #2 (same name, fresh registry entry): cumulative 40
@@ -491,7 +489,7 @@ mod tests {
         );
 
         state.proxy_manager.remove(pname).await;
-        state.proxy_metrics.remove(pname).await;
+        state.proxy_metrics.remove(pname);
         proxy_removed(pname).await;
     }
 

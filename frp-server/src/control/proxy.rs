@@ -190,7 +190,7 @@ pub(crate) async fn handle_close_proxy<W: AsyncWriteExt + Unpin>(
         } else {
             ctx.state.tcpmux_manager.unregister(&cp.proxy_name).await;
         }
-        ctx.state.proxy_metrics.remove(&cp.proxy_name).await;
+        ctx.state.proxy_metrics.remove(&cp.proxy_name);
         #[cfg(feature = "dashboard")]
         crate::metrics::prom::proxy_removed(&cp.proxy_name).await;
         #[cfg(feature = "vnet")]
@@ -648,6 +648,7 @@ mod tests {
             udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
+        let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(64);
         let mut ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
@@ -662,6 +663,8 @@ mod tests {
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retry_tx,
+            retry_rx,
         };
         // Simulate the handle_new_proxy registration: per-proxy child token.
         let token = ctl.udp_cancel.child_token();
@@ -719,6 +722,7 @@ mod tests {
             udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
+        let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(64);
         let mut ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
@@ -733,6 +737,8 @@ mod tests {
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retry_tx,
+            retry_rx,
         };
         let bridge_token = ctl.bridge_cancel.clone();
         assert!(!bridge_token.is_cancelled(), "token starts live");
@@ -793,6 +799,7 @@ mod tests {
             udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
+        let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(64);
         let mut ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
@@ -807,6 +814,8 @@ mod tests {
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retry_tx,
+            retry_rx,
         };
 
         let mut writer = Vec::new();
@@ -887,6 +896,7 @@ mod tests {
             udp_packet_codec: String::new(),
             _run_mu_guard: run_mu_guard,
         };
+        let (retry_tx, retry_rx) = tokio::sync::mpsc::channel(64);
         let mut ctl = ControlState {
             shutting_down: false,
             shutdown_done: None,
@@ -901,6 +911,8 @@ mod tests {
             udp_sockets: HashMap::new(),
             last_ping: tokio::time::Instant::now(),
             superseded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retry_tx,
+            retry_rx,
         };
 
         let mut writer = Vec::new();

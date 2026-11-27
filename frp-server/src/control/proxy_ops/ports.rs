@@ -11,7 +11,21 @@ use tracing::{debug, info};
 
 use crate::service::AppState;
 
-use super::{is_udp_port_bindable, ProxyInfo, RwLockExt};
+use super::{is_udp_port_bindable_async, ProxyInfo, RwLockExt};
+
+/// First UDP candidate whose OS-level bind probe succeeds, each probed off
+/// the executor via `spawn_blocking`.
+async fn first_udp_bindable(
+    bind_addr: &str,
+    candidates: impl IntoIterator<Item = u16>,
+) -> Option<u16> {
+    for p in candidates {
+        if is_udp_port_bindable_async(bind_addr, p).await {
+            return Some(p);
+        }
+    }
+    None
+}
 
 /// First candidate whose OS-level bind probe succeeds, each probed off the
 /// executor via `spawn_blocking` (audit r3/server#1 — the sync bind must not
@@ -106,75 +120,116 @@ pub(super) async fn allocate_proxy_port(
         // configured remote_port (usually 0) for display only.
         Ok(remote_port)
     } else if is_udp_type {
-        // UDP/SuDP port allocation: no TCP bind probe (UdpSocket::bind handles
-        // OS-level validation later). Use dedicated used_udp_ports tracking
-        // separate from TCP used_ports (Go frp compat).
-        let mut ports = state.used_udp_ports.write().await;
+        // UDP/SuDP three-phase port allocation (mirroring TCP below):
+        // pick candidates under a brief read lock, run the OS bind probe off
+        // the executor via `spawn_blocking` OUTSIDE any lock, then commit
+        // under a short write lock (re-checking to close the TOCTOU window).
+        // `port_reservations` and `used_udp_ports` are never locked nested.
         if remote_port > 0 {
+            {
+                let ports = state.used_udp_ports.read().await;
+                if ports.contains(&remote_port) {
+                    // Port already used by another UDP proxy. SUDP allows
+                    // sharing, pure UDP does not — Go ErrPortAlreadyUsed
+                    // (ports.go:138-140).
+                    return if is_sudp {
+                        Ok(remote_port)
+                    } else {
+                        Err(PortError::AlreadyUsed)
+                    };
+                }
+            }
+            if !is_udp_port_bindable_async(&state.proxy_bind_addr, remote_port).await {
+                // OS-level UDP bind probe failed (Go frp compat:
+                // Manager.isPortAvailable does net.ListenUDP for UDP
+                // netType) — Go ErrPortUnAvailable (ports.go:130-136).
+                return Err(PortError::UnAvailable);
+            }
+            let mut ports = state.used_udp_ports.write().await;
             if ports.contains(&remote_port) {
-                // Port already used by another UDP proxy. SUDP allows sharing,
-                // pure UDP does not — Go ErrPortAlreadyUsed for the pure case
-                // (the `usedPorts` hit at ports.go:138-140).
                 if is_sudp {
                     Ok(remote_port)
                 } else {
                     Err(PortError::AlreadyUsed)
                 }
-            } else if !is_udp_port_bindable(&state.proxy_bind_addr, remote_port) {
-                // OS-level UDP bind probe failed (Go frp compat:
-                // Manager.isPortAvailable does net.ListenUDP for UDP
-                // netType) — an in-range explicit port that cannot bind is
-                // Go ErrPortUnAvailable (ports.go:130-136), NOT exhaustion.
-                Err(PortError::UnAvailable)
             } else {
                 ports.insert(remote_port);
                 Ok(remote_port)
             }
         } else {
-            // 24h reservation: re-registration with the same proxy name reuses
-            // its previous port when still free (Go ports.Manager.Acquire).
-            let mut found = None;
-            {
+            // 24h reservation: check and expire under `port_reservations`
+            // alone (never nested with `used_udp_ports`), then check
+            // `used_udp_ports` and probe bindability outside locks.
+            let res_candidate = {
                 let mut reservations = state.port_reservations.write().await;
-                // Lazy cleanup (Go cleanReservedPortsWorker): drop expired
-                // entries so the map does not grow without bound.
                 if let Some(&(res_port, true, reserved_at)) = reservations.get(&np.proxy_name) {
                     if reserved_at.elapsed() >= std::time::Duration::from_secs(24 * 3600) {
                         reservations.remove(&np.proxy_name);
-                    } else if !ports.contains(&res_port)
-                        && is_udp_port_bindable(&state.proxy_bind_addr, res_port)
-                    {
-                        ports.insert(res_port);
-                        found = Some(res_port);
+                        None
+                    } else {
+                        Some(res_port)
+                    }
+                } else {
+                    None
+                }
+            };
+            let res_candidate = match res_candidate {
+                Some(res_port) => {
+                    let used = state.used_udp_ports.read().await;
+                    if used.contains(&res_port) {
+                        None
+                    } else {
+                        Some(res_port)
                     }
                 }
-            }
-            if found.is_none() {
-                // Auto-assign: scan allow_ports ranges for first available UDP
-                // port with OS-level bind probe (Go frp compat).
-                let allow_ports = state.reloadable.read_ok().allow_ports.clone();
-                drop(ports); // Release write lock before re-acquiring
+                None => None,
+            };
+            let res_candidate = match res_candidate {
+                Some(p) if is_udp_port_bindable_async(&state.proxy_bind_addr, p).await => Some(p),
+                _ => None,
+            };
+            if let Some(p) = res_candidate {
                 let mut ports = state.used_udp_ports.write().await;
-                for r in allow_ports.iter() {
-                    for p in r.iter() {
-                        if !ports.contains(&p) && is_udp_port_bindable(&state.proxy_bind_addr, p) {
-                            ports.insert(p);
-                            found = Some(p);
-                            break;
-                        }
-                    }
-                    if found.is_some() {
-                        break;
-                    }
-                }
-                if found.is_none() {
-                    tracing::warn!(
-                        ranges = ?allow_ports,
-                        "UDP port exhaustion: no available ports in configured allow_ports ranges",
-                    );
+                if !ports.contains(&p) {
+                    ports.insert(p);
+                    return Ok(p);
                 }
             }
-            found.ok_or(PortError::NoAvailable)
+
+            // Auto-assign: collect unused candidates from allow_ports under a
+            // brief read lock, probe OUTSIDE any lock, then commit under a
+            // brief write lock. Retry on concurrent TOCTOU conflict without
+            // holding the write lock across probes.
+            let allow_ports = state.reloadable.read_ok().allow_ports.clone();
+            const MAX_UDP_COMMIT_RETRIES: usize = 8;
+            for _ in 0..MAX_UDP_COMMIT_RETRIES {
+                let candidates: Vec<u16> = {
+                    let used = state.used_udp_ports.read().await;
+                    allow_ports
+                        .iter()
+                        .flat_map(|r| r.iter())
+                        .filter(|p| !used.contains(p))
+                        .take(4096)
+                        .collect()
+                };
+                let Some(p) = first_udp_bindable(&state.proxy_bind_addr, candidates).await else {
+                    break;
+                };
+                let mut ports = state.used_udp_ports.write().await;
+                if !ports.contains(&p) {
+                    ports.insert(p);
+                    return Ok(p);
+                }
+                tracing::debug!(
+                    port = %p,
+                    "UDP port {p} taken by a concurrent registration during allocation, retrying",
+                );
+            }
+            tracing::warn!(
+                ranges = ?allow_ports,
+                "UDP port exhaustion: no available ports in configured allow_ports ranges",
+            );
+            Err(PortError::NoAvailable)
         }
     } else {
         // TCP-type proxy (tcp): three-phase port allocation. The blocking OS

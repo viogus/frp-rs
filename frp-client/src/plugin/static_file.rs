@@ -443,28 +443,132 @@ async fn handle_static_file_conn(
         return Err(format!("index.html suffix redirect: {url_path}"));
     }
 
-    // Audit finding D4 (the base canonicalize moved BELOW the open): the
-    // open-failure arms answer Go's serveError → toHTTPError pages without
-    // paying the base-directory walk (~4-8 syscalls saved per
-    // open-failure request — the walk exists only to verify an open that
-    // never happened). A base that vanished under the plugin now answers
-    // 404 through Go's own ENOENT arm below (fs.go:680-696), and an
-    // unreadable base answers 403 like Go's IsPermission arm — the old
-    // pre-open walk collapsed both to a blanket 404. The Rust-only
-    // containment guard still precedes every content-serve arm; it needs
-    // the base only once the open SUCCEEDED (next block).
-    let file = match std::fs::File::open(&full_path) {
-        Ok(f) => f,
-        Err(e) => {
+    enum StaticFsResolution {
+        OpenFailed(std::io::Error),
+        BaseResolveFailed(std::io::Error),
+        HandleResolveFailed(String),
+        PathTraversal,
+        StatFailed(std::io::Error),
+        DirNeedsTrailingSlash,
+        DirNotModified304,
+        DirListing {
+            mtime: Option<u64>,
+            body: String,
+        },
+        DirListFailed {
+            canon: std::path::PathBuf,
+            err: String,
+        },
+        File {
+            file: std::fs::File,
+            meta: std::fs::Metadata,
+            canon: std::path::PathBuf,
+            from_index: bool,
+        },
+    }
+
+    let slash_terminated = url_remainder.is_empty() || url_remainder.ends_with(b"/");
+    let ims_parsed = if_modified_since
+        .as_deref()
+        .and_then(parse_if_modified_since);
+
+    // Run all synchronous filesystem syscalls (open, canonicalize, fd realpath
+    // containment check, stat, index.html probe, and directory listing) on
+    // Tokio's blocking pool in a single hop so slow/network filesystems never
+    // stall async worker threads.
+    let fs_full_path = full_path.clone();
+    let fs_local_path = local_path.to_string();
+    let resolution = tokio::task::spawn_blocking(move || {
+        // Audit finding D4 (base canonicalize below open): open-failure arms
+        // answer Go's serveError → toHTTPError pages without paying the
+        // base-directory walk.
+        let file = match std::fs::File::open(&fs_full_path) {
+            Ok(f) => f,
+            Err(e) => return StaticFsResolution::OpenFailed(e),
+        };
+
+        // Rust-only hardening: canonicalize base per request and verify via
+        // the already-open handle (eliminates stale base cache and TOCTOU).
+        let base = match std::fs::canonicalize(&fs_local_path) {
+            Ok(b) => b,
+            Err(e) => return StaticFsResolution::BaseResolveFailed(e),
+        };
+
+        let resolved = match open_handle_canonical(&file, &fs_full_path) {
+            Ok(p) => p,
+            Err(e) => return StaticFsResolution::HandleResolveFailed(e),
+        };
+        if !resolved.starts_with(&base) {
+            return StaticFsResolution::PathTraversal;
+        }
+        let meta = match file.metadata() {
+            Ok(m) => m,
+            Err(e) => return StaticFsResolution::StatFailed(e),
+        };
+
+        let mut f = file;
+        let mut f_meta = meta;
+        let mut f_canon = resolved;
+
+        if f_meta.is_dir() {
+            if !slash_terminated {
+                return StaticFsResolution::DirNeedsTrailingSlash;
+            }
+            // Go serveFile index.html swap (fs.go:735-745): OPEN-based.
+            let index_path = f_canon.join("index.html");
+            if let Ok(ix) = std::fs::File::open(&index_path) {
+                let ix_canon = match open_handle_canonical(&ix, &index_path) {
+                    Ok(p) => p,
+                    Err(e) => return StaticFsResolution::HandleResolveFailed(e),
+                };
+                if !ix_canon.starts_with(&base) {
+                    return StaticFsResolution::PathTraversal;
+                }
+                if let Ok(im) = ix.metadata() {
+                    f = ix;
+                    f_meta = im;
+                    f_canon = ix_canon;
+                }
+            }
+            if !f_meta.is_dir() {
+                return StaticFsResolution::File {
+                    file: f,
+                    meta: f_meta,
+                    canon: f_canon,
+                    from_index: true,
+                };
+            }
+
+            let mtime = mtime_secs(&f_meta);
+            if let (Some(ims), Some(mt)) = (ims_parsed, mtime) {
+                if mt <= ims {
+                    return StaticFsResolution::DirNotModified304;
+                }
+            }
+            match render_dir_listing(&f_canon) {
+                Ok(body) => StaticFsResolution::DirListing { mtime, body },
+                Err(err) => StaticFsResolution::DirListFailed {
+                    canon: f_canon,
+                    err,
+                },
+            }
+        } else {
+            StaticFsResolution::File {
+                file: f,
+                meta: f_meta,
+                canon: f_canon,
+                from_index: false,
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("static_file blocking task failed: {e}"))?;
+
+    let (f, f_meta, f_canon) = match resolution {
+        StaticFsResolution::OpenFailed(e) => {
             // Round-17 finding F: Go serveError → toHTTPError (fs.go:
             // 680-696) maps IsNotExist → 404 page, IsPermission → 403
-            // page, anything else → 500 — every arm via http.Error
-            // (text/plain body of the status text + "\n", nosniff). The
-            // pre-fix arm collapsed all three to the shared 404 page; now
-            // the io::ErrorKind decides, mirroring os.IsNotExist /
-            // os.IsPermission (a Kind-carrying error maps on kind; a
-            // kind-less error falls to the default 500, like Go's
-            // syscall.Errno-less error).
+            // page, anything else → 500 — every arm via http.Error.
             let resp = match e.kind() {
                 std::io::ErrorKind::NotFound => super::GO_404_NOT_FOUND_RENDER.to_string(),
                 std::io::ErrorKind::PermissionDenied => {
@@ -477,35 +581,8 @@ async fn handle_static_file_conn(
             }
             return Err(format!("failed to open {}: {e}", full_path.display()));
         }
-    };
-
-    // Rust-only hardening (Go's http.Dir cleans the joined name — path.Clean
-    // clamps "..", so traversal cannot escape — then deliberately FOLLOWS
-    // symlinks wherever they point; escaping the root is a documented Go
-    // footgun this plugin declines to copy): canonicalize the base directory
-    // PER REQUEST and verify via the ALREADY-OPEN handle above that the
-    // target stays within the base. A startup cache of the base realpath
-    // went stale when a base-dir symlink retargeted (versioned deploys like
-    // /var/www/current) and 403'd every file (round-17 review LOW) — audit
-    // finding D4 reviewed hoisting the walk to plugin start / reload and
-    // refused: the realpath is mutable filesystem state with a
-    // false-ACCEPT direction too (a retargeted base would sail the stale
-    // starts_with check and serve OUTSIDE the new root), so the walk stays
-    // per-request — the deliberate cost that replaces the staleable cache.
-    // The verification must resolve the open fd's inode, not re-resolve the
-    // path: re-canonicalizing the path after open() lets a symlink swap
-    // between the two make the check disagree with the opened inode
-    // (TOCTOU). Cost: a short path walk per request, not per byte.
-    let base = match std::fs::canonicalize(local_path) {
-        Ok(b) => b,
-        Err(e) => {
-            // Round-17 finding G — reachable only as a post-open race now
-            // (audit finding D4 moved the walk below the open): the open
-            // above succeeded, so the base existed moments ago; a concurrent
-            // rename/retarget between the open and this walk fails here.
-            // Go's serveError/toHTTPError maps the same condition (its own
-            // open of the joined name ENOENTs) to the 404 page — render the
-            // same page before closing.
+        StaticFsResolution::BaseResolveFailed(e) => {
+            // Round-17 finding G — reachable only as a post-open race now.
             if let Err(we) = client
                 .write_all(super::GO_404_NOT_FOUND_RENDER.as_bytes())
                 .await
@@ -517,58 +594,18 @@ async fn handle_static_file_conn(
                 local_path
             ));
         }
-    };
-
-    let resolved = open_handle_canonical(&file, &full_path)?;
-    if !resolved.starts_with(&base) {
-        // Escaping target — 403, redirects and listings included
-        // (round-16 FIX 6). Content-Length: 0 head, repo shape.
-        let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-        if let Err(e) = client.write_all(resp).await {
-            tracing::debug!(error = %e, "plugin relay error: {}", e);
+        StaticFsResolution::HandleResolveFailed(e) => return Err(e),
+        StaticFsResolution::PathTraversal => {
+            let resp = b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            if let Err(e) = client.write_all(resp).await {
+                tracing::debug!(error = %e, "plugin relay error: {}", e);
+            }
+            return Err("path traversal rejected".into());
         }
-        return Err("path traversal rejected".into());
-    }
-    let meta = file
-        .metadata()
-        .map_err(|e| format!("failed to stat {}: {e}", full_path.display()))?;
-
-    // Go serveFile keeps (f, d) as a mutable pair and swaps BOTH on an
-    // index.html hit (fs.go:742-744) — the metadata a later arm reads must
-    // describe the SWAPPED target. frp-rs mirrors with a triple (handle,
-    // metadata, canonical path); `resolved` doubles as the symlink-free
-    // path the listing arms read from (an escaping target already 403'd,
-    // so reading `resolved` never leaves the base).
-    let mut f = file;
-    let mut f_meta = meta;
-    let mut f_canon = resolved;
-
-    // Directory handling — serveFile's redirect block (fs.go:705-725) runs
-    // inside http.FileServer: after Go frp's auth middleware (401 first,
-    // then the redirect) and unreachable for non-GET (the route method gate
-    // above already answered 405 — gorilla never hands another method to
-    // FileServer; probe: POST on a slash-less dir is 405, never this 301).
-    // Round-16 FIX 11: the arm fires only for in-base targets (guard-first).
-    let slash_terminated = url_remainder.is_empty() || url_remainder.ends_with(b"/");
-    if f_meta.is_dir() {
-        // A directory URL that does not end in '/' answers 301 with a
-        // Location derived from the CLEANED path:
-        //   * canonical request path → Go FileServer localRedirect:
-        //     RELATIVE Location = path.Base(stripped URL path) + "/"
-        //     (fs.go:705-713) — relative stays correct under the strip
-        //     prefix. Query appended verbatim.
-        //   * non-canonical path (dot-segments / duplicate slashes —
-        //     gorilla cleanPath would have 301'd at the ROUTER, pre-auth
-        //     and pre-strip) → ABSOLUTE single-hop Location: escaped
-        //     cleaned FULL path + "/" (Go's chain is two hops — router 301
-        //     to the canonical path, then the FileServer redirect above;
-        //     the fold redirects once to the canonical slash-terminated
-        //     URL). A relative Location from the UNCLEANED remainder would
-        //     send the client back to the non-canonical URL (handler-head
-        //     note; round-16 FIX 11 — the old code derived every Location
-        //     from the uncleaned remainder, so "/static//sub" 301'd back to
-        //     "/static//sub/" and never converged).
-        if !slash_terminated {
+        StaticFsResolution::StatFailed(e) => {
+            return Err(format!("failed to stat {}: {e}", full_path.display()));
+        }
+        StaticFsResolution::DirNeedsTrailingSlash => {
             let mut location: Vec<u8>;
             if canonical_full != decoded_path {
                 location = Vec::with_capacity(canonical_full.len() + 8);
@@ -577,11 +614,6 @@ async fn handle_static_file_conn(
                     location.push(b'/');
                 }
             } else {
-                // Canonical: Go path.Base of the stripped URL path — last
-                // non-empty cleaned component. (A bare trailing "/."
-                // cleaning to the root is non-canonical and took the arm
-                // above; "." is unreachable here but mirrors Go's
-                // path.Base("") fallback shape.)
                 location = Vec::with_capacity(8);
                 match rel_components.last() {
                     Some(base) => location.extend_from_slice(base),
@@ -596,125 +628,76 @@ async fn handle_static_file_conn(
             }
             return Err(format!("directory without trailing slash: {url_path}"));
         }
-
-        // Go serveFile index.html swap (fs.go:735-745): OPEN-based — when
-        // the index entry opens and stats cleanly, the target swaps to it,
-        // even when the index entry is ITSELF a directory (Go then lists
-        // ITS contents below). Round-16 FIX 7: the old code probed with
-        // std::fs::metadata — a mode-000 index.html stats cleanly but fails
-        // to OPEN, so Go skips the swap and dirLists the directory (200);
-        // the metadata probe swapped, and the later open 404'd. A missing
-        // index leaves the directory as the target.
-        let index_path = f_canon.join("index.html");
-        if let Ok(ix) = std::fs::File::open(&index_path) {
-            // Rust-only: an index.html symlink escaping the base is denied
-            // (Go would serve the outside file).
-            let ix_canon = open_handle_canonical(&ix, &index_path)?;
-            if !ix_canon.starts_with(&base) {
-                let resp =
-                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                if let Err(e) = client.write_all(resp).await {
-                    tracing::debug!(error = %e, "plugin relay error: {}", e);
-                }
-                return Err("path traversal rejected".into());
-            }
-            if let Ok(im) = ix.metadata() {
-                f = ix;
-                f_meta = im;
-                f_canon = ix_canon;
-            }
-            // Stat error (raced deletion): keep the directory — Go's
-            // `ff, err := fs.Open(index); if err != nil { return }` arm
-            // likewise leaves d/f untouched.
+        StaticFsResolution::DirNotModified304 => {
+            let resp = b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n";
+            client
+                .write_all(resp)
+                .await
+                .map_err(|e| format!("write 304: {e}"))?;
+            return Ok(());
         }
-        // Swapped target may now be a FILE — Go re-tests `d.IsDir()` after
-        // the swap and serves the swapped file via serveContent when it is;
-        // the listing arm below is the still-a-directory case (an index
-        // entry that is itself a directory, or no openable index at all).
-        if !f_meta.is_dir() {
+        StaticFsResolution::DirListFailed { canon, err } => {
+            tracing::debug!(error = %err, "static_file: dirList read error: {err}");
+            let err_body = "Error reading directory\n";
+            let head = format!(
+                "HTTP/1.1 500 Internal Server Error\r\n\
+                 Content-Type: text/plain; charset=utf-8\r\n\
+                 X-Content-Type-Options: nosniff\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                err_body.len()
+            );
+            if let Err(we) = client.write_all(head.as_bytes()).await {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            if let Err(we) = client.write_all(err_body.as_bytes()).await {
+                tracing::debug!(error = %we, "plugin relay error: {}", we);
+            }
+            return Err(format!("dirList failed for {}: {err}", canon.display()));
+        }
+        StaticFsResolution::DirListing { mtime, body } => {
+            let mut head =
+                String::from("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n");
+            if let Some(mt) = mtime {
+                head.push_str(&format!("Last-Modified: {}\r\n", format_http_date(mt)));
+            }
+            head.push_str(&format!(
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ));
+            client
+                .write_all(head.as_bytes())
+                .await
+                .map_err(|e| format!("write headers: {e}"))?;
+            client
+                .write_all(body.as_bytes())
+                .await
+                .map_err(|e| format!("write body: {e}"))?;
+            return Ok(());
+        }
+        StaticFsResolution::File {
+            file,
+            meta,
+            canon,
+            from_index: true,
+        } => {
             return serve_open_file(
                 &mut client,
-                f,
-                &f_meta,
-                &f_canon,
+                file,
+                &meta,
+                &canon,
                 if_modified_since.as_deref(),
             )
             .await;
         }
+        StaticFsResolution::File {
+            file,
+            meta,
+            canon,
+            from_index: false,
+        } => (file, meta, canon),
+    };
 
-        // Go serveFile "still a directory" arm (fs.go:748-756): no
-        // openable index.html (or the index entry was itself a directory —
-        // see the swap above), so answer Go's dirList page. Precondition
-        // order mirrors Go: If-Modified-Since is evaluated against the
-        // CURRENT target's mtime first (possibly the swapped index-dir) — a
-        // hit answers 304 with no Last-Modified, no Content-Type, no CL.
-        // Round-16 FIX 15 (citation): Go's setLastModified for the listing
-        // runs only after the IMS gate passes (probe-verified go1.25: dir
-        // 304 wire = status + Date) — the frp-rs no-LM 304 head is the same
-        // header SET minus Go's Date plus the repo's Connection: close.
-        // "Exact parity" was previously claimed here — overstated: Go
-        // stamps Date and keep-alives the connection; frp-rs closes after
-        // every response, no Date anywhere (repo convention). Then the 200
-        // listing carries Last-Modified of the current target.
-        let mtime = mtime_secs(&f_meta);
-        if let Some(ims) = if_modified_since
-            .as_deref()
-            .and_then(parse_if_modified_since)
-        {
-            if let Some(mt) = mtime {
-                if mt <= ims {
-                    let resp = b"HTTP/1.1 304 Not Modified\r\nConnection: close\r\n\r\n";
-                    client
-                        .write_all(resp)
-                        .await
-                        .map_err(|e| format!("write 304: {e}"))?;
-                    return Ok(());
-                }
-            }
-        }
-        let body = match render_dir_listing(&f_canon) {
-            Ok(b) => b,
-            Err(e) => {
-                // Go dirList read error (fs.go:158-161): log +
-                // http.Error(w, "Error reading directory", 500) — the
-                // frp-rs shape (no Date, close after).
-                tracing::debug!(error = %e, "static_file: dirList read error: {e}");
-                let err_body = "Error reading directory\n";
-                let head = format!(
-                    "HTTP/1.1 500 Internal Server Error\r\n\
-                     Content-Type: text/plain; charset=utf-8\r\n\
-                     X-Content-Type-Options: nosniff\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n",
-                    err_body.len()
-                );
-                if let Err(we) = client.write_all(head.as_bytes()).await {
-                    tracing::debug!(error = %we, "plugin relay error: {}", we);
-                }
-                if let Err(we) = client.write_all(err_body.as_bytes()).await {
-                    tracing::debug!(error = %we, "plugin relay error: {}", we);
-                }
-                return Err(format!("dirList failed for {}: {e}", f_canon.display()));
-            }
-        };
-        let mut head =
-            String::from("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n");
-        if let Some(mt) = mtime {
-            head.push_str(&format!("Last-Modified: {}\r\n", format_http_date(mt)));
-        }
-        head.push_str(&format!(
-            "Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        ));
-        client
-            .write_all(head.as_bytes())
-            .await
-            .map_err(|e| format!("write headers: {e}"))?;
-        client
-            .write_all(body.as_bytes())
-            .await
-            .map_err(|e| format!("write body: {e}"))?;
-        return Ok(());
-    } else if slash_terminated {
+    if slash_terminated {
         // Round-16 FIX 4: Go serveFile's file-with-trailing-slash redirect
         // (fs.go:714-724) — a FILE URL ending in '/' answers 301 Location:
         // "../" + path.Base(url) (the base resolves one directory UP out of
@@ -872,17 +855,17 @@ async fn serve_open_file(
     //   INM handling) answers 304. Token-less requests are parity; "*" is
     //   Go-304 / frp-rs-200. The audit scoped Last-Modified/304 only.
     let mut file = tokio::fs::File::from_std(file);
-    let mut chunk = [0u8; 64 * 1024];
+    let mut chunk = frp_core::buffer_pool::PoolGuard::acquire();
     loop {
         let n = file
-            .read(&mut chunk)
+            .read(chunk.as_mut_slice())
             .await
             .map_err(|e| format!("failed to read file: {e}"))?;
         if n == 0 {
             break;
         }
         client
-            .write_all(&chunk[..n])
+            .write_all(&chunk.raw_buf()[..n])
             .await
             .map_err(|e| format!("write body: {e}"))?;
     }

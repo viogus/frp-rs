@@ -111,6 +111,16 @@ fn is_udp_port_bindable(bind_addr: &str, port: u16) -> bool {
     }
 }
 
+/// Async wrapper around [`is_udp_port_bindable`] that runs the blocking OS
+/// bind probe on Tokio's blocking pool (mirroring
+/// `crate::proxy::is_tcp_port_bindable_async`).
+async fn is_udp_port_bindable_async(bind_addr: &str, port: u16) -> bool {
+    let bind_addr = bind_addr.to_string();
+    tokio::task::spawn_blocking(move || is_udp_port_bindable(&bind_addr, port))
+        .await
+        .unwrap_or(false)
+}
+
 /// Register a new proxy and start listening on its assigned port.
 /// Returns `true` when the proxy was fully registered (listener up, success
 /// response written), `false` when it was rejected at any stage — the caller

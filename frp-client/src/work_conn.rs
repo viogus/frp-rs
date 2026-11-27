@@ -1135,45 +1135,102 @@ pub(crate) fn spawn_work_conn(cfg: WorkConnConfig) -> tokio::task::JoinHandle<()
                         debug!(label = %label, "Work conn {}: session dead, skipping bridge", label);
                         return;
                     }
-                    // TCP/HTTP/STCP: connect to local TCP service and bridge
-                    match proxy::connect_local_with_dns(&info.local_addr, dns_server.as_deref())
-                        .await
-                    {
-                        Ok(mut local) => {
-                            // M9 (Go http_common.go:116-117 parity): hand the
-                            // https2http/https2https plugins the real tunnel
-                            // peer — their listener is loopback, so without
-                            // this X-Forwarded-For would carry 127.0.0.1. Go
-                            // wraps the conn and calls
-                            // SetRemoteAddr(connInfo.SrcAddr); here the plugin
-                            // accept handler looks the real addr up by this
-                            // dial's local ephemeral port. F5: the returned
-                            // guard removes the registry entry when this task's
-                            // scope ends — normal bridge end, early return, or
-                            // abort (dropping the future drops the guard);
-                            // the accept-handler take consumes the entry long
-                            // before then (the plugin accept fires once the
-                            // listener wakes, while the bridge below is still
-                            // running). The guard MUST bind at this arm scope:
-                            // audit R1 caught a nested binding whose Drop fired
-                            // nanoseconds after insert — the entry was removed
-                            // before the accept handler's 8×1ms plugin_peer_ip
-                            // retry could take it, so every tunneled request
-                            // fell back to X-Forwarded-For: 127.0.0.1.
-                            let mut _plugin_peer_guard: Option<crate::plugin::PluginPeerGuard> =
-                                None;
-                            if matches!(info.plugin.as_str(), "https2http" | "https2https") {
-                                if let (Some(src), Some(src_port)) =
-                                    (swc.src_addr.as_deref(), swc.src_port)
-                                {
-                                    if let Ok(real_ip) = src.parse::<std::net::IpAddr>() {
-                                        if let Ok(dialer_local) = local.local_addr() {
-                                            _plugin_peer_guard =
-                                                Some(crate::plugin::register_plugin_peer(
-                                                    dialer_local.port(),
-                                                    std::net::SocketAddr::new(real_ip, src_port),
-                                                ));
+                    // TCP/HTTP/STCP: connect to local TCP service and bridge.
+                    //
+                    // M9 (Go http_common.go:116-117 parity): hand the
+                    // https2http/https2https plugins the real tunnel peer —
+                    // their listener is loopback, so without this
+                    // X-Forwarded-For would carry 127.0.0.1. Pre-bind an
+                    // ephemeral loopback port and register it BEFORE `connect`
+                    // sends SYN so the plugin accept handler hits immediately
+                    // on first lookup with zero race and zero sleep.
+                    let mut _plugin_peer_guard: Option<crate::plugin::PluginPeerGuard> = None;
+                    let real_plugin_peer =
+                        if matches!(info.plugin.as_str(), "https2http" | "https2https") {
+                            match (swc.src_addr.as_deref(), swc.src_port) {
+                                (Some(src), Some(src_port)) => src
+                                    .parse::<std::net::IpAddr>()
+                                    .ok()
+                                    .map(|ip| std::net::SocketAddr::new(ip, src_port)),
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+                    let local_res = if let (Some(real_peer), Ok(target_addr)) = (
+                        real_plugin_peer,
+                        info.local_addr.parse::<std::net::SocketAddr>(),
+                    ) {
+                        if target_addr.is_ipv4() && target_addr.ip().is_loopback() {
+                            match tokio::net::TcpSocket::new_v4().and_then(|sock| {
+                                sock.bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))?;
+                                let dialer_port = sock.local_addr()?.port();
+                                Ok((sock, dialer_port))
+                            }) {
+                                Ok((sock, dialer_port)) => {
+                                    _plugin_peer_guard = Some(crate::plugin::register_plugin_peer(
+                                        dialer_port,
+                                        real_peer,
+                                    ));
+                                    match tokio::time::timeout(
+                                        std::time::Duration::from_secs(10),
+                                        sock.connect(target_addr),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(s)) => {
+                                            frp_core::transport::set_nodelay(&s);
+                                            Ok(s)
                                         }
+                                        Ok(Err(e)) => {
+                                            _plugin_peer_guard = None;
+                                            Err(frp_core::Error::Transport(
+                                                format!(
+                                                    "connect to local plugin {target_addr}: {e}"
+                                                )
+                                                .into(),
+                                            ))
+                                        }
+                                        Err(_) => {
+                                            _plugin_peer_guard = None;
+                                            Err(frp_core::Error::Transport(
+                                                format!(
+                                                    "connect to local plugin {target_addr}: timed out"
+                                                )
+                                                .into(),
+                                            ))
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    proxy::connect_local_with_dns(
+                                        &info.local_addr,
+                                        dns_server.as_deref(),
+                                    )
+                                    .await
+                                }
+                            }
+                        } else {
+                            proxy::connect_local_with_dns(&info.local_addr, dns_server.as_deref())
+                                .await
+                        }
+                    } else {
+                        proxy::connect_local_with_dns(&info.local_addr, dns_server.as_deref()).await
+                    };
+                    match local_res {
+                        Ok(mut local) => {
+                            // Fallback post-connect registration when pre-bind
+                            // did not run (e.g. non-IPv4 or hostname target).
+                            // F5: the guard stays bound at this arm scope so it
+                            // lives until the bridge exits.
+                            if _plugin_peer_guard.is_none() {
+                                if let Some(real_peer) = real_plugin_peer {
+                                    if let Ok(dialer_local) = local.local_addr() {
+                                        _plugin_peer_guard =
+                                            Some(crate::plugin::register_plugin_peer(
+                                                dialer_local.port(),
+                                                real_peer,
+                                            ));
                                     }
                                 }
                             }

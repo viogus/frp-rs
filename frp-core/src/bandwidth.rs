@@ -1,6 +1,5 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::Mutex;
 
 /// A per-proxy shared bandwidth limiter: one token bucket covering BOTH
 /// bridge directions and ALL concurrent connections of the proxy (Go frp
@@ -72,7 +71,7 @@ impl BandwidthLimiter {
     /// `NewWriter` (bidirectional traffic shares one rate).
     pub async fn consume_shared(lim: &SharedBandwidthLimiter, n: usize) {
         let wait = {
-            let mut l = lim.lock().await;
+            let mut l = lim.lock().unwrap_or_else(|e| e.into_inner());
             l.reserve(n)
         };
         if let Some(wait) = wait {
