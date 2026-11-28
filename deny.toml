@@ -1,5 +1,5 @@
 # cargo-deny configuration for frp-rs
-# Run: cargo deny check
+# Run: cargo deny --all-features check
 
 [graph]
 targets = [
@@ -10,15 +10,11 @@ targets = [
 ]
 
 [advisories]
-ignore = [
-    # quick-xml 0.26.x (pulled by pprof -> inferno for on-demand CPU flamegraph
-    # profiling). RUSTSEC-2026-0194/0195 affect XML parsing in the profiling
-    # tool path, which is opt-in, developer-only, never exposed to network
-    # input, and absent from all shipped default/tiny/micro builds. pprof
-    # upstream still pins inferno 0.11; track for a fixed release.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
-]
+# All prior ignores retired:
+# - RUSTSEC-2024-0449 (unsafe-libyaml via serde_yaml_ng) → yaml-rust2 0.13
+# - RUSTSEC-2023-0071 (rsa via vendored russh) → russh 0.65.4 / rsa 0.10.0
+# - RUSTSEC-2026-0194/0195 (quick-xml via pprof/inferno 0.11) → dropped `flamegraph` feature in favor of `frp-core/src/profiling.rs` SVG renderer
+ignore = []
 
 [licenses]
 allow = [
@@ -38,11 +34,6 @@ allow = [
 exceptions = [
     # ring: ISC-style with OpenSSL exception for BoringSSL-derived code
     { name = "ring", allow = ["ISC", "OpenSSL"] },
-    # inferno 0.11 (flamegraph rendering): CDDL-1.0, OSI-approved weak
-    # copyleft. Pulled only by pprof via the opt-in `profiling` feature
-    # (dev-only, absent from all shipped default/tiny/micro builds). Scoped
-    # here so the global allow list stays strict.
-    { name = "inferno", allow = ["CDDL-1.0"] },
 ]
 
 [[licenses.clarify]]
