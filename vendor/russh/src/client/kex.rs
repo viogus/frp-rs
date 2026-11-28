@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use log::{debug, error, warn};
 use ssh_encoding::{Decode, Encode};
-use ssh_key::{Certificate, Mpint, PublicKey, Signature};
+use ssh_key::{Algorithm, Certificate, Mpint, PublicKey, Signature};
 
 use super::IncomingSshPacket;
 use crate::client::{Config, NewKeys};
@@ -22,6 +22,49 @@ use crate::{CryptoVec, Error, SshId, msg, negotiation, strict_kex_violation};
 
 thread_local! {
     static HASH_BUFFER: RefCell<CryptoVec> = RefCell::new(CryptoVec::new());
+}
+
+// RFC 4253 §7.1, §8. The verifier takes the algorithm from the signature
+// blob, so it accepts an RSA key when ed25519 was negotiated, and an ssh-rsa
+// (SHA-1) signature when rsa-sha2-512 was
+fn matches_negotiated_host_key_algorithm(
+    negotiated: &Algorithm,
+    host_key: &PublicKey,
+    signature: &Signature,
+) -> bool {
+    let key_type_matches = match (negotiated, host_key.algorithm()) {
+        // An RSA key's algorithm has no hash. Only the signature's does
+        (Algorithm::Rsa { .. }, Algorithm::Rsa { .. }) => true,
+        (negotiated, presented) => *negotiated == presented,
+    };
+    key_type_matches && signature.algorithm() == *negotiated
+}
+
+// Some servers (Huawei VRP among them) pad ECDSA signature scalars with leading
+// zeros. ssh-key rejects that as a non-canonical mpint; OpenSSH accepts it.
+// Re-encodes r and s canonically so the strict decoder can take it from there.
+fn canonicalize_ecdsa_signature(blob: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = blob;
+    let algorithm = String::decode(&mut reader).ok()?;
+    if !algorithm.starts_with("ecdsa-sha2-") {
+        return None;
+    }
+    let inner = Vec::<u8>::decode(&mut reader).ok()?;
+    let mut scalars = inner.as_slice();
+    let mut canonical_scalars = Vec::new();
+    for _ in 0..2 {
+        let scalar = Vec::<u8>::decode(&mut scalars).ok()?;
+        Mpint::from_positive_bytes(&scalar)
+            .encode(&mut canonical_scalars)
+            .ok()?;
+    }
+    if !reader.is_empty() || !scalars.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    algorithm.encode(&mut out).ok()?;
+    canonical_scalars.encode(&mut out).ok()?;
+    Some(out)
 }
 
 #[derive(Debug)]
@@ -333,9 +376,30 @@ impl ClientKex {
 
                 let signature_blob = Bytes::decode(r)?;
                 let mut signature_reader = &signature_blob[..];
-                let signature = Signature::decode(&mut signature_reader)?;
-                ensure_end(&signature_reader)?;
+                let signature = match Signature::decode(&mut signature_reader) {
+                    Err(err @ ssh_key::Error::Encoding(ssh_encoding::Error::MpintEncoding)) => {
+                        let canonical =
+                            canonicalize_ecdsa_signature(&signature_blob).ok_or(err)?;
+                        Signature::decode(&mut canonical.as_slice())?
+                    }
+                    result => {
+                        let signature = result?;
+                        ensure_end(&signature_reader)?;
+                        signature
+                    }
+                };
                 ensure_end(r)?;
+
+                if !matches_negotiated_host_key_algorithm(&names.key, &server_host_key, &signature)
+                {
+                    debug!(
+                        "server host key ({}) or signature ({}) is not of the negotiated algorithm ({})",
+                        server_host_key.algorithm(),
+                        signature.algorithm(),
+                        names.key
+                    );
+                    return Err(Error::WrongServerSig);
+                }
 
                 if let Err(e) =
                     signature::Verifier::verify(&server_host_key, hash.as_ref(), &signature)
@@ -453,4 +517,134 @@ fn compute_keys(
         cipher: c,
         session_id: session_id_cv,
     })
+}
+
+#[cfg(test)]
+mod ecdsa_signature_canonicalization_tests {
+    use ssh_encoding::{Decode, Encode};
+    use ssh_key::Signature;
+
+    use super::canonicalize_ecdsa_signature;
+
+    fn blob(algorithm: &str, r: &[u8], s: &[u8]) -> Vec<u8> {
+        let mut scalars = Vec::new();
+        r.encode(&mut scalars).unwrap();
+        s.encode(&mut scalars).unwrap();
+        let mut out = Vec::new();
+        algorithm.encode(&mut out).unwrap();
+        scalars.encode(&mut out).unwrap();
+        out
+    }
+
+    #[test]
+    fn strips_leading_zeros() {
+        let r = [vec![0, 0, 0], vec![0x42; 65]].concat();
+        let s = [vec![0, 0], vec![0x80; 66]].concat();
+        let padded = blob("ecdsa-sha2-nistp521", &r, &s);
+        assert!(matches!(
+            Signature::decode(&mut padded.as_slice()),
+            Err(ssh_key::Error::Encoding(ssh_encoding::Error::MpintEncoding))
+        ));
+
+        let canonical = canonicalize_ecdsa_signature(&padded).unwrap();
+        assert_eq!(canonical, blob("ecdsa-sha2-nistp521", &r[3..], &s[1..]));
+        assert!(Signature::decode(&mut canonical.as_slice()).is_ok());
+
+        let p256 = blob("ecdsa-sha2-nistp256", &[0, 1], &[2]);
+        assert_eq!(
+            canonicalize_ecdsa_signature(&p256).unwrap(),
+            blob("ecdsa-sha2-nistp256", &[1], &[2])
+        );
+    }
+
+    #[test]
+    fn rejects_other_algorithms_and_malformed_blobs() {
+        assert!(canonicalize_ecdsa_signature(&blob("ssh-rsa", &[0, 1], &[2])).is_none());
+
+        let good = blob("ecdsa-sha2-nistp521", &[0, 1], &[2]);
+        assert!(canonicalize_ecdsa_signature(&good[..good.len() - 1]).is_none());
+        assert!(canonicalize_ecdsa_signature(&[good.clone(), vec![0xff]].concat()).is_none());
+
+        let mut scalars = Vec::new();
+        for s in [&[0, 1][..], &[2], &[3]] {
+            s.encode(&mut scalars).unwrap();
+        }
+        let mut three_scalars = Vec::new();
+        "ecdsa-sha2-nistp521".encode(&mut three_scalars).unwrap();
+        scalars.encode(&mut three_scalars).unwrap();
+        assert!(canonicalize_ecdsa_signature(&three_scalars).is_none());
+    }
+}
+
+#[cfg(test)]
+mod negotiated_host_key_algorithm_tests {
+    use ssh_key::{Algorithm, HashAlg, PrivateKey, Signature};
+
+    use super::matches_negotiated_host_key_algorithm;
+
+    fn ed25519() -> (PrivateKey, Signature) {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let signature = signature::Signer::try_sign(&key, b"hash").unwrap();
+        (key, signature)
+    }
+
+    #[test]
+    fn accepts_the_negotiated_algorithm() {
+        let (key, signature) = ed25519();
+        assert!(matches_negotiated_host_key_algorithm(
+            &Algorithm::Ed25519,
+            key.public_key(),
+            &signature
+        ));
+    }
+
+    #[test]
+    fn rejects_a_key_of_another_type() {
+        let (key, signature) = ed25519();
+        for negotiated in [
+            Algorithm::Rsa {
+                hash: Some(HashAlg::Sha512),
+            },
+            Algorithm::SkEd25519,
+        ] {
+            assert!(!matches_negotiated_host_key_algorithm(
+                &negotiated,
+                key.public_key(),
+                &signature
+            ));
+        }
+    }
+
+    #[cfg(feature = "rsa")]
+    #[test]
+    fn rejects_an_rsa_signature_with_another_hash() {
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Rsa { hash: None }).unwrap();
+        let ssh_key::private::KeypairData::Rsa(keypair) = key.key_data() else {
+            unreachable!()
+        };
+        let sign = |hash| -> Signature {
+            signature::Signer::try_sign(&(keypair, hash), b"hash".as_slice()).unwrap()
+        };
+        let sha512 = Algorithm::Rsa {
+            hash: Some(HashAlg::Sha512),
+        };
+
+        assert!(matches_negotiated_host_key_algorithm(
+            &sha512,
+            key.public_key(),
+            &sign(Some(HashAlg::Sha512))
+        ));
+        for hash in [None, Some(HashAlg::Sha256)] {
+            assert!(!matches_negotiated_host_key_algorithm(
+                &sha512,
+                key.public_key(),
+                &sign(hash)
+            ));
+        }
+        assert!(!matches_negotiated_host_key_algorithm(
+            &Algorithm::Rsa { hash: None },
+            key.public_key(),
+            &sign(Some(HashAlg::Sha512))
+        ));
+    }
 }

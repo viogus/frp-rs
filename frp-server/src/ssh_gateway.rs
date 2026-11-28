@@ -10,10 +10,6 @@
 //! the SSH client, matching Go frp's ssh tunnel gateway (pkg/ssh/server.go,
 //! gateway.go). Go semantics: `tcpip-forward` is accepted without binding a
 //! port; the recorded address is used as the forwarded-tcpip channel payload.
-//!
-//! NOTE: russh 0.61 transitively depends on rsa 0.10.0-rc.18 which has a known
-//! timing sidechannel (RUSTSEC-2023-0071, Marvin Attack). Only affects the SSH
-//! gateway feature. Monitor upstream for fix.
 
 mod args;
 mod bridge;

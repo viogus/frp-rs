@@ -125,5 +125,5 @@ fn decode_rsa_pkcs1_der(secret: &[u8]) -> Result<ssh_key::private::RsaKeypair, E
 
     use pkcs1::DecodeRsaPrivateKey;
 
-    Ok(rsa::RsaPrivateKey::from_pkcs1_der(secret)?.try_into()?)
+    Ok(rsa::PrivateKey::from_pkcs1_der(secret)?.try_into()?)
 }

@@ -11,13 +11,6 @@ targets = [
 
 [advisories]
 ignore = [
-    # rsa 0.10.0-rc.18: Marvin Attack timing sidechannel (RUSTSEC-2023-0071).
-    # Pulled by the russh "rsa" feature (RSA client-key auth). NOT REACHABLE:
-    # the Marvin sidechannel is in RSA private-key decryption, but frp-rs never
-    # performs RSA private-key ops — the SSH host key is Ed25519 and RSA is used
-    # only for signature *verification* of client public keys. Feature kept so
-    # RSA-key clients can still authenticate. No fixed rsa version exists.
-    "RUSTSEC-2023-0071",
     # quick-xml 0.26.x (pulled by pprof -> inferno for on-demand CPU flamegraph
     # profiling). RUSTSEC-2026-0194/0195 affect XML parsing in the profiling
     # tool path, which is opt-in, developer-only, never exposed to network
