@@ -4834,11 +4834,10 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: cargo audit (dependency vulnerability scan)
         # RUSTSEC-2026-0194/0195 (quick-xml via the opt-in pprof profiling
-        # path) and RUSTSEC-2023-0071 (rsa Marvin sidechannel, unreachable —
-        # frp-rs only verifies RSA signatures, never private-key ops) are
-        # documented pre-existing issues with no upstream fix. Full rationale
-        # in CLAUDE.md "Security audit" and deny.toml [advisories].
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071
+        # path) is a documented pre-existing dev/profiling issue with no
+        # upstream fix. Full rationale in CLAUDE.md "Security audit" and
+        # deny.toml [advisories].
+        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
       - name: cargo deny check (advisories + licenses + bans + sources)
         # --all-features so the graph matches Cargo.lock (which cargo audit
         # scans): opt-in deps like pprof -> inferno -> quick-xml are otherwise

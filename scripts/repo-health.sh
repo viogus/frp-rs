@@ -2458,7 +2458,7 @@ CLAIMS = [
     ('README.md',              r'\[`yamux`\]\(vendor/yamux/README-FRP-RS\.md\) \| ([0-9.]+)', v_yamux, 'vendor/yamux/Cargo.toml'),
     ('README.md',              r'\[`russh`\]\(vendor/russh/README-FRP-RS\.md\) \| ([0-9.]+)', v_russh, 'vendor/russh/Cargo.toml'),
     ('CLAUDE.md',              r'\*\*Vendored\*\* at `vendor/rustls` ([0-9.]+)', v_rustls, 'vendor/rustls/Cargo.toml'),
-    ('CLAUDE.md',              r'pinned by russh ([0-9.]+) \(latest\)',    v_russh,    'vendor/russh/Cargo.toml'),
+    ('CLAUDE.md',              r'\*\*Vendored\*\* at `vendor/russh` ([0-9.]+)', v_russh, 'vendor/russh/Cargo.toml'),
     ('CLAUDE.md',              r'SSH feature chain \(russh ([0-9.]+)',     v_russh,    'vendor/russh/Cargo.toml'),
     ('docs/architecture.md',   r'vendors rustls \(([0-9.]+) at',           v_rustls,   'vendor/rustls/Cargo.toml'),
     ('docs/developing.md',     r'\(`([0-9.]+)`, the RUSTSEC-2026-0346',  v_rustls,   'vendor/rustls/Cargo.toml'),

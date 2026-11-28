@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.89"
 name = "russh"
-version = "0.65.0"
+version = "0.65.4"
 authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
 build = false
 autolib = false
@@ -165,7 +165,12 @@ version = "0.9"
 
 [dependencies.aws-lc-rs]
 version = "1.16.2"
+features = [
+    "alloc",
+    "aws-lc-sys",
+]
 optional = true
+default-features = false
 
 [dependencies.bitflags]
 version = "2.0"
@@ -241,9 +246,6 @@ optional = true
 [dependencies.futures]
 version = "0.3"
 
-[dependencies.generic-array]
-version = "1.3.3"
-
 [dependencies.getrandom]
 version = "0.4"
 features = ["wasm_js"]
@@ -286,7 +288,7 @@ version = "0.14"
 features = ["ecdh"]
 
 [dependencies.pkcs1]
-version = "=0.8.0-rc.4"
+version = "0.8"
 optional = true
 
 [dependencies.pkcs8]
@@ -307,7 +309,7 @@ version = "0.17.14"
 optional = true
 
 [dependencies.rsa]
-version = "=0.10.0-rc.18"
+version = "0.10"
 optional = true
 
 [dependencies.russh-cryptovec]
@@ -340,7 +342,7 @@ version = "0.3"
 features = ["bytes"]
 
 [dependencies.ssh-key]
-version = "=0.7.0-rc.11"
+version = "=0.7.0-rc.12"
 features = [
     "ed25519",
     "p256",
