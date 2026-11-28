@@ -532,9 +532,7 @@ impl KcpSocket {
             // Sample the monotonic clock ONCE per `recvmmsg` batch instead of
             // once per datagram (saves ~1% total CPU in `__vdso_clock_gettime`).
             let now_ms = self.start.elapsed().as_millis() as u32;
-            let n_pkts = recv_batch.out.len();
-            for idx in 0..n_pkts {
-                let (slot, off, len, src) = recv_batch.out[idx];
+            for &(slot, off, len, src) in &recv_batch.out {
                 self.handle_datagram(&slots[slot][off..off + len], src, now_ms)
                     .await;
             }

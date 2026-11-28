@@ -353,7 +353,6 @@ impl VhostManager {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn register(
         &self,
         proxy_name: &str,
