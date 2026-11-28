@@ -4833,15 +4833,13 @@ jobs:
       - name: Install cargo-deny
         run: cargo install cargo-deny --locked
       - name: cargo audit (dependency vulnerability scan)
-        # RUSTSEC-2026-0194/0195 (quick-xml via the opt-in pprof profiling
-        # path) is a documented pre-existing dev/profiling issue with no
-        # upstream fix. Full rationale in CLAUDE.md "Security audit" and
-        # deny.toml [advisories].
-        run: cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+        # No ignored advisories: all workspace dependencies (including opt-in
+        # features) are clean. Policy in CLAUDE.md "Security audit" and deny.toml.
+        run: cargo audit
       - name: cargo deny check (advisories + licenses + bans + sources)
         # --all-features so the graph matches Cargo.lock (which cargo audit
-        # scans): opt-in deps like pprof -> inferno -> quick-xml are otherwise
-        # invisible to the license/advisory checks.
+        # scans): opt-in deps (pprof, otel, mimalloc) are otherwise invisible to
+        # the license/advisory checks.
         run: cargo deny --all-features check
       # Appended at EOF so no existing `ci.yml:<n>` citation is renumbered by
       # this step. The three `[patch.crates-io]` crates have no registry source,
