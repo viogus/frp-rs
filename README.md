@@ -38,19 +38,19 @@ version number is deliberately not independent (see
   `scripts/protocol-matrix.sh` asserts that all 11 transport rows actually move
   bytes and stay above a per-row throughput floor. Each of those counts is re-measured by `scripts/repo-health.sh`, which
   fails if this line drifts.
-- **3.5× smaller and 2.7× lighter** at the default tier, and 1.9 MB of frps plus
-  2.1 MB of frpc at `micro` — small enough for OpenWrt routers, IoT devices and
+- **3.5× smaller and 2.8× lighter** at the default tier, and 2.1 MB of frps plus
+  2.3 MB of frpc at `micro` — small enough for OpenWrt routers, IoT devices and
   size-capped images where a 17 MB Go binary does not fit at all. Every figure in
   this bullet is read off the measured, generated table in
   [Technical Differences](#technical-differences-vs-go-frp) (produced by
-  `scripts/compare-go-frp.sh`, its only copy): 17.7/5.1 = 3.5×, 26.3/9.9 = 2.7×.
+  `scripts/compare-go-frp.sh`, its only copy): 18.4/5.3 = 3.5×, 27.5/10.0 = 2.8×.
 - **No garbage collector** — a stable heap instead of one that grows to roughly 2×
   live, and no stop-the-world component in the tail. Long-uptime head-to-head RSS
   is still an open measurement: see [TODO.md](TODO.md).
 - **Faster than Go frp on every transport, with a fraction of the CPU and RAM.**
   Measured head-to-head against the official Go frp v0.72.0 release on the same
   4-vCPU Linux VM with identical TOML configs (3/3 interleaved wins on all 10
-  rows):
+  transport rows):
   - **Default (`tcpMux` + TLS):** **+67% throughput** (`769` vs `460 MiB/s`),
     **38% less CPU per MiB**, **2.2–2.5× lower peak RSS**, and **35% lower p50 RTT**.
   - **WebSocket / WSS (`tcpMux`):** **+93% to +104% throughput** (up to **2.0×**
@@ -60,6 +60,20 @@ version number is deliberately not independent (see
     faster), **3.2–4.4× higher CPU efficiency**, and **68× lower p50 / 22× lower p99 RTT**.
   - **Plain TCP (`splice`):** **+59% throughput** (`2.92` vs `1.84 GiB/s`) at
     **3.1× CPU efficiency** (`68%` less CPU per MiB).
+  - **HTTP/1.1 & HTTP/2 VHost, UDP & `/metrics`:** On the same VM and TOML
+    configs, **+66% HTTP/1.1 VHost RPS** (`4,161` vs `2,500 req/s`, `39%`
+    lower p50, `48%` less CPU, `2.5–3.1×` lower peak RSS), **+28% H2
+    `vhost_h2c` throughput** (`599.7` vs `468.5 MiB/s`) with **`−93%`
+    stalled-client RSS growth** (`+1.6` vs `+24.2 MB`), **+53% UDP packet rate**
+    (`8.00` vs `5.24 kpps`, `51%` less CPU/pkt), and **3.3× lower `frps` RSS**
+    (`−27%` p99, `−29%` CPU) on 200-proxy `/metrics`.
+- **High-throughput client plugins (same-branch A/B):** Kernel `splice(2)` pushes
+  `socks5` 4-stream TCP `CONNECT` to **4,305 MiB/s** (**+19.3%**, **3.04×** CPU
+  efficiency) and zero-alloc `UDP ASSOCIATE` to **62.0 MiB/s** (`Domain`,
+  **+14.4%**) / **52.7 kpps** (`IPv4` 64 B, **+9.7%**); the `frp-rs`-only
+  `http2connect` extension reaches **1,376.7 MiB/s** 1-stream TCP UL
+  (**+195%**), **1,183.7 MiB/s** 4-stream DL (**+67%**), **75.0 MiB/s** over
+  20 ms RTT (**28.6×**), and **71.7 kpps** on 1,400 B `CONNECT-UDP` (**+70%**).
   Full tables, latency numbers, methodology and caveats are in
   [Performance](#performance).
 - **Operational knobs Go frp does not have** — UDP bandwidth limiting, SSH gateway
@@ -178,25 +192,55 @@ median of 3 × 2,000 interleaved samples) and Linux `x86_64` release binaries:
 | WebSocket + `tcpMux` RTT (`p50` / `p99`) | **157 µs** / **327 µs** | 268 µs / 632 µs | **−41% p50, −48% p99** |
 | QUIC RTT (`p50` / `p99`) | **212 µs** / **592 µs** | 306 µs / 1,035 µs | **−31% p50, −43% p99** |
 | KCP + TLS + `tcpMux` RTT (`p50` / `p99`) | **0.30 ms** / **1.06 ms** | 20.34 ms / 23.63 ms | **68× lower p50, 22× lower p99** |
-| Linux `x86_64` release binary (`frps` / `frpc`) | **8.6 / 7.3 MB** | 21.3 / 17.5 MB | **2.4–2.5× smaller** |
+| Linux `x86_64` release binary (`frps` / `frpc`) | **8.7 / 7.3 MB** | 21.3 / 17.5 MB | **2.4× smaller** |
 
 *(At 8 concurrent streams on the same VM, KCP reaches **222.5 MiB/s** with
 `tcpMux` + TLS and **369.2 MiB/s** without `tcpMux` — 1.7× and 3.5× Go frp
 respectively — while remaining 100% wire-compatible with Go frp v0.72.0.)*
 
+### HTTP/1.1 & HTTP/2 VHost, UDP, Plugins & Observability
+
+Three interleaved head-to-head rounds on the same 4-vCPU Linux VM (`transport.tcpMux = true` + TLS, identical v0.72.0 TOML configs, zero errors across all rounds; peak RSS `VmHWM` pairs report `frps / frpc`):
+
+| Workload | frp-rs | Go frp v0.72.0 | frp-rs advantage |
+|---|---:|---:|---:|
+| HTTP/1.1 VHost (`12c`, header rewrites) | **4,161.4 req/s** (`2,596 µs` p50, `524 µs` CPU/req, `12.2 / 9.5 MB` `VmHWM`) | 2,499.6 req/s (`4,290 µs` p50, `1,011 µs` CPU/req, `37.8 / 23.7 MB` `VmHWM`) | **+66% RPS, −39% p50, −48% CPU, 2.5–3.1× lower RSS** |
+| HTTP/2 `vhost_h2c` (4×32 MiB DL) | **599.7 MiB/s** (`3,516 µs` CPU/MiB, `17.3 / 13.1 MB` `VmHWM`) | 468.5 MiB/s (`4,531 µs` CPU/MiB, `46.8 / 23.0 MB` `VmHWM`) | **+28% throughput, −22% CPU, 1.8–2.7× lower RSS** |
+| H2 `vhost_h2c` stalled client (64 MiB, 1.5 s) | **+1.6 MB** `frps` `VmHWM` growth (`11.7 MB` peak) | +24.2 MB `frps` `VmHWM` growth (`56.5 MB` peak) | **−93% growth (4.8× lower peak RSS)** |
+| UDP proxy (4 sockets, 1,200 B echo) | **8.00 kpps** / `9.15 MiB/s` (`185 µs` CPU/pkt, `9.5 / 9.0 MB` `VmHWM`) | 5.24 kpps / `6.00 MiB/s` (`377 µs` CPU/pkt, `34.7 / 23.6 MB` `VmHWM`) | **+53% pps, −51% CPU/pkt, 2.6–3.7× lower RSS** |
+| Prometheus `/metrics` (200 HTTP proxies, 2,000 scrapes) | **957.3 req/s** (`1,675 µs` p99, `1,020 µs` CPU/scrape, `11.2 MB` `frps` `VmHWM`) | 960.2 req/s (`2,290 µs` p99, `1,440 µs` CPU/scrape, `37.3 MB` `frps` `VmHWM`) | **−27% p99, −29% CPU, 3.3× lower RSS** |
+
+Same-branch A/B benchmarks (pre- vs post-optimization `frp-rs` on the same 4-vCPU Linux VM) also measured:
+
+- **`socks5` client plugin:** Kernel `splice(2)` pushes 4-stream TCP `CONNECT` to **4,304.6 MiB/s** (**+19.3%**, **3.04×** CPU efficiency); zero-alloc `UDP ASSOCIATE` reaches **62.0 MiB/s** (`Domain`, **+14.4%**) and **52.7 kpps** (`IPv4` 64 B, **+9.7%**).
+- **`http2connect` client plugin (`frp-rs` extension):** Pooled H2 streams reach **1,376.7 MiB/s** 1-stream TCP UL (**+195%**), **1,183.7 MiB/s** 4-stream DL (**+67%**), **75.0 MiB/s** over 20 ms RTT (**28.6×**), and **71.7 kpps / 95.7 MiB/s** on 1,400 B `CONNECT-UDP` (**+70%**).
+- **Hot-path progression (Batches 1–5):** Off-loop inbound `NewWorkConn` Yamux handshakes (`FuturesUnordered`) + `tokio::spawn` `StartWorkConn` delivery/bridging + lock-free `TcpStream::into_split()` (`static_file` **2,036 req/s**, **+9.9%**; `http_proxy CONNECT` **898 MB/s**, **+6.2%**), H2 `reserve_capacity`/`poll_capacity` backpressure (`−97.0%` to `−97.6%` stalled `VmHWM`; `vhost_h2c` UL **510.4 MB/s**, **+116%**; `https2http` UL **328.1 MB/s**, **+240%**), V2 8 B in-place UDP headroom (`UDP Enc 1200B` **13.2 kpps**, **+7.6%**), two-pass `Cow` VHost header scan + `O(1)` `proxy_removed` `/metrics` cleanup & single-mutex `LAST_TRAFFIC` tracking (**+38.7% RPS**, **−27.7% CPU** under `release-perf`), and dropping `uuid` + gating `tokio-util/compat` behind `tcp-mux` (`frps-micro` down to **96** unique crates / **115** `cargo tree` entries, `−4` entries from 119).
+
 ### Why frp-rs Is Faster
 
-- **Zero-copy Plain TCP (`splice`) & pooled 64 KiB bridge:** On Linux, plain TCP
-  forwards bytes directly between sockets in kernel space via `splice(2)` (only
-  428 µs CPU/MiB, **3.1×** Go's CPU efficiency); non-splice paths reuse pooled
-  64 KiB buffers aligned to a single `tcpMux` frame.
-- **Lock-free Yamux driver & zero-allocation body pool:** The vendored `yamux`
-  crate runs a driver-owned `Writer` with vectored `writev` framing, burst
-  flushing (at most once per 16-frame burst, zero flushes when idle), immediate
-  consumed-chunk return to the connection `body_pool`, `alloc_zeroed`/4 KiB
-  slab fills (avoiding `opt-level = "z"` byte-by-byte zeroing), lock-free
-  `AtomicU64` + `Notify` write-stall watchdogs (zero idle timer ticks), and
-  persistent `interval_at` keepalives.
+- **Zero-copy Plain TCP & `socks5` (`splice`) + pooled 64 KiB bridge:** On Linux,
+  plain TCP and `socks5` TCP `CONNECT` forward bytes directly between sockets in
+  kernel space via `splice(2)` (`428 µs` CPU/MiB on plain TCP, **3.1×** Go's CPU
+  efficiency), with streamlined pipe setup (`4→1 fcntl`/pipe, `−6` syscalls per
+  bridge); non-splice paths reuse pooled 64 KiB buffers aligned to a single
+  `tcpMux` frame.
+- **Lock-free Yamux driver, off-loop handshakes & zero-allocation body pool:** The
+  vendored `yamux` crate runs a driver-owned `Writer` with vectored `writev`
+  framing, burst flushing (at most once per 16-frame burst, zero flushes when
+  idle), immediate consumed-chunk return to the connection `body_pool`,
+  `alloc_zeroed`/4 KiB slab fills (avoiding `opt-level = "z"` byte-by-byte
+  zeroing), lock-free `AtomicU64` + `Notify` write-stall watchdogs (zero idle
+  timer ticks), persistent `interval_at` keepalives, off-loop inbound
+  `NewWorkConn` handshakes via `FuturesUnordered`, `tokio::spawn`
+  `StartWorkConn` delivery/bridging, and lock-free `TcpStream::into_split()`.
+- **HTTP/1.1 & HTTP/2 VHost backpressure + `http2connect` pooling:**
+  `vhost_h2c`, `plugin/h2`, and `http2connect` propagate downstream
+  `reserve_capacity`/`poll_capacity` flow-control backpressure instead of
+  buffering unbounded response bodies (`−93%` stalled `VmHWM` growth vs Go,
+  `−97%` in H2 A/B), while HTTP/1.1 VHost uses a two-pass `Cow` header scan with
+  a single output allocation, `PrecompiledRequestHeaders`, and a unified
+  `Arc<VhostRouteConfig>` (with `PrecompiledResponseHeaders` on the
+  `ResponseHeaderInjector` bridge path).
 - **Zero-copy WebSocket / WSS framing:** Coalesces vectored writes across up to
   15 slices with an inline partial-progress loop for `tokio-rustls`'s 64 KiB
   write cap, parses frame headers from a 64 B stack `preroll` buffer, streams
@@ -210,16 +254,22 @@ respectively — while remaining 100% wire-compatible with Go frp v0.72.0.)*
   along a non-shrinking `7 MiB → 1 MiB` ladder on every QUIC socket (eliminating
   kernel `RcvbufErrors` under burst load) and scales `send_window` to
   `2 × stream_receive_window` while keeping the 2 MiB pre-auth receive cap.
-- **KCP Linux UDP GSO/GRO + SIMD FEC:** Coalesces up to 44 equal-length KCP/FEC
-  datagrams (~62 KiB) per `sendmsg`/`recvmmsg` with zero extra user-space copy
-  (automatic fallback on older kernels and non-Linux hosts), paired with AVX2 /
-  NEON GF(2^8) FEC tables, separated chunk/datagram pools, and batch-cached
-  timestamps.
-- **No garbage collector & predictable RSS:** No 2× live-heap GC headroom and no
-  stop-the-world pauses, delivering 2–3× lower peak RSS across TCP, WebSocket
-  and KCP under load, plus [one write per protocol frame][coalesce] (+46% UDP
-  packets/s under `tcpMux`) and [zero-timer UDP reply forwarding][udp-reply]
-  (773 → 7,916 pps).
+- **KCP Linux UDP GSO/GRO + SIMD FEC & V2 zero-copy UDP:** Coalesces up to 44
+  equal-length KCP/FEC datagrams (~62 KiB) per `sendmsg`/`recvmmsg` with zero
+  extra user-space copy (automatic fallback on older kernels and non-Linux hosts),
+  paired with AVX2 / NEON GF(2^8) FEC tables, session-private `fec_rx_pool` and
+  `fec_group_pool`, zero-copy final FEC shards, batch-cached timestamps, V2 8 B
+  in-place UDP headroom, persistent 5 s UDP housekeeping and liveness check
+  intervals, `frp-vnet` `readv` vectored reads, and `BufferedRead` layer
+  flattening with immediate prefix-buffer release on drain.
+- **Reduced-contention observability, lock fast-paths & no garbage collector:** No
+  2× live-heap GC headroom and no stop-the-world pauses, delivering 2–3× lower
+  peak RSS across HTTP, WebSocket, UDP, and `/metrics` under load, `O(1)`
+  `proxy_removed` metrics cleanup, single-mutex borrowed-key `LAST_TRAFFIC`
+  updates, `AtomicBool` fast-path skip of the `group_health` `RwLock` when
+  unused, `ring`-backed PBKDF2/SHA-1, [one write per protocol frame][coalesce]
+  (+46% UDP packets/s under `tcpMux`), and
+  [zero-timer UDP reply forwarding][udp-reply] (773 → 7,916 pps).
 
 ### Methodology & Caveats
 
@@ -405,25 +455,32 @@ links. The short version:
    [compatibility audit](docs/go-frp-compat-audit.md) and the
    [development log](docs/history/development-log.md), and the compat suite runs
    against the real Go binary on every push.
-6. **Faster across every transport we measure.** +67% throughput in the shipping
-   `tcpMux` + TLS configuration, +93% to +104% on WebSocket/WSS + `tcpMux`,
-   +39% on QUIC, and +97% to +183% on KCP — with 19–77% less CPU per MiB,
-   2.1–3.3× lower peak RSS across TCP and WebSocket, 31–48% lower p99 RTT on
-   WebSocket/QUIC, and 68× lower p50 RTT on KCP, plus +46% UDP packets/s from
-   writing each frame once and 10.2× the datagram rate on the UDP reply path.
-   Full tables, method and caveats: [Performance](#performance).
+6. **Faster on every transport, and tighter tail latency, lower CPU, or lower
+   RSS on every workload we measure.** Against Go frp v0.72.0: +67%
+   throughput in the shipping `tcpMux` + TLS configuration, +93% to +104% on
+   WebSocket/WSS + `tcpMux`, +39% on QUIC, and +97% to +183% on KCP — with
+   19–77% less CPU per MiB, 2.1–3.3× lower peak RSS across TCP and WebSocket,
+   31–48% lower p99 RTT on WebSocket/QUIC, and 68× lower p50 RTT on KCP, plus
+   +66% HTTP/1.1 VHost RPS (`−39%` p50), +28% H2 `vhost_h2c` throughput
+   (`−93%` stalled RSS growth), +53% UDP packets/s (`−51%` CPU/pkt), and 3.3×
+   lower `frps` RSS (`−27%` p99, `−29%` CPU) on 200-proxy `/metrics`. In
+   same-branch A/B benchmarks, protocol and plugin refinements also delivered
+   +46% UDP packets/s under `tcpMux` (one write per frame), 10.2× the UDP reply
+   datagram rate, **4,304.6 MiB/s** on `socks5` TCP (`+19.3%`), and
+   **1,376.7 MiB/s** 1-stream TCP UL on `http2connect` (`+195%`). Full tables,
+   method and caveats: [Performance](#performance).
 
-<!-- Generated by scripts/compare-go-frp.sh on 2026-11-06 —
+<!-- Generated by scripts/compare-go-frp.sh on 2026-11-28 —
      platform: darwin_arm64; frp-rs 0.72.0; Go frp 0.72.0;
      rustc 1.98.1 (48a229cea 2026-09-01); declared release profile.
      Regenerate rather than editing these numbers by hand. -->
 
 | Metric | Go frp v0.72.0 | frp-rs (default) | frp-rs (`tiny`) | frp-rs (`micro`) |
 |--------|---------------|------------------|-----------------|-------------------|
-| frps binary | 18.4 MB | 5.1 MB | 3.3 MB | 2.0 MB |
-| frpc binary | 14.9 MB | 4.3 MB | 2.9 MB | 2.2 MB |
-| Memory (idle, frps) | 27.9 MB | 10.0 MB | 9.0 MB | 3.8 MB |
-| Memory (idle, frpc) | 18.0 MB | 9.5 MB | — | — |
+| frps binary | 18.4 MB | 5.3 MB | 3.4 MB | 2.1 MB |
+| frpc binary | 14.9 MB | 4.4 MB | 3.0 MB | 2.3 MB |
+| Memory (idle, frps) | 27.5 MB | 10.0 MB | 9.0 MB | 3.8 MB |
+| Memory (idle, frpc) | 18.2 MB | 9.6 MB | — | — |
 
 Measured on **macOS arm64**, both implementations at **v0.72.0**, with the declared
 release profile (`fat-LTO`, `opt-level=z`, `codegen-units=1`, `strip = "symbols"`,
