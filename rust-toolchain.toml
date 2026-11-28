@@ -58,6 +58,6 @@
 #   4. fix any lint the new compiler reports in that same PR — that diff is the
 #      point of the pin, not a separate chore.
 [toolchain]
-channel = "1.98.1"
+channel = "1.100.1"
 profile = "minimal"
 components = ["clippy", "rustfmt"]

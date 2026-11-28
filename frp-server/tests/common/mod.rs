@@ -1199,10 +1199,7 @@ impl FrpsHandle {
                         in_web = true;
                         return false;
                     }
-                    if in_web && l.trim().starts_with("port") {
-                        return true;
-                    }
-                    false
+                    in_web && l.trim().starts_with("port")
                 })
             })
             .and_then(|l| l.split('=').nth(1))
